@@ -1,0 +1,47 @@
+name: Latvi Check-in
+
+on:
+  schedule:
+    # 每天 UTC 02:25（北京时间 10:25）触发，给脚本内部等待留足余量
+    - cron: "25 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  latvi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120  # latvi 可能等待数小时，给足超时时间
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore latvi state
+        uses: actions/cache@v4
+        with:
+          path: .latvi_state.json
+          key: latvi-state
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Latvi check-in
+        env:
+          LATVI_EMAIL: ${{ secrets.LATVI_EMAIL }}
+          LATVI_PASSWORD: ${{ secrets.LATVI_PASSWORD }}
+          LATVI_STATE_FILE: .latvi_state.json
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python3 scripts/latvi.py
+
+      - name: Save latvi state
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: .latvi_state.json
+          key: latvi-state

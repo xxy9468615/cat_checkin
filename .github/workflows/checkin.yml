@@ -1,0 +1,56 @@
+name: Daily Check-in
+
+on:
+  schedule:
+    - cron: "25 2 * * *"  # 北京时间 10:25（给 latvi 随机延迟 0-5min + 冷却重试留余量）
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily check-in
+        env:
+          TZ: Asia/Shanghai
+          DAILY_PUSH: "true"
+          DAILY_EXCLUDE: birdiesearch.py,latvi.py
+          # Telegram
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # === 站点凭证 ===
+          GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
+          GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
+          GLADOS_AUTO_EXCHANGE: "true"
+          GLADOS_DOMAINS: glados.cloud
+          "2LIBRA_COOKIES": ${{ secrets.TWO_LIBRA_COOKIES }}
+          FNNAS_cookie: ${{ secrets.FNNAS_COOKIE }}
+          BIANJIE_AI_ACCOUNTS: ${{ secrets.BIANJIE_AI_ACCOUNTS }}
+          MOXING_username: ${{ secrets.MOXING_USERNAME }}
+          MOXING_password: ${{ secrets.MOXING_PASSWORD }}
+          MOXING_Domain: https://moxing.vip
+          MOXING_UA: ${{ secrets.MOXING_UA }}
+          UGNAS_cookie: ${{ secrets.UGNAS_COOKIE }}
+          # LATVI_* 不在此传入：latvi.py 已由 DAILY_EXCLUDE 排除，凭证只在 latvi.yml 中提供
+          PCBETA_username: ${{ secrets.PCBETA_USERNAME }}
+          PCBETA_password: ${{ secrets.PCBETA_PASSWORD }}
+          CLOUDSTUDIO_cookie: ${{ secrets.CLOUDSTUDIO_COOKIE }}
+          CLOUDSTUDIO_xsrf: ${{ secrets.CLOUDSTUDIO_XSRF }}
+          NAIXI_username: ${{ secrets.NAIXI_USERNAME }}
+          NAIXI_password: ${{ secrets.NAIXI_PASSWORD }}
+          DJI_cookie: ${{ secrets.DJI_COOKIE }}
+          MONKEYCODE_cookie: ${{ secrets.MONKEYCODE_COOKIE }}
+          SOPHNET_TOKENS: ${{ secrets.SOPHNET_TOKENS }}
+        run: python3 scripts/daily_report.py
