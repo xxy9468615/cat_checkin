@@ -285,32 +285,35 @@ def schedule_repo_dispatch(event_type: str, delay_seconds: int) -> tuple[bool, s
     if missing:
         return False, f"未配置延时调度依赖({', '.join(missing)})"
 
-    # GitHub repository_dispatch API 目标地址；QStash publish 的 topic 是目标 URL（需编码为路径片段）
+    # GitHub repository_dispatch API 目标地址
     dispatch_api = f"https://api.github.com/repos/{repo}/dispatches"
-    topic = urllib.parse.quote(dispatch_api, safe="")
 
     # 拼接 publish URL：无论 QSTASH_URL 配的是裸域名还是已带 /v2/publish[/<旧topic>]
-    # （含无尾斜杠的写法），都先剥掉 publish 路径再统一拼，避免双重前缀导致
-    # QStash 把目的地解析成 "v2/publish/https://…" 而报 invalid scheme
+    # （含无尾斜杠的写法），都先剥掉 publish 路径再统一拼，避免双重前缀。
+    # destination 用字面量 URL 而非百分号编码：区域端点（如 qstash-us-east-1）
+    # 不解码路径 topic，编码后的 https%3A%2F%2F… 会被判 "endpoint has invalid scheme"
     base = qstash_url.split("/v2/publish", 1)[0].rstrip("/")
-    publish_url = f"{base}/v2/publish/{topic}"
+    publish_url = f"{base}/v2/publish/{dispatch_api}"
 
     # QStash `…/v2/publish/{目标URL}` 会把请求体原样转发给目标，Body 必须是 GitHub
     # dispatches API 要求的原始 JSON（{"event_type": …}）。
     # GitHub 所需的鉴权/接受头通过 QStash 的 Upstash-Forward-* 前缀透传——
     # QStash 收到带该前缀的头时，会把前缀剥离后原样转发（Upstash → GitHub）。
+    # Upstash-Delay 必须带单位（Go duration 语法），纯数字会报
+    # "time: missing unit in duration"
     body = json.dumps({"event_type": event_type}, ensure_ascii=False)
     headers = {
         "Authorization": f"Bearer {qstash_token}",
         "Content-Type": "application/json",
-        "Upstash-Delay": str(int(delay_seconds)),
+        "Upstash-Delay": f"{int(delay_seconds)}s",
         "Upstash-Forward-Authorization": f"Bearer {gh_pat}",
         "Upstash-Forward-Accept": "application/vnd.github+json",
         "Upstash-Forward-X-GitHub-Api-Version": "2022-11-28",
     }
 
     resp = Http().request("POST", publish_url, headers=headers, data=body)
-    if resp.code == 200:
+    # publish 成功返回 200/201（201 Created 带 messageId，异步投递）
+    if resp.code in (200, 201):
         return True, str(int(delay_seconds))
     detail = resp.text[:200] if resp.text else ""
     return False, f"HTTP {resp.code}{': ' + detail if detail else ''}"
