@@ -160,12 +160,12 @@ jobs:
           MAIL_PASS: ${{ secrets.MAIL_PASS }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
-        run: |
-          python3 scripts/unified_report.py
-          date -u > .report_sent
+        run: python3 scripts/unified_report.py
 
+      # always()：脚本有任务失败时 exit 1，但邮件已发出、标记已写，必须照常保存；
+      # hashFiles：无结果中止时标记不存在，跳过保存（让 10:30 兜底重试）
       - name: Save report sent marker
-        if: steps.should_run.outputs.skip != 'true'
+        if: always() && steps.should_run.outputs.skip != 'true' && hashFiles('.report_sent') != ''
         uses: actions/cache/save@v4
         with:
           path: .report_sent

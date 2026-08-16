@@ -95,6 +95,14 @@ def main() -> None:
     if push_enabled:
         send_email(title, report, results)
         send_resend(title, report, results)
+        # 邮件已推送（无论任务成败）即写当日标记：report.yml 靠它去重，
+        # 避免「有任务失败 → exit 1 → 标记未写 → 10:30 兜底重发」的重复邮件。
+        # 结果为空时在上面已提前 exit，不会走到这里。
+        Path(".report_sent").write_text(
+            json.dumps({"date": today, "sent_at": dt.datetime.now(tz).isoformat()}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print("🔖 已写入今日发送标记 .report_sent")
 
     if fail_count:
         sys.exit(1)
