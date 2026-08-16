@@ -1,0 +1,57 @@
+name: ModelScope Check-in
+
+on:
+  schedule:
+    # 北京时间 09:10（UTC 01:10）。魔粒每日奖励凌晨访问不发放（实测 05:42 前
+    # today_used 仍为 0、余额不变），须等奖励窗口开启后再跑，且需早于 10:00 统一报告
+    - cron: "10 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: modelscope-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  modelscope:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set TODAY
+        run: echo "TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Run ModelScope check-in
+        env:
+          TZ: Asia/Shanghai
+          TASK_OUTPUT_DIR: .task_results
+          MODELSCOPE_cookie: ${{ secrets.MODELSCOPE_COOKIE }}
+          MODELSCOPE_HOST: ${{ secrets.MODELSCOPE_HOST }}
+          MODELSCOPE_AI_COOKIE: ${{ secrets.MODELSCOPE_AI_COOKIE }}
+        run: |
+          python3 scripts/run_task.py scripts/modelscope.py
+
+      - name: Cache task result
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: .task_results/
+          key: task-result-modelscope.py-${{ env.TODAY }}
+
+      # 冗余备份：artifact 独立于 cache，防止 cache 保存偶发静默失败时 report 读不到结果
+      - name: Upload task result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: task-result-modelscope.py
+          path: .task_results/
+          retention-days: 1
+          include-hidden-files: true

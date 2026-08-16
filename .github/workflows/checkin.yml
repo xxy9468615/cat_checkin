@@ -25,7 +25,6 @@ jobs:
           - bianjie_ai.py
           - dji.py
           - hw_dev.py
-          - modelscope.py
           - monkeycode.py
           - moxing_vip.py
           - naixi_forum.py
@@ -87,9 +86,6 @@ jobs:
           MONKEYCODE_email: ${{ secrets.MONKEYCODE_EMAIL }}
           MONKEYCODE_password: ${{ secrets.MONKEYCODE_PASSWORD }}
           SOPHNET_TOKENS: ${{ secrets.SOPHNET_TOKENS }}
-          MODELSCOPE_cookie: ${{ secrets.MODELSCOPE_COOKIE }}
-          MODELSCOPE_HOST: ${{ secrets.MODELSCOPE_HOST }}
-          MODELSCOPE_AI_COOKIE: ${{ secrets.MODELSCOPE_AI_COOKIE }}
         run: |
           python3 scripts/run_task.py "scripts/${{ matrix.script }}"
 

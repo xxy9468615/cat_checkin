@@ -120,6 +120,8 @@ jobs:
           }
           fetch_latest "Daily Check-in (Matrix Async)" "task-result-*"
           fetch_latest "WorkBuddy Check-in" "workbuddy-result-*"
+          # ModelScope 单独 09:10 跑（魔粒奖励凌晨未开放，混在 00:50 矩阵必失败）
+          fetch_latest "ModelScope Check-in" "task-result-modelscope.py"
           # Latvi 固定 18:00 运行（24h 间隔约束），10:00 报告取最近一次 run 的结果
           fetch_latest "Latvi Check-in" "task-result-latvi.py"
 
