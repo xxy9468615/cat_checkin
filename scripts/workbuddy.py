@@ -982,7 +982,9 @@ def _run_one(cookie: str, idx: int, total: int, wait_travel: bool) -> Tuple[bool
     # 3. AI 对话任务（辅助激活签到面板，尽力而为，不阻塞主流程）
     conv_msg, conv_ok = _run_conversation_and_wait(h, cookie, timeout_seconds=120)
     checkin_ok = daily_ok or conv_ok
-    checkin_msg = f"{daily_msg}｜AI对话：{conv_msg}"
+    # AI 对话是辅助通道：主 API 签到已成功时不把辅助通道的超时噪音带进摘要
+    #（避免「签到成功｜超时」这种读起来像报错的组合），仅主通道失败时附详情排查
+    checkin_msg = daily_msg if daily_ok else f"{daily_msg}｜AI对话：{conv_msg}"
 
     # 3. 活动一：连登兑换与抽奖追踪（取决于签到是否达成）
     redeem_msg, _ = _redeem_rewards(h, cookie)
