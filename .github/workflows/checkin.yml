@@ -15,7 +15,9 @@ concurrency:
 jobs:
   checkin-matrix:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # hw_dev 腿冷缓存时装 Playwright chromium（~150MB + apt 依赖）约 3-6 分钟，
+    # 加 300s 任务上限，15 分钟在慢网络日可能超时，放宽到 20
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

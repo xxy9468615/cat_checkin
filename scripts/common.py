@@ -117,10 +117,16 @@ class Http:
         except urllib.error.HTTPError as exc:
             return Response(exc.code, exc.headers, exc.read(), url)
         except urllib.error.URLError as exc:
-            # DNS failure / TLS error / connection reset / timeout escape as URLError.
+            # DNS failure / TLS error / connection-phase timeout escape as URLError.
             # Surface as a synthetic error response so callers get a usable .text/.json()
             # instead of an unhandled exception (which main_guard would flag as failure).
             return Response(-1, None, str(getattr(exc, "reason", exc)).encode("utf-8", "replace"), url)
+        except OSError as exc:
+            # 读超时（socket.timeout=TimeoutError）与读到一半的连接重置（ConnectionError、
+            # RemoteDisconnected）不会被 urllib 包装成 URLError，会直接穿透 except 与
+            # @retry —— 同样收敛为合成 -1 响应，让 retry 对慢 CDN / 连接抖动真正生效
+            #（urllib.error.URLError 本身是 OSError 子类，放最后只兜住非 URLError 的网络异常）。
+            return Response(-1, None, str(exc).encode("utf-8", "replace"), url)
 
 class Browser:
     """Playwright-based browser client for WAF-protected sites and session-bound APIs.

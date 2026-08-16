@@ -59,6 +59,9 @@ jobs:
         env:
           # 每个账号写入独立的结果文件名，避免多账号结果互相覆盖
           TASK_RESULT_NAME: workbuddy-account-${{ matrix.account }}.json
+          # 单账号正常 <5 分钟，但 AI 对话轮询上限 120s + 兑换/抽奖/放风链路在服务端
+          # 劣化时会超 300s 默认值（签到可能已成功却被记超时失败），放宽到 25 分钟
+          TASK_TIMEOUT: "1500"
 
       # report.yml 的统一汇总通过 download-artifact 读取结果（pattern: workbuddy-result-*），
       # 不再单独发邮件，全部并入每日 10:00 统一报告。
