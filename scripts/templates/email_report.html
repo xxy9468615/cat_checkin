@@ -1,0 +1,19 @@
+<!--
+  cat_checkin 每日签到汇总邮件模板（卡片式，邮件客户端安全）
+  可用占位符（daily_report.py 用简单字符串替换填充，不用 .format）：
+    {{SUBJECT}}  邮件标题行
+    {{STAT}}     状态统计行（成功/失败/总计）
+    {{CARDS}}    各任务的卡片 HTML（已由 python 端生成并转义）
+    {{FOOTER}}   页脚（生成时间等）
+  样式尽量内联、克制；渐变 header + 白底卡片区。
+-->
+<div style="margin:0;padding:16px;background:#f0f2f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif;">
+  <div style="max-width:680px;margin:0 auto;">
+    <div style="background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);border-radius:10px 10px 0 0;padding:24px 24px 18px;">
+      <div style="font-size:20px;font-weight:700;color:#ffffff;letter-spacing:.3px;">{{SUBJECT}}</div>
+      <div style="margin-top:8px;font-size:13px;color:#a0aec0;">{{STAT}}</div>
+    </div>
+    <div style="background:#fff;border-radius:0 0 10px 10px;padding:20px 20px 8px;">{{CARDS}}</div>
+    <div style="padding:14px 20px;font-size:12px;color:#9aa4b0;text-align:center;">{{FOOTER}}</div>
+  </div>
+</div>

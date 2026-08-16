@@ -1,0 +1,67 @@
+# Local secrets / env files
+.env
+.env.*
+*.env.local
+.local.env
+env.local
+.env.backup
+!.env.example
+
+# Local Claude Code state
+.claude/
+
+# Runtime/cache files
+__pycache__/
+*/__pycache__/
+*.pyc
+*.pyo
+*.log
+.DS_Store
+docs
+.task_results/
+.heal/
+.zcode/
+.report_sent
+.checkin_report.json
+.latvi_result.json
+.latvi_state.json
+.workbuddy_result.json
+
+# WSL2 metadata
+*:Zone.Identifier
+
+# HAR captures
+*.har
+
+# Test fixtures / local backups (never commit)
+test_data/
+*.enc
+*.db
+
+# ============================================================================
+# 本地 ONLY - 永远不提交 (安全占位)
+# ============================================================================
+
+# 环境变量 & secrets
+*.secret
+*.key
+*.pem
+*.credentials
+*.password
+*.token
+*.secret.json
+
+# 备份文件
+*.bak
+*.backup
+*.old
+
+# 项目存档/旧版
+archive/
+old/
+legacy/
+CLAUDE.md
+
+# HW 脚本本地源码（公开仓库仅提交混淆生成版）
+scripts/hw_dev.src.py
+scripts/hw_dev.gen.py

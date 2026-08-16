@@ -1,0 +1,111 @@
+name: WorkBuddy Check-in
+
+on:
+  schedule:
+    # 北京时间 10:00（UTC 02:00）每日触发，为 4 小时放风旅行留足完成窗口
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+  repository_dispatch:
+    types: [workbuddy_travel_claim]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workbuddy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  workbuddy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30  # 放风改为延时调度，不再阻塞等待；签到/兑换/抽奖/状态查询正常 < 5 分钟，AI 对话轮询上限 120s
+
+    # 多账号独立流程：每个账号用各自独立的 Cookie（独立 secret），互不打扰，
+    # 防风回访领取礼物也更方便。与 workbuddy-test.yml 保持一致的矩阵结构。
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - account: "1"
+            secret: WORKBUDDY_COOKIE
+          - account: "2"
+            secret: WORKBUDDY_COOKIE_2
+
+    env:
+      TZ: Asia/Shanghai
+      GITHUB_REPO: ${{ github.repository }}
+      QSTASH_URL: ${{ secrets.QSTASH_URL }}
+      QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      WORKBUDDY_COOKIE: ${{ secrets[matrix.secret] }}
+      WORKBUDDY_WAIT_TRAVEL: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set TODAY
+        run: echo "TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Syntax check (stdlib only)
+        run: python3 -m py_compile scripts/*.py
+
+      - name: Run WorkBuddy check-in (account ${{ matrix.account }})
+        run: python3 scripts/run_task.py scripts/workbuddy.py
+        env:
+          # 每个账号写入独立的结果文件名，避免多账号结果互相覆盖
+          TASK_RESULT_NAME: workbuddy-account-${{ matrix.account }}.json
+
+      # notify 作业通过 download-artifact 读取结果，无需再写 cache
+      - name: Upload task result artifact (account ${{ matrix.account }})
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workbuddy-result-account-${{ matrix.account }}
+          path: .task_results/
+          retention-days: 1
+          include-hidden-files: true
+
+  # 邮件推送：复用 daily_report.py 的卡片式 HTML 模板 + Resend/SMTP 发送，
+  # 作为「生产环境每日签到」的一部分直接推送（不再依赖 report.yml 统一汇总，避免重复发送）。
+  notify:
+    needs: workbuddy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: always()
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set TODAY
+        run: echo "TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Download all WorkBuddy result artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: workbuddy-result-*
+          path: .task_results
+          merge-multiple: true
+
+      - name: Send check-in email (Resend)
+        env:
+          TZ: Asia/Shanghai
+          DAILY_PUSH: "true"
+          TASK_OUTPUT_DIR: .task_results
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM: ${{ secrets.RESEND_FROM }}
+          RESEND_TO: ${{ secrets.RESEND_TO }}
+          MAIL_HOST: ${{ secrets.MAIL_HOST }}
+          MAIL_PORT: ${{ secrets.MAIL_PORT }}
+          MAIL_USER: ${{ secrets.MAIL_USER }}
+          MAIL_PASS: ${{ secrets.MAIL_PASS }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: python3 scripts/unified_report.py

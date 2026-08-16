@@ -1,0 +1,163 @@
+name: Daily Unified Report
+
+on:
+  schedule:
+    - cron: "0 12 * * *"  # 北京时间 20:00 主定时（每日统一汇总推送）
+    - cron: "0 14 * * *"  # 北京时间 22:00 兜底定时
+  workflow_run:
+    workflows: ["Latvi Check-in"]
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '是否强制重新发送（忽略今日已发送标记）'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: report-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Syntax check (stdlib only)
+        run: python3 -m py_compile scripts/*.py
+
+      - name: Set TODAY
+        run: echo "TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Check if report sent today
+        id: check_sent
+        uses: actions/cache/restore@v4
+        with:
+          path: .report_sent
+          key: report-sent-${{ env.TODAY }}
+
+      - name: Determine if execution is needed
+        id: should_run
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "🔄 手动强制重发，忽略已发送标记"
+            exit 0
+          fi
+
+          if [ "${{ steps.check_sent.outputs.cache-hit }}" = "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "✅ 今日报告已于更早时间成功推送，跳过重复发送 (Cache Hit)"
+            exit 0
+          fi
+
+          echo "Checking GitHub API for successful runs today..."
+          API_SENT=$(python3 -c "
+          import json, subprocess, os, datetime as dt
+          try:
+              out = subprocess.check_output(['gh', 'run', 'list', '--workflow', 'Daily Unified Report', '--status', 'success', '--json', 'databaseId,createdAt', '--limit', '10'], text=True)
+              runs = json.loads(out)
+              tz = dt.timezone(dt.timedelta(hours=8))
+              today = dt.datetime.now(tz).strftime('%Y-%m-%d')
+
+              sent = False
+              for r in runs:
+                  created_utc = dt.datetime.fromisoformat(r['createdAt'].replace('Z', '+00:00'))
+                  created_bj = created_utc.astimezone(tz).strftime('%Y-%m-%d')
+                  if created_bj == today:
+                      print(f'Found successful run today: {r[\"databaseId\"]} at {created_bj}')
+                      sent = True
+                      break
+              print('true' if sent else 'false')
+          except Exception as e:
+              import traceback
+              traceback.print_exc()
+              print('false')
+          ")
+
+          if [ "$API_SENT" = "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "✅ 今日报告已于更早时间成功推送，跳过重复发送 (API Check Hit)"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 1. 恢复所有任务的独立缓存结果
+      - name: Restore task results from cache
+        if: steps.should_run.outputs.skip != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .task_results/
+          key: task-results-${{ env.TODAY }}-${{ github.run_id }}
+          restore-keys: |
+            task-result-
+
+      # 2. 备用兜底：下载所有任务的 artifact 结果
+      - name: Download all task result artifacts
+        if: steps.should_run.outputs.skip != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: task-result-*
+          path: .task_results
+          merge-multiple: true
+        continue-on-error: true
+
+      # 3. 兼容旧版单一结果文件恢复
+      - name: Restore legacy checkin results
+        if: steps.should_run.outputs.skip != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .checkin_report.json
+          key: checkin-report-${{ env.TODAY }}
+
+      - name: Verify collected result files
+        if: steps.should_run.outputs.skip != 'true'
+        run: |
+          count=$(find .task_results -name "*.json" 2>/dev/null | wc -l)
+          echo "📊 .task_results/ 目录共发现 $count 份任务结果 JSON"
+          if [ "$count" -eq 0 ] && [ ! -f .checkin_report.json ]; then
+            echo "⚠️ 未发现任何任务结果文件"
+            exit 1
+          fi
+          echo "✅ 结果文件就绪，开始执行统一邮件汇总推送"
+
+      - name: Send unified report
+        if: steps.should_run.outputs.skip != 'true'
+        env:
+          TZ: Asia/Shanghai
+          DAILY_PUSH: "true"
+          TASK_OUTPUT_DIR: .task_results
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM: ${{ secrets.RESEND_FROM }}
+          RESEND_TO: ${{ secrets.RESEND_TO }}
+          MAIL_HOST: ${{ secrets.MAIL_HOST }}
+          MAIL_PORT: ${{ secrets.MAIL_PORT }}
+          MAIL_USER: ${{ secrets.MAIL_USER }}
+          MAIL_PASS: ${{ secrets.MAIL_PASS }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: |
+          python3 scripts/unified_report.py
+          date -u > .report_sent
+
+      - name: Save report sent marker
+        if: steps.should_run.outputs.skip != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .report_sent
+          key: report-sent-${{ env.TODAY }}

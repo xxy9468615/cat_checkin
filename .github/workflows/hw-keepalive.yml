@@ -1,0 +1,61 @@
+name: HW Cookie Keepalive
+
+on:
+  schedule:
+    - cron: "0 */5 * * *"  # 每 5 小时探测一次（北京 05/10/15/20/00 点）
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hw-keepalive
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Playwright (self-heal)
+        run: |
+          pip install "playwright==1.61.0"
+          python -m playwright install chromium --with-deps
+
+      - name: Probe session and self-heal if expired
+        env:
+          TZ: Asia/Shanghai
+          HW_DEV_cookie: ${{ secrets.HW_DEV_COOKIE }}
+          HW_DEV_STATE: ${{ secrets.HW_DEV_STATE }}
+        run: python3 scripts/hw_keepalive.py
+
+      - name: Write back refreshed credentials
+        if: always() && hashFiles('.heal/*') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::未配置 GH_PAT Secret，无法回写刷新后的 HW 凭证"
+            exit 0
+          fi
+          if [ -s .heal/cookie.txt ]; then
+            gh secret set HW_DEV_COOKIE -R "$GITHUB_REPOSITORY" < .heal/cookie.txt
+            echo "✅ HW_DEV_COOKIE 已回写"
+          fi
+          if [ -s .heal/state.json ]; then
+            gh secret set HW_DEV_STATE -R "$GITHUB_REPOSITORY" < .heal/state.json
+            echo "✅ HW_DEV_STATE 已回写"
+          fi

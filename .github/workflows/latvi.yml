@@ -1,0 +1,75 @@
+name: Latvi Check-in
+
+on:
+  schedule:
+    # 北京时间 18:00（UTC 10:00）触发，距 24h 签到窗口约 1h 以内
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: latvi-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  latvi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120  # 距签到窗口最多 1h，给足等待时间
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set TODAY
+        run: echo "TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Syntax check (stdlib only)
+        run: python3 -m py_compile scripts/*.py
+
+      # 缓存不可变：固定 key 会让 save 被跳过（状态永不更新）。
+      # 用 run_id 做唯一 key 写入，靠 restore-keys 前缀回退到上一次的状态。
+      - name: Restore latvi state
+        uses: actions/cache/restore@v4
+        with:
+          path: .latvi_state.json
+          key: latvi-state-${{ github.run_id }}
+          restore-keys: |
+            latvi-state-
+
+      - name: Run Latvi check-in
+        env:
+          LATVI_EMAIL: ${{ secrets.LATVI_EMAIL }}
+          LATVI_PASSWORD: ${{ secrets.LATVI_PASSWORD }}
+          LATVI_STATE_FILE: .latvi_state.json
+          TASK_OUTPUT_DIR: .task_results
+        run: |
+          python3 scripts/run_task.py scripts/latvi.py
+
+      - name: Save latvi state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .latvi_state.json
+          key: latvi-state-${{ github.run_id }}
+
+      - name: Cache task result
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: .task_results/
+          key: task-result-latvi.py-${{ env.TODAY }}
+
+      # 冗余备份：artifact 独立于 cache，防止 cache 保存偶发静默失败时 report 读不到结果
+      - name: Upload task result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: task-result-latvi.py
+          path: .task_results/
+          retention-days: 1
+          include-hidden-files: true
