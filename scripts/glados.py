@@ -304,6 +304,11 @@ class Checker:
                         res = self._run_one(api, cookie, cookie_index, domain)
                     except CookieExpiredError as e:
                         res = self._cookie_invalid_result(cookie_index, domain, "", str(e))
+                    except Exception as e:
+                        # 与账号分支对齐：单个 cookie 的解析等异常不能中断其余 cookie
+                        print(f"❌ 账号 {cookie_index} on {domain} 执行失败: {e}")
+                        res = Result(cookie_index=cookie_index, domain=domain, account_name="",
+                                     status=f"失败: {e}")
                     self.results.append(res)
 
     def _cookie_invalid_result(self, cookie_index: int, domain: str, account_name: str, detail: str) -> Result:

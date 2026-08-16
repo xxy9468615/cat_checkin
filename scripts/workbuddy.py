@@ -245,7 +245,7 @@ def _acp_connect(h: Http, acp_url: str, stop_event: "threading.Event", token: st
         headers = _acp_headers(token, with_auth=with_auth)
         req = _urllib_req.Request(acp_url, headers=headers, method="GET")
         try:
-            resp = h.opener.open(req)  # type: ignore[attr-defined]
+            resp = h.opener.open(req, timeout=30)  # type: ignore[attr-defined]  # 网关 SYN 黑洞时防主线程长期挂起
         except _urllib_err.HTTPError as e:
             last_exc = e
             if e.code == 401 and with_auth is True and token:
@@ -324,7 +324,7 @@ def _acp_call(h: Http, acp_url: str, conn_id: str, method: str, params: Dict[str
 
     def _open():
         try:
-            r = h.opener.open(req)  # type: ignore[attr-defined]
+            r = h.opener.open(req, timeout=30)  # type: ignore[attr-defined]  # 防挂起
             status = r.status
             # prompt 返回 200 SSE，会持续推送；放后台排空，避免阻塞主流程
             threading.Thread(target=_drain_resp, args=(r,), daemon=True).start()
@@ -509,10 +509,8 @@ def _run_conversation_and_wait(h: Http, cookie: str, timeout_seconds: int = 240)
     # 超时：关闭 ACP SSE 连接
     stop_event.set()
     if last_status:
-        active, checked_in = last_status
-        if checked_in:
-            _dbg(f"[workbuddy] 签到成功 (轮询结束时已完成)")
-            return "签到成功 (轮询结束时已完成)", True
+        # checked_in 为真时轮询循环内已提前 return，这里只会是「未签」状态
+        active, _checked_in = last_status
         if active:
             _dbg(f"[workbuddy] 对话任务已激活但 {timeout_seconds}s 内未完成签到")
             return f"对话任务已激活但 {timeout_seconds}s 内未完成签到", False
@@ -597,6 +595,9 @@ def _redeem_rewards(h: Http, cookie: str) -> Tuple[str, int]:
                     redeemed_msgs.append(f"兑换【{tier_name}】({', '.join(reward_parts)})")
                 else:
                     redeemed_msgs.append(f"兑换【{tier_name}】失败({r_json.get('msg', '未知')})")
+            else:
+                # 非 200（含网络错误 -1）：显式记录，不再静默掉落
+                redeemed_msgs.append(f"兑换【{tier_name}】失败(HTTP {redeem_resp.code})")
 
     # 统计已兑换和未达标状态
     claimed_tiers = [t_name for t_code, t_name, _ in tiers_config if redemption_status.get(f"tier_{t_code}_status") == "claimed"]
@@ -615,15 +616,19 @@ def _draw_lottery(h: Http, cookie: str) -> str:
     headers = dict(BASE_HEADERS)
     headers["Cookie"] = cookie
 
-    # 查询剩余抽奖次数
+    # 查询剩余抽奖次数（chances/summary 双接口兜底）
     resp = h.request("GET", f"{BASE_URL}/activity/growth/lottery/chances", headers=headers)
-    chances = 0
+    chances = None
     if resp.code == 200:
-        chances = resp.json({}).get("data", {}).get("balance", 0)
-    else:
+        chances = resp.json({}).get("data", {}).get("balance")
+    if chances is None:
         sum_resp = h.request("GET", f"{BASE_URL}/activity/growth/lottery/summary", headers=headers)
         if sum_resp.code == 200:
-            chances = sum_resp.json({}).get("data", {}).get("chances", 0)
+            chances = sum_resp.json({}).get("data", {}).get("chances")
+
+    if chances is None:
+        # 查询失败不能伪装成「0 次（无需抽奖）」——当日抽奖机会会被静默浪费
+        return "抽奖次数查询失败（今日抽奖未执行，请排查）"
 
     if chances <= 0:
         return "抽奖机会 0 次（无需抽奖）"
@@ -631,7 +636,8 @@ def _draw_lottery(h: Http, cookie: str) -> str:
     prizes: List[str] = []
     success_draws = 0
 
-    for i in range(chances):
+    # 上限 20 次防服务端异常大值把任务拖到超时
+    for i in range(min(chances, 20)):
         client_token = f"draw-{uuid.uuid4()}"
         draw_resp = h.request(
             "POST",
@@ -655,21 +661,21 @@ def _draw_lottery(h: Http, cookie: str) -> str:
     return f"完成 {success_draws}/{chances} 次抽奖：{', '.join(prizes)}"
 
 
-def _claim_travel_reward(h: Http, headers: Dict[str, str], travel_data: Dict[str, Any], loc_name: str) -> str:
-    """回访领取放风奖励，返回可读的结果文案。
+def _claim_travel_reward(h: Http, headers: Dict[str, str], travel_data: Dict[str, Any], loc_name: str) -> Tuple[bool, str]:
+    """回访领取放风奖励，返回 (是否领取成功/已领取, 可读的结果文案)。
 
     礼物 = 猫咪带回的 letter（来信，含 guide_text） + reward_credit 积分。
-    处理幂等：若服务端判定已领取，按“已领取”处理而非报错。
+    处理幂等：若服务端判定已领取，按“已领取”处理而非报错（计为成功）。
     """
     claim_resp = h.request("POST", f"{BASE_URL}/activity/growth/buddy/travel/claim", headers=headers, json_data={})
     if claim_resp.code != 200:
-        return f"回访领奖失败（HTTP {claim_resp.code}）"
+        return False, f"回访领奖失败（HTTP {claim_resp.code}）"
     cj = claim_resp.json({})
     if cj.get("code") != 0:
         msg = str(cj.get("msg", ""))
         if "已" in msg or "重复" in msg or "claimed" in msg.lower():
-            return "放风奖励（已领取，无需重复领取）"
-        return f"回访领奖失败：{msg or cj.get('code')}"
+            return True, "放风奖励（已领取，无需重复领取）"
+        return False, f"回访领奖失败：{msg or cj.get('code')}"
     c_data = cj.get("data", {}) or {}
     credit = c_data.get("reward_credit") or 0
     # letter 优先取领取响应，回退到状态里的（arrived 态状态里已带 letter）
@@ -681,7 +687,7 @@ def _claim_travel_reward(h: Http, headers: Dict[str, str], travel_data: Dict[str
             letter_info = f"，收到来信《{guide}》"
         else:
             letter_info = "，收到来信"
-    return f"已领取【{loc_name}】放风奖励（+{credit} 积分{letter_info}）"
+    return True, f"已领取【{loc_name}】放风奖励（+{credit} 积分{letter_info}）"
 
 
 def _schedule_travel_claim(remaining_seconds: int) -> str:
@@ -698,7 +704,7 @@ def _schedule_travel_claim(remaining_seconds: int) -> str:
         return f"已调度下一轮领奖（{delay}秒后，约 {_format_beijing_time(eta)}）"
     if detail.startswith("未配置"):
         return f"{detail}，将等待下次定时触发"
-    return f"延时调度失败（{detail}）"
+    return f"⚠️ 延时调度失败（{detail}）"
 
 
 def _handle_traveling(h: Http, headers: Dict[str, str], travel_data: Dict[str, Any], loc_name: str, wait_travel: bool) -> str:
@@ -712,8 +718,15 @@ def _handle_traveling(h: Http, headers: Dict[str, str], travel_data: Dict[str, A
     remaining_seconds = max(0, arrive_at - server_now)
 
     if remaining_seconds == 0:
-        _dbg(f"🔔 放风已完成，正在自动回访【{loc_name}】领取奖励...")
-        return _claim_travel_reward(h, headers, travel_data, loc_name)
+        print(f"🔔 放风已完成，正在自动回访【{loc_name}】领取奖励...")
+        claim_ok, claim_msg = _claim_travel_reward(h, headers, travel_data, loc_name)
+        if not claim_ok:
+            time.sleep(3)
+            claim_ok, claim_msg = _claim_travel_reward(h, headers, travel_data, loc_name)
+        if not claim_ok:
+            # 领取失败：调度 5 分钟后的接力 run 重试，奖励不静默丢到次日
+            return f"{claim_msg}；{_schedule_travel_claim(0)}"
+        return claim_msg
 
     if wait_travel:
         schedule_msg = _schedule_travel_claim(remaining_seconds)
@@ -767,7 +780,16 @@ def _process_travel(h: Http, cookie: str, wait_travel: bool = True) -> str:
                     break
                 actions.append("放风奖励已领取，等待状态刷新")
                 break
-            actions.append(_claim_travel_reward(h, headers, travel_data, loc_name))
+            claim_ok, claim_msg = _claim_travel_reward(h, headers, travel_data, loc_name)
+            if not claim_ok:
+                time.sleep(3)
+                claim_ok, claim_msg = _claim_travel_reward(h, headers, travel_data, loc_name)
+            if not claim_ok:
+                # 领取失败不置已领标记（否则本场永不重试）：调度 5 分钟后接力重领，
+                # 奖励不再因一次 5xx/网络抖动静默丢到次日 00:50
+                actions.append(f"{claim_msg}；{_schedule_travel_claim(0)}")
+                break
+            actions.append(claim_msg)
             claimed_this_arrival = True
             if daily_limit_reached:
                 actions.append("今日放风次数已达上限，今日任务已完成")
@@ -934,7 +956,9 @@ def _run_one(cookie: str, idx: int, total: int, wait_travel: bool) -> Tuple[bool
     daily_msg, daily_ok = _daily_meter_checkin(h, cookie)
 
     # 3. AI 对话任务（辅助激活签到面板，尽力而为，不阻塞主流程）
-    conv_msg, conv_ok = _run_conversation_and_wait(h, cookie, timeout_seconds=120)
+    # 主 API 签到已成功时缩短轮询：辅助通道价值有限，省时间给兑换/抽奖/放风链路
+    conv_timeout = 45 if daily_ok else 120
+    conv_msg, conv_ok = _run_conversation_and_wait(h, cookie, timeout_seconds=conv_timeout)
     checkin_ok = daily_ok or conv_ok
     # AI 对话是辅助通道：主 API 签到已成功时不把辅助通道的超时噪音带进摘要
     #（避免「签到成功｜超时」这种读起来像报错的组合），仅主通道失败时附详情排查

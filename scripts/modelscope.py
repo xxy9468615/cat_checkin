@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from typing import Any, Dict, List, Tuple
 
 from common import Http, env, main_guard
@@ -76,7 +77,7 @@ def _get_balance(h: Http, cookie: str, host: str) -> str:
     return str(bal_data.get("data", {}).get("available_balance", "?"))
 
 
-def _run_one(cookie: str, host: str, idx: int, site: str) -> Tuple[bool, str]:
+def _run_one(cookie: str, host: str) -> Tuple[bool, str]:
     """执行单个账号的签到逻辑。返回 (成功, 描述)。"""
     h = Http()
 
@@ -88,11 +89,24 @@ def _run_one(cookie: str, host: str, idx: int, site: str) -> Tuple[bool, str]:
     today_used = daily_rule.get("today_used", 0)
     amount = daily_rule.get("amount", 200)
 
+    # 09:10 开跑时奖励偶发尚未发放可见（发放到接口可见有延迟）：
+    # today_used=0 时等 90 秒复查，最多 3 轮查询（总耗时 ~3 分钟，TASK_TIMEOUT=600 内）
+    for attempt in range(2):
+        if bool(today_used):
+            break
+        print(f"  今日奖励尚未到账（today_used=0），90 秒后第 {attempt + 2}/3 次复查...")
+        time.sleep(90)
+        try:
+            daily_rule = _get_rules(h, cookie, host)
+        except Exception as e:
+            return False, f"复查失败：{e}"
+        today_used = daily_rule.get("today_used", 0)
+
     if bool(today_used):
         status = f"签到成功，今日已领取 {amount} 魔粒"
     else:
-        # 国际站偶发 today_used=0：cookie 未刷新/时区未重置，非严重异常
-        status = f"今日奖励未到账（today_used=0，可能 cookie 未刷新或未到重置时间）"
+        # 3 轮复查后仍 today_used=0：cookie 未刷新/当日未到重置时间/发放异常
+        status = f"今日奖励未到账（3 轮复查后 today_used 仍为 0，可能 cookie 未刷新或未到重置时间）"
 
     balance = _get_balance(h, cookie, host)
     return bool(today_used), f"{status}，当前余额：{balance} 魔粒"
@@ -111,7 +125,7 @@ def _run_site(
     results = []
     for idx, cookie in enumerate(cookies, 1):
         try:
-            ok, msg = _run_one(cookie, host, idx, site)
+            ok, msg = _run_one(cookie, host)
             line = f"  [{idx}/{len(cookies)}] {msg}"
             print(line)
             results.append((ok, line))

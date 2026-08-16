@@ -60,8 +60,15 @@ def _run_one(cookie: str, auth: str) -> str:
     isotime = find(r'(?<=")\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z(?=")', stats)
     d, t = bj_time_from_iso_z(isotime) if isotime else ("", "")
     msg = find(r'(?<="m":").*?(?=")', sign.text)
+    if coins:
+        first = f"签到成功，签到时间为：{d} {t}，本次签到获得 {coins} 金币"
+    elif msg:
+        first = msg
+    else:
+        # coins 与错误消息都取不到（多为 cookie 失效返回错误页），不能当成功上报
+        raise RuntimeError(f"签到结果未知（响应非预期）：{sign.text[:120]}")
     line = f"{username}（第 {num} 号会员）\n"
-    line += f"签到成功，签到时间为：{d} {t}，本次签到获得 {coins} 金币" if coins else (msg or "签到结果未知")
+    line += first
     line += f"\n当前金币总数为 {bal} 个，已累计签到 {streak} 天\n当前用户等级为 {lvl} 级，经验值为 {cur} 点，距离升级还差 {nxt} 点"
     return line
 

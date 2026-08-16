@@ -4,7 +4,7 @@
 import os
 import re
 import sys
-from common import Http, env, main_guard
+from common import Http, env, main_guard, mask_str
 
 PREFIX = "SOPHNET_"
 
@@ -71,7 +71,7 @@ def run_account(idx: int, token: str, refresh_token: str, h: Http) -> None:
         new_ref = res.get("refreshToken")
         if new_ref:
             refresh_token = new_ref
-        print(f"✅ 账号 #{idx} 成功刷新令牌！(新 Token: {token[:15]}...)")
+        print(f"✅ 账号 #{idx} 成功刷新令牌！(新 Token: {mask_str(token)})")
         return token, refresh_token
 
     if not token and refresh_token:
@@ -100,7 +100,8 @@ def run_account(idx: int, token: str, refresh_token: str, h: Http) -> None:
     elif "已签到" in msg:
         print(f"✅ 账号 #{idx} Sophnet 今日已完成签到")
     else:
-        print(f"❌ 账号 #{idx} Sophnet 签到信息: {msg} (status={status_code})")
+        # 签到失败必须抛出：否则脚本 exit 0，报告显示成功（假成功）
+        raise RuntimeError(f"Sophnet 签到信息: {msg} (status={status_code})")
 
     # 2. 查询福利与账户状态
     resp_w = h.request("GET", "https://sophnet.com/api/sys/checkin/welfare", headers=headers)

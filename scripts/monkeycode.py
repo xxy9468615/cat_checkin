@@ -54,6 +54,7 @@ def _prng(seed, length):
 
 def solve_challenge(token, challenge):
     """对每个子挑战暴力搜索 nonce，使 sha256(salt+nonce) 以 target 开头。"""
+    import time as _time
     count = int(challenge["c"])
     salt_len = int(challenge["s"])
     difficulty = int(challenge["d"])
@@ -62,8 +63,11 @@ def solve_challenge(token, challenge):
         salt = _prng(f"{token}{i}", salt_len).encode()
         target = _prng(f"{token}{i}d", difficulty)
         nonce = 0
+        deadline = _time.monotonic() + 120  # 难度异常上调时防 CPU 空转到任务超时
         while not hashlib.sha256(salt + str(nonce).encode()).hexdigest().startswith(target):
             nonce += 1
+            if nonce % 100000 == 0 and _time.monotonic() > deadline:
+                raise RuntimeError(f"PoW 验证码难度异常（第 {i} 个子挑战已算 {nonce} 次未命中），放弃求解")
         solutions.append(nonce)
     return solutions
 

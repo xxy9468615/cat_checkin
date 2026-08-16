@@ -16,8 +16,10 @@ import datetime as dt
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -56,7 +58,11 @@ def main() -> None:
         print(f"❌ 目标脚本不存在: {target_raw}")
         sys.exit(1)
 
-    timeout = int(os.getenv("TASK_TIMEOUT", "300"))
+    try:
+        timeout = int(os.getenv("TASK_TIMEOUT") or "300")
+    except ValueError:
+        timeout = 300
+        print("⚠️ TASK_TIMEOUT 格式不正确，已回退默认 300 秒")
     out_dir = Path(os.getenv("TASK_OUTPUT_DIR", ".task_results"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -77,24 +83,35 @@ def main() -> None:
     ok = False
     output = ""
     try:
-        proc = subprocess.run(
+        # 独立进程组：超时可整组击杀。只杀直接子进程时，继承 stdout 管道的孙进程
+        # （如 hw_dev 拉起的 chromium）不退出会让 communicate 迟迟拿不到 EOF，
+        # 实际挂到 job 级超时才死
+        proc = subprocess.Popen(
             [sys.executable, str(target_path)],
             cwd=str(ROOT_DIR),
             env=os.environ.copy(),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=timeout,
-            check=False,
+            start_new_session=True,
         )
-        elapsed = time.monotonic() - start_time
-        output = (proc.stdout or "").strip()
-        ok = proc.returncode == 0
-    except subprocess.TimeoutExpired as exc:
-        elapsed = time.monotonic() - start_time
-        out_part = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
-        output = f"任务超时（>{timeout}s）\n{out_part.strip()}".strip()
-        ok = False
+        try:
+            stdout_data, _ = proc.communicate(timeout=timeout)
+            elapsed = time.monotonic() - start_time
+            output = (stdout_data or "").strip()
+            ok = proc.returncode == 0
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            try:
+                stdout_data, _ = proc.communicate(timeout=10)
+            except Exception:
+                stdout_data = ""
+            elapsed = time.monotonic() - start_time
+            output = f"任务超时（>{timeout}s）\n{(stdout_data or '').strip()}".strip()
+            ok = False
     except Exception as exc:
         elapsed = time.monotonic() - start_time
         output = f"执行异常: {exc}"
@@ -116,8 +133,17 @@ def main() -> None:
     }
 
     result_file = out_dir / result_name
-    result_file.write_text(json.dumps(result_dict, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"💾 任务结果已写入: {result_file} (ok={ok}, elapsed={elapsed:.1f}s)")
+    try:
+        result_file.write_text(json.dumps(result_dict, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"💾 任务结果已写入: {result_file} (ok={ok}, elapsed={elapsed:.1f}s)")
+    except Exception as exc:
+        # 结果写不出时该任务会在每日报告里「缺席」而非标红——降级写系统临时目录并显式报错
+        fallback = Path(tempfile.gettempdir()) / result_name
+        try:
+            fallback.write_text(json.dumps(result_dict, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"❌ 结果写入 {result_file} 失败（{exc}），已降级写入 {fallback}")
+        except Exception as exc2:
+            print(f"❌ 结果写入彻底失败: {exc} / {exc2}")
 
     if not ok:
         sys.exit(1)

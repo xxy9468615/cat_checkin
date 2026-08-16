@@ -17,12 +17,20 @@ def main():
         if "登录" in rr.text: domain=c.rstrip('/'); break
     login=h.request("GET",domain+"/member.php?mod=logging&action=login",headers=headers).text
     formhash=find(r'formhash. value=.(\w+).',login); loginhash=find(r'loginhash=(\w+)',login)
-    if formhash and loginhash:
-        h.request("POST",domain+f"/member.php?mod=logging&action=login&loginsubmit=yes&loginhash={loginhash}&inajax=1",headers=headers,form={"formhash":formhash,"username":username,"password":hashlib.md5(password.encode()).hexdigest()})
+    if not (formhash and loginhash):
+        # 解析不到登录表单：站点改版/被风控，静默跳过登录只会假成功
+        raise RuntimeError("登录页解析失败（formhash/loginhash 缺失），可能站点改版或被风控")
+    h.request("POST",domain+f"/member.php?mod=logging&action=login&loginsubmit=yes&loginhash={loginhash}&inajax=1",headers=headers,form={"formhash":formhash,"username":username,"password":hashlib.md5(password.encode()).hexdigest()})
     page=h.request("GET",domain+"/plugin.php?id=k_misign%3Asign",headers=headers).text
     q=find(r'(plugin.php.+qiandao.+\w+)',page)
-    if q: h.request("GET",domain+"/"+q,headers=headers)
+    if not q:
+        print("ℹ️ 未找到签到入口（可能今日已签到或插件变动）")
+    else:
+        h.request("GET",domain+"/"+q,headers=headers)
     prof=h.request("GET",domain+"/home.php?mod=space",headers=headers).text
+    # 登录失败时个人资料页是游客/跳转页：显式失败，否则报告假成功
+    if "个人资料" not in prof:
+        raise RuntimeError("登录失败：个人资料页未检测到用户信息（账号密码错误或被风控）")
     credit=h.request("GET",domain+"/home.php?mod=spacecp&ac=credit&showcredit=1&inajax=1",headers=headers).text
     msg=""
     auth=h.request("GET",domain+"/auth.php",headers=headers)
