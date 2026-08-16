@@ -2,12 +2,8 @@ name: Daily Unified Report
 
 on:
   schedule:
-    - cron: "0 12 * * *"  # 北京时间 20:00 主定时（每日统一汇总推送）
-    - cron: "0 14 * * *"  # 北京时间 22:00 兜底定时
-  workflow_run:
-    workflows: ["Latvi Check-in"]
-    types:
-      - completed
+    - cron: "0 2 * * *"   # 北京时间 10:00 主定时（每日统一汇总推送）
+    - cron: "30 2 * * *"  # 北京时间 10:30 兜底定时（覆盖 GitHub cron 抖动）
   workflow_dispatch:
     inputs:
       force:
@@ -97,8 +93,38 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # 1. 恢复所有任务的独立缓存结果
-      - name: Restore task results from cache
+      # 1. 主路径：跨 run 下载各任务的 artifact 结果。
+      #    注意：download-artifact action 默认只可见当前 run 的 artifact（各任务在别的 run），
+      #    cache 的 restore-keys 前缀也只命中最近一条（矩阵每腿独立保存），
+      #    因此必须用 gh run download 按 run-id 跨 run 拉取。
+      - name: Download task results from task runs
+        if: steps.should_run.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          fetch_latest() {  # fetch_latest <workflow-name> <artifact-pattern>
+            local wf="$1" pattern="$2" rid
+            rid=$(gh run list --workflow "$wf" --status completed --limit 10 \
+                    --json databaseId --jq '.[0].databaseId // empty' || true)
+            if [ -z "$rid" ]; then
+              echo "⚠️ $wf 没有已完成的 run，跳过"
+              return 0
+            fi
+            echo "⬇️ $wf（run $rid）: $pattern"
+            if gh run download "$rid" --pattern "$pattern" --dir .task_results; then
+              echo "✅ $wf 结果已下载"
+            else
+              echo "⚠️ $wf artifact 下载失败（可能超过 1 天保留期）"
+            fi
+          }
+          fetch_latest "Daily Check-in (Matrix Async)" "task-result-*"
+          fetch_latest "WorkBuddy Check-in" "workbuddy-result-*"
+          # Latvi 固定 18:00 运行（24h 间隔约束），10:00 报告取最近一次 run 的结果
+          fetch_latest "Latvi Check-in" "task-result-latvi.py"
+
+      # 2. 兜底：从 cache 恢复（前缀命中最近一条单腿结果，仅作补充）
+      - name: Restore task results from cache (fallback)
         if: steps.should_run.outputs.skip != 'true'
         uses: actions/cache/restore@v4
         with:
@@ -106,31 +132,14 @@ jobs:
           key: task-results-${{ env.TODAY }}-${{ github.run_id }}
           restore-keys: |
             task-result-
-
-      # 2. 备用兜底：下载所有任务的 artifact 结果
-      - name: Download all task result artifacts
-        if: steps.should_run.outputs.skip != 'true'
-        uses: actions/download-artifact@v4
-        with:
-          pattern: task-result-*
-          path: .task_results
-          merge-multiple: true
         continue-on-error: true
-
-      # 3. 兼容旧版单一结果文件恢复
-      - name: Restore legacy checkin results
-        if: steps.should_run.outputs.skip != 'true'
-        uses: actions/cache/restore@v4
-        with:
-          path: .checkin_report.json
-          key: checkin-report-${{ env.TODAY }}
 
       - name: Verify collected result files
         if: steps.should_run.outputs.skip != 'true'
         run: |
           count=$(find .task_results -name "*.json" 2>/dev/null | wc -l)
           echo "📊 .task_results/ 目录共发现 $count 份任务结果 JSON"
-          if [ "$count" -eq 0 ] && [ ! -f .checkin_report.json ]; then
+          if [ "$count" -eq 0 ]; then
             echo "⚠️ 未发现任何任务结果文件"
             exit 1
           fi

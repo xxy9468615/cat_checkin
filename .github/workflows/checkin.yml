@@ -2,7 +2,7 @@ name: Daily Check-in (Matrix Async)
 
 on:
   schedule:
-    - cron: "25 2 * * *"  # 北京时间 10:25
+    - cron: "50 16 * * *"  # 北京时间 00:50（GitHub Actions 低谷期）
   workflow_dispatch:
 
 permissions:

@@ -2,7 +2,7 @@ name: HW Cookie Keepalive
 
 on:
   schedule:
-    - cron: "0 */5 * * *"  # 每 5 小时探测一次（北京 05/10/15/20/00 点）
+    - cron: "0 */5 * * *"  # 每 5 小时探测一次（UTC 00/05/10/15/20 = 北京 08/13/18/23/04 点）
   workflow_dispatch:
 
 permissions:

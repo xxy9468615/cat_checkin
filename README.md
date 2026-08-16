@@ -81,4 +81,4 @@ DAILY_MAX_TASK_OUTPUT=1500   # 单个任务日志最大字符数
 
 ## CI 部署
 
-在 GitHub Repo Settings → Secrets 填写站点凭据，Action 在 UTC 02:25（北京 10:25）自动触发。Latvi 有独立工作流。
+在 GitHub Repo Settings → Secrets 填写站点凭据，签到任务在 UTC 16:50（北京 00:50，Actions 低谷期）自动触发，Latvi 独立工作流（北京 18:00，24h 冷却约束），每日北京 10:00 统一邮件汇总。

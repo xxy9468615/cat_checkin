@@ -22,10 +22,7 @@ docs
 .heal/
 .zcode/
 .report_sent
-.checkin_report.json
-.latvi_result.json
 .latvi_state.json
-.workbuddy_result.json
 
 # WSL2 metadata
 *:Zone.Identifier
