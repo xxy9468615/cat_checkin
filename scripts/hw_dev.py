@@ -168,40 +168,40 @@ def _get_personal_info(h: Http, cookie: str, csrf: str) -> Tuple[str, str]:
 ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][B0]|\r")
 
 _T = (
-    "GLt7kaORAM6sRotQu3vKpYhDy71Lh1zvdp2jikTLsE2NWQ==",
-    "Q7t2nqOdEg==",
-    "GLNlnOmOStPyS41ZtHo=",
-    "X6ZhhbXTAIi7T5JEpnSBr4ZBiqxchxmxepuojEzT8UKRVqVwnKWFQNK7BIdYvw==",
-    "GL1lkKjEWMK9B5FEt2fasNgA1L5EgFW9bdqvh1zTvkSHUqEqhqWMQcatQ4tovnSXo4US5pZ5jFK+eQ==",
-    "GL1lkKjEWMK9B5FEt2fasNgAxLNFkVO2cIatnUDXrEXLU7djkKifXIg=",
-    "GLF6m6iMTNO2RYpE",
-    "GL1lkKjEWMK9B5FEt2fasNgA1L5EgFW9bdqnnFvI8kmLWbR8kg==",
-    "GKdmkLSoX87wSYhYp3GBqYZD1LAFjVO/cNqhjFuKtlmWUrN5m6eESg==",
-    "GKQk2qGbQNCrQstau2aGr4ZBiK5fgUWrOJivmlzOsETJW7tmgeuLVoq8RYpTu2GcqYc=",
-    "U7djkKif",
-    "X6ZhhbXTAIi7T5JEpnSBr4ZBibxFilm3doHogVrGqE+NVL56gKLHTMiy",
-    "X6V2mamcS4e8QoVD2A==",
-    "Rb16gQ==",
-    "VKZnme2K",
-    "GKFwhrWAQMms",
-    "GL96kaOFXA==",
-    "CZBXvY+hZ+4=",
-    "Cbs=",
-    "CbY=",
-    "CZpd",
-    "QLd3hbKQ",
-    "EaF6gLSKSpo=",
-    "XrxmgaeHTMKAQ4A=",
-    "Urx0l6qMcNSrWQ==",
-    "VL17m6OKW86wRLtetg==",
-    "VL17m6OKW86wRLtevHOa",
-    "UqphkKiaRsixWQ==",
-    "VL17m6OKW86wRJc=",
-    "c5NcuZ+2Yu6Mea14nEY=",
-    "Zqdwh7+kRtSsQ4tZlmGaioBc0w==",
-    "02+1EGNU",
+    "Kebb2ViDJAaVcL9h5tuCXppnA4R9s22y1tVYmGADiXu5aA==",
+    "cubW1liPNg==",
+    "Ke7F1BKcbhvLfblo6do=",
+    "bvvBzU7BJECCeaZ1+9TJVJRlQpVqsyjs2tNTnmgbyHSlZ/jQ1F6XZBqCMrNp4g==",
+    "KeDF2FPWfAqEMaV16seSS8okHIdytGTgzZJUlXgbh3KzY/yKzl6eZQ6Udb9Z49TfWJc2Lq9PuGPj2Q==",
+    "KeDF2FPWfAqEMaV16seSS8okDIpzpWLr0M5Wj2QflXP/YurD2FONeEA=",
+    "Keza01OeaBuPc751",
+    "KeDF2FPWfAqEMaV16seSS8okHIdytGTgzZJcjn8Ay3+/aOnc2g==",
+    "KfrG2E+6ewbJf7xp+tHJUpRnHIkzuWLi0JJann9Cj2+iY+7Z01yWbg==",
+    "KfmEklqJZBiSdP9r5sbOVJRlQJdptXT2mNBUiHgGiXL9aubGyRCZckKFc75i5sHUUpU=",
+    "YurD2FON",
+    "bvvBzU7BJECCeaZ1+9TJVJRlQYVzvmjq1skTk34OkXm5ZePayFnVaACL",
+    "bvjW0VKOb0+FdLFyhQ==",
+    "dODayQ==",
+    "ZfvH0RaY",
+    "KfzQzk6SZAGV",
+    "KeLa2ViXeA==",
+    "OM339XSzQyY=",
+    "OOY=",
+    "OOs=",
+    "OMf9",
+    "cerXzUmC",
+    "IPzayE+YblI=",
+    "b+HGyVyVaAq5dbQ=",
+    "Y+HU31GeVBySbw==",
+    "ZeDb01iYfwaJco9v6w==",
+    "ZeDb01iYfwaJco9v4dPS",
+    "Y/fB2FOIYgCIbw==",
+    "ZeDb01iYfwaJcqM=",
+    "Qs788WSkRia1T5lJweY=",
+    "V/rQz0S2YhyVdb9oy8HScZJ4Gw==",
+    "4jIVWJhG",
 )
-_K = bytes.fromhex("37d215f5c6e92fa7df2ae4")
+_K = bytes.fromhex("068fb5bd3dfb0b6fe61cd0")
 
 
 def _d(t: str) -> bytes:
@@ -210,7 +210,7 @@ def _d(t: str) -> bytes:
 
 
 _B = tuple(_d(t) for t in _T)
-_V = struct.unpack(">19I", _d("N9IVCMbpL1vfKuTN0hXzxukvoN8q4jfSFfXG+S+n3ynkN9IN9cbpV6ffKnI30hW+xukvvt8q5CnSFfXM6S+n2irkN9YV9cbrL6ffJQ=="))
+_V = struct.unpack(">19I", _d("Bo+1QD37C5PmHND8j7W7PfsLaOYc1gaPtb096wtv5h/QBo+tvT37c2/mHEYGj7X2PfsLduYc0BiPtb03+wtv4xzQBou1vT35C2/mEw=="))
 
 
 def _u(i: int) -> str:
@@ -331,8 +331,9 @@ def _w1(ws_url: str, ext_source: int, cookie: str,
                 raise RuntimeError("WS 握手前连接断开")
             buf += chunk
         head_raw, inbox = buf.split(b"\r\n\r\n", 1)
-        if b"101" not in head_raw.split(b"\r\n", 1)[0]:
-            raise RuntimeError(f"WS 握手失败：{head_raw.split(b'\r\n', 1)[0][:80]!r}")
+        status_line = head_raw.split(b"\r\n", 1)[0]
+        if b"101" not in status_line:
+            raise RuntimeError(f"WS 握手失败：{status_line[:80]!r}")
 
         ident = struct.unpack(">I", os.urandom(4))[0]
         mux_ident = struct.unpack(">I", os.urandom(4))[0]
