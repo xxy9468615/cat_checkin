@@ -103,27 +103,53 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
-          fetch_latest() {  # fetch_latest <workflow-name> <artifact-pattern>
-            local wf="$1" pattern="$2" rid
-            rid=$(gh run list --workflow "$wf" --status completed --limit 10 \
-                    --json databaseId --jq '.[0].databaseId // empty' || true)
-            if [ -z "$rid" ]; then
-              echo "⚠️ $wf 没有已完成的 run，跳过"
+          TODAY_BJ=$(TZ=Asia/Shanghai date +%Y-%m-%d)
+          YDAY_BJ=$(TZ=Asia/Shanghai -d "yesterday" +%Y-%m-%d)
+          fetch_latest() {  # fetch_latest <workflow-name> <artifact-pattern> <min-bj-date>
+            local wf="$1" pattern="$2" mind="$3" raw rids
+            # 只取 min-date 之后完成的 run：防止 10:00 时今日 run 尚未完成，
+            # 一路回退拿昨日 run 的过期 artifact（retention 已过 → 下载失败/白名单丢弃）
+            raw=$(gh run list --workflow "$wf" --status completed --limit 10 \
+                  --json databaseId,createdAt --jq '.[] | [.databaseId, .createdAt] | @tsv' 2>/dev/null || true)
+            rids=$(printf '%s\n' "$raw" | python3 -c '
+          import sys, datetime as dt
+          tz = dt.timezone(dt.timedelta(hours=8))
+          mind = sys.argv[1]
+          for line in sys.stdin:
+              parts = line.rstrip("\n").split("\t")
+              if len(parts) != 2:
+                  continue
+              rid, created = parts
+              try:
+                  bj = dt.datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone(tz)
+              except ValueError:
+                  continue
+              if bj.strftime("%Y-%m-%d") >= mind:
+                  print(rid)
+          ' "$mind")
+            if [ -z "$rids" ]; then
+              echo "⚠️ $wf 在 $mind 起没有已完成的 run，跳过（期望清单会标红）"
               return 0
             fi
-            echo "⬇️ $wf（run $rid）: $pattern"
-            if gh run download "$rid" --pattern "$pattern" --dir .task_results; then
-              echo "✅ $wf 结果已下载"
-            else
-              echo "⚠️ $wf artifact 下载失败（可能超过 1 天保留期）"
-            fi
+            local tried=0 rid
+            for rid in $rids; do
+              tried=$((tried+1))
+              [ "$tried" -gt 3 ] && break
+              echo "⬇️ $wf（run $rid）: $pattern"
+              if gh run download "$rid" --pattern "$pattern" --dir .task_results; then
+                echo "✅ $wf 结果已下载"
+                return 0
+              fi
+              echo "⚠️ $wf run $rid 下载失败（可能超过 1 天保留期），尝试次新 run"
+            done
+            echo "⚠️ $wf 全部候选 run 下载失败（期望清单会标红）"
           }
-          fetch_latest "Daily Check-in (Matrix Async)" "task-result-*"
-          fetch_latest "WorkBuddy Check-in" "workbuddy-result-*"
+          fetch_latest "Daily Check-in (Matrix Async)" "task-result-*" "$TODAY_BJ"
+          fetch_latest "WorkBuddy Check-in" "workbuddy-result-*" "$TODAY_BJ"
           # ModelScope 单独 09:10 跑（魔粒奖励凌晨未开放，混在 00:50 矩阵必失败）
-          fetch_latest "ModelScope Check-in" "task-result-modelscope.py"
-          # Latvi 固定 18:00 运行（24h 间隔约束），10:00 报告取最近一次 run 的结果
-          fetch_latest "Latvi Check-in" "task-result-latvi.py"
+          fetch_latest "ModelScope Check-in" "task-result-modelscope.py" "$TODAY_BJ"
+          # Latvi 固定 18:00 运行（24h 间隔约束），10:00 报告取最近一次（昨日）结果
+          fetch_latest "Latvi Check-in" "task-result-latvi.py" "$YDAY_BJ"
 
       # 2. 兜底：从 cache 恢复（前缀命中最近一条单腿结果，仅作补充）
       - name: Restore task results from cache (fallback)

@@ -501,38 +501,45 @@ def _split_recipients(raw: str) -> List[str]:
     return [x for x in re.split(r"[,;\s]+", raw.strip()) if x]
 
 
-def send_email(subject: str, report: str, results: List[Tuple[bool, Path, str, float]]) -> None:
+def send_email(subject: str, report: str, results: List[Tuple[bool, Path, str, float]]) -> bool:
+    """SMTP 邮件推送。返回是否真正发送成功（未配置/无收件人/异常均为 False）。"""
     host = os.getenv("MAIL_HOST", "").strip()
     user = os.getenv("MAIL_USER", "").strip()
     password = os.getenv("MAIL_PASS", "").strip()
     if not host or not user or not password:
         print("未配置 MAIL_HOST + MAIL_USER + MAIL_PASS，跳过邮件推送。")
-        return
+        return False
 
     sender = os.getenv("MAIL_FROM", "").strip() or user
     recipients = _split_recipients(os.getenv("MAIL_TO", "") or user)
     if not recipients:
         print("未配置有效收件人 MAIL_TO，跳过邮件推送。")
-        return
-
-    port = int(os.getenv("MAIL_PORT", "465"))
-    use_ssl = bool_env("MAIL_SSL", True) if os.getenv("MAIL_SSL") is not None else (port == 465)
-
-    # subject 首行作为邮件标题、状态行作为副标题
-    report_lines = report.split("\n")
-    subject_line = next((ln for ln in report_lines if ln.startswith("📢")), subject)
-    stat_line = next((ln for ln in report_lines if ln.startswith("📊")), "")
-
-    html_body = build_email_html(results, stat_line, subject_line)
-
-    msg = email.mime.multipart.MIMEMultipart("alternative")
-    msg["Subject"] = subject_line or subject
-    msg["From"] = sender
-    msg["To"] = ", ".join(recipients)
-    msg.attach(email.mime.text.MIMEText(report, "plain", "utf-8"))
-    msg.attach(email.mime.text.MIMEText(html_body, "html", "utf-8"))
+        return False
 
     try:
+        port = int(os.getenv("MAIL_PORT") or "465")
+    except ValueError:
+        port = 465
+        print("⚠️ MAIL_PORT 格式不正确，已回退为默认端口 465。")
+    # MAIL_SSL 未设置（或被 workflow 注入为空串）时按端口推断
+    mail_ssl = (os.getenv("MAIL_SSL") or "").strip()
+    use_ssl = bool_env("MAIL_SSL", True) if mail_ssl else (port == 465)
+
+    try:
+        # subject 首行作为邮件标题、状态行作为副标题
+        report_lines = report.split("\n")
+        subject_line = next((ln for ln in report_lines if ln.startswith("📢")), subject)
+        stat_line = next((ln for ln in report_lines if ln.startswith("📊")), "")
+
+        html_body = build_email_html(results, stat_line, subject_line)
+
+        msg = email.mime.multipart.MIMEMultipart("alternative")
+        msg["Subject"] = subject_line or subject
+        msg["From"] = sender
+        msg["To"] = ", ".join(recipients)
+        msg.attach(email.mime.text.MIMEText(report, "plain", "utf-8"))
+        msg.attach(email.mime.text.MIMEText(html_body, "html", "utf-8"))
+
         if use_ssl:
             server = smtplib.SMTP_SSL(host, port, timeout=60)
         else:
@@ -545,30 +552,36 @@ def send_email(subject: str, report: str, results: List[Tuple[bool, Path, str, f
             server.login(user, password)
             server.sendmail(sender, recipients, msg.as_string())
         print(f"✅ 邮件推送完成（{len(recipients)} 位收件人）")
+        return True
     except Exception as exc:
         print(f"❌ 邮件推送失败: {exc}")
+        return False
 
 
-def send_resend(subject: str, report: str, results: List[Tuple[bool, Path, str, float]]) -> None:
-    """通过 Resend HTTP API 发送汇总邮件（不依赖 SMTP）。"""
+def send_resend(subject: str, report: str, results: List[Tuple[bool, Path, str, float]]) -> bool:
+    """通过 Resend HTTP API 发送汇总邮件（不依赖 SMTP）。返回是否真正发送成功。"""
     import json as _json
     import urllib.error
 
     api_key = os.getenv("RESEND_API_KEY", "").strip()
     if not api_key:
         print("未配置 RESEND_API_KEY，跳过 Resend 推送。")
-        return
+        return False
 
     sender = os.getenv("RESEND_FROM", "").strip() or "cat_checkin <onboarding@resend.dev>"
     recipients = _split_recipients(os.getenv("RESEND_TO", "") or os.getenv("MAIL_TO", ""))
     if not recipients:
         print("未配置有效收件人 RESEND_TO / MAIL_TO，跳过 Resend 推送。")
-        return
+        return False
 
     report_lines = report.split("\n")
     subject_line = next((ln for ln in report_lines if ln.startswith("📢")), subject)
     stat_line = next((ln for ln in report_lines if ln.startswith("📊")), "")
-    html_body = build_email_html(results, stat_line, subject_line)
+    try:
+        html_body = build_email_html(results, stat_line, subject_line)
+    except Exception as exc:
+        print(f"❌ Resend 推送失败（HTML 模板渲染异常）: {exc}")
+        return False
 
     payload = {
         "from": sender,
@@ -597,11 +610,14 @@ def send_resend(subject: str, report: str, results: List[Tuple[bool, Path, str, 
             except Exception:
                 pass
             print(f"✅ Resend 推送完成（{len(recipients)} 位收件人，id={mail_id}）")
+            return True
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:300]
         print(f"❌ Resend 推送失败: HTTP {exc.code} {detail}")
+        return False
     except Exception as exc:
         print(f"❌ Resend 推送失败: {exc}")
+        return False
 
 
 def main() -> None:
