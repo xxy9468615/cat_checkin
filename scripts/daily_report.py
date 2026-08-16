@@ -401,11 +401,12 @@ def _extract_fields(output: str) -> Dict[str, str]:
 
 
 def _truncate_output(text: str, max_length: int = 1200) -> str:
-    """截断输出文本，同时保留换行符。"""
+    """截断输出文本，保留换行符。超长时保留尾部——各脚本的结果摘要与
+    报错堆栈都打印在末尾，头部多为过程性日志（如 workbuddy 的轮询心跳）。"""
     text = text.strip()
     if len(text) <= max_length:
         return text
-    return text[:max_length] + "\n…"
+    return "…（前文已截断）\n" + text[-max_length:]
 
 
 def _build_task_card(ok: bool, path: Path, output: str, elapsed: float) -> str:

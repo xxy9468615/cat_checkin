@@ -27,6 +27,7 @@
   - WORKBUDDY_WAIT_TRAVEL：是否开启放风动态等待并自动回访领奖（默认 true，如设为 false 则仅输出当前倒计时）
   - QSTASH_URL / QSTASH_TOKEN：QStash 延时发布服务凭证（放风时通过延时 Webhook 触发下一轮接力）
   - GH_PAT：GitHub Personal Access Token with Actions: write，用于 repository_dispatch（未配置时脚本静默跳过）
+  - WORKBUDDY_DEBUG：设为 1 时实时打印过程调试日志（默认缓冲，仅账号失败时随错误输出）
 """
 from __future__ import annotations
 
@@ -59,6 +60,26 @@ def _parse_cookies(raw: str) -> List[str]:
     if not raw:
         return []
     return [x.strip() for x in raw.replace("&&", "\n").splitlines() if x.strip()]
+
+
+# 过程日志治理：stdout 会原样进入每日邮件卡片，请求头 dump / 轮询心跳等
+# 调试信息默认只缓冲不输出（成功时丢弃），账号失败时才随错误一起输出便于排查；
+# WORKBUDDY_DEBUG=1 可恢复实时打印（本地调试用）。
+_DEBUG = os.getenv("WORKBUDDY_DEBUG", "").lower() in ("1", "true", "yes")
+_DEBUG_LINES: List[str] = []
+
+
+def _dbg(msg: str) -> None:
+    if _DEBUG:
+        print(msg, flush=True)
+    else:
+        _DEBUG_LINES.append(msg)
+
+
+def _flush_dbg() -> None:
+    if _DEBUG_LINES:
+        print("\n".join(_DEBUG_LINES))
+        _DEBUG_LINES.clear()
 
 
 def _format_countdown(seconds: int) -> str:
@@ -98,7 +119,7 @@ def _get_account_info(h: Http, cookie: str) -> Tuple[str, str]:
     # 调试日志脱敏：绝不打印 Cookie 等敏感头
     safe_headers = {k: ("<redacted>" if k.lower() in ("cookie", "authorization", "x-api-key") else v)
                     for k, v in headers.items()}
-    print(f"[workbuddy] _get_account_info 请求头: {json.dumps(safe_headers, ensure_ascii=False, indent=2)}")
+    _dbg(f"[workbuddy] _get_account_info 请求头: {json.dumps(safe_headers, ensure_ascii=False, indent=2)}")
     resp = h.request("GET", f"{BASE_URL}/console/accounts", headers=headers)
     if resp.code in (401, 403):
         raise RuntimeError(f"Cookie 已失效（HTTP {resp.code}），请重新登录并更新 Cookie")
@@ -228,13 +249,13 @@ def _acp_connect(h: Http, acp_url: str, stop_event: "threading.Event", token: st
         except _urllib_err.HTTPError as e:
             last_exc = e
             if e.code == 401 and with_auth is True and token:
-                print(f"[workbuddy] ACP GET /acp 401（带 Bearer token），尝试无鉴权重试...")
+                _dbg(f"[workbuddy] ACP GET /acp 401（带 Bearer token），尝试无鉴权重试...")
                 continue
-            print(f"[workbuddy] ACP GET /acp 连接失败: HTTP {e.code}")
+            _dbg(f"[workbuddy] ACP GET /acp 连接失败: HTTP {e.code}")
             return "", None, []
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
-            print(f"[workbuddy] ACP GET /acp 连接失败: {exc}")
+            _dbg(f"[workbuddy] ACP GET /acp 连接失败: {exc}")
             return "", None, []
 
         conn_id = resp.headers.get("acp-connection-id", "")
@@ -246,7 +267,7 @@ def _acp_connect(h: Http, acp_url: str, stop_event: "threading.Event", token: st
             last_exc = "响应未返回 acp-connection-id"
             if with_auth is True and token:
                 continue
-            print(f"[workbuddy] ACP GET /acp 连接失败: {last_exc}")
+            _dbg(f"[workbuddy] ACP GET /acp 连接失败: {last_exc}")
             return "", None, []
 
         sse_events: list = []
@@ -269,7 +290,7 @@ def _acp_connect(h: Http, acp_url: str, stop_event: "threading.Event", token: st
         t.start()
         return conn_id, t, sse_events
 
-    print(f"[workbuddy] ACP GET /acp 连接失败: {last_exc}")
+    _dbg(f"[workbuddy] ACP GET /acp 连接失败: {last_exc}")
     return "", None, []
 
 
@@ -311,7 +332,7 @@ def _acp_call(h: Http, acp_url: str, conn_id: str, method: str, params: Dict[str
         except _urllib_err.HTTPError as e:
             return e.code
         except Exception as exc:  # noqa: BLE001
-            print(f"[workbuddy] ACP {method} 调用异常: {exc}")
+            _dbg(f"[workbuddy] ACP {method} 调用异常: {exc}")
             return -1
 
     # 同步拿到状态码即可（响应体后台排空）
@@ -353,21 +374,21 @@ def _run_conversation_and_wait(h: Http, cookie: str, timeout_seconds: int = 240)
     conv = _create_conversation(h, cookie)
     conv_id = conv.get("id")
     if not conv_id:
-        print("[workbuddy] 创建对话任务失败，无法激活签到面板")
+        _dbg("[workbuddy] 创建对话任务失败，无法激活签到面板")
         return "创建对话任务失败，无法激活签到面板", False
 
-    print(f"[workbuddy] 对话任务已创建，conversation_id={conv_id}")
+    _dbg(f"[workbuddy] 对话任务已创建，conversation_id={conv_id}")
 
     # 2. 获取 session 信息
     session_data = _get_conversation_session(h, cookie, conv_id)
     e2b_endpoint = session_data.get("e2bEndpoint", "")
     session_id = session_data.get("sessionId", conv_id)
     if not e2b_endpoint:
-        print(f"[workbuddy] conversation_id={conv_id} 但无法获取 ACP endpoint，签到面板可能无法激活")
+        _dbg(f"[workbuddy] conversation_id={conv_id} 但无法获取 ACP endpoint，签到面板可能无法激活")
         return f"对话已创建 (ID:{conv_id}) 但无法获取 ACP endpoint，签到面板可能无法激活", False
 
-    print(f"[workbuddy] ACP endpoint: {e2b_endpoint}，session_id: {session_id}")
-    print(f"[workbuddy] session 配置(脱敏): {_safe_session_dump(session_data)}")
+    _dbg(f"[workbuddy] ACP endpoint: {e2b_endpoint}，session_id: {session_id}")
+    _dbg(f"[workbuddy] session 配置(脱敏): {_safe_session_dump(session_data)}")
 
     # ACP 实际地址优先用 link（sandbox 直连 /acp），回退到 e2bEndpoint+/acp；
     # link 已含 /acp 后缀，无需再拼。
@@ -382,7 +403,7 @@ def _run_conversation_and_wait(h: Http, cookie: str, timeout_seconds: int = 240)
     conn_id, sse_thread, sse_events = _acp_connect(h, acp_url, stop_event, token)
     if not conn_id:
         return "ACP 连接建立失败（未返回 acp-connection-id）", False
-    print(f"[workbuddy] ACP 连接已建立 acp-connection-id={conn_id}")
+    _dbg(f"[workbuddy] ACP 连接已建立 acp-connection-id={conn_id}")
 
     # 2) 依次发送 ACP JSON-RPC：initialize -> session/load -> session/prompt
     init_status = _acp_call(h, acp_url, conn_id, "initialize", {
@@ -392,14 +413,14 @@ def _run_conversation_and_wait(h: Http, cookie: str, timeout_seconds: int = 240)
             "fs": {"readTextFile": False, "writeTextFile": False},
         },
     }, 0, token)
-    print(f"[workbuddy] initialize 状态码: {init_status}")
+    _dbg(f"[workbuddy] initialize 状态码: {init_status}")
 
     load_status = _acp_call(h, acp_url, conn_id, "session/load", {
         "sessionId": conv_id,
         "cwd": "/workspace",
         "mcpServers": [],
     }, 1, token)
-    print(f"[workbuddy] session/load 状态码: {load_status}")
+    _dbg(f"[workbuddy] session/load 状态码: {load_status}")
 
     prompt_payload = {
         "sessionId": conv_id,
@@ -415,16 +436,16 @@ def _run_conversation_and_wait(h: Http, cookie: str, timeout_seconds: int = 240)
         },
     }
     prompt_status = _acp_call(h, acp_url, conn_id, "session/prompt", prompt_payload, 2, token)
-    print(f"[workbuddy] session/prompt 状态码: {prompt_status}")
+    _dbg(f"[workbuddy] session/prompt 状态码: {prompt_status}")
 
     acp_codes = [init_status, load_status, prompt_status]
     if not all(c in (200, 202) for c in acp_codes):
-        print(f"[workbuddy] ACP 调用状态码异常: {acp_codes}")
+        _dbg(f"[workbuddy] ACP 调用状态码异常: {acp_codes}")
         stop_event.set()
         return f"ACP 调用异常 (状态码 {acp_codes})，签到可能无法完成", False
 
     # 3) 保持 SSE 连接打开，等待 AI 完成；随后轮询签到状态
-    print(f"[workbuddy] 对话任务已创建并发送 prompt (conversation ID: {conv_id})，等待 AI 完成...")
+    _dbg(f"[workbuddy] 对话任务已创建并发送 prompt (conversation ID: {conv_id})，等待 AI 完成...")
 
     # 5. 轮询签到状态
     headers = _init_conversations_headers(cookie)
@@ -436,18 +457,18 @@ def _run_conversation_and_wait(h: Http, cookie: str, timeout_seconds: int = 240)
 
     while time.time() - start < timeout_seconds:
         elapsed = time.time() - start
-        print(f"[workbuddy] [{elapsed:.0f}s] 轮询签到状态...")
+        _dbg(f"[workbuddy] [{elapsed:.0f}s] 轮询签到状态...")
         resp = h.request("POST", f"{BASE_URL}/billing/meter/checkin-status", headers=headers, json_data={})
         if resp.code != 200:
             last_msg = f"查询签到状态失败 (HTTP {resp.code})"
-            print(f"[workbuddy] 查询签到状态失败 (HTTP {resp.code})")
+            _dbg(f"[workbuddy] 查询签到状态失败 (HTTP {resp.code})")
             time.sleep(5)
             continue
 
         data = resp.json({})
         if data.get("code") != 0:
             last_msg = f"签到状态异常：{data.get('msg', '未知')}"
-            print(f"[workbuddy] 签到状态异常：{data.get('msg', '未知')}")
+            _dbg(f"[workbuddy] 签到状态异常：{data.get('msg', '未知')}")
             time.sleep(5)
             continue
 
@@ -464,16 +485,16 @@ def _run_conversation_and_wait(h: Http, cookie: str, timeout_seconds: int = 240)
             f"streak={streak_days}天"
         )
 
-        print(f"[workbuddy] [{elapsed:.0f}s] active={active}, today_checked_in={today_checked_in}, streak={streak_days}天, credit={daily_credit}")
+        _dbg(f"[workbuddy] [{elapsed:.0f}s] active={active}, today_checked_in={today_checked_in}, streak={streak_days}天, credit={daily_credit}")
 
         if today_checked_in:
             if is_streak_day:
-                print(f"[workbuddy] 签到成功 (+{daily_credit} 算力，连签 {streak_days} 天，连续签到日)")
+                _dbg(f"[workbuddy] 签到成功 (+{daily_credit} 算力，连签 {streak_days} 天，连续签到日)")
                 return (
                     f"签到成功 (+{daily_credit} 算力，连签 {streak_days} 天，连续签到日)",
                     True,
                 )
-            print(f"[workbuddy] 签到成功 (+{daily_credit} 算力，连签 {streak_days} 天)")
+            _dbg(f"[workbuddy] 签到成功 (+{daily_credit} 算力，连签 {streak_days} 天)")
             return f"签到成功 (+{daily_credit} 算力，连签 {streak_days} 天)", True
 
         if not active:
@@ -490,14 +511,14 @@ def _run_conversation_and_wait(h: Http, cookie: str, timeout_seconds: int = 240)
     if last_status:
         active, checked_in = last_status
         if checked_in:
-            print(f"[workbuddy] 签到成功 (轮询结束时已完成)")
+            _dbg(f"[workbuddy] 签到成功 (轮询结束时已完成)")
             return "签到成功 (轮询结束时已完成)", True
         if active:
-            print(f"[workbuddy] 对话任务已激活但 {timeout_seconds}s 内未完成签到")
+            _dbg(f"[workbuddy] 对话任务已激活但 {timeout_seconds}s 内未完成签到")
             return f"对话任务已激活但 {timeout_seconds}s 内未完成签到", False
-        print(f"[workbuddy] 对话任务未激活签到面板，{timeout_seconds}s 超时")
+        _dbg(f"[workbuddy] 对话任务未激活签到面板，{timeout_seconds}s 超时")
         return f"对话任务未激活签到面板，{timeout_seconds}s 超时", False
-    print(f"[workbuddy] 轮询超时 ({timeout_seconds}s)，无法获知签到状态")
+    _dbg(f"[workbuddy] 轮询超时 ({timeout_seconds}s)，无法获知签到状态")
     return f"轮询超时 ({timeout_seconds}s)，无法获知签到状态", False
 
 
@@ -694,12 +715,11 @@ def _schedule_travel_claim(remaining_seconds: int) -> str:
     import urllib.parse
     topic = urllib.parse.quote(dispatch_api, safe="")
 
-    # 拼接 publish URL：复用用户已有的基地址结构（若包含 /v2/publish/），否则拼接
-    if "/v2/publish/" in qstash_url:
-        base_part = qstash_url.split("/v2/publish/")[0] + "/v2/publish/"
-        publish_url = f"{base_part}{topic}"
-    else:
-        publish_url = f"{qstash_url.rstrip('/')}/v2/publish/{topic}"
+    # 拼接 publish URL：无论 QSTASH_URL 配的是裸域名还是已带 /v2/publish[/<旧topic>]
+    # （含无尾斜杠的写法），都先剥掉 publish 路径再统一拼，避免双重前缀导致
+    # QStash 把目的地解析成 "v2/publish/https://…" 而报 invalid scheme
+    base = qstash_url.split("/v2/publish", 1)[0].rstrip("/")
+    publish_url = f"{base}/v2/publish/{topic}"
 
     delay = remaining_seconds + 300  # 5 分钟缓冲，防止时钟/接口延迟导致提前到达
 
@@ -738,7 +758,7 @@ def _handle_traveling(h: Http, headers: Dict[str, str], travel_data: Dict[str, A
     remaining_seconds = max(0, arrive_at - server_now)
 
     if remaining_seconds == 0:
-        print(f"🔔 放风已完成，正在自动回访【{loc_name}】领取奖励...")
+        _dbg(f"🔔 放风已完成，正在自动回访【{loc_name}】领取奖励...")
         return _claim_travel_reward(h, headers, travel_data, loc_name)
 
     if wait_travel:
@@ -1026,9 +1046,14 @@ def main():
     for idx, cookie in enumerate(cookies, 1):
         try:
             ok, msg = _run_one(cookie, idx, total, wait_travel=wait_travel)
+            if ok:
+                _DEBUG_LINES.clear()  # 成功：丢弃过程日志，保持邮件卡片干净
+            else:
+                _flush_dbg()          # 失败：附带调试轨迹便于排查
             print(msg)
             results.append((ok, msg))
         except Exception as e:
+            _flush_dbg()
             err_msg = f"[{idx}/{total}] 签到失败：{e}" if total > 1 else f"签到失败：{e}"
             print(err_msg)
             results.append((False, err_msg))
