@@ -24,7 +24,8 @@ if str(BASE_DIR) not in sys.path:
 from daily_report import build_report, send_email, send_resend  # noqa: E402
 
 # Latvi 的结果文件名（24h 间隔约束，18:00 运行，报告取昨日结果）
-LATVI_RESULT_FILE = "latvi.py.json"
+# 注意 run_task.py 用 Path.stem 命名：latvi.py → latvi.json（.py 后缀被剥掉）
+LATVI_RESULT_FILE = "latvi.json"
 
 
 def _load_single_result(path: Path, accepted_dates: Set[str]) -> Optional[dict]:
@@ -49,10 +50,11 @@ def collect_all_results(today: str, yesterday: str) -> List[Tuple[bool, Path, st
     """收集所有任务结果并转换为 build_report 所需格式。"""
     collected: Dict[str, dict] = {}
 
-    # 扫描 .task_results/ 目录（全异步任务主路径：cache + artifact 两路汇入）
+    # 递归扫描 .task_results/（主路径：gh run download 会按 artifact 名建子目录，
+    # 如 .task_results/task-result-glados.py/glados.json，不能只扫顶层）
     task_results_dir = Path(os.getenv("TASK_OUTPUT_DIR", ".task_results"))
     if task_results_dir.exists() and task_results_dir.is_dir():
-        for json_file in sorted(task_results_dir.glob("*.json")):
+        for json_file in sorted(task_results_dir.rglob("*.json")):
             # 以唯一文件名作为 key，避免同一脚本的多账号结果被脚本名覆盖合并
             dates = {today, yesterday} if json_file.name == LATVI_RESULT_FILE else {today}
             res = _load_single_result(json_file, dates)
