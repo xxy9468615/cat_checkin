@@ -2,9 +2,12 @@ name: Latvi Check-in
 
 on:
   schedule:
-    # 北京时间 18:00（UTC 10:00）触发，距 24h 签到窗口约 1h 以内
+    # 北京时间 18:00（UTC 10:00）兜底锚点：接力链活着时被幂等闸门快速放行（~20s），
+    # 链断裂（QStash/GitHub dispatch 失败）时当天补签并重建接力链
     - cron: "0 10 * * *"
   workflow_dispatch:
+  repository_dispatch:
+    types: [latvi_next_sign]
 
 permissions:
   contents: read
@@ -16,7 +19,7 @@ concurrency:
 jobs:
   latvi:
     runs-on: ubuntu-latest
-    timeout-minutes: 120  # 距签到窗口最多 1h，给足等待时间
+    timeout-minutes: 120  # 常规接力 run ~20s；上限给足 QStash 失败回退等待/冷却重试的余量
 
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +50,14 @@ jobs:
           LATVI_PASSWORD: ${{ secrets.LATVI_PASSWORD }}
           LATVI_STATE_FILE: .latvi_state.json
           TASK_OUTPUT_DIR: .task_results
+          # 常规路径（dispatch 接力）几十秒完成；TASK_TIMEOUT 7000s 兜底两条慢路径：
+          # ① QStash 调度失败回退原地等待 ② 服务端冷却重试的 sleep 循环
+          TASK_TIMEOUT: "7000"
+          # QStash 延时接力调度（签到成功后 +24h+3~5min dispatch 下一轮）
+          GITHUB_REPO: ${{ github.repository }}
+          QSTASH_URL: ${{ secrets.QSTASH_URL }}
+          QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           python3 scripts/run_task.py scripts/latvi.py
 

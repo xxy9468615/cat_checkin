@@ -40,7 +40,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Tuple
 
-from common import Http, env, main_guard, mask_str
+from common import Http, env, main_guard, mask_str, schedule_repo_dispatch
 
 PREFIX = "WORKBUDDY_"
 BASE_URL = "https://www.workbuddy.cn"
@@ -689,62 +689,16 @@ def _schedule_travel_claim(remaining_seconds: int) -> str:
 
     不在本地阻塞等待放风时长——改为提取剩余秒数后通过 QStash 延时发布，
     由下一轮 workbuddy.yml 接力发现 arrived 状态后自动领奖，避免长时间占用 Runner。
+    （QStash publish URL 拼接 / 鉴权透传统一在 common.schedule_repo_dispatch）
     """
-    qstash_url = os.getenv("QSTASH_URL") or os.getenv("WORKBUDDY_QSTASH_URL")
-    qstash_token = os.getenv("QSTASH_TOKEN") or os.getenv("WORKBUDDY_QSTASH_TOKEN")
-    gh_pat = os.getenv("GH_PAT") or os.getenv("WORKFLOW_TOKEN")
-    repo = os.getenv("GITHUB_REPO", "")
-
-    if not all([qstash_url, qstash_token, gh_pat]):
-        missing = []
-        if not qstash_url:
-            missing.append("QSTASH_URL")
-        if not qstash_token:
-            missing.append("QSTASH_TOKEN")
-        if not gh_pat:
-            missing.append("GH_PAT")
-        return f"未配置延时调度依赖({', '.join(missing)})，将等待下次定时触发"
-
-    if not repo:
-        return "未配置 GITHUB_REPO，无法构造 dispatch 目标"
-
-    # GitHub repository_dispatch API 目标地址
-    dispatch_api = f"https://api.github.com/repos/{repo}/dispatches"
-
-    # QStash publish 的 topic 是目标 URL（需编码为路径片段）
-    import urllib.parse
-    topic = urllib.parse.quote(dispatch_api, safe="")
-
-    # 拼接 publish URL：无论 QSTASH_URL 配的是裸域名还是已带 /v2/publish[/<旧topic>]
-    # （含无尾斜杠的写法），都先剥掉 publish 路径再统一拼，避免双重前缀导致
-    # QStash 把目的地解析成 "v2/publish/https://…" 而报 invalid scheme
-    base = qstash_url.split("/v2/publish", 1)[0].rstrip("/")
-    publish_url = f"{base}/v2/publish/{topic}"
-
     delay = remaining_seconds + 300  # 5 分钟缓冲，防止时钟/接口延迟导致提前到达
-
-    # QStash `…/v2/publish/{目标URL}` 会把请求体原样转发给目标，Body 必须是 GitHub
-    # dispatches API 要求的原始 JSON（{"event_type": …}）。
-    # GitHub 所需的鉴权/接受头通过 QStash 的 Upstash-Forward-* 前缀透传——
-    # QStash 收到带该前缀的头时，会把前缀剥离后原样转发（Upstash → GitHub）。
-    body = json.dumps({"event_type": "workbuddy_travel_claim"}, ensure_ascii=False)
-
-    headers = {
-        "Authorization": f"Bearer {qstash_token}",
-        "Content-Type": "application/json",
-        "Upstash-Delay": str(delay),
-        "Upstash-Forward-Authorization": f"Bearer {gh_pat}",
-        "Upstash-Forward-Accept": "application/vnd.github+json",
-        "Upstash-Forward-X-GitHub-Api-Version": "2022-11-28",
-    }
-
-    h = Http()
-    resp = h.request("POST", publish_url, headers=headers, data=body)
-    if resp.code == 200:
+    ok, detail = schedule_repo_dispatch("workbuddy_travel_claim", delay)
+    if ok:
         eta = int(time.time()) + delay
         return f"已调度下一轮领奖（{delay}秒后，约 {_format_beijing_time(eta)}）"
-    msg = resp.text[:200] if resp.text else ""
-    return f"延时调度失败（HTTP {resp.code}{': ' + msg if msg else ''})"
+    if detail.startswith("未配置"):
+        return f"{detail}，将等待下次定时触发"
+    return f"延时调度失败（{detail}）"
 
 
 def _handle_traveling(h: Http, headers: Dict[str, str], travel_data: Dict[str, Any], loc_name: str, wait_travel: bool) -> str:

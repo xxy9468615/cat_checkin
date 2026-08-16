@@ -250,6 +250,66 @@ class Browser:
             self._sync = None
 
 
+def schedule_repo_dispatch(event_type: str, delay_seconds: int) -> tuple[bool, str]:
+    """通过 QStash 延时 Webhook 触发 GitHub repository_dispatch（跨 run 接力调度）。
+
+    供 workbuddy 放风领奖接力、latvi 24h 冷却签到接力等场景共用：不在本地阻塞
+    等待，由 QStash 在 delay_seconds 后回调 repository_dispatch API 触发下一个
+    工作流。QStash 免费版延时上限 7 天，覆盖 24h 级接力。
+
+    环境变量：QSTASH_URL / QSTASH_TOKEN / GH_PAT（需 Actions: write）/ GITHUB_REPO。
+    返回 (是否已成功调度, 说明)；未配置依赖或发布失败时返回 False，调用方自行回退
+    （workbuddy 回退为等下次定时触发，latvi 回退为原地等待）。
+    """
+    qstash_url = os.getenv("QSTASH_URL") or os.getenv("WORKBUDDY_QSTASH_URL")
+    qstash_token = os.getenv("QSTASH_TOKEN") or os.getenv("WORKBUDDY_QSTASH_TOKEN")
+    gh_pat = os.getenv("GH_PAT") or os.getenv("WORKFLOW_TOKEN")
+    repo = os.getenv("GITHUB_REPO", "")
+
+    missing = [
+        key
+        for key, value in (
+            ("QSTASH_URL", qstash_url),
+            ("QSTASH_TOKEN", qstash_token),
+            ("GH_PAT", gh_pat),
+            ("GITHUB_REPO", repo),
+        )
+        if not value
+    ]
+    if missing:
+        return False, f"未配置延时调度依赖({', '.join(missing)})"
+
+    # GitHub repository_dispatch API 目标地址；QStash publish 的 topic 是目标 URL（需编码为路径片段）
+    dispatch_api = f"https://api.github.com/repos/{repo}/dispatches"
+    topic = urllib.parse.quote(dispatch_api, safe="")
+
+    # 拼接 publish URL：无论 QSTASH_URL 配的是裸域名还是已带 /v2/publish[/<旧topic>]
+    # （含无尾斜杠的写法），都先剥掉 publish 路径再统一拼，避免双重前缀导致
+    # QStash 把目的地解析成 "v2/publish/https://…" 而报 invalid scheme
+    base = qstash_url.split("/v2/publish", 1)[0].rstrip("/")
+    publish_url = f"{base}/v2/publish/{topic}"
+
+    # QStash `…/v2/publish/{目标URL}` 会把请求体原样转发给目标，Body 必须是 GitHub
+    # dispatches API 要求的原始 JSON（{"event_type": …}）。
+    # GitHub 所需的鉴权/接受头通过 QStash 的 Upstash-Forward-* 前缀透传——
+    # QStash 收到带该前缀的头时，会把前缀剥离后原样转发（Upstash → GitHub）。
+    body = json.dumps({"event_type": event_type}, ensure_ascii=False)
+    headers = {
+        "Authorization": f"Bearer {qstash_token}",
+        "Content-Type": "application/json",
+        "Upstash-Delay": str(int(delay_seconds)),
+        "Upstash-Forward-Authorization": f"Bearer {gh_pat}",
+        "Upstash-Forward-Accept": "application/vnd.github+json",
+        "Upstash-Forward-X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    resp = Http().request("POST", publish_url, headers=headers, data=body)
+    if resp.code == 200:
+        return True, str(int(delay_seconds))
+    detail = resp.text[:200] if resp.text else ""
+    return False, f"HTTP {resp.code}{': ' + detail if detail else ''}"
+
+
 def env(prefix: str, name: str, default: str = "", required: bool = True) -> str:
     clean_prefix = prefix.removeprefix("QL_")
     keys = [
