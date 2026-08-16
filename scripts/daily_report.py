@@ -1,34 +1,15 @@
 #!/usr/bin/env python3
 # cron: 30 10 * * *
 # new Env("每日签到统一汇总推送")
-"""Run standalone sign-in scripts sequentially and push a daily report (Telegram / SMTP / Resend).
+"""每日报告函数库：报告文本构建 + HTML 邮件卡片 + SMTP/Resend 双通道发送。
 
-Environment:
-  TG_BOT_TOKEN            Telegram Bot token, required for push.
-  TG_CHAT_ID              Telegram chat_id, preferred.
-  TG_USER_ID              Alias of TG_CHAT_ID.
-  TG_API_HOST             Optional, default: https://api.telegram.org
-  DAILY_TASKS             Optional comma-separated script list. Default: all *.py except common/report.
-  DAILY_EXCLUDE           Optional comma-separated script list to skip.
-  DAILY_TIMEOUT           Per-task timeout seconds, default: 180.
-  DAILY_PUSH              true/false, default: true. If false only prints report.
-  DAILY_MAX_TASK_OUTPUT   Max characters per task block, default: 1500.
+由 unified_report.py（report.yml 每日 10:00 调用）import 使用；
+任务执行与结果落盘由 run_task.py 在各签到 workflow 内完成，本模块不再执行任务。
 
-  Email (SMTP) 推送，配置齐全时与 Telegram 并行发送：
-  MAIL_HOST               SMTP 服务器，如 smtp.qq.com / smtp.gmail.com。
-  MAIL_PORT               端口，默认 465（SSL）；587/25 走 STARTTLS。
-  MAIL_USER               登录账号（通常是发件邮箱）。
-  MAIL_PASS               登录密码 / 授权码。
-  MAIL_FROM               发件人地址，默认取 MAIL_USER。
-  MAIL_TO                 收件人，多个用逗号/分号/空格分隔，默认取 MAIL_USER。
-  MAIL_SSL                true/false，默认 true（端口 465 强制 SSL）。
-  MAIL_PORT=587 时自动 STARTTLS。
-
-  Email (Resend API) 推送，配置齐全时与 Telegram / SMTP 并行发送：
-  RESEND_API_KEY          Resend API Key（re_ 开头）。
-  RESEND_FROM             发件人，如 "cat_checkin <noreply@your-domain>"，
-                          需为 Resend 已验证域名；缺省用 onboarding@resend.dev。
-  RESEND_TO               收件人，多个用逗号/分号/空格分隔。缺省回退 MAIL_TO。
+Environment（邮件通道）：
+  SMTP: MAIL_HOST / MAIL_PORT(默认465) / MAIL_USER / MAIL_PASS / MAIL_FROM / MAIL_TO / MAIL_SSL
+  Resend: RESEND_API_KEY / RESEND_FROM / RESEND_TO（缺省回退 MAIL_TO）
+  send_email / send_resend 返回 bool（未配置/失败为 False），由调用方决定发送标记与退出码。
 """
 
 from __future__ import annotations
@@ -40,18 +21,11 @@ import html as _html
 import os
 import re
 import smtplib
-import subprocess
-import sys
-import textwrap
-import time
-import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
 BASE_DIR = Path(__file__).resolve().parent
-SELF_NAME = Path(__file__).name
-DEFAULT_EXCLUDE = {"common.py", SELF_NAME}
 
 
 def bool_env(name: str, default: bool) -> bool:
@@ -59,17 +33,6 @@ def bool_env(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.lower() in {"1", "true", "yes", "y", "on"}
-
-
-def split_csv(value: str) -> List[str]:
-    return [x.strip() for x in value.split(",") if x.strip()]
-
-
-def normalize_script_name(name: str) -> str:
-    name = name.strip()
-    if not name.endswith(".py"):
-        name += ".py"
-    return name
 
 
 def get_task_title(path: Path) -> str:
@@ -82,46 +45,6 @@ def get_task_title(path: Path) -> str:
     except Exception:
         pass
     return path.stem
-
-
-def discover_tasks() -> List[Path]:
-    raw_tasks = os.getenv("DAILY_TASKS") or os.getenv("QL_DAILY_TASKS", "")
-    raw_excludes = os.getenv("DAILY_EXCLUDE") or os.getenv("QL_DAILY_EXCLUDE", "")
-    explicit = split_csv(raw_tasks)
-    excludes = {normalize_script_name(x) for x in split_csv(raw_excludes)}
-    excludes |= DEFAULT_EXCLUDE
-
-    if explicit:
-        tasks = [BASE_DIR / normalize_script_name(x) for x in explicit]
-    else:
-        tasks = sorted([p for p in BASE_DIR.glob("*.py") if not p.name.startswith("_")])
-
-    return [p for p in tasks if p.name not in excludes and p.exists()]
-
-
-def run_task(path: Path, timeout: int) -> Tuple[bool, Path, str, float]:
-    start = time.monotonic()
-    try:
-        proc = subprocess.run(
-            [sys.executable, str(path)],
-            cwd=str(BASE_DIR),
-            env=os.environ.copy(),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-            check=False,
-        )
-        elapsed = time.monotonic() - start
-        output = (proc.stdout or "").strip()
-        return proc.returncode == 0, path, output, elapsed
-    except subprocess.TimeoutExpired as exc:
-        elapsed = time.monotonic() - start
-        output = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
-        return False, path, f"任务超时（>{timeout}s）\n{output.strip()}", elapsed
-    except Exception as exc:
-        elapsed = time.monotonic() - start
-        return False, path, f"执行异常: {exc}", elapsed
 
 
 def _last_meaningful_line(text: str) -> str:
@@ -158,119 +81,6 @@ def build_report(results: Iterable[Tuple[bool, Path, str, float]]) -> Tuple[str,
                 lines.append(f"  {reason}")
         lines.append("")
     return summary_header, "\n".join(lines).strip(), fail_count
-
-
-def telegram_chunks(header: str, task_blocks: List[str], limit: int = 3800) -> List[str]:
-    """按任务块边界智能分片 Telegram 消息，避免中断单个任务的输出内容。"""
-    if not task_blocks:
-        return [header]
-
-    raw_chunks: List[str] = []
-    current_lines: List[str] = []
-    current_len = 0
-
-    for block in task_blocks:
-        block = block.strip()
-        if not block:
-            continue
-        block_len = len(block) + 2  # plus \n\n
-
-        if len(block) > limit:
-            if current_lines:
-                raw_chunks.append("\n\n".join(current_lines))
-                current_lines = []
-                current_len = 0
-
-            lines = block.split("\n")
-            sub_chunk: List[str] = []
-            sub_len = 0
-            for line in lines:
-                if sub_len + len(line) + 1 > limit:
-                    if sub_chunk:
-                        raw_chunks.append("\n".join(sub_chunk))
-                        sub_chunk = []
-                        sub_len = 0
-                sub_chunk.append(line)
-                sub_len += len(line) + 1
-            if sub_chunk:
-                raw_chunks.append("\n".join(sub_chunk))
-            continue
-
-        if current_lines and (current_len + block_len > limit):
-            raw_chunks.append("\n\n".join(current_lines))
-            current_lines = [block]
-            current_len = block_len
-        else:
-            current_lines.append(block)
-            current_len += block_len
-
-    if current_lines:
-        raw_chunks.append("\n\n".join(current_lines))
-
-    total = len(raw_chunks)
-    if total <= 1:
-        body = raw_chunks[0] if raw_chunks else ""
-        return [f"{header}\n\n{body}".strip()]
-
-    formatted_chunks: List[str] = []
-    header_lines = [h.strip() for h in header.split("\n") if h.strip()]
-    title_line = header_lines[0] if header_lines else "📢 每日签到汇总"
-    rest_header = "\n".join(header_lines[1:]) if len(header_lines) > 1 else ""
-
-    for idx, chunk in enumerate(raw_chunks, 1):
-        if idx == 1:
-            first_header = f"{title_line} [{idx}/{total}]"
-            if rest_header:
-                first_header += f"\n{rest_header}"
-            formatted_chunks.append(f"{first_header}\n\n{chunk}".strip())
-        else:
-            formatted_chunks.append(f"📢 每日签到汇总 (续 {idx}/{total})\n\n{chunk}".strip())
-    return formatted_chunks
-
-
-def send_telegram(title: str, content: str) -> None:
-    token = os.getenv("TG_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TG_CHAT_ID", "").strip() or os.getenv("TG_USER_ID", "").strip()
-    if not token or not chat_id:
-        print("未配置 TG_BOT_TOKEN + TG_CHAT_ID/TG_USER_ID，跳过 Telegram 推送。")
-        return
-
-    api_host = os.getenv("TG_API_HOST", "https://api.telegram.org").rstrip("/")
-    url = f"{api_host}/bot{token}/sendMessage"
-
-    # 按任务标题行切分，不能用 split("\n\n")：脚本输出内部常含空行
-    # （如 Sophnet 每个账号之间），否则单个任务会被拆散，分片时标题与内容分离。
-    header_parts: List[str] = []
-    task_blocks: List[str] = []
-    current: List[str] = []
-
-    for line in content.split("\n"):
-        if line.startswith("📢") or line.startswith("📊"):
-            header_parts.append(line)
-        elif re.match(r"^[✅❌]\s", line):
-            if current:
-                task_blocks.append("\n".join(current).strip())
-            current = [line]
-        elif current:
-            current.append(line)
-    if current:
-        task_blocks.append("\n".join(current).strip())
-
-    header = "\n".join(header_parts)
-    chunks = telegram_chunks(header, task_blocks)
-
-    for chunk in chunks:
-        payload = {
-            "chat_id": chat_id,
-            "text": chunk,
-            "disable_web_page_preview": "true",
-        }
-        data = urllib.parse.urlencode(payload).encode()
-        req = urllib.request.Request(url, data=data, method="POST")
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            if resp.status < 200 or resp.status >= 300:
-                raise RuntimeError(f"Telegram 推送失败: HTTP {resp.status}")
-    print("✅ Telegram 推送完成")
 
 
 TEMPLATE_DIR = BASE_DIR / "templates"
@@ -619,52 +429,3 @@ def send_resend(subject: str, report: str, results: List[Tuple[bool, Path, str, 
         print(f"❌ Resend 推送失败: {exc}")
         return False
 
-
-def main() -> None:
-    try:
-        timeout = int(os.getenv("DAILY_TIMEOUT") or os.getenv("QL_DAILY_TIMEOUT", "180"))
-    except ValueError:
-        timeout = 180
-        print("⚠️ DAILY_TIMEOUT / QL_DAILY_TIMEOUT 格式不正确，已回退为默认值 180 秒。")
-    tasks = discover_tasks()
-    if not tasks:
-        raise SystemExit("未发现可执行签到脚本")
-
-    print(f"发现 {len(tasks)} 个签到脚本，将顺序执行：")
-    for task in tasks:
-        print(f"- {task.name}")
-    print("")
-
-    results = [run_task(task, timeout) for task in tasks]
-    title, report, fail_count = build_report(results)
-    print("\n========== 每日汇总 ==========")
-    print(report)
-
-    # 保存结果 JSON（供 report.yml 统一收集）
-    report_file = os.getenv("DAILY_REPORT_FILE", "")
-    if report_file:
-        import json as _json
-        tz = datetime.timezone(datetime.timedelta(hours=8))
-        bj_date = datetime.datetime.now(tz).strftime("%Y-%m-%d")
-        serialized = [
-            {"ok": ok, "script": path.name, "output": output, "elapsed": elapsed, "date": bj_date}
-            for ok, path, output, elapsed in results
-        ]
-        Path(report_file).write_text(
-            _json.dumps(serialized, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        print(f"📝 签到结果已保存: {report_file}")
-
-    push_enabled = bool_env("DAILY_PUSH", True) if os.getenv("DAILY_PUSH") is not None else bool_env("QL_DAILY_PUSH", True)
-    if push_enabled:
-        # send_telegram(title, report)  # 已停用 TG
-        send_email(title, report, results)
-        send_resend(title, report, results)
-
-    if fail_count:
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
