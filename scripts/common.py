@@ -256,6 +256,68 @@ class Browser:
             self._sync = None
 
 
+def qstash_publish(
+    destination: str,
+    body: str,
+    *,
+    forward_headers: Optional[Dict[str, str]] = None,
+    delay_seconds: int = 0,
+    retries: Optional[int] = None,
+    content_dedup: bool = False,
+) -> tuple[bool, str]:
+    """发布消息到 QStash，由其持久化投递到 destination（自动重试/退避/DLQ）。
+
+    环境变量：QSTASH_URL / QSTASH_TOKEN（兼容 WORKBUDDY_QSTASH_* 旧名）。
+    - destination: 目标 API 的完整 URL
+    - forward_headers: 透传给目标 API 的请求头——QStash 收到 Upstash-Forward-* 前缀
+      的头时会把前缀剥离后原样转发（如 Resend/GitHub 的 Authorization）
+    - delay_seconds: >0 时延时投递（Upstash-Delay，Go duration 语法须带单位；
+      免费版上限 7 天）
+    - retries: 显式重试上限（None = QStash 默认 3 次；任何非 2xx 都重试，
+      退避 e^(2.5n)≈12s/2m28s/30m8s，耗尽入 DLQ）
+    - content_dedup: 开 10 分钟内容级去重（同 destination+body+headers 的重复
+      publish 返回 202 + 原 messageId，防 ack 丢失重发导致目标收双份）
+
+    返回 (是否发布成功, messageId 或失败说明)；200/201/202 均视为成功
+    （201 Created 带 messageId；202 = 内容去重命中重复）。
+    """
+    qstash_url = os.getenv("QSTASH_URL") or os.getenv("WORKBUDDY_QSTASH_URL")
+    qstash_token = os.getenv("QSTASH_TOKEN") or os.getenv("WORKBUDDY_QSTASH_TOKEN")
+    if not qstash_url or not qstash_token:
+        return False, "未配置 QStash(QSTASH_URL, QSTASH_TOKEN)"
+
+    # 拼接 publish URL：无论 QSTASH_URL 配的是裸域名还是已带 /v2/publish[/<旧topic>]
+    # （含无尾斜杠的写法），都先剥掉 publish 路径再统一拼，避免双重前缀。
+    # destination 用字面量 URL 而非百分号编码：区域端点（如 qstash-us-east-1）
+    # 不解码路径 topic，编码后的 https%3A%2F%2F… 会被判 "endpoint has invalid scheme"
+    base = qstash_url.split("/v2/publish", 1)[0].rstrip("/")
+    publish_url = f"{base}/v2/publish/{destination}"
+
+    # publish 请求体原样转发给目标，body 必须是目标 API 要求的原始 JSON 文本。
+    headers: Dict[str, str] = {
+        "Authorization": f"Bearer {qstash_token}",
+        "Content-Type": "application/json",
+    }
+    if delay_seconds > 0:
+        # Upstash-Delay 必须带单位（Go duration 语法），纯数字会报
+        # "time: missing unit in duration"
+        headers["Upstash-Delay"] = f"{int(delay_seconds)}s"
+    for name, value in (forward_headers or {}).items():
+        headers[f"Upstash-Forward-{name}"] = value
+    if retries is not None:
+        headers["Upstash-Retries"] = str(int(retries))
+    if content_dedup:
+        headers["Upstash-Content-Based-Deduplication"] = "true"
+
+    resp = Http().request("POST", publish_url, headers=headers, data=body)
+    if resp.code in (200, 201, 202):
+        data = resp.json()
+        msg_id = str(data.get("messageId", "") or "") if isinstance(data, dict) else ""
+        return True, msg_id
+    detail = resp.text[:200] if resp.text else ""
+    return False, f"HTTP {resp.code}{': ' + detail if detail else ''}"
+
+
 def schedule_repo_dispatch(event_type: str, delay_seconds: int) -> tuple[bool, str]:
     """通过 QStash 延时 Webhook 触发 GitHub repository_dispatch（跨 run 接力调度）。
 
@@ -264,8 +326,8 @@ def schedule_repo_dispatch(event_type: str, delay_seconds: int) -> tuple[bool, s
     工作流。QStash 免费版延时上限 7 天，覆盖 24h 级接力。
 
     环境变量：QSTASH_URL / QSTASH_TOKEN / GH_PAT（需 Actions: write）/ GITHUB_REPO。
-    返回 (是否已成功调度, 说明)；未配置依赖或发布失败时返回 False，调用方自行回退
-    （workbuddy 回退为等下次定时触发，latvi 回退为原地等待）。
+    返回 (是否已成功调度, 延时秒数或失败说明)；未配置依赖或发布失败时返回 False，
+    调用方自行回退（workbuddy 回退为等下次定时触发，latvi 回退为原地等待）。
     """
     qstash_url = os.getenv("QSTASH_URL") or os.getenv("WORKBUDDY_QSTASH_URL")
     qstash_token = os.getenv("QSTASH_TOKEN") or os.getenv("WORKBUDDY_QSTASH_TOKEN")
@@ -285,38 +347,18 @@ def schedule_repo_dispatch(event_type: str, delay_seconds: int) -> tuple[bool, s
     if missing:
         return False, f"未配置延时调度依赖({', '.join(missing)})"
 
-    # GitHub repository_dispatch API 目标地址
-    dispatch_api = f"https://api.github.com/repos/{repo}/dispatches"
-
-    # 拼接 publish URL：无论 QSTASH_URL 配的是裸域名还是已带 /v2/publish[/<旧topic>]
-    # （含无尾斜杠的写法），都先剥掉 publish 路径再统一拼，避免双重前缀。
-    # destination 用字面量 URL 而非百分号编码：区域端点（如 qstash-us-east-1）
-    # 不解码路径 topic，编码后的 https%3A%2F%2F… 会被判 "endpoint has invalid scheme"
-    base = qstash_url.split("/v2/publish", 1)[0].rstrip("/")
-    publish_url = f"{base}/v2/publish/{dispatch_api}"
-
-    # QStash `…/v2/publish/{目标URL}` 会把请求体原样转发给目标，Body 必须是 GitHub
-    # dispatches API 要求的原始 JSON（{"event_type": …}）。
-    # GitHub 所需的鉴权/接受头通过 QStash 的 Upstash-Forward-* 前缀透传——
-    # QStash 收到带该前缀的头时，会把前缀剥离后原样转发（Upstash → GitHub）。
-    # Upstash-Delay 必须带单位（Go duration 语法），纯数字会报
-    # "time: missing unit in duration"
-    body = json.dumps({"event_type": event_type}, ensure_ascii=False)
-    headers = {
-        "Authorization": f"Bearer {qstash_token}",
-        "Content-Type": "application/json",
-        "Upstash-Delay": f"{int(delay_seconds)}s",
-        "Upstash-Forward-Authorization": f"Bearer {gh_pat}",
-        "Upstash-Forward-Accept": "application/vnd.github+json",
-        "Upstash-Forward-X-GitHub-Api-Version": "2022-11-28",
-    }
-
-    resp = Http().request("POST", publish_url, headers=headers, data=body)
-    # publish 成功返回 200/201（201 Created 带 messageId，异步投递）
-    if resp.code in (200, 201):
-        return True, str(int(delay_seconds))
-    detail = resp.text[:200] if resp.text else ""
-    return False, f"HTTP {resp.code}{': ' + detail if detail else ''}"
+    # GitHub 所需的鉴权/接受头通过 Upstash-Forward-* 透传（见 qstash_publish）
+    ok, detail = qstash_publish(
+        f"https://api.github.com/repos/{repo}/dispatches",
+        json.dumps({"event_type": event_type}, ensure_ascii=False),
+        forward_headers={
+            "Authorization": f"Bearer {gh_pat}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        delay_seconds=delay_seconds,
+    )
+    return (True, str(int(delay_seconds))) if ok else (False, detail)
 
 
 def env(prefix: str, name: str, default: str = "", required: bool = True) -> str:
