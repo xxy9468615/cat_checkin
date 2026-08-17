@@ -148,16 +148,26 @@ jobs:
               echo "⚠️ $wf 在 $mind 起没有已完成的 run，跳过（期望清单会标红）"
               return 0
             fi
-            local tried=0 rid
+            local tried=0 rid stage
             for rid in $rids; do
               tried=$((tried+1))
               [ "$tried" -gt 3 ] && break
               echo "⬇️ $wf（run $rid）: $pattern"
-              if gh run download "$rid" --pattern "$pattern" --dir .task_results; then
+              # gh run download 没有覆盖参数：直接解压进 .task_results 时，同名 artifact
+              #（旧矩阵 run 与专用 workflow run 共用 artifact 名）已存在的文件会使其整体
+              # 报错 "file exists"（ModelScope 红卡事故 2026-08-17）。
+              # 因此先落到隔离暂存目录，成功后再覆盖合并进 .task_results（新数据胜出）。
+              stage=".task_stage.$$"
+              rm -rf "$stage"
+              if gh run download "$rid" --pattern "$pattern" --dir "$stage"; then
+                mkdir -p .task_results
+                cp -rf "$stage"/. .task_results/
+                rm -rf "$stage"
                 echo "✅ $wf 结果已下载"
                 return 0
               fi
-              echo "⚠️ $wf run $rid 下载失败（可能超过 1 天保留期），尝试次新 run"
+              rm -rf "$stage"
+              echo "⚠️ $wf run $rid 下载失败（保留期已过或网络错误），尝试次新 run"
             done
             echo "⚠️ $wf 全部候选 run 下载失败（期望清单会标红）"
           }
