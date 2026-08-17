@@ -62,3 +62,10 @@ CLAUDE.md
 # HW 脚本本地源码（公开仓库仅提交混淆生成版）
 scripts/hw_dev.src.py
 scripts/hw_dev.gen.py
+
+# HW 签到已停用（2026-08-17，SSO <24h 失效无解）：相关代码仅本地保留，不进公开仓库
+scripts/hw_dev.py
+scripts/hw_keepalive.py
+scripts/hw_login.py
+scripts/cred_store.py
+.github/workflows/hw-keepalive.yml
