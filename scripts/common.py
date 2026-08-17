@@ -325,7 +325,7 @@ def schedule_repo_dispatch(event_type: str, delay_seconds: int) -> tuple[bool, s
     等待，由 QStash 在 delay_seconds 后回调 repository_dispatch API 触发下一个
     工作流。QStash 免费版延时上限 7 天，覆盖 24h 级接力。
 
-    环境变量：QSTASH_URL / QSTASH_TOKEN / GH_PAT（需 Actions: write）/ GITHUB_REPO。
+    环境变量：QSTASH_URL / QSTASH_TOKEN / GH_PAT（需 contents: write —— dispatches API 要求）/ GITHUB_REPO。
     返回 (是否已成功调度, 延时秒数或失败说明)；未配置依赖或发布失败时返回 False，
     调用方自行回退（workbuddy 回退为等下次定时触发，latvi 回退为原地等待）。
     """
