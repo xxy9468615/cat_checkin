@@ -67,5 +67,7 @@ scripts/hw_dev.gen.py
 scripts/hw_dev.py
 scripts/hw_keepalive.py
 scripts/hw_login.py
+scripts/hw_vps_daemon.py
 scripts/cred_store.py
 .github/workflows/hw-keepalive.yml
+hw-keepalive.service
