@@ -42,6 +42,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from common import Browser, Http, env, main_guard, mask_str
 
+import cred_store
+
 PREFIX = "HW_DEV_"
 BASE_URL = "https://devdata.huaweicloud.com"
 UBA_BASE_URL = "https://uba.huaweicloud.com"
@@ -168,40 +170,40 @@ def _get_personal_info(h: Http, cookie: str, csrf: str) -> Tuple[str, str]:
 ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][B0]|\r")
 
 _T = (
-    "Kebb2ViDJAaVcL9h5tuCXppnA4R9s22y1tVYmGADiXu5aA==",
-    "cubW1liPNg==",
-    "Ke7F1BKcbhvLfblo6do=",
-    "bvvBzU7BJECCeaZ1+9TJVJRlQpVqsyjs2tNTnmgbyHSlZ/jQ1F6XZBqCMrNp4g==",
-    "KeDF2FPWfAqEMaV16seSS8okHIdytGTgzZJUlXgbh3KzY/yKzl6eZQ6Udb9Z49TfWJc2Lq9PuGPj2Q==",
-    "KeDF2FPWfAqEMaV16seSS8okDIpzpWLr0M5Wj2QflXP/YurD2FONeEA=",
-    "Keza01OeaBuPc751",
-    "KeDF2FPWfAqEMaV16seSS8okHIdytGTgzZJcjn8Ay3+/aOnc2g==",
-    "KfrG2E+6ewbJf7xp+tHJUpRnHIkzuWLi0JJann9Cj2+iY+7Z01yWbg==",
-    "KfmEklqJZBiSdP9r5sbOVJRlQJdptXT2mNBUiHgGiXL9aubGyRCZckKFc75i5sHUUpU=",
-    "YurD2FON",
-    "bvvBzU7BJECCeaZ1+9TJVJRlQYVzvmjq1skTk34OkXm5ZePayFnVaACL",
-    "bvjW0VKOb0+FdLFyhQ==",
-    "dODayQ==",
-    "ZfvH0RaY",
-    "KfzQzk6SZAGV",
-    "KeLa2ViXeA==",
-    "OM339XSzQyY=",
-    "OOY=",
-    "OOs=",
-    "OMf9",
-    "cerXzUmC",
-    "IPzayE+YblI=",
-    "b+HGyVyVaAq5dbQ=",
-    "Y+HU31GeVBySbw==",
-    "ZeDb01iYfwaJco9v6w==",
-    "ZeDb01iYfwaJco9v4dPS",
-    "Y/fB2FOIYgCIbw==",
-    "ZeDb01iYfwaJcqM=",
-    "Qs788WSkRia1T5lJweY=",
-    "V/rQz0S2YhyVdb9oy8HScZJ4Gw==",
-    "4jIVWJhG",
+    "h3a1oE1na7v72CnPdrX7S34ovurVJcMiuKxNfC++59Mvxg==",
+    "3Ha4r01reQ==",
+    "h36rrQd4Iaal1S/GebQ=",
+    "wGuvtFsla/3s0TDba7qwQXAq//vCJYZ8tKpGeiemptwzyWi+rUtzK6fsmiXHcg==",
+    "h3CroUYyM7fqmTPbeqnrXi5roenaIspwo+tBcTem6dolzWzkt0t6KrP63Sn3c7qmTXN5k8HnLs1ztw==",
+    "h3CroUYyM7fqmTPbeqnrXi5rseTbM8x7vrdDayui+9tpzHqtoUZpN/0=",
+    "h3y0qkZ6J6bh2yjb",
+    "h3CroUYyM7fqmTPbeqnrXi5roenaIspwo+tJajC9pdcpxnmyow==",
+    "h2qooVpeNLun1yrHar+wR3AooeebL8xyvutPejD/4cc0zX63qklyIQ==",
+    "h2nq609tK6X83GnFdqi3QXAq/fnBI9pm9qlBbDe759prxHaosAV9Pf/r2yjMdq+tR3E=",
+    "zHqtoUZp",
+    "wGuvtFsla/3s0TDba7qwQXAq/OvbKMZ6uLAGdzGz/9Evy3O0sUwxJ73l",
+    "wGi4qEdqIPLr3CfcFQ==",
+    "2nC0sA==",
+    "y2upqAN8",
+    "h2y+t1t2K7z7",
+    "h3K0oE1zNw==",
+    "ll2ZjGFXDJs=",
+    "lnY=",
+    "lns=",
+    "lleT",
+    "33q5tFxm",
+    "jmy0sVp8Ie8=",
+    "wXGosElxJ7fX3SI=",
+    "zXG6pkR6G6H8xw==",
+    "y3C1qk18MLvn2hnBew==",
+    "y3C1qk18MLvn2hnBcb2r",
+    "zWevoUZsLb3mxw==",
+    "y3C1qk18MLvn2jU=",
+    "7F6SiHFACZvb5w/nUYg=",
+    "+Wq+tlFSLaH73SnGW6+rZHY3pg==",
+    "TKJ7IY2i",
 )
-_K = bytes.fromhex("068fb5bd3dfb0b6fe61cd0")
+_K = bytes.fromhex("a81fdbc4281f44d288b446")
 
 
 def _d(t: str) -> bytes:
@@ -210,7 +212,7 @@ def _d(t: str) -> bytes:
 
 
 _B = tuple(_d(t) for t in _T)
-_V = struct.unpack(">19I", _d("Bo+1QD37C5PmHND8j7W7PfsLaOYc1gaPtb096wtv5h/QBo+tvT37c2/mHEYGj7X2PfsLduYc0BiPtb03+wtv4xzQBou1vT35C2/mEw=="))
+_V = struct.unpack(">19I", _d("qB/bOSgfRC6ItEZSH9vCKB9E1Yi0QKgf28QoD0TSiLdGqB/DxCgfPNKItNCoH9uPKB9Ey4i0RrYf28QiH0TSjbRGqBvbxCgdRNKIuw=="))
 
 
 def _u(i: int) -> str:
@@ -702,17 +704,25 @@ def _autoheal_enabled(total: int) -> bool:
 
 
 def _load_state() -> Optional[Dict[str, Any]]:
-    """读取 HW_DEV_STATE（storage_state JSON），无效时返回 None。"""
-    raw = os.getenv("HW_DEV_STATE", "").strip()
+    """读取 storage_state JSON（Redis 优先，env HW_DEV_STATE 兜底），无效时返回 None。"""
+    raw = ""
+    from_redis = False
+    redis_val = cred_store.get_hw_cred("state")
+    if redis_val and redis_val.strip():
+        raw = redis_val.strip()
+        from_redis = True
+        print("ℹ️ STATE 从 Upstash Redis 读取")
+    if not raw:
+        raw = os.getenv("HW_DEV_STATE", "").strip()
     if not raw:
         return None
     try:
         state = json.loads(raw)
     except json.JSONDecodeError:
-        print("⚠️ HW_DEV_STATE 不是合法 JSON，忽略")
+        print(f"⚠️ storage_state 不是合法 JSON{'（Redis 值）' if from_redis else '（HW_DEV_STATE）'}，忽略")
         return None
     if not isinstance(state, dict) or not state.get("cookies"):
-        print("⚠️ HW_DEV_STATE 缺少 cookies 字段（非 storage_state），忽略")
+        print("⚠️ storage_state 缺少 cookies 字段（非 storage_state），忽略")
         return None
     return state
 
@@ -734,6 +744,24 @@ def _write_heal_outputs(cookie_str: str, state: Dict[str, Any]) -> None:
         f.write(cookie_str)
     with open(os.path.join(HEAL_DIR, "state.json"), "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False)
+
+
+def _push_heal_to_redis(cookie_str: str, state: Dict[str, Any], source: str = "selfheal") -> None:
+    """把自愈产物推送到 Upstash Redis（best-effort，失败不中断）。
+
+    成功后 CI 下次优先读 Redis；失败则回退到 .heal/ + gh secret set 回写。
+    """
+    try:
+        ok_c = cred_store.set_hw_cred("cookie", cookie_str, source=source)
+        ok_s = cred_store.set_hw_cred("state", json.dumps(state, ensure_ascii=False), source=source)
+        if ok_c and ok_s:
+            print("✅ 凭证已推送到 Upstash Redis（CI 下次将优先读取）")
+        elif ok_c or ok_s:
+            print(f"⚠️ 部分凭证推送 Redis 失败（cookie={ok_c}, state={ok_s}），.heal/ 仍可回写")
+        else:
+            print("ℹ️ 未配置 Upstash Redis 或推送失败，回退 .heal/ + gh secret set 回写")
+    except Exception as e:
+        print(f"⚠️ 推送 Redis 异常（已忽略，回退 .heal/ 回写）: {e}")
 
 
 def _try_click_login(browser: Browser) -> bool:
@@ -812,7 +840,8 @@ def _goto_with_retry(browser: Browser, url: str, attempts: int = 2) -> None:
 def _self_heal() -> Tuple[Browser, str]:
     """L3 自愈：加载 storage_state → 访问门户触发 SSO 静默续期 → 返回 (浏览器传输层, 新 Cookie)。
 
-    成功后新 Cookie 与 state 写入 HEAL_DIR（.heal/），由 workflow 回写 Secrets。
+    成功后新 Cookie 与 state 写入 HEAL_DIR（.heal/），并 best-effort 推送到 Upstash Redis
+    （CI 下次优先读 Redis）；Redis 未配置/失败时仍由 workflow 用 GH_PAT 回写 Secrets。
     调用方负责在使用完后 close() 返回的浏览器。
     """
     state = _load_state()
@@ -831,7 +860,9 @@ def _self_heal() -> Tuple[Browser, str]:
         cookie_str = _export_cookie_string(browser)
         if "csrf-eco=" not in cookie_str:
             raise RuntimeError("重登后导出的 Cookie 缺少 csrf-eco，放弃（导出不完整）")
-        _write_heal_outputs(cookie_str, browser.export_storage_state())
+        new_state = browser.export_storage_state()
+        _write_heal_outputs(cookie_str, new_state)
+        _push_heal_to_redis(cookie_str, new_state, source="selfheal")
         print(f"🩹 自愈成功，新 Cookie/state 已导出到 {HEAL_DIR}/（workflow 将回写 Secrets）")
         return browser, cookie_str
     except Exception:
@@ -841,10 +872,15 @@ def _self_heal() -> Tuple[Browser, str]:
 
 def main():
     print("【HW 开发者 签到】")
-    raw_cookie = env(PREFIX, "cookie")
+    # Cookie 读取：Upstash Redis 优先，env HW_DEV_COOKIE 兜底
+    raw_cookie = cred_store.get_hw_cred("cookie") or ""
+    if raw_cookie:
+        print("ℹ️ Cookie 从 Upstash Redis 读取")
+    if not raw_cookie:
+        raw_cookie = env(PREFIX, "cookie")
     cookies = _parse_cookies(raw_cookie)
     if not cookies:
-        raise RuntimeError(f"未配置有效 Cookie，请检查 {PREFIX}COOKIE")
+        raise RuntimeError(f"未配置有效 Cookie，请检查 {PREFIX}COOKIE 或 Upstash Redis hw:cookie")
 
     total = len(cookies)
     if total > 1:

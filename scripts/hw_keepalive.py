@@ -15,6 +15,8 @@ from typing import Any, Dict, Optional, Tuple
 
 from common import Http, main_guard, mask_str
 
+from cred_store import get_hw_cred, set_meta
+
 from hw_dev import (
     BASE_HEADERS,
     BASE_URL,
@@ -49,7 +51,13 @@ def _probe(h: Http, cookie: str) -> Tuple[int, Optional[Dict[str, Any]], str]:
 
 def main() -> None:
     print("【HW Cookie 保活探测】")
-    cookies = _parse_cookies(os.getenv("HW_DEV_COOKIE", "") or os.getenv("HW_DEV_cookie", ""))
+    # Cookie 读取：Upstash Redis 优先，env HW_DEV_COOKIE 兜底
+    raw_cookie = get_hw_cred("cookie") or ""
+    if raw_cookie:
+        print("ℹ️ Cookie 从 Upstash Redis 读取")
+    if not raw_cookie:
+        raw_cookie = os.getenv("HW_DEV_COOKIE", "") or os.getenv("HW_DEV_cookie", "")
+    cookies = _parse_cookies(raw_cookie)
     if not cookies:
         raise RuntimeError("未配置 HW_DEV_COOKIE，无法探测")
 
@@ -65,10 +73,12 @@ def main() -> None:
         if code == 200 and data:
             who = mask_str(str(data.get("memName") or data.get("account_name") or "?"))
             print(f"✅ 会话存活（用户 {who}），Set-Cookie 轮换: {rotated}，无需干预")
+            set_meta({"last_probe": _now_bj(), "status": "alive"})
             return
         print(f"❌ 探测异常: HTTP {code}（非 200 响应），按会话失效处理")
 
     if not _autoheal_enabled(total=1):
+        set_meta({"last_probe": _now_bj(), "status": "expired-no-autoheal"})
         sys.exit(1)
     browser = None
     try:
@@ -77,15 +87,25 @@ def main() -> None:
         if code2 == 200 and data2:
             who = mask_str(str(data2.get("memName") or data2.get("account_name") or "?"))
             print(f"✅ 自愈后验证通过（用户 {who}），.heal/ 已导出待回写")
+            set_meta({"last_probe": _now_bj(), "status": "healed"})
         else:
             print(f"⚠️ 自愈后探测仍异常: HTTP {code2}，请检查日志")
+            set_meta({"last_probe": _now_bj(), "status": "heal-verify-failed"})
             sys.exit(1)
     except Exception as e:
         print(f"❌ 自愈失败: {e}")
+        set_meta({"last_probe": _now_bj(), "status": "sso-expired-manual-required"})
         sys.exit(1)
     finally:
         if browser is not None:
             browser.close()
+
+
+def _now_bj() -> str:
+    """北京时间 ISO 串（探测时间戳记入 hw:meta）。"""
+    import datetime as dt
+
+    return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=8)).isoformat(timespec="seconds")
 
 
 if __name__ == "__main__":

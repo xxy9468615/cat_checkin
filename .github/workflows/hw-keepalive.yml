@@ -40,23 +40,42 @@ jobs:
           TZ: Asia/Shanghai
           HW_DEV_cookie: ${{ secrets.HW_DEV_COOKIE }}
           HW_DEV_STATE: ${{ secrets.HW_DEV_STATE }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
         run: python3 scripts/hw_keepalive.py
 
       - name: Write back refreshed credentials
         if: always() && hashFiles('.heal/*') != ''
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
         run: |
           set -euo pipefail
+          # 主路径：hw_dev._self_heal 已在脚本内推送 Upstash Redis；本步兜底回写 Secrets。
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, "scripts")
+          from cred_store import set_hw_cred, set_meta
+          ok = True
+          cookie = open(".heal/cookie.txt").read() if os.path.exists(".heal/cookie.txt") else ""
+          state_path = ".heal/state.json"
+          if cookie:
+              ok = set_hw_cred("cookie", cookie, source="keepalive-writeback") and ok
+          if os.path.exists(state_path):
+              ok = set_hw_cred("state", open(state_path).read(), source="keepalive-writeback") and ok
+          set_meta({"source": "keepalive-writeback"})
+          print("Redis 推送:", "成功" if ok else "未配置/失败（回退 gh secret set）")
+          PY
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::warning::未配置 GH_PAT Secret，无法回写刷新后的 HW 凭证"
+            echo "::warning::未配置 GH_PAT Secret，跳过 Secrets 回写（Redis 已是主路径）"
             exit 0
           fi
           if [ -s .heal/cookie.txt ]; then
             gh secret set HW_DEV_COOKIE -R "$GITHUB_REPOSITORY" < .heal/cookie.txt
-            echo "✅ HW_DEV_COOKIE 已回写"
+            echo "✅ HW_DEV_COOKIE 已回写 Secrets（兜底）"
           fi
           if [ -s .heal/state.json ]; then
             gh secret set HW_DEV_STATE -R "$GITHUB_REPOSITORY" < .heal/state.json
-            echo "✅ HW_DEV_STATE 已回写"
+            echo "✅ HW_DEV_STATE 已回写 Secrets（兜底）"
           fi

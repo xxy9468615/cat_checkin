@@ -3,15 +3,19 @@
 """HW 开发者门户一次性本地引导：有头浏览器手动登入，导出 storage_state 与 Cookie。
 
 背景：门户会话 Cookie 约 24h 失效且无续期接口，但 SSO 会话有效期长得多。
-本脚本把"已登入的完整浏览器状态"（含 SSO + 门户 Cookie）存为
-HW_DEV_STATE Secret，之后 CI 中的签到脚本会在会话过期时用它
-静默重登自愈（见 hw_dev.py 的 L3 自愈）。
+本脚本把"已登入的完整浏览器状态"（含 SSO + 门户 Cookie）存为 HW_DEV_STATE，
+之后 CI 中的签到脚本会在会话过期时用它静默重登自愈（见 hw_dev.py 的 L3 自愈）。
+
+凭证存储（Redis 为主、Secrets 兜底）：
+  - 主：写入 Upstash Redis（hw:cookie / hw:state），CI 优先读取。
+  - 兜底：gh secret set 写 GitHub Secrets（HW_DEV_COOKIE / HW_DEV_STATE）。
+    未配置 Redis 或 gh 不可用时仍可走 Secrets 路径。
 
 用法（本机执行，需要图形界面；引导完成后无需重复，直到 SSO 也失效）：
   pip install -r requirements.txt
   python -m playwright install chromium
-  python3 scripts/hw_login.py                    # 登入后自动写入 GitHub Secrets
-  python3 scripts/hw_login.py --no-push         # 仅导出本地文件，手动设置
+  python3 scripts/hw_login.py                    # 登入后写 Redis + Secrets
+  python3 scripts/hw_login.py --no-push         # 仅写 Redis（若配置），不动 Secrets
 
 写入的 Secrets（本机已 gh auth login 时自动完成，值经 stdin 传入不回显）：
   HW_DEV_COOKIE             浏览器同源 Cookie 串（L1 快路径用）
@@ -28,6 +32,8 @@ import sys
 import time
 
 from common import Browser, Http, mask_str
+
+from cred_store import set_hw_cred, set_meta
 
 from hw_dev import (
     BASE_HEADERS,
@@ -104,6 +110,22 @@ def _gh_secret_set(repo: str, name: str, value: str) -> bool:
     return True
 
 
+def _write_redis_only(cookie_str: str, state: dict) -> None:
+    """把凭证推送到 Upstash Redis（主存储）。best-effort，未配置/失败仅警告。"""
+    try:
+        ok_c = set_hw_cred("cookie", cookie_str, source="login-script")
+        ok_s = set_hw_cred("state", json.dumps(state, ensure_ascii=False), source="login-script")
+        if ok_c and ok_s:
+            print("✅ 凭证已推送到 Upstash Redis（CI 下次将优先读取）")
+            set_meta({"source": "login-script", "cookie_len": len(cookie_str)})
+        elif ok_c or ok_s:
+            print(f"⚠️ 部分凭证推送 Redis 失败（cookie={ok_c}, state={ok_s}）")
+        else:
+            print("ℹ️ 未配置 Upstash Redis（UPSTASH_REDIS_REST_URL/TOKEN），跳过 Redis 推送")
+    except Exception as e:
+        print(f"⚠️ 推送 Upstash Redis 异常（已忽略）: {e}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="HW 开发者门户登入引导（一次性）")
     parser.add_argument("--repo", default=DEFAULT_REPO, help=f"GitHub 仓库（默认 {DEFAULT_REPO}）")
@@ -141,10 +163,15 @@ def main() -> None:
                 print(f"   {u[:130]}")
 
         if args.no_push:
-            print("\n--no-push 模式：请手动设置以下 GitHub Secrets（内容见上述文件）：")
+            # --no-push 模式：仍尝试写 Redis（若配置了 env），仅跳过 gh
+            _write_redis_only(cookie_str, state)
+            print("\n--no-push 模式：已尝试写 Upstash Redis；如未配置 Redis，请手动设置以下 GitHub Secrets：")
             print("  HW_DEV_COOKIE <- .heal/cookie.txt")
             print("  HW_DEV_STATE  <- .heal/state.json")
             return
+
+        # 先写 Upstash Redis（主，CI 下次优先读取），再 gh secret set（兜底）
+        _write_redis_only(cookie_str, state)
 
         if not _gh_available():
             print("\n⚠️ 未找到 gh 命令，请手动设置 Secrets（或安装并 gh auth login 后重跑）：")
