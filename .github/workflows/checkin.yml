@@ -15,9 +15,7 @@ concurrency:
 jobs:
   checkin-matrix:
     runs-on: ubuntu-latest
-    # hw_dev 腿冷缓存时装 Playwright chromium（~150MB + apt 依赖）约 3-6 分钟，
-    # 加 300s 任务上限，15 分钟在慢网络日可能超时，放宽到 20
-    timeout-minutes: 20
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -26,7 +24,6 @@ jobs:
           - 2libra.py
           - bianjie_ai.py
           - dji.py
-          - hw_dev.py
           - monkeycode.py
           - moxing_vip.py
           - naixi_forum.py
@@ -44,19 +41,6 @@ jobs:
 
       - name: Set TODAY
         run: echo "TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_ENV"
-
-      - name: Cache Playwright browsers
-        if: matrix.script == 'hw_dev.py'
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ hashFiles('requirements.txt') }}
-
-      - name: Install Playwright (hw self-heal)
-        if: matrix.script == 'hw_dev.py'
-        run: |
-          pip install "playwright==1.61.0"
-          python -m playwright install chromium --with-deps
 
       - name: Run check-in task (${{ matrix.script }})
         env:
@@ -78,10 +62,6 @@ jobs:
           PCBETA_password: ${{ secrets.PCBETA_PASSWORD }}
           CLOUDSTUDIO_cookie: ${{ secrets.CLOUDSTUDIO_COOKIE }}
           CLOUDSTUDIO_xsrf: ${{ secrets.CLOUDSTUDIO_XSRF }}
-          HW_DEV_cookie: ${{ secrets.HW_DEV_COOKIE }}
-          HW_DEV_STATE: ${{ secrets.HW_DEV_STATE }}
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
           NAIXI_username: ${{ secrets.NAIXI_USERNAME }}
           NAIXI_PASSWORD: ${{ secrets.NAIXI_PASSWORD }}
           DJI_cookie: ${{ secrets.DJI_COOKIE }}
@@ -92,44 +72,6 @@ jobs:
           SOPHNET_TOKENS: ${{ secrets.SOPHNET_TOKENS }}
         run: |
           python3 scripts/run_task.py "scripts/${{ matrix.script }}"
-
-      - name: Write back refreshed HW credentials
-        if: always() && matrix.script == 'hw_dev.py' && hashFiles('.heal/*') != ''
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-        run: |
-          set -euo pipefail
-          # 主路径：hw_dev._self_heal 已在脚本内推送到 Upstash Redis。
-          # 兜底：gh secret set 写 GitHub Secrets（Redis 未配置/故障或 GH_PAT 缺失时仍可用）。
-          python3 - <<'PY'
-          import json, os, sys
-          sys.path.insert(0, "scripts")
-          from cred_store import set_hw_cred, set_meta
-          ok = True
-          cookie = open(".heal/cookie.txt").read() if os.path.exists(".heal/cookie.txt") else ""
-          state_path = ".heal/state.json"
-          if cookie:
-              ok = set_hw_cred("cookie", cookie, source="checkin-writeback") and ok
-          if os.path.exists(state_path):
-              state = open(state_path).read()
-              ok = set_hw_cred("state", state, source="checkin-writeback") and ok
-          set_meta({"source": "checkin-writeback"})
-          print("Redis 推送:", "成功" if ok else "未配置/失败（回退 gh secret set）")
-          PY
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::warning::未配置 GH_PAT Secret，跳过 Secrets 回写（Redis 已是主路径）"
-            exit 0
-          fi
-          if [ -s .heal/cookie.txt ]; then
-            gh secret set HW_DEV_COOKIE -R "$GITHUB_REPOSITORY" < .heal/cookie.txt
-            echo "✅ HW_DEV_COOKIE 已回写 Secrets（兜底）"
-          fi
-          if [ -s .heal/state.json ]; then
-            gh secret set HW_DEV_STATE -R "$GITHUB_REPOSITORY" < .heal/state.json
-            echo "✅ HW_DEV_STATE 已回写 Secrets（兜底）"
-          fi
 
       - name: Cache task result
         if: always()

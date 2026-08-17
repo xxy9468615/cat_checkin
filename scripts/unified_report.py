@@ -32,7 +32,7 @@ LATVI_RESULT_FILE = "latvi.json"
 # 缺席的结果会合成显式失败卡片，杜绝「某站点结果丢失 → 邮件里静默少一张卡」。
 EXPECTED_RESULTS: Dict[str, str] = {
     **{f"{name}.json": f"{name}.py" for name in (
-        "glados", "2libra", "bianjie_ai", "dji", "hw_dev", "monkeycode",
+        "glados", "2libra", "bianjie_ai", "dji", "monkeycode",
         "moxing_vip", "naixi_forum", "pcbeta", "sophnet", "tencent_cloudstudio",
         "ugnas_club",
     )},

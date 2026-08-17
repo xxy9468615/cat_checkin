@@ -1,8 +1,10 @@
 name: HW Cookie Keepalive
 
 on:
-  schedule:
-    - cron: "0 */5 * * *"  # 每 5 小时探测一次（UTC 00/05/10/15/20 = 北京 08/13/18/23/04 点）
+  # schedule 停用于 2026-08-17：实测 SSO 会话本身短命（<24h），L3 自愈无望，
+  # 每 5h 的探测只会持续红字。恢复签到时取消注释即可。
+  # schedule:
+  #   - cron: "0 */5 * * *"  # 每 5 小时探测一次（UTC 00/05/10/15/20 = 北京 08/13/18/23/04 点）
   workflow_dispatch:
 
 permissions:
