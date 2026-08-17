@@ -121,7 +121,7 @@ jobs:
         run: |
           set -uo pipefail
           TODAY_BJ=$(TZ=Asia/Shanghai date +%Y-%m-%d)
-          YDAY_BJ=$(TZ=Asia/Shanghai -d "yesterday" +%Y-%m-%d)
+          YDAY_BJ=$(TZ=Asia/Shanghai date -d "yesterday" +%Y-%m-%d)
           fetch_latest() {  # fetch_latest <workflow-name> <artifact-pattern> <min-bj-date>
             local wf="$1" pattern="$2" mind="$3" raw rids
             # 只取 min-date 之后完成的 run：防止 10:00 时今日 run 尚未完成，
