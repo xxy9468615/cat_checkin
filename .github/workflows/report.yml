@@ -38,12 +38,23 @@ jobs:
       - name: Set TODAY
         run: echo "TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_ENV"
 
+      # 缓存不可变：固定 key 会让 save 被跳过（状态永不更新）。
+      # 用 run_id 做唯一 key 写入，靠 restore-keys 前缀回退到上一次的状态。
       - name: Check if report sent today
         id: check_sent
         uses: actions/cache/restore@v4
         with:
           path: .report_sent
-          key: report-sent-${{ env.TODAY }}
+          key: report-sent-${{ env.TODAY }}-${{ github.run_id }}
+          restore-keys: |
+            report-sent-${{ env.TODAY }}-
+
+      - name: Verify QStash email delivery
+        id: delivery
+        env:
+          QSTASH_URL: ${{ secrets.QSTASH_URL }}
+          QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
+        run: python3 scripts/check_qstash_delivery.py
 
       - name: Determine if execution is needed
         id: should_run
@@ -57,6 +68,12 @@ jobs:
           fi
 
           if [ "${{ steps.check_sent.outputs.cache-hit }}" = "true" ]; then
+            # QStash 投递失败（重试耗尽入 DLQ）→ 重发
+            if [ "${{ steps.delivery.outputs.delivery }}" = "failed" ]; then
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              echo "❌ QStash 报告邮件投递失败（重试耗尽），触发重发"
+              exit 0
+            fi
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "✅ 今日报告已于更早时间成功推送，跳过重复发送 (Cache Hit)"
             exit 0
@@ -182,6 +199,8 @@ jobs:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           RESEND_FROM: ${{ secrets.RESEND_FROM }}
           RESEND_TO: ${{ secrets.RESEND_TO }}
+          QSTASH_URL: ${{ secrets.QSTASH_URL }}
+          QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
           MAIL_HOST: ${{ secrets.MAIL_HOST }}
           MAIL_PORT: ${{ secrets.MAIL_PORT }}
           MAIL_USER: ${{ secrets.MAIL_USER }}
@@ -197,4 +216,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .report_sent
-          key: report-sent-${{ env.TODAY }}
+          key: report-sent-${{ env.TODAY }}-${{ github.run_id }}

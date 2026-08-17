@@ -9,7 +9,8 @@
 Environment（邮件通道）：
   SMTP: MAIL_HOST / MAIL_PORT(默认465) / MAIL_USER / MAIL_PASS / MAIL_FROM / MAIL_TO / MAIL_SSL
   Resend: RESEND_API_KEY / RESEND_FROM / RESEND_TO（缺省回退 MAIL_TO）
-  send_email / send_resend 返回 bool（未配置/失败为 False），由调用方决定发送标记与退出码。
+  send_email 返回 bool；send_resend 返回 Tuple[bool, str]（成功? + msg_id），
+  msg_id 为 QStash messageId（持久投递可查）或 Resend email id（直发）。
 """
 
 from __future__ import annotations
@@ -18,10 +19,10 @@ import datetime
 import email.mime.multipart
 import email.mime.text
 import html as _html
+import json as _json
 import os
 import re
 import smtplib
-import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -368,21 +369,28 @@ def send_email(subject: str, report: str, results: List[Tuple[bool, Path, str, f
         return False
 
 
-def send_resend(subject: str, report: str, results: List[Tuple[bool, Path, str, float]]) -> bool:
-    """通过 Resend HTTP API 发送汇总邮件（不依赖 SMTP）。返回是否真正发送成功。"""
-    import json as _json
-    import urllib.error
+def send_resend(subject: str, report: str, results: List[Tuple[bool, Path, str, float]]) -> Tuple[bool, str]:
+    """通过 Resend HTTP API 发送汇总邮件。
+
+    返回 (成功?, msg_id)。
+    - QStash 主路径（配置了 QSTASH_URL + QSTASH_TOKEN 且 payload ≤ 900KB）：
+      通过 QStash 持久投递，msg_id 为 QStash messageId（可经 /v2/logs 核查状态）。
+    - 直发回退（未配置 QStash / payload 超限 / QStash publish 失败）：
+      用 common.Http 直发 Resend（自动获得 @retry），msg_id 为 Resend email id。
+    - 未配置 RESEND_API_KEY 或无收件人：返回 (False, "")。
+    """
+    import common as _common
 
     api_key = os.getenv("RESEND_API_KEY", "").strip()
     if not api_key:
         print("未配置 RESEND_API_KEY，跳过 Resend 推送。")
-        return False
+        return False, ""
 
     sender = os.getenv("RESEND_FROM", "").strip() or "cat_checkin <onboarding@resend.dev>"
     recipients = _split_recipients(os.getenv("RESEND_TO", "") or os.getenv("MAIL_TO", ""))
     if not recipients:
         print("未配置有效收件人 RESEND_TO / MAIL_TO，跳过 Resend 推送。")
-        return False
+        return False, ""
 
     report_lines = report.split("\n")
     subject_line = next((ln for ln in report_lines if ln.startswith("📢")), subject)
@@ -391,7 +399,7 @@ def send_resend(subject: str, report: str, results: List[Tuple[bool, Path, str, 
         html_body = build_email_html(results, stat_line, subject_line)
     except Exception as exc:
         print(f"❌ Resend 推送失败（HTML 模板渲染异常）: {exc}")
-        return False
+        return False, ""
 
     payload = {
         "from": sender,
@@ -400,32 +408,48 @@ def send_resend(subject: str, report: str, results: List[Tuple[bool, Path, str, 
         "html": html_body,
         "text": report,
     }
-    req = urllib.request.Request(
+    body_str = _json.dumps(payload, ensure_ascii=False)
+
+    # --- QStash 主路径 ---
+    qstash_url = os.getenv("QSTASH_URL") or os.getenv("WORKBUDDY_QSTASH_URL")
+    qstash_token = os.getenv("QSTASH_TOKEN") or os.getenv("WORKBUDDY_QSTASH_TOKEN")
+    if qstash_url and qstash_token and len(body_str.encode("utf-8")) <= 900 * 1024:
+        ok, msg_id = _common.qstash_publish(
+            "https://api.resend.com/emails",
+            body_str,
+            forward_headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            retries=2,
+            content_dedup=True,
+        )
+        if ok:
+            print(f"✅ Resend 推送已入队 QStash（{len(recipients)} 位收件人，msg_id={msg_id}）")
+            return True, msg_id
+        print(f"⚠️ QStash publish 失败（{msg_id}），回退直发 Resend")
+
+    # --- 直发回退（common.Http 自动获得 @retry） ---
+    resp = _common.Http().request(
+        "POST",
         "https://api.resend.com/emails",
-        data=_json.dumps(payload).encode("utf-8"),
-        method="POST",
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "User-Agent": "cat_checkin/1.0 (+https://github.com)",
             "Accept": "application/json",
         },
+        data=body_str.encode("utf-8"),
     )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            body = resp.read().decode("utf-8", "replace")
-            mail_id = ""
-            try:
-                mail_id = _json.loads(body).get("id", "")
-            except Exception:
-                pass
-            print(f"✅ Resend 推送完成（{len(recipients)} 位收件人，id={mail_id}）")
-            return True
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:300]
-        print(f"❌ Resend 推送失败: HTTP {exc.code} {detail}")
-        return False
-    except Exception as exc:
-        print(f"❌ Resend 推送失败: {exc}")
-        return False
+    if 200 <= resp.code < 300:
+        mail_id = ""
+        try:
+            mail_id = str(resp.json().get("id", "") or "")
+        except Exception:
+            pass
+        print(f"✅ Resend 推送完成（{len(recipients)} 位收件人，id={mail_id}）")
+        return True, mail_id
+    detail = resp.text[:200] if resp.text else ""
+    print(f"❌ Resend 推送失败: HTTP {resp.code}{' ' + detail if detail else ''}")
+    return False, ""
 

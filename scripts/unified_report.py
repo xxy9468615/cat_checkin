@@ -125,15 +125,18 @@ def main() -> None:
     push_enabled = os.getenv("DAILY_PUSH", "true").lower() not in {"0", "false", "no"}
     if push_enabled:
         sent_smtp = send_email(title, report, results)
-        sent_resend = send_resend(title, report, results)
+        sent_resend, resend_msg_id = send_resend(title, report, results)
         if not (sent_smtp or sent_resend):
             print("❌ 所有邮件通道推送失败：不写发送标记并退出非零，等待 10:30 兜底重试")
             sys.exit(1)
-        # 邮件已真正送达（至少一个通道）才写当日标记：report.yml 靠它去重。
-        # 此前无条件写标记会让 Resend 瞬时故障被当成已发送，10:30 兜底被跳过、
-        # 当天邮件静默丢失。
+        # 邮件已送达或已交接 QStash（至少一个通道）才写当日标记：report.yml 靠它去重。
+        # resend_msg_id 可为空（SMTP-only / 直发失败 / QStash publish 失败回退直发但 Resend 未返回 id），
+        # 有值时 10:30 兜底 run 可查询 QStash /v2/logs 确认投递状态。
+        marker = {"date": today, "sent_at": dt.datetime.now(tz).isoformat()}
+        if resend_msg_id:
+            marker["resend_msg_id"] = resend_msg_id
         Path(".report_sent").write_text(
-            json.dumps({"date": today, "sent_at": dt.datetime.now(tz).isoformat()}, ensure_ascii=False),
+            json.dumps(marker, ensure_ascii=False),
             encoding="utf-8",
         )
         print("🔖 已写入今日发送标记 .report_sent")
