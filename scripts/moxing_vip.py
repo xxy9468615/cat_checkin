@@ -4,17 +4,32 @@
 import hashlib, re
 from common import Http, env, find, findall, strip_tags, main_guard, mask_str
 PREFIX = "MOXING_"
+NAV_URL = "https://moxing.vip/"  # 站点导航页：论坛本体迁移时此处列出最新可用域名
+
+def _resolve_domain(h, headers, default):
+    """解析存活的论坛域名：member.php 登录页能解析出 formhash+loginhash 才算存活。
+
+    moxing.vip 已改版为纯导航页（2026-08），论坛本体迁移到多点域名（moxing.chat 等）。
+    默认域名失效时从导航页抓候选列表自动切换，站点再迁移无需改代码。
+    """
+    def alive(d):
+        r = h.request("GET", d + "/member.php?mod=logging&action=login", headers=headers)
+        return r.code == 200 and find(r'formhash. value=.(\w+).', r.text) and find(r'loginhash=(\w+)', r.text)
+    if alive(default):
+        return default
+    nav = h.request("GET", NAV_URL, headers=headers)
+    for c in findall(r'href="(https?://[\w.-]+)"', nav.text):
+        c = c.rstrip('/')
+        if c != default and alive(c):
+            print(f"ℹ️ 默认域名不可用，切换到: {c}")
+            return c
+    raise RuntimeError("未找到可用论坛域名（站点可能再次迁移）")
+
 def main():
     print("【moxing.vip 签到】")
-    username=env(PREFIX,"username"); password=env(PREFIX,"password"); domain=env(PREFIX,"Domain","https://moxing.vip",False).rstrip('/'); ua=env(PREFIX,"UA","Mozilla/5.0 (Android 14; Mobile; rv:130.0) Gecko/130.0 Firefox/130.0",False)
-    h=Http(); headers={"User-Agent":ua,"Referer":domain+"/"}
-    first=h.request("GET",domain,headers=headers)
-    candidates=[]
-    if first.headers and first.headers.get("Location"): candidates.append(first.headers.get("Location"))
-    candidates += findall(r'href="(https://\w+\.\w+)"',first.text)
-    for c in candidates:
-        rr=h.request("GET",c,headers=headers)
-        if "登录" in rr.text: domain=c.rstrip('/'); break
+    username=env(PREFIX,"username"); password=env(PREFIX,"password"); domain=env(PREFIX,"Domain","https://moxing.chat",False).rstrip('/'); ua=env(PREFIX,"UA","Mozilla/5.0 (Android 14; Mobile; rv:130.0) Gecko/130.0 Firefox/130.0",False)
+    h=Http(); headers={"User-Agent":ua}
+    domain=_resolve_domain(h,headers,domain); headers["Referer"]=domain+"/"
     login=h.request("GET",domain+"/member.php?mod=logging&action=login",headers=headers).text
     formhash=find(r'formhash. value=.(\w+).',login); loginhash=find(r'loginhash=(\w+)',login)
     if not (formhash and loginhash):

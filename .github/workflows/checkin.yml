@@ -55,7 +55,7 @@ jobs:
           BIANJIE_AI_ACCOUNTS: ${{ secrets.BIANJIE_AI_ACCOUNTS }}
           MOXING_username: ${{ secrets.MOXING_USERNAME }}
           MOXING_password: ${{ secrets.MOXING_PASSWORD }}
-          MOXING_Domain: https://moxing.vip
+          MOXING_Domain: https://moxing.chat
           MOXING_UA: ${{ secrets.MOXING_UA }}
           UGNAS_cookie: ${{ secrets.UGNAS_COOKIE }}
           PCBETA_username: ${{ secrets.PCBETA_USERNAME }}
