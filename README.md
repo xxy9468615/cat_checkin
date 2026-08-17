@@ -12,7 +12,9 @@
                     18:00 cron 仅作兜底锚点（链活着时幂等快速退出）
 每5h   hw-keepalive.yml ─ HW Cookie 探活与自愈回写
 10:00  report.yml ─ fetch_latest 跨 run 收集当日 artifact → unified_report.py
-                    期望清单比对（缺席即红卡）→ Resend/SMTP 邮件（10:30 兜底重发）
+                    期望清单比对（缺席即红卡）→ Resend 邮件走 QStash 持久投递
+                    （retries=2, content_dedup=true；直发回退吃 @retry）
+                    10:30 兜底升级为投递状态核查（check_qstash_delivery.py）
 ```
 
 单个任务的链路：workflow → `run_task.py`（进程组超时控制）→ `scripts/<site>.py`（`main_guard` 统一异常出口）→ `.task_results/<site>.json`（ok/output/elapsed/date）→ artifact + actions/cache 双写 → 次日 report 汇聚。
@@ -30,9 +32,11 @@
 │   └── report.yml            # 每日统一邮件（北京 10:00 / 10:30 兜底）
 ├── scripts/
 │   ├── common.py             # 共享 stdlib HTTP 客户端 / 重试 / QStash dispatch 助手
+│   │                           # qstash_publish 通用发布 + schedule_repo_dispatch 薄封装
 │   ├── run_task.py           # 单任务运行器（超时进程组击杀 + 结果 JSON 落盘）
 │   ├── unified_report.py     # 结果汇聚 + 期望清单 + 发送语义（report.yml 入口）
 │   ├── daily_report.py       # 报告构建 + HTML 邮件卡片 + SMTP/Resend 发送（函数库）
+│   │                           # send_resend: QStash 持久投递主路径 + common.Http 直发回退
 │   └── <site>.py             # 每站签到模块
 ├── templates/                # 邮件 HTML 模板
 └── .env.example              # 环境变量模板（CI 走 GitHub Secrets 同名注入）
@@ -66,6 +70,7 @@ CI 在 Repo Settings → Secrets 填写站点凭据（命名对照 `.env.example
 TASK_TIMEOUT=300            # 单任务超时秒数（workbuddy/latvi/modelscope 在 workflow 内单独放宽）
 DAILY_PUSH=true             # 是否发送报告邮件
 QSTASH_URL / QSTASH_TOKEN / GH_PAT   # QStash 延时接力（workbuddy 放风 / latvi 24h 冷却）
+                                       # + Resend 邮件持久投递（自动重试/DLQ/状态核查）
 RESEND_API_KEY / RESEND_FROM / RESEND_TO   # 邮件主通道
 MAIL_HOST / MAIL_USER / MAIL_PASS / MAIL_TO 等   # 邮件 SMTP 备选通道
 ```
@@ -94,4 +99,4 @@ MAIL_HOST / MAIL_USER / MAIL_PASS / MAIL_TO 等   # 邮件 SMTP 备选通道
 | 09:10 | modelscope.yml | 魔粒奖励凌晨未开放，单独调度 |
 | 08/13/18/23/04 | hw-keepalive.yml | HW Cookie 保活 |
 | 18:00 | latvi.yml | 24h 冷却兜底锚点（主链路为 QStash 接力） |
-| 10:00 / 10:30 | report.yml | 统一邮件 / 兜底重发 |
+| 10:00 / 10:30 | report.yml | 统一邮件（QStash 持久投递）/ 投递状态核查与兜底重发 |
