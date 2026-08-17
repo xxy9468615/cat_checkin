@@ -1,1 +1,2 @@
-playwright==1.61.0
+# 签到脚本全部使用 Python 标准库，CI 无额外依赖。
+# playwright 仅本地调试可选（当前无 workflow 使用）。

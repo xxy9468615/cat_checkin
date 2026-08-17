@@ -139,7 +139,7 @@ class Browser:
     status/headers/body come back without CORS limits — suitable for driving
     authenticated JSON APIs from a browser session.
 
-    Session keep-alive flows (e.g. hw_dev self-heal) can seed a saved
+    Session keep-alive flows can seed a saved
     `storage_state` (cookies + localStorage), drive the page with `goto()` so the
     site's own silent-SSO redirect chain runs, then export `cookies()` /
     `export_storage_state()` for persistence.

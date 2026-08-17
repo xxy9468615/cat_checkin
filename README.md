@@ -5,12 +5,11 @@
 ## 架构
 
 ```text
-00:50  checkin.yml ── 12 站点矩阵（run_task.py 子进程执行，产出结构化结果 JSON）
+00:50  checkin.yml ── 11 站点矩阵（run_task.py 子进程执行，产出结构化结果 JSON）
 00:50  workbuddy.yml ─ 2 账号并行；放风领奖经 QStash 延时 dispatch 接力（~05:00）
 09:10  modelscope.yml ─ 魔粒奖励 09:10 后才发放，单独调度
 18:00  latvi.yml ─ 24h 冷却；签到成功后 +24h+3~5min 经 QStash dispatch 接力，
                     18:00 cron 仅作兜底锚点（链活着时幂等快速退出）
-每5h   hw-keepalive.yml ─ HW Cookie 探活与自愈回写（凭证入 Upstash Redis，Secrets 兜底）
 10:00  report.yml ─ fetch_latest 跨 run 收集当日 artifact → unified_report.py
                     期望清单比对（缺席即红卡）→ Resend 邮件走 QStash 持久投递
                     （retries=2, content_dedup=true；直发回退吃 @retry）
@@ -24,11 +23,10 @@
 ```text
 .
 ├── .github/workflows/        # GitHub Actions 工作流
-│   ├── checkin.yml           # 主签到矩阵（12 站点，北京 00:50）
+│   ├── checkin.yml           # 主签到矩阵（11 站点，北京 00:50）
 │   ├── workbuddy.yml         # WorkBuddy 双账号 + QStash 放风接力
 │   ├── modelscope.yml        # ModelScope 独立调度（北京 09:10）
 │   ├── latvi.yml             # Latvi 24h 冷却 + QStash 接力（北京 18:00 兜底）
-│   ├── hw-keepalive.yml      # HW Cookie 保活（每 5 小时）
 │   └── report.yml            # 每日统一邮件（北京 10:00 / 10:30 兜底）
 ├── scripts/
 │   ├── common.py             # 共享 stdlib HTTP 客户端 / 重试 / QStash dispatch 助手
@@ -42,7 +40,7 @@
 └── .env.example              # 环境变量模板（CI 走 GitHub Secrets 同名注入）
 ```
 
-依赖：签到脚本全部使用 Python 标准库；仅 `hw_dev.py` 需要 `playwright`（workflow 内按需安装，见 requirements.txt）。
+依赖：签到脚本全部使用 Python 标准库（requirements.txt 仅保留本地调试可选项）。
 
 持久化：Latvi 的上次签到时间戳经 `actions/cache` 保存 `.latvi_state.json`；各任务结果当日经 artifact/cache 传递，跨日过期由日期白名单挡住。
 
@@ -57,10 +55,6 @@ python3 scripts/run_task.py scripts/sophnet.py
 
 # 本地预览统一报告（不发送；TASK_OUTPUT_DIR 指向已有结果目录）
 DAILY_PUSH=false TASK_OUTPUT_DIR=.task_results python3 scripts/unified_report.py
-
-# HW 会话本地重建（portal 与 SSO 双失效时）
-# 默认写 Upstash Redis（若配置）+ GitHub Secrets（gh auth login 后）；--no-push 仅写 Redis
-python3 scripts/hw_login.py
 ```
 
 ## 环境变量
@@ -72,7 +66,6 @@ TASK_TIMEOUT=300            # 单任务超时秒数（workbuddy/latvi/modelscope
 DAILY_PUSH=true             # 是否发送报告邮件
 QSTASH_URL / QSTASH_TOKEN / GH_PAT   # QStash 延时接力（workbuddy 放风 / latvi 24h 冷却）
                                        # + Resend 邮件持久投递（自动重试/DLQ/状态核查）
-UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN   # HW 凭证中心（hw:cookie/state；CI 优先读 Redis，Secrets 兜底）
 RESEND_API_KEY / RESEND_FROM / RESEND_TO   # 邮件主通道
 MAIL_HOST / MAIL_USER / MAIL_PASS / MAIL_TO 等   # 邮件 SMTP 备选通道
 ```
@@ -96,9 +89,8 @@ MAIL_HOST / MAIL_USER / MAIL_PASS / MAIL_TO 等   # 邮件 SMTP 备选通道
 
 | 时间 | Workflow | 说明 |
 |------|----------|------|
-| 00:50 | checkin.yml | 12 站点矩阵，Actions 低谷期 |
+| 00:50 | checkin.yml | 11 站点矩阵，Actions 低谷期 |
 | 00:50 | workbuddy.yml | 双账号；放风奖励 QStash 延时接力（~05:00 完成） |
 | 09:10 | modelscope.yml | 魔粒奖励凌晨未开放，单独调度 |
-| 08/13/18/23/04 | hw-keepalive.yml | HW Cookie 保活 |
 | 18:00 | latvi.yml | 24h 冷却兜底锚点（主链路为 QStash 接力） |
 | 10:00 / 10:30 | report.yml | 统一邮件（QStash 持久投递）/ 投递状态核查与兜底重发 |
