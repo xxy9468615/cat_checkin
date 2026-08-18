@@ -6,6 +6,20 @@ from common import Http, env, find, findall, strip_tags, main_guard, mask_str
 PREFIX = "MOXING_"
 NAV_URL = "https://moxing.vip/"  # 站点导航页：论坛本体迁移时此处列出最新可用域名
 
+def _extract_login_fields(text: str) -> tuple[str, str]:
+    """从 Discuz 登录页提取 formhash 和 loginhash。"""
+    formhash = (
+        find(r'name=["\']formhash["\']\s+value=["\']([a-zA-Z0-9_]+)["\']', text)
+        or find(r'value=["\']([a-zA-Z0-9_]+)["\']\s+name=["\']formhash["\']', text)
+        or find(r'formhash[^\w\n]+value[^\w\n]+([a-zA-Z0-9_]+)', text)
+        or find(r'formhash=([a-zA-Z0-9_]+)', text)
+    )
+    loginhash = (
+        find(r'loginhash=([a-zA-Z0-9_]+)', text)
+        or find(r'loginhash["\']?\s*[:=]\s*["\']?([a-zA-Z0-9_]+)', text)
+    )
+    return formhash, loginhash
+
 def _resolve_domain(h, headers, default):
     """解析存活的论坛域名：member.php 登录页能解析出 formhash+loginhash 才算存活。
 
@@ -14,7 +28,11 @@ def _resolve_domain(h, headers, default):
     """
     def alive(d):
         r = h.request("GET", d + "/member.php?mod=logging&action=login", headers=headers)
-        return r.code == 200 and find(r'formhash. value=.(\w+).', r.text) and find(r'loginhash=(\w+)', r.text)
+        if r.code != 200:
+            return False
+        fh, lh = _extract_login_fields(r.text)
+        return bool(fh and lh)
+
     if alive(default):
         return default
     nav = h.request("GET", NAV_URL, headers=headers)
@@ -31,7 +49,7 @@ def main():
     h=Http(); headers={"User-Agent":ua}
     domain=_resolve_domain(h,headers,domain); headers["Referer"]=domain+"/"
     login=h.request("GET",domain+"/member.php?mod=logging&action=login",headers=headers).text
-    formhash=find(r'formhash. value=.(\w+).',login); loginhash=find(r'loginhash=(\w+)',login)
+    formhash, loginhash = _extract_login_fields(login)
     if not (formhash and loginhash):
         # 解析不到登录表单：站点改版/被风控，静默跳过登录只会假成功
         raise RuntimeError("登录页解析失败（formhash/loginhash 缺失），可能站点改版或被风控")

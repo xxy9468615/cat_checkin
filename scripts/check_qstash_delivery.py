@@ -41,6 +41,9 @@ def check_delivery() -> str:
     except (json.JSONDecodeError, ValueError):
         return "none"
 
+    if not isinstance(marker, dict):
+        return "none"
+
     today = os.getenv("TODAY", "")
     if today and marker.get("date") != today:
         # marker 日期不是今天（不应发生，防御性检查）

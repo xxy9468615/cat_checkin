@@ -2,8 +2,9 @@ name: Daily Unified Report
 
 on:
   schedule:
-    - cron: "0 2 * * *"   # 北京时间 10:00 主定时（每日统一汇总推送）
-    - cron: "30 2 * * *"  # 北京时间 10:30 兜底定时（覆盖 GitHub cron 抖动）
+    # 北京时间 09:35（UTC 01:35）触发，避开整点/半点 Actions 排队拥堵高峰；
+    # 此时 00:50 的 checkin/workbuddy 与 09:10 的 modelscope 均已完成
+    - cron: "35 1 * * *"
   workflow_dispatch:
     inputs:
       force:
@@ -59,6 +60,7 @@ jobs:
       - name: Determine if execution is needed
         id: should_run
         env:
+          TODAY: ${{ env.TODAY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
@@ -67,21 +69,26 @@ jobs:
             exit 0
           fi
 
-          if [ "${{ steps.check_sent.outputs.cache-hit }}" = "true" ]; then
-            # QStash 投递失败（重试耗尽入 DLQ）→ 重发
-            if [ "${{ steps.delivery.outputs.delivery }}" = "failed" ]; then
-              echo "skip=false" >> "$GITHUB_OUTPUT"
-              echo "❌ QStash 报告邮件投递失败（重试耗尽），触发重发"
+          # 1. 优先检查恢复出来的 marker 文件（彻底避开 prefix match 时 cache-hit 恒为 false 的问题）
+          if [ -f .report_sent ]; then
+            MARKER_DATE=$(python3 -c "import json; print(json.load(open('.report_sent', encoding='utf-8')).get('date', ''))" 2>/dev/null || echo "")
+            if [ "$MARKER_DATE" = "$TODAY" ]; then
+              # QStash 投递明确失败（重试耗尽入 DLQ）→ 触发重发
+              if [ "${{ steps.delivery.outputs.delivery }}" = "failed" ]; then
+                echo "skip=false" >> "$GITHUB_OUTPUT"
+                echo "❌ QStash 报告邮件投递失败（重试耗尽），触发重发"
+                exit 0
+              fi
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "✅ 今日报告已于更早时间成功推送，跳过重复发送 (Marker Hit: $TODAY)"
               exit 0
             fi
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "✅ 今日报告已于更早时间成功推送，跳过重复发送 (Cache Hit)"
-            exit 0
           fi
 
+          # 2. 兜底 API 查重（纯净 stdout 输出，debug 信息输出到 stderr，防多行污染变量）
           echo "Checking GitHub API for successful runs today..."
           API_SENT=$(python3 -c "
-          import json, subprocess, os, datetime as dt
+          import json, subprocess, sys, datetime as dt
           try:
               out = subprocess.check_output(['gh', 'run', 'list', '--workflow', 'Daily Unified Report', '--status', 'success', '--json', 'databaseId,createdAt', '--limit', '10'], text=True)
               runs = json.loads(out)
@@ -93,14 +100,14 @@ jobs:
                   created_utc = dt.datetime.fromisoformat(r['createdAt'].replace('Z', '+00:00'))
                   created_bj = created_utc.astimezone(tz).strftime('%Y-%m-%d')
                   if created_bj == today:
-                      print(f'Found successful run today: {r[\"databaseId\"]} at {created_bj}')
+                      sys.stderr.write(f'Found successful run today: {r[\"databaseId\"]} at {created_bj}\n')
                       sent = True
                       break
-              print('true' if sent else 'false')
+              print('true' if sent else 'false', flush=True)
           except Exception as e:
               import traceback
-              traceback.print_exc()
-              print('false')
+              traceback.print_exc(file=sys.stderr)
+              print('false', flush=True)
           ")
 
           if [ "$API_SENT" = "true" ]; then
@@ -160,10 +167,16 @@ jobs:
               stage=".task_stage.$$"
               rm -rf "$stage"
               if gh run download "$rid" --pattern "$pattern" --dir "$stage"; then
+                file_count=$(find "$stage" -name "*.json" 2>/dev/null | wc -l)
+                if [ "$file_count" -eq 0 ]; then
+                  echo "⚠️ $wf run $rid 下载成功但未发现 .json 文件，尝试次新 run"
+                  rm -rf "$stage"
+                  continue
+                fi
                 mkdir -p .task_results
                 cp -rf "$stage"/. .task_results/
                 rm -rf "$stage"
-                echo "✅ $wf 结果已下载"
+                echo "✅ $wf 结果已下载（$file_count 个 JSON）"
                 return 0
               fi
               rm -rf "$stage"
