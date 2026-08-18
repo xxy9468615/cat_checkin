@@ -34,7 +34,7 @@ EXPECTED_RESULTS: Dict[str, str] = {
     **{f"{name}.json": f"{name}.py" for name in (
         "glados", "2libra", "bianjie_ai", "dji", "monkeycode",
         "moxing_vip", "naixi_forum", "pcbeta", "sophnet", "tencent_cloudstudio",
-        "ugnas_club",
+        "ugnas_club", "ai_router",
     )},
     "workbuddy-account-1.json": "workbuddy.py",
     "workbuddy-account-2.json": "workbuddy.py",

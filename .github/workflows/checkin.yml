@@ -31,6 +31,7 @@ jobs:
           - sophnet.py
           - tencent_cloudstudio.py
           - ugnas_club.py
+          - ai_router.py
 
     steps:
       - uses: actions/checkout@v4
@@ -70,6 +71,10 @@ jobs:
           MONKEYCODE_email: ${{ secrets.MONKEYCODE_EMAIL }}
           MONKEYCODE_password: ${{ secrets.MONKEYCODE_PASSWORD }}
           SOPHNET_TOKENS: ${{ secrets.SOPHNET_TOKENS }}
+          AI_ROUTER_TOKEN: ${{ secrets.AI_ROUTER_TOKEN }}
+          AI_ROUTER_REFRESH_TOKEN: ${{ secrets.AI_ROUTER_REFRESH_TOKEN }}
+          AI_ROUTER_COOKIE: ${{ secrets.AI_ROUTER_COOKIE }}
+          AI_ROUTER_ACCOUNTS: ${{ secrets.AI_ROUTER_ACCOUNTS }}
         run: |
           python3 scripts/run_task.py "scripts/${{ matrix.script }}"
 
