@@ -33,7 +33,8 @@ jobs:
         env:
           TZ: Asia/Shanghai
           TASK_OUTPUT_DIR: .task_results
-          # 脚本内含 today_used=0 的 90s×2 轮复查（奖励发放延迟容忍），预算放宽到 10 分钟
+          # 脚本内含 today_used=0 的渐进式退避复查（10s→20s→30s→45s），
+          # 每次复查前 touch 会话激活奖励发放；TASK_TIMEOUT=600 绰绰有余
           TASK_TIMEOUT: "600"
           MODELSCOPE_cookie: ${{ secrets.MODELSCOPE_COOKIE }}
           MODELSCOPE_HOST: ${{ secrets.MODELSCOPE_HOST }}
