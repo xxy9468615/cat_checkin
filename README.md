@@ -1,6 +1,6 @@
 # cat_checkin
 
-轻量签到自动化：GitHub Actions 低谷期（北京 00:50）矩阵执行 `scripts/*.py` 签到脚本，结果经 artifact/cache 双通道汇聚，每日北京 10:00 统一推送邮件（Resend 主通道 + SMTP 备选）。无服务器，无数据库。
+轻量签到自动化：GitHub Actions 低谷期（北京 00:50）矩阵执行 `scripts/*.py` 签到脚本，结果经 artifact/cache 双通道汇聚，每日北京 10:00 统一推送邮件（Resend 主通道 + SMTP 备选）。无服务器，历史汇总存入 Upstash Redis（Serverless，无需自建数据库）。
 
 ## 架构
 
@@ -15,7 +15,7 @@
 09:35  report.yml ─ fetch_latest 跨 run 收集当日 artifact → unified_report.py
                     期望清单比对（缺席即红卡）→ Resend 邮件走 QStash 持久投递
                     → 失败矩阵站点自动 dispatch checkin.yml 重签（每日至多一次）
-                    → 送达后当日汇总归档 data 分支 data/checkins-YYYY-MM.json
+                    → 送达后当日汇总写入 Upstash Redis（daily / month / dates 时间线 / latest）
 ```
 
 单个任务的链路：workflow → `run_task.py`（进程组超时控制）→ `scripts/<site>.py`（`main_guard` 统一异常出口）→ `.task_results/<site>.json`（ok/output/elapsed/date）→ artifact + actions/cache 双写 → 次日 report 汇聚。

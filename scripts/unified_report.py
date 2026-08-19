@@ -9,7 +9,6 @@ Latvi 因 24h 签到间隔约束固定在 18:00 运行，10:00 报告取其昨�
 """
 from __future__ import annotations
 
-import base64
 import datetime as dt
 import json
 import os
@@ -22,7 +21,7 @@ ROOT_DIR = BASE_DIR.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from common import Http  # noqa: E402
+from common import upstash_redis_pipeline  # noqa: E402
 from daily_report import build_report, send_email, send_resend  # noqa: E402
 
 # Latvi 的结果文件名（24h 间隔约束，18:00 运行，报告取昨日结果）
@@ -144,89 +143,66 @@ def _emit_failed_sites(collected: Dict[str, dict]) -> List[str]:
 
 
 def archive_daily_summary(collected: Dict[str, dict], today: str) -> None:
-    """将当日汇总追加到仓库 data 分支的月度 JSON（best-effort，绝不阻塞报告链路）。
+    """将当日汇总写入 Upstash Redis（best-effort，绝不阻塞报告链路）。
 
-    文件 data/checkins-YYYY-MM.json：{ "YYYY-MM-DD": { "<站点键>": {"ok", "elapsed"} } }，
+    Key Schema（前缀可用 CAT_CHECKIN_REDIS_PREFIX 覆盖，默认 cat_checkin:）：
+      - cat_checkin:daily:YYYY-MM-DD  String(JSON)  单日完整汇总明细
+      - cat_checkin:month:YYYY-MM     Hash          Field=YYYY-MM-DD, Value=站点状态 JSON
+      - cat_checkin:dates             ZSet          Score=BJT 日期时间戳, Member=YYYY-MM-DD
+      - cat_checkin:latest            String(JSON)  最新一次完整汇总明细
     同日重跑时新结果覆盖旧条目。解锁 30 天成功率 / 断签站点等历史分析
     （此前唯一的历史留存只有邮件）。
-    凭据：GH_PAT 或 GITHUB_TOKEN（需 contents: write）；本地无 token 时跳过。
+    凭据：UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN；未配置时跳过。
     """
     if os.getenv("ARCHIVE_SUMMARY", "true").lower() in {"0", "false", "no"}:
         return
-    token = os.getenv("GH_PAT") or os.getenv("GITHUB_TOKEN") or ""
-    repo = os.getenv("GITHUB_REPOSITORY", "")
-    if not token or not repo:
-        print("ℹ️ 历史归档跳过：非 CI 环境或未配置 GH_PAT/GITHUB_TOKEN")
+    url = os.getenv("UPSTASH_REDIS_REST_URL", "")
+    token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+    if not url or not token:
+        print("ℹ️ 历史归档跳过：未配置 UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN")
         return
 
-    branch = os.getenv("ARCHIVE_BRANCH", "data")
-    path = f"data/checkins-{today[:7]}.json"
-    api_base = f"https://api.github.com/repos/{repo}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
+    prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
+    now = dt.datetime.now(dt.timezone(dt.timedelta(hours=8)))
+    updated_at = now.isoformat()
+    sites = {
+        (key[:-5] if key.endswith(".json") else key): {
+            "ok": bool(d.get("ok")),
+            "elapsed": d.get("elapsed", 0),
+            "script": d.get("script", ""),
+        }
+        for key, d in sorted(collected.items())
     }
-    h = Http()
+    total = len(sites)
+    success = sum(1 for s in sites.values() if s["ok"])
+    summary = {
+        "date": today,
+        "updated_at": updated_at,
+        "total": total,
+        "success": success,
+        "failed": total - success,
+        "sites": sites,
+    }
+    body = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+    month = today[:7]
+    # ZADD score 用北京时间当日 UTC 时间戳（跨时区索引稳定；member 唯一）
+    score = int(now.timestamp())
+    commands = [
+        ["SET", f"{prefix}:daily:{today}", body],
+        ["HSET", f"{prefix}:month:{month}", today, body],
+        ["ZADD", f"{prefix}:dates", score, today],
+        ["SET", f"{prefix}:latest", body],
+    ]
 
     try:
-        # 1. 确保 data 分支存在（首次从默认分支锚定；已存在时创建返回 422，忽略）
-        ref = h.request("GET", f"{api_base}/git/ref/heads/{branch}", headers=headers)
-        if ref.code != 200:
-            repo_info = h.request("GET", api_base, headers=headers).json({}) or {}
-            default_branch = repo_info.get("default_branch") or "main"
-            head = h.request("GET", f"{api_base}/git/ref/heads/{default_branch}", headers=headers)
-            head_sha = ((head.json({}) or {}).get("object") or {}).get("sha", "")
-            if head.code != 200 or not head_sha:
-                print(f"⚠️ 历史归档跳过：无法解析默认分支 HEAD (HTTP {head.code})")
-                return
-            created = h.request(
-                "POST", f"{api_base}/git/refs", headers=headers,
-                json_data={"ref": f"refs/heads/{branch}", "sha": head_sha},
+        ok, detail = upstash_redis_pipeline(commands)
+        if ok:
+            print(
+                f"🗂️ 当日汇总已归档 → Upstash Redis（{prefix}:daily:{today}，"
+                f"{success}/{total} 成功）"
             )
-            if created.code not in (201, 422):
-                print(f"⚠️ 历史归档跳过：创建 {branch} 分支失败 (HTTP {created.code}) {created.text[:120]}")
-                return
-
-        # 2. 读取当月文件（404 = 当月首次写入）
-        blob = h.request("GET", f"{api_base}/contents/{path}?ref={branch}", headers=headers)
-        if blob.code == 200:
-            info = blob.json({}) or {}
-            blob_sha = info.get("sha", "")
-            raw = (info.get("content") or "").replace("\n", "")
-            month_data = json.loads(base64.b64decode(raw)) if raw else {}
-            if not isinstance(month_data, dict):
-                month_data = {}
-        elif blob.code == 404:
-            blob_sha = ""
-            month_data = {}
         else:
-            print(f"⚠️ 历史归档跳过：读取 {path} 失败 (HTTP {blob.code})")
-            return
-
-        # 3. 覆盖式写入今日条目并提交
-        month_data[today] = {
-            (key[:-5] if key.endswith(".json") else key): {
-                "ok": bool(d.get("ok")),
-                "elapsed": d.get("elapsed", 0),
-            }
-            for key, d in sorted(collected.items())
-        }
-        content = base64.b64encode(
-            json.dumps(month_data, ensure_ascii=False, indent=2).encode("utf-8")
-        ).decode("ascii")
-        payload = {
-            "message": f"data: {today} checkin summary ({len(collected)} sites)",
-            "branch": branch,
-            "content": content,
-        }
-        if blob_sha:
-            payload["sha"] = blob_sha
-        put = h.request("PUT", f"{api_base}/contents/{path}", headers=headers, json_data=payload)
-        if put.code in (200, 201):
-            print(f"🗂️ 当日汇总已归档 → {branch}:{path}")
-        else:
-            print(f"⚠️ 历史归档写入失败 (HTTP {put.code}) {put.text[:120]}")
+            print(f"⚠️ 历史归档写入失败: {detail}")
     except Exception as e:
         print(f"⚠️ 历史归档异常（不影响报告发送）: {e}")
 

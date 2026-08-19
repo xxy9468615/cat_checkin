@@ -234,6 +234,49 @@ def schedule_repo_dispatch(event_type: str, delay_seconds: int) -> tuple[bool, s
     return (True, str(int(delay_seconds))) if ok else (False, detail)
 
 
+def _upstash_redis_env() -> tuple[str, str]:
+    """读取 Upstash Redis REST 凭据（URL 去尾斜杠）。"""
+    url = (os.getenv("UPSTASH_REDIS_REST_URL") or "").rstrip("/")
+    token = os.getenv("UPSTASH_REDIS_REST_TOKEN") or ""
+    return url, token
+
+
+def _upstash_redis_request(url: str, token: str, body: str) -> tuple[bool, Any]:
+    """POST 一条/多头 Redis 命令到 Upstash REST API。Http 自带 @retry 重试网络抖动。"""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    resp = Http().request("POST", url, headers=headers, data=body)
+    if resp.code == 200:
+        return True, resp.json()
+    return False, f"HTTP {resp.code}: {resp.text[:200]}"
+
+
+def upstash_redis_command(command: list) -> tuple[bool, Any]:
+    """执行单条 Upstash Redis 命令（REST，免驱动）。
+
+    环境变量：UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN。
+    返回 (成功?, 命令结果 或 失败说明)；未配置凭据时返回 False。
+    """
+    url, token = _upstash_redis_env()
+    if not url or not token:
+        return False, "未配置 UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN"
+    return _upstash_redis_request(url, token, json.dumps(command, ensure_ascii=False))
+
+
+def upstash_redis_pipeline(commands: list) -> tuple[bool, Any]:
+    """管道批量执行多条 Upstash Redis 命令（POST /pipeline，一次 RTT 原子提交）。
+
+    commands 形如 [["SET", "k", "v"], ["HSET", "h", "f", "v"], ...]。
+    返回 (成功?, 各命令结果数组 或 失败说明)。
+    """
+    url, token = _upstash_redis_env()
+    if not url or not token:
+        return False, "未配置 UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN"
+    return _upstash_redis_request(f"{url}/pipeline", token, json.dumps(commands, ensure_ascii=False))
+
+
 def env(prefix: str, name: str, default: str = "", required: bool = True) -> str:
     clean_prefix = prefix.removeprefix("QL_")
     keys = [

@@ -14,7 +14,7 @@ on:
         default: false
 
 permissions:
-  contents: write  # 每日汇总归档到 data 分支 + workflow dispatch（GITHUB_TOKEN 兜底路径）
+  contents: write  # workflow dispatch 重跑（GITHUB_TOKEN 兜底路径）；每日汇总历史现存入 Upstash Redis，不再提交 data 分支
   actions: write   # gh workflow run 触发 checkin.yml 重跑（write 含 read，跨 run 拉 artifact 亦可用）
 
 concurrency:
@@ -227,6 +227,8 @@ jobs:
           RESEND_TO: ${{ secrets.RESEND_TO }}
           QSTASH_URL: ${{ secrets.QSTASH_URL }}
           QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
           MAIL_HOST: ${{ secrets.MAIL_HOST }}
           MAIL_PORT: ${{ secrets.MAIL_PORT }}
           MAIL_USER: ${{ secrets.MAIL_USER }}
