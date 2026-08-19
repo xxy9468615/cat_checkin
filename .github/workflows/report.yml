@@ -90,7 +90,7 @@ jobs:
           API_SENT=$(python3 -c "
           import json, subprocess, sys, datetime as dt
           try:
-              out = subprocess.check_output(['gh', 'run', 'list', '--workflow', 'Daily Unified Report', '--status', 'success', '--json', 'databaseId,createdAt', '--limit', '10'], text=True)
+              out = subprocess.check_output(['gh', 'run', 'list', '--workflow', 'report.yml', '--status', 'success', '--json', 'databaseId,createdAt', '--limit', '10'], text=True)
               runs = json.loads(out)
               tz = dt.timezone(dt.timedelta(hours=8))
               today = dt.datetime.now(tz).strftime('%Y-%m-%d')
@@ -184,12 +184,14 @@ jobs:
             done
             echo "⚠️ $wf 全部候选 run 下载失败（期望清单会标红）"
           }
-          fetch_latest "Daily Check-in (Matrix Async)" "task-result-*" "$TODAY_BJ"
-          fetch_latest "WorkBuddy Check-in" "workbuddy-result-*" "$TODAY_BJ"
+          # 用工作流文件名（.yml）而非显示名称查询：名称可改，文件名稳定。
+          # gh run list --workflow <文件名> 始终可用；显示名称曾改名导致 API 404 → 结果全红卡。
+          fetch_latest "checkin.yml" "task-result-*" "$TODAY_BJ"
+          fetch_latest "workbuddy.yml" "workbuddy-result-*" "$TODAY_BJ"
           # ModelScope 单独 09:10 跑（魔粒奖励凌晨未开放，混在 00:50 矩阵必失败）
-          fetch_latest "ModelScope Check-in" "task-result-modelscope.py" "$TODAY_BJ"
+          fetch_latest "modelscope.yml" "task-result-modelscope.py" "$TODAY_BJ"
           # Latvi 固定 18:00 运行（24h 间隔约束），10:00 报告取最近一次（昨日）结果
-          fetch_latest "Latvi Check-in" "task-result-latvi.py" "$YDAY_BJ"
+          fetch_latest "latvi.yml" "task-result-latvi.py" "$YDAY_BJ"
 
       # 2. 兜底：从 cache 恢复（前缀命中最近一条单腿结果，仅作补充）
       - name: Restore task results from cache (fallback)
