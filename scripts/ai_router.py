@@ -59,6 +59,23 @@ def _save_state(state: dict) -> None:
         print(f"⚠️ 保存 state 失败: {e}")
 
 
+def _resolve_rtr(refresh_token: str, state: dict) -> tuple[str, bool]:
+    """沿轮转链追溯 RTR refresh token，返回 (最新 token, 是否发生过追溯)。
+
+    state 映射为 旧rt -> 新rt。RTR 严格轮转下服务端每次刷新都作废旧 rt，
+    多日运行会形成 rt_1 -> rt_2 -> rt_3 的链；静态的 rt_1 必须沿链追溯到
+    最新的 rt_3，否则下一次续期必 401。visited 集合防 state 数据损坏时死循环。
+    """
+    if not refresh_token:
+        return refresh_token or "", False
+    current = refresh_token
+    visited: set[str] = set()
+    while current in state and current not in visited:
+        visited.add(current)
+        current = state[current]
+    return current, current != refresh_token
+
+
 def _load_accounts():
     """解析并返回账号凭据列表 [{'token': ..., 'refresh_token': ..., 'cookie': ...}, ...]"""
     raw = os.getenv(f"{PREFIX}ACCOUNTS", "").strip() or os.getenv(f"QL_{PREFIX}ACCOUNTS", "").strip() or os.getenv(f"{PREFIX}accounts", "").strip()
@@ -91,13 +108,15 @@ def _load_accounts():
     ref_token = os.getenv(f"{PREFIX}REFRESH_TOKEN", "").strip() or os.getenv(f"{PREFIX}refresh_token", "").strip() or os.getenv(f"QL_{PREFIX}REFRESH_TOKEN", "").strip()
     cookie = os.getenv(f"{PREFIX}COOKIE", "").strip() or os.getenv(f"{PREFIX}cookie", "").strip() or os.getenv(f"QL_{PREFIX}COOKIE", "").strip()
 
-    # 用持久化的轮转 refresh token 覆盖静态旧值（RTR 模式）
+    # 用持久化的轮转 refresh token 覆盖静态旧值（RTR 模式，沿链追溯最新 rt）
     state = _load_state()
-    if ref_token and ref_token in state:
-        ref_token = state[ref_token]
-        print(f"📦 从 state 缓存恢复 Refresh Token（轮转续期）")
+    if ref_token:
+        new_rt, traced = _resolve_rtr(ref_token, state)
+        if traced:
+            ref_token = new_rt
+            print(f"📦 从 state 缓存恢复 Refresh Token（轮转续期）")
     elif cookie and cookie in state:
-        ref_token = state[cookie]
+        ref_token, _traced = _resolve_rtr(state[cookie], state)
         print(f"📦 从 state 缓存恢复 Refresh Token（cookie 映射）")
 
     # 处理从 cookie 里误传 token 的情况
@@ -111,6 +130,16 @@ def _load_accounts():
         accounts.append({"token": token, "refresh_token": ref_token, "cookie": cookie})
     elif (token or ref_token) and not any(a.get("refresh_token") == ref_token for a in accounts if ref_token):
         accounts.append({"token": token, "refresh_token": ref_token, "cookie": cookie})
+
+    # 多账号：对 AI_ROUTER_ACCOUNTS 解析出的每个账号应用同样的 RTR 追溯
+    if accounts:
+        for acc in accounts:
+            acc_rt = acc.get("refresh_token", "")
+            if acc_rt:
+                new_rt, traced = _resolve_rtr(acc_rt, state)
+                if traced:
+                    acc["refresh_token"] = new_rt
+                    print(f"📦 多账号 RTR 追溯 {mask_str(acc_rt)} → {mask_str(new_rt)}")
 
     return accounts
 
@@ -206,47 +235,41 @@ def _run_one(idx: int, total: int, account: dict, api_url: str) -> str:
     active_balance = user_info.get("active_balance", 0)
     frozen_balance = user_info.get("frozen_balance", 0)
 
-    # 2. 查询今日签到状态
-    status_resp = h.request("GET", f"{api_url}/user/daily-checkin", headers=headers)
-    status_data = status_resp.json({}).get("data", {})
-    checked_today = status_data.get("checked_today", False)
-    reward_amount = status_data.get("reward_amount", 1)
-
+    # 2. 直接发起每日签到 POST /user/daily-checkin
+    # 前端 claimDailyCheckin() 直接 POST、不预查 GET（GET 是独立的状态查询接口，
+    # 其字段语义与 POST 幂等信号不一致，依赖它预判会导致「恒判已签到、跳过真正发奖励的 POST」）。
     sign_ok = False
     sign_msg = ""
     reward_desc = ""
 
-    if checked_today:
+    sign_resp = h.request("POST", f"{api_url}/user/daily-checkin", headers=headers, json_data={})
+    sign_res_data = sign_resp.json({})
+    code = sign_res_data.get("code") if isinstance(sign_res_data, dict) else None
+    reason = sign_res_data.get("reason", "")
+    msg = sign_res_data.get("message") or ""
+
+    if sign_resp.code == 200 and code == 0:
+        sign_ok = True
+        sign_msg = "签到成功"
+        claimed_amount = sign_res_data.get("data", {}).get("reward_amount", 1)
+        reward_desc = f" | 🎁 奖励：${claimed_amount:.2f} USD"
+        # 刷新最新资产余额
+        try:
+            ref_resp = h.request("GET", f"{api_url}/auth/me", headers=headers)
+            ref_user = ref_resp.json({}).get("data", {})
+            if isinstance(ref_user, dict) and "balance" in ref_user:
+                balance = ref_user.get("balance", balance)
+                active_balance = ref_user.get("active_balance", active_balance)
+                frozen_balance = ref_user.get("frozen_balance", frozen_balance)
+        except Exception:
+            pass
+    elif sign_resp.code == 409 or code == 409 or reason == "DAILY_CHECKIN_CLAIMED" or "already claimed" in msg.lower():
         sign_ok = True
         sign_msg = "今日已签到过"
     else:
-        # 3. 发起每日签到 POST /user/daily-checkin
-        sign_resp = h.request("POST", f"{api_url}/user/daily-checkin", headers=headers, json_data={})
-        sign_res_data = sign_resp.json({})
-        code = sign_res_data.get("code") if isinstance(sign_res_data, dict) else None
-        reason = sign_res_data.get("reason", "")
-        msg = sign_res_data.get("message") or ""
-
-        if sign_resp.code == 200 and code == 0:
-            sign_ok = True
-            sign_msg = "签到成功"
-            claimed_amount = sign_res_data.get("data", {}).get("reward_amount") or reward_amount
-            reward_desc = f" | 🎁 奖励：${claimed_amount:.2f} USD"
-            # 刷新最新资产余额
-            try:
-                ref_resp = h.request("GET", f"{api_url}/auth/me", headers=headers)
-                ref_user = ref_resp.json({}).get("data", {})
-                if isinstance(ref_user, dict) and "balance" in ref_user:
-                    balance = ref_user.get("balance", balance)
-                    active_balance = ref_user.get("active_balance", active_balance)
-                    frozen_balance = ref_user.get("frozen_balance", frozen_balance)
-            except Exception:
-                pass
-        elif code == 409 or reason == "DAILY_CHECKIN_CLAIMED" or "already claimed" in msg.lower():
-            sign_ok = True
-            sign_msg = "今日已签到过"
-        else:
-            sign_msg = msg or f"签到失败 (code={code})"
+        # 记录原始响应便于诊断（失败原因常藏在非 200 响应体里）
+        sign_msg = msg or f"签到失败 (HTTP {sign_resp.code}, code={code})"
+        print(f"   ↳ 签到原始响应: {sign_resp.text[:200]}")
 
     # 4. 构建格式化日志输出
     user_tag = mask_str(email) if email else f"账号{idx}"
