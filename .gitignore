@@ -22,6 +22,7 @@ docs
 .zcode/
 .report_sent
 .latvi_state.json
+.ai_router_state.json
 
 # WSL2 metadata
 *:Zone.Identifier

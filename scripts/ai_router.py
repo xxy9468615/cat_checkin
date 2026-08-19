@@ -25,18 +25,43 @@ for (let i = 0; i < localStorage.length; i++) {
   AI_ROUTER_ACCOUNTS      多账号配置，换行或 && 分隔，格式为 token|refresh_token 或仅填 refresh_token
   AI_ROUTER_API_URL       接口基础地址（默认 https://api.ai-router.dev/api/v1）
 """
+import json
 import os
 import re
 import sys
+from pathlib import Path
 from common import Http, env, main_guard, mask_str
 
 PREFIX = "AI_ROUTER_"
 DEFAULT_API_URL = "https://api.ai-router.dev/api/v1"
 
+# Refresh Token 轮转持久化文件（防御 RTR 模式：服务端每次刷新后作废旧 rt，签发新 rt）
+# GitHub Actions 通过 actions/cache 持久化此文件，确保下次 run 使用最新 rt_
+STATE_FILE = Path(os.getenv("AI_ROUTER_STATE_FILE", ".ai_router_state.json"))
+
+
+def _load_state() -> dict:
+    """从 state 文件加载持久化的 refresh token 映射（按 refresh_token 前缀 hash 去重）"""
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    """持久化 refresh token 映射到 state 文件"""
+    try:
+        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print(f"⚠️ 保存 state 失败: {e}")
+
 
 def _load_accounts():
     """解析并返回账号凭据列表 [{'token': ..., 'refresh_token': ..., 'cookie': ...}, ...]"""
-    raw = os.getenv(f"{PREFIX}ACCOUNTS", "").strip() or os.getenv(f"QL_{PREFIX}ACCOUNTS", "").strip()
+    raw = os.getenv(f"{PREFIX}ACCOUNTS", "").strip() or os.getenv(f"QL_{PREFIX}ACCOUNTS", "").strip() or os.getenv(f"{PREFIX}accounts", "").strip()
     accounts = []
 
     if raw:
@@ -62,9 +87,18 @@ def _load_accounts():
                     accounts.append({"token": "", "refresh_token": "", "cookie": chunk})
 
     # 单账号兼容
-    token = os.getenv(f"{PREFIX}TOKEN", "").strip() or os.getenv(f"{PREFIX}token", "").strip()
-    ref_token = os.getenv(f"{PREFIX}REFRESH_TOKEN", "").strip() or os.getenv(f"{PREFIX}refresh_token", "").strip()
-    cookie = os.getenv(f"{PREFIX}COOKIE", "").strip() or os.getenv(f"{PREFIX}cookie", "").strip()
+    token = os.getenv(f"{PREFIX}TOKEN", "").strip() or os.getenv(f"{PREFIX}token", "").strip() or os.getenv(f"QL_{PREFIX}TOKEN", "").strip()
+    ref_token = os.getenv(f"{PREFIX}REFRESH_TOKEN", "").strip() or os.getenv(f"{PREFIX}refresh_token", "").strip() or os.getenv(f"QL_{PREFIX}REFRESH_TOKEN", "").strip()
+    cookie = os.getenv(f"{PREFIX}COOKIE", "").strip() or os.getenv(f"{PREFIX}cookie", "").strip() or os.getenv(f"QL_{PREFIX}COOKIE", "").strip()
+
+    # 用持久化的轮转 refresh token 覆盖静态旧值（RTR 模式）
+    state = _load_state()
+    if ref_token and ref_token in state:
+        ref_token = state[ref_token]
+        print(f"📦 从 state 缓存恢复 Refresh Token（轮转续期）")
+    elif cookie and cookie in state:
+        ref_token = state[cookie]
+        print(f"📦 从 state 缓存恢复 Refresh Token（cookie 映射）")
 
     # 处理从 cookie 里误传 token 的情况
     if cookie and cookie.startswith("rt_") and not ref_token:
@@ -95,6 +129,13 @@ def _do_refresh(h: Http, refresh_token: str, api_url: str) -> tuple[str, str]:
 
     if resp.code != 200 or not isinstance(data, dict) or data.get("code") != 0:
         err_msg = data.get("message") if isinstance(data, dict) else resp.text[:100]
+        # 400/401 → Refresh Token 本身已失效，需重新登录获取
+        if resp.code in (400, 401) or (isinstance(data, dict) and data.get("code") in (400, 401)):
+            raise RuntimeError(
+                f"Refresh Token 已失效/过期 (HTTP {resp.code}): {err_msg}\n"
+                f"请登录 https://ai-router.dev 重新获取 Refresh Token 并更新 GitHub Secrets / .env 中的 "
+                f"{PREFIX}REFRESH_TOKEN（rt_... 开头）后重试。"
+            )
         raise RuntimeError(f"Refresh Token 续期失败 (HTTP {resp.code}): {err_msg}")
 
     res_data = data.get("data", {})
@@ -103,6 +144,13 @@ def _do_refresh(h: Http, refresh_token: str, api_url: str) -> tuple[str, str]:
 
     if not new_token:
         raise RuntimeError("续期响应中未包含有效 access_token")
+
+    # RTR 防御：服务端若轮转签发新 rt（且与原 rt 不同），持久化 mapping 供下次 run 使用
+    if new_rt != refresh_token:
+        state = _load_state()
+        state[refresh_token] = new_rt
+        _save_state(state)
+        print(f"🔄 Refresh Token 已轮转，new rt = {mask_str(new_rt)}")
 
     return new_token, new_rt
 

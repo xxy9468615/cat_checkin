@@ -85,6 +85,14 @@ jobs:
           path: .task_results/
           key: task-result-${{ matrix.script }}-${{ env.TODAY }}
 
+      - name: Cache AI-ROUTER token rotation state
+        if: matrix.script == 'ai_router.py'
+        uses: actions/cache@v4
+        with:
+          path: .ai_router_state.json
+          key: ai-router-state-${{ github.run_id }}
+          restore-keys: ai-router-state-
+
       - name: Upload task result artifact
         if: always()
         uses: actions/upload-artifact@v4
