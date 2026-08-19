@@ -5,15 +5,17 @@
 ## 架构
 
 ```text
-00:50  checkin.yml ── 11 站点矩阵（run_task.py 子进程执行，产出结构化结果 JSON）
+00:50  checkin.yml ── 12 站点矩阵（run_task.py 子进程执行，产出结构化结果 JSON）
+                      workflow_dispatch 支持 scripts=glados.py,ai_router.py 选择性重跑
+                      （report.yml 红卡自动重跑用此路径）
 00:50  workbuddy.yml ─ 2 账号并行；放风领奖经 QStash 延时 dispatch 接力（~05:00）
 09:10  modelscope.yml ─ 魔粒奖励 09:10 后才发放，单独调度
 18:00  latvi.yml ─ 24h 冷却；签到成功后 +24h+3~5min 经 QStash dispatch 接力，
                     18:00 cron 仅作兜底锚点（链活着时幂等快速退出）
-10:00  report.yml ─ fetch_latest 跨 run 收集当日 artifact → unified_report.py
+09:35  report.yml ─ fetch_latest 跨 run 收集当日 artifact → unified_report.py
                     期望清单比对（缺席即红卡）→ Resend 邮件走 QStash 持久投递
-                    （retries=2, content_dedup=true；直发回退吃 @retry）
-                    10:30 兜底升级为投递状态核查（check_qstash_delivery.py）
+                    → 失败矩阵站点自动 dispatch checkin.yml 重签（每日至多一次）
+                    → 送达后当日汇总归档 data 分支 data/checkins-YYYY-MM.json
 ```
 
 单个任务的链路：workflow → `run_task.py`（进程组超时控制）→ `scripts/<site>.py`（`main_guard` 统一异常出口）→ `.task_results/<site>.json`（ok/output/elapsed/date）→ artifact + actions/cache 双写 → 次日 report 汇聚。

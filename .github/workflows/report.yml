@@ -14,8 +14,8 @@ on:
         default: false
 
 permissions:
-  contents: read
-  actions: read
+  contents: write  # 每日汇总归档到 data 分支 + workflow dispatch（GITHUB_TOKEN 兜底路径）
+  actions: write   # gh workflow run 触发 checkin.yml 重跑（write 含 read，跨 run 拉 artifact 亦可用）
 
 concurrency:
   group: report-${{ github.ref }}
@@ -216,6 +216,7 @@ jobs:
           echo "✅ 结果文件就绪，开始执行统一邮件汇总推送"
 
       - name: Send unified report
+        id: send_report
         if: steps.should_run.outputs.skip != 'true'
         env:
           TZ: Asia/Shanghai
@@ -233,6 +234,49 @@ jobs:
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
         run: python3 scripts/unified_report.py
+
+      # 红卡自动重跑：邮件发出后，对失败/缺席的矩阵站点自动 dispatch checkin.yml 重签。
+      # 站点签到服务端幂等（已签到一律放行），重跑安全；重跑落同名 artifact（新数据胜出），
+      # 结果以站点余额/奖励为准，次日报告或手动 force 重发邮件时可见。
+      # 防循环：每日最多自动重跑一次——今日已存在 workflow_dispatch 触发的 checkin run
+      #（人工或自动）即跳过。独立 workflow 站点（workbuddy/modelscope/latvi）有各自
+      # 恢复机制，不在重跑范围。
+      - name: Auto-retry failed matrix sites
+        if: always() && steps.should_run.outputs.skip != 'true' && steps.send_report.outputs.failed_matrix != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          FAILED_MATRIX: ${{ steps.send_report.outputs.failed_matrix }}
+        run: |
+          set -uo pipefail
+          RETRIED=$(python3 - <<'EOF'
+          import datetime as dt, json, subprocess
+          tz = dt.timezone(dt.timedelta(hours=8))
+          today = dt.datetime.now(tz).strftime("%Y-%m-%d")
+          try:
+              out = subprocess.check_output(
+                  ["gh", "run", "list", "--workflow", "checkin.yml", "--event", "workflow_dispatch",
+                   "--limit", "10", "--json", "createdAt"], text=True)
+              runs = json.loads(out)
+          except Exception:
+              print("unknown", flush=True)
+          else:
+              hit = any(
+                  dt.datetime.fromisoformat(r["createdAt"].replace("Z", "+00:00"))
+                  .astimezone(tz).strftime("%Y-%m-%d") == today
+                  for r in runs)
+              print("true" if hit else "false", flush=True)
+          EOF
+          )
+          if [ "$RETRIED" != "false" ]; then
+            echo "ℹ️ 今日已存在手动/自动触发的 checkin run（$RETRIED），跳过自动重跑"
+            exit 0
+          fi
+          echo "🔁 失败矩阵站点自动重跑：$FAILED_MATRIX"
+          if gh workflow run checkin.yml --ref "${GITHUB_REF_NAME:-main}" -f scripts="$FAILED_MATRIX" -f retry=true; then
+            echo "✅ 重跑已触发（站点签到服务端幂等，重复执行安全）"
+          else
+            echo "⚠️ 自动重跑触发失败，请人工检查"
+          fi
 
       # always()：脚本有任务失败时 exit 1，但邮件已发出、标记已写，必须照常保存；
       # hashFiles：无结果中止时标记不存在，跳过保存（让 10:30 兜底重试）

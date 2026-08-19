@@ -1,37 +1,70 @@
 name: Daily Check-in
 
+run-name: >-
+  checkin: ${{ inputs.retry == true && 'auto-retry(report)' || (github.event_name == 'workflow_dispatch' && 'manual' || 'scheduled') }}
+
 on:
   schedule:
     - cron: "50 16 * * *"  # 北京时间 00:50（GitHub Actions 低谷期）
   workflow_dispatch:
+    inputs:
+      scripts:
+        description: '要执行的站点脚本，逗号分隔（留空 = 全部矩阵站点）'
+        required: false
+        default: ''
+        type: string
+      retry:
+        description: '标记为报告自动重跑（防循环；人工触发保持 false）'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
+  actions: read  # ai_router state 的 artifact 兜底恢复需读取历史 run 的 artifact
 
 concurrency:
   group: checkin-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  select:
+    # 矩阵选择：cron/手动留空 = 全量；report.yml 自动重跑时只跑指定失败站点。
+    # 站点清单在此维护（新增站点 = 此列表 + unified_report.py EXPECTED_RESULTS 两处同步）。
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - name: Pick matrix scripts
+        id: pick
+        env:
+          SCRIPTS_INPUT: ${{ inputs.scripts }}
+        run: |
+          python3 <<'EOF'
+          import json, os
+          full = ["glados.py", "2libra.py", "bianjie_ai.py", "dji.py", "monkeycode.py",
+                  "moxing_vip.py", "naixi_forum.py", "pcbeta.py", "sophnet.py",
+                  "tencent_cloudstudio.py", "ugnas_club.py", "ai_router.py"]
+          sel = os.environ.get("SCRIPTS_INPUT", "").strip()
+          if sel:
+              wanted = {s.strip() for s in sel.split(",") if s.strip()}
+              picked = [s for s in full if s in wanted]
+              if not picked:
+                  raise SystemExit(f"❌ 输入脚本与矩阵站点无交集：{sel}（可用：{', '.join(full)}）")
+          else:
+              picked = full
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write("matrix=" + json.dumps({"script": picked}) + "\n")
+          print(f"▶️ 本次执行站点：{', '.join(picked)}")
+          EOF
+
   checkin-matrix:
+    needs: select
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
-      matrix:
-        script:
-          - glados.py
-          - 2libra.py
-          - bianjie_ai.py
-          - dji.py
-          - monkeycode.py
-          - moxing_vip.py
-          - naixi_forum.py
-          - pcbeta.py
-          - sophnet.py
-          - tencent_cloudstudio.py
-          - ugnas_club.py
-          - ai_router.py
+      matrix: ${{ fromJson(needs.select.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +75,32 @@ jobs:
 
       - name: Set TODAY
         run: echo "TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      # RTR 状态必须先恢复再跑签到脚本（actions/cache 在步骤执行时恢复、job 结束时保存；
+      # 若缓存步骤放在任务之后，脚本永远读不到恢复的 state，恢复还会覆盖脚本刚写的新链）。
+      # 唯一 run_id key + 前缀回退，与 latvi.yml 同款。
+      - name: Restore AI-ROUTER token rotation state
+        id: ai_state
+        if: matrix.script == 'ai_router.py'
+        uses: actions/cache/restore@v4
+        with:
+          path: .ai_router_state.json
+          key: ai-router-state-${{ github.run_id }}
+          restore-keys: ai-router-state-
+
+      # cache 静默丢失/保存失败的兜底：从最近完成 run 的 state artifact 恢复 RTR 链
+      - name: Restore AI-ROUTER state from artifact (fallback)
+        if: matrix.script == 'ai_router.py' && steps.ai_state.outputs.cache-hit != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for rid in $(gh run list --workflow checkin.yml --status completed --limit 5 --json databaseId --jq '.[].databaseId'); do
+            if gh run download "$rid" -n ai-router-state --dir . 2>/dev/null; then
+              echo "✅ 已从 run $rid 的 artifact 恢复 AI-ROUTER state（cache 未命中兜底）"
+              break
+            fi
+          done
 
       - name: Run check-in task (${{ matrix.script }})
         env:
@@ -85,13 +144,23 @@ jobs:
           path: .task_results/
           key: task-result-${{ matrix.script }}-${{ env.TODAY }}
 
-      - name: Cache AI-ROUTER token rotation state
-        if: matrix.script == 'ai_router.py'
-        uses: actions/cache@v4
+      # hashFiles 守卫：state 文件不存在（脚本早夭）时跳过保存，避免 save 步骤报错
+      - name: Save AI-ROUTER token rotation state
+        if: always() && matrix.script == 'ai_router.py' && hashFiles('.ai_router_state.json') != ''
+        uses: actions/cache/save@v4
         with:
           path: .ai_router_state.json
           key: ai-router-state-${{ github.run_id }}
-          restore-keys: ai-router-state-
+
+      # state 双通道冗余（与任务结果 artifact 同思路）：防 cache 保存偶发静默失败断 RTR 链
+      - name: Upload AI-ROUTER state artifact
+        if: always() && matrix.script == 'ai_router.py' && hashFiles('.ai_router_state.json') != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-router-state
+          path: .ai_router_state.json
+          retention-days: 7
 
       - name: Upload task result artifact
         if: always()

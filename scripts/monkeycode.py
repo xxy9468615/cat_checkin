@@ -337,40 +337,37 @@ def _run_one(acc: Dict[str, Optional[str]], idx: int, total: int) -> Tuple[bool,
     h, headers, user_name = build_session(cookie, email, password, is_multi=(total > 1))
     masked_name = mask_str(user_name or email or "用户")
 
-    resp, status = api(h, "GET", "/api/v1/users/wallet/checkin", headers)
-    ensure(
-        isinstance(status, dict) and status.get("code") == 0,
-        f"查询签到状态失败 (HTTP {resp.code}): {resp.text[:200]}",
+    # 直接 POST 签到，不做 GET 预判（ai_router 2026-08-19 事故的同型防御：
+    # GET 状态字段 checked_in 的语义可能与 POST 幂等信号不一致，若实测恒 true，
+    # 真正发奖励的 POST 会被永久跳过）。POST 自身幂等，每日多花一次 ~0.1s 的
+    # PoW 求解（d=3），换「已签/未签」判定只依赖发奖接口本身的信号。
+    captcha_token = fetch_captcha_token(h, headers)
+    resp, result = api(
+        h,
+        "POST",
+        "/api/v1/users/wallet/checkin",
+        headers,
+        json_data={"captcha_token": captcha_token},
     )
 
-    if (status.get("data") or {}).get("checked_in"):
+    if os.getenv("DEBUG"):
+        print("[DEBUG] checkin response:", json.dumps(result, ensure_ascii=False))
+
+    if not isinstance(result, dict):
+        raise RuntimeError(f"响应无法解析 (HTTP {resp.code}): {resp.text[:200]}")
+
+    code = result.get("code", -1)
+    message = result.get("message", "未知错误")
+    checked_in = (result.get("data") or {}).get("checked_in", False) if isinstance(result.get("data"), dict) else False
+
+    if code == 0 and checked_in:
+        lines.append(f"{prefix_label}用户【{masked_name}】签到成功，获得 100 积分")
+    elif "已签" in message or "already" in message.lower():
         lines.append(f"{prefix_label}用户【{masked_name}】今日已签到，无需重复签到")
+    elif code == 0:
+        raise RuntimeError("code=0 但 checked_in=false，签到未生效")
     else:
-        captcha_token = fetch_captcha_token(h, headers)
-        resp, result = api(
-            h,
-            "POST",
-            "/api/v1/users/wallet/checkin",
-            headers,
-            json_data={"captcha_token": captcha_token},
-        )
-
-        if os.getenv("DEBUG"):
-            print("[DEBUG] checkin response:", json.dumps(result, ensure_ascii=False))
-
-        if not isinstance(result, dict):
-            raise RuntimeError(f"响应无法解析 (HTTP {resp.code}): {resp.text[:200]}")
-
-        code = result.get("code", -1)
-        message = result.get("message", "未知错误")
-        checked_in = (result.get("data") or {}).get("checked_in", False) if isinstance(result.get("data"), dict) else False
-
-        if code == 0 and checked_in:
-            lines.append(f"{prefix_label}用户【{masked_name}】签到成功，获得 100 积分")
-        elif code == 0:
-            raise RuntimeError("code=0 但 checked_in=false，签到未生效")
-        else:
-            raise RuntimeError(f"{message} (code={code})")
+        raise RuntimeError(f"{message} (code={code})")
 
     wallet_lines = get_wallet_info_lines(h, headers)
     lines.extend(wallet_lines)

@@ -9,6 +9,7 @@ Latvi 因 24h 签到间隔约束固定在 18:00 运行，10:00 报告取其昨�
 """
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import json
 import os
@@ -21,6 +22,7 @@ ROOT_DIR = BASE_DIR.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
+from common import Http  # noqa: E402
 from daily_report import build_report, send_email, send_resend  # noqa: E402
 
 # Latvi 的结果文件名（24h 间隔约束，18:00 运行，报告取昨日结果）
@@ -42,6 +44,14 @@ EXPECTED_RESULTS: Dict[str, str] = {
     "latvi.json": "latvi.py",
 }
 
+# 有独立 workflow 与自身恢复机制的站点（不参与报告触发的自动重跑）：
+# workbuddy/modelscope/latvi 各有专属调度（QStash 接力 / 奖励窗口 / 24h 冷却锚点），
+# 自动 dispatch 反而可能干扰其接力链。其余站点由 checkin.yml 矩阵统一承载。
+NON_MATRIX_SCRIPTS = {"workbuddy.py", "modelscope.py", "latvi.py"}
+CHECKIN_MATRIX_SCRIPTS = sorted(
+    script for script in EXPECTED_RESULTS.values() if script not in NON_MATRIX_SCRIPTS
+)
+
 
 def _load_single_result(path: Path, accepted_dates: Set[str]) -> Optional[dict]:
     """读取并校验单个任务结果 JSON（date 须在 accepted_dates 白名单内）。"""
@@ -62,8 +72,11 @@ def _load_single_result(path: Path, accepted_dates: Set[str]) -> Optional[dict]:
         return None
 
 
-def collect_all_results(today: str, yesterday: str) -> List[Tuple[bool, Path, str, float]]:
-    """收集所有任务结果并转换为 build_report 所需格式。"""
+def collect_all_results(today: str, yesterday: str) -> Tuple[List[Tuple[bool, Path, str, float]], Dict[str, dict]]:
+    """收集所有任务结果。返回 (build_report 所需元组列表, 原始结果字典 key→data)。
+
+    原始字典供归档使用（key 区分 workbuddy-account-1/2 等同名脚本多账号）。
+    """
     collected: Dict[str, dict] = {}
 
     # 递归扫描 .task_results/（主路径：gh run download 会按 artifact 名建子目录，
@@ -103,7 +116,119 @@ def collect_all_results(today: str, yesterday: str) -> List[Tuple[bool, Path, st
         output = str(data.get("output") or "")
         out.append((ok, path, output, elapsed))
 
-    return out
+    return out, collected
+
+
+def _emit_failed_sites(collected: Dict[str, dict]) -> List[str]:
+    """汇总失败/缺席站点并写入 GITHUB_OUTPUT（供 report.yml 自动重跑 step 使用）。
+
+    输出两个 step output：
+    - failed_sites  全部失败脚本名（含独立 workflow 站点，供日志/排查）
+    - failed_matrix 其中属于 checkin.yml 矩阵的脚本（自动重跑仅 dispatch 这些）
+    """
+    failed_scripts = sorted(
+        {str(d.get("script")) for d in collected.values() if not d.get("ok")} - {""}
+    )
+    failed_matrix = [s for s in CHECKIN_MATRIX_SCRIPTS if s in failed_scripts]
+    if failed_scripts:
+        print(
+            f"🔴 失败站点：{', '.join(failed_scripts)}"
+            f"（可自动重跑的矩阵站点：{', '.join(failed_matrix) or '无'}）"
+        )
+    gh_output = os.getenv("GITHUB_OUTPUT")
+    if gh_output:
+        with open(gh_output, "a", encoding="utf-8") as fh:
+            fh.write(f"failed_sites={','.join(failed_scripts)}\n")
+            fh.write(f"failed_matrix={','.join(failed_matrix)}\n")
+    return failed_matrix
+
+
+def archive_daily_summary(collected: Dict[str, dict], today: str) -> None:
+    """将当日汇总追加到仓库 data 分支的月度 JSON（best-effort，绝不阻塞报告链路）。
+
+    文件 data/checkins-YYYY-MM.json：{ "YYYY-MM-DD": { "<站点键>": {"ok", "elapsed"} } }，
+    同日重跑时新结果覆盖旧条目。解锁 30 天成功率 / 断签站点等历史分析
+    （此前唯一的历史留存只有邮件）。
+    凭据：GH_PAT 或 GITHUB_TOKEN（需 contents: write）；本地无 token 时跳过。
+    """
+    if os.getenv("ARCHIVE_SUMMARY", "true").lower() in {"0", "false", "no"}:
+        return
+    token = os.getenv("GH_PAT") or os.getenv("GITHUB_TOKEN") or ""
+    repo = os.getenv("GITHUB_REPOSITORY", "")
+    if not token or not repo:
+        print("ℹ️ 历史归档跳过：非 CI 环境或未配置 GH_PAT/GITHUB_TOKEN")
+        return
+
+    branch = os.getenv("ARCHIVE_BRANCH", "data")
+    path = f"data/checkins-{today[:7]}.json"
+    api_base = f"https://api.github.com/repos/{repo}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    h = Http()
+
+    try:
+        # 1. 确保 data 分支存在（首次从默认分支锚定；已存在时创建返回 422，忽略）
+        ref = h.request("GET", f"{api_base}/git/ref/heads/{branch}", headers=headers)
+        if ref.code != 200:
+            repo_info = h.request("GET", api_base, headers=headers).json({}) or {}
+            default_branch = repo_info.get("default_branch") or "main"
+            head = h.request("GET", f"{api_base}/git/ref/heads/{default_branch}", headers=headers)
+            head_sha = ((head.json({}) or {}).get("object") or {}).get("sha", "")
+            if head.code != 200 or not head_sha:
+                print(f"⚠️ 历史归档跳过：无法解析默认分支 HEAD (HTTP {head.code})")
+                return
+            created = h.request(
+                "POST", f"{api_base}/git/refs", headers=headers,
+                json_data={"ref": f"refs/heads/{branch}", "sha": head_sha},
+            )
+            if created.code not in (201, 422):
+                print(f"⚠️ 历史归档跳过：创建 {branch} 分支失败 (HTTP {created.code}) {created.text[:120]}")
+                return
+
+        # 2. 读取当月文件（404 = 当月首次写入）
+        blob = h.request("GET", f"{api_base}/contents/{path}?ref={branch}", headers=headers)
+        if blob.code == 200:
+            info = blob.json({}) or {}
+            blob_sha = info.get("sha", "")
+            raw = (info.get("content") or "").replace("\n", "")
+            month_data = json.loads(base64.b64decode(raw)) if raw else {}
+            if not isinstance(month_data, dict):
+                month_data = {}
+        elif blob.code == 404:
+            blob_sha = ""
+            month_data = {}
+        else:
+            print(f"⚠️ 历史归档跳过：读取 {path} 失败 (HTTP {blob.code})")
+            return
+
+        # 3. 覆盖式写入今日条目并提交
+        month_data[today] = {
+            (key[:-5] if key.endswith(".json") else key): {
+                "ok": bool(d.get("ok")),
+                "elapsed": d.get("elapsed", 0),
+            }
+            for key, d in sorted(collected.items())
+        }
+        content = base64.b64encode(
+            json.dumps(month_data, ensure_ascii=False, indent=2).encode("utf-8")
+        ).decode("ascii")
+        payload = {
+            "message": f"data: {today} checkin summary ({len(collected)} sites)",
+            "branch": branch,
+            "content": content,
+        }
+        if blob_sha:
+            payload["sha"] = blob_sha
+        put = h.request("PUT", f"{api_base}/contents/{path}", headers=headers, json_data=payload)
+        if put.code in (200, 201):
+            print(f"🗂️ 当日汇总已归档 → {branch}:{path}")
+        else:
+            print(f"⚠️ 历史归档写入失败 (HTTP {put.code}) {put.text[:120]}")
+    except Exception as e:
+        print(f"⚠️ 历史归档异常（不影响报告发送）: {e}")
 
 
 def main() -> None:
@@ -112,11 +237,15 @@ def main() -> None:
     today = os.getenv("TODAY") or now.strftime("%Y-%m-%d")
     yesterday = (now - dt.timedelta(days=1)).strftime("%Y-%m-%d")
 
-    results = collect_all_results(today, yesterday)
+    results, collected = collect_all_results(today, yesterday)
 
     if not results:
         print("❌ 今日（10:00 前）未收集到任何完成的签到任务结果，跳过推送。")
         sys.exit(1)
+
+    # 尽早输出失败清单（GITHUB_OUTPUT）：即使后续邮件通道全失败（exit 1），
+    # report.yml 的自动重跑 step（if: always()）也能拿到 failed_matrix
+    _emit_failed_sites(collected)
 
     title, report, fail_count = build_report(results)
     print("\n========== 每日统一汇总 ==========")
@@ -140,6 +269,8 @@ def main() -> None:
             encoding="utf-8",
         )
         print("🔖 已写入今日发送标记 .report_sent")
+        # 报告送达后归档当日汇总（best-effort，失败仅警告）
+        archive_daily_summary(collected, today)
         # 邮件已送达即视为本次运行成功（任务失败详情已在邮件正文的红卡片里）：
         # exit 0 让 run 结论为 success，report.yml 的 API 去重（只认 success run）
         # 才能兜住 marker cache 保存静默失败时的重复发送场景
