@@ -40,6 +40,8 @@ jobs:
       GH_PAT: ${{ secrets.GH_PAT }}
       WORKBUDDY_COOKIE: ${{ secrets[matrix.secret] }}
       WORKBUDDY_WAIT_TRAVEL: "true"
+      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
 
     steps:
       - uses: actions/checkout@v4

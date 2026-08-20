@@ -8,11 +8,11 @@ import re
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from common import Http, env, must_match, find, main_guard, schedule_repo_dispatch
+from common import Http, env, must_match, find, main_guard, schedule_repo_dispatch, upstash_redis_command
 
 # Latvi 是 24 小时冷却制，不是每天固定时间刷新。
 # 需要记录上次成功签到时间，下次在 +24h 之后才能再签。
-# 状态持久化：本地 /data/latvi_state.json（app_runner 环境），GitHub Actions 用 cache（.latvi_state.json）。
+# 状态持久化：优先 Upstash Redis（cat_checkin:state:latvi），本地 /data/latvi_state.json 或 .latvi_state.json 兜底备份。
 #
 # 接力调度（对齐 workbuddy 放风模式）：签到成功后按「本次时间 + 24h + 3~5 分钟」
 # 通过 QStash 延时触发 repository_dispatch（latvi_next_sign），下一个 run 在签到
@@ -22,6 +22,7 @@ from common import Http, env, must_match, find, main_guard, schedule_repo_dispat
 PREFIX = "LATVI_"
 BJT = timezone(timedelta(hours=8))
 STATE_FILE = Path(os.getenv("LATVI_STATE_FILE", "/data/latvi_state.json"))
+LATVI_REDIS_KEY = f"{os.getenv('CAT_CHECKIN_REDIS_PREFIX', 'cat_checkin:').rstrip(':')}:state:latvi"
 
 # QStash 接力调度的事件名（latvi.yml 的 repository_dispatch 类型）
 DISPATCH_EVENT = "latvi_next_sign"
@@ -32,23 +33,61 @@ INLINE_WAIT_MAX = 240
 
 
 def _get_last_sign_time() -> datetime | None:
-    """读取上次成功签到时间"""
-    if not STATE_FILE.exists():
-        return None
-    try:
-        data = json.loads(STATE_FILE.read_text())
-        ts = data.get("last_sign_ts")
-        if ts:
-            return datetime.fromtimestamp(ts, tz=BJT)
-    except Exception:
-        pass
+    """读取上次成功签到时间（优先 Upstash Redis，本地文件兜底）"""
+    # 1. 优先从 Upstash Redis 远程读取
+    url = os.getenv("UPSTASH_REDIS_REST_URL", "")
+    token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+    if url and token:
+        try:
+            ok, res = upstash_redis_command(["GET", LATVI_REDIS_KEY])
+            if ok and isinstance(res, dict):
+                raw = res.get("result")
+                if raw:
+                    data = json.loads(raw) if isinstance(raw, str) else raw
+                    if isinstance(data, dict):
+                        ts = data.get("last_sign_ts")
+                        if ts:
+                            return datetime.fromtimestamp(float(ts), tz=BJT)
+        except Exception as e:
+            print(f"⚠️ 从 Redis 读取 Latvi 状态异常: {e}")
+
+    # 2. 本地文件兜底
+    if STATE_FILE.exists():
+        try:
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            ts = data.get("last_sign_ts")
+            if ts:
+                return datetime.fromtimestamp(float(ts), tz=BJT)
+        except Exception:
+            pass
     return None
 
 
 def _set_last_sign_time(ts: datetime) -> None:
-    """写入成功签到时间"""
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps({"last_sign_ts": ts.timestamp()}, ensure_ascii=False))
+    """写入成功签到时间（本地文件 + Upstash Redis 同步持久化）"""
+    state_data = {
+        "last_sign_ts": ts.timestamp(),
+        "last_sign_time": ts.isoformat(),
+    }
+    # 1. 保存本地文件
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(state_data, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print(f"⚠️ 保存 Latvi 本地状态失败: {e}")
+
+    # 2. 同步保存至 Upstash Redis
+    url = os.getenv("UPSTASH_REDIS_REST_URL", "")
+    token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+    if url and token:
+        try:
+            ok, res = upstash_redis_command(["SET", LATVI_REDIS_KEY, json.dumps(state_data, ensure_ascii=False)])
+            if ok:
+                print(f"☁️ Latvi 冷却状态已同步至 Upstash Redis ({LATVI_REDIS_KEY})")
+            else:
+                print(f"⚠️ Latvi 状态同步 Redis 失败: {res}")
+        except Exception as e:
+            print(f"⚠️ Latvi 状态同步 Redis 异常: {e}")
 
 
 def _calc_wait_seconds() -> int:

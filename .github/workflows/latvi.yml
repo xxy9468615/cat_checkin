@@ -58,6 +58,8 @@ jobs:
           QSTASH_URL: ${{ secrets.QSTASH_URL }}
           QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
           GH_PAT: ${{ secrets.GH_PAT }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
         run: |
           python3 scripts/run_task.py scripts/latvi.py
 

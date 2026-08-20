@@ -159,10 +159,13 @@ def fetch_records_from_redis(dates: List[str]) -> Dict[str, Optional[dict]]:
         if not raw:
             continue
         try:
-            if isinstance(raw, str):
-                records[d] = json.loads(raw)
-            elif isinstance(raw, dict):
-                records[d] = raw
+            val = raw.get("result") if isinstance(raw, dict) and "result" in raw else raw
+            if not val:
+                continue
+            if isinstance(val, str):
+                records[d] = json.loads(val)
+            elif isinstance(val, dict):
+                records[d] = val
         except Exception as e:
             print(f"⚠️ 解析 {d} 归档数据失败: {e}", file=sys.stderr)
 

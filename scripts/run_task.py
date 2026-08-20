@@ -25,6 +25,10 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BASE_DIR.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+from common import upstash_redis_pipeline
 
 
 def get_task_title(path: Path) -> str:
@@ -144,6 +148,26 @@ def main() -> None:
             print(f"❌ 结果写入 {result_file} 失败（{exc}），已降级写入 {fallback}")
         except Exception as exc2:
             print(f"❌ 结果写入彻底失败: {exc} / {exc2}")
+
+    # 直写 Upstash Redis 数据库（免依赖 GitHub Actions artifact 跨 run 传输）
+    try:
+        url = os.getenv("UPSTASH_REDIS_REST_URL", "")
+        token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+        if url and token:
+            prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
+            raw_key = f"{prefix}:raw:{today_bj}"
+            res_json = json.dumps(result_dict, ensure_ascii=False, separators=(",", ":"))
+            # 写入当日本日任务结果 Hash 并设置 14 天 TTL
+            ok_redis, detail = upstash_redis_pipeline([
+                ["HSET", raw_key, result_name, res_json],
+                ["EXPIRE", raw_key, 1209600],
+            ])
+            if ok_redis:
+                print(f"📡 任务结果已同步 → Upstash Redis ({raw_key}[{result_name}])")
+            else:
+                print(f"⚠️ Upstash Redis 同步失败: {detail}")
+    except Exception as exc:
+        print(f"ℹ️ Upstash Redis 暂存未写入: {exc}")
 
     if not ok:
         sys.exit(1)

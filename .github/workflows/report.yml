@@ -24,7 +24,7 @@ concurrency:
 jobs:
   report:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
 
     steps:
       - uses: actions/checkout@v4
@@ -39,16 +39,53 @@ jobs:
       - name: Set TODAY
         run: echo "TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_ENV"
 
-      # 缓存不可变：固定 key 会让 save 被跳过（状态永不更新）。
-      # 用 run_id 做唯一 key 写入，靠 restore-keys 前缀回退到上一次的状态。
-      - name: Check if report sent today
+      - name: Check if report sent today (Redis marker)
         id: check_sent
-        uses: actions/cache/restore@v4
-        with:
-          path: .report_sent
-          key: report-sent-${{ env.TODAY }}-${{ github.run_id }}
-          restore-keys: |
-            report-sent-${{ env.TODAY }}-
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          TODAY: ${{ env.TODAY }}
+        run: |
+          python3 <<'EOF'
+          import os, json, sys, urllib.request
+          url = (os.getenv("UPSTASH_REDIS_REST_URL") or "").rstrip("/")
+          token = os.getenv("UPSTASH_REDIS_REST_TOKEN") or ""
+          today = os.getenv("TODAY", "")
+          gh_output = os.getenv("GITHUB_OUTPUT")
+          prefix = (os.getenv("CAT_CHECKIN_REDIS_PREFIX") or "cat_checkin:").rstrip(":")
+          marker_key = f"{prefix}:sent:{today}"
+
+          if not url or not token:
+              if gh_output:
+                  with open(gh_output, "a", encoding="utf-8") as f:
+                      f.write("sent=false\n")
+              sys.exit(0)
+
+          req = urllib.request.Request(
+              f"{url}/get/{marker_key}",
+              headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  data = json.loads(resp.read().decode())
+                  res = data.get("result")
+                  if res:
+                      marker = json.loads(res) if isinstance(res, str) else res
+                      if isinstance(marker, dict) and marker.get("date") == today:
+                          print(f"✅ Redis 发现今日已发送标记: {marker_key} (sent_at={marker.get('sent_at')})")
+                          if gh_output:
+                              with open(gh_output, "a", encoding="utf-8") as f:
+                                  f.write("sent=true\n")
+                                  if marker.get("resend_msg_id"):
+                                      f.write(f"resend_msg_id={marker.get('resend_msg_id')}\n")
+                          sys.exit(0)
+          except Exception as e:
+              print(f"⚠️ 检查 Redis 发送标记异常: {e}", file=sys.stderr)
+
+          if gh_output:
+              with open(gh_output, "a", encoding="utf-8") as f:
+                  f.write("sent=false\n")
+          EOF
 
       - name: Verify QStash email delivery
         id: delivery
@@ -69,20 +106,17 @@ jobs:
             exit 0
           fi
 
-          # 1. 优先检查恢复出来的 marker 文件（彻底避开 prefix match 时 cache-hit 恒为 false 的问题）
-          if [ -f .report_sent ]; then
-            MARKER_DATE=$(python3 -c "import json; print(json.load(open('.report_sent', encoding='utf-8')).get('date', ''))" 2>/dev/null || echo "")
-            if [ "$MARKER_DATE" = "$TODAY" ]; then
-              # QStash 投递明确失败（重试耗尽入 DLQ）→ 触发重发
-              if [ "${{ steps.delivery.outputs.delivery }}" = "failed" ]; then
-                echo "skip=false" >> "$GITHUB_OUTPUT"
-                echo "❌ QStash 报告邮件投递失败（重试耗尽），触发重发"
-                exit 0
-              fi
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              echo "✅ 今日报告已于更早时间成功推送，跳过重复发送 (Marker Hit: $TODAY)"
+          # 1. 优先检查 Redis 发送标记
+          if [ "${{ steps.check_sent.outputs.sent }}" = "true" ]; then
+            # QStash 投递明确失败（重试耗尽入 DLQ）→ 触发重发
+            if [ "${{ steps.delivery.outputs.delivery }}" = "failed" ]; then
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              echo "❌ QStash 报告邮件投递失败（重试耗尽），触发重发"
               exit 0
             fi
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "✅ 今日报告已于更早时间成功推送，跳过重复发送 (Redis Marker Hit: $TODAY)"
+            exit 0
           fi
 
           # 2. 兜底 API 查重（纯净 stdout 输出，debug 信息输出到 stderr，防多行污染变量）
@@ -116,104 +150,6 @@ jobs:
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
-
-      # 1. 主路径：跨 run 下载各任务的 artifact 结果。
-      #    注意：download-artifact action 默认只可见当前 run 的 artifact（各任务在别的 run），
-      #    cache 的 restore-keys 前缀也只命中最近一条（矩阵每腿独立保存），
-      #    因此必须用 gh run download 按 run-id 跨 run 拉取。
-      - name: Download task results from task runs
-        if: steps.should_run.outputs.skip != 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -uo pipefail
-          TODAY_BJ=$(TZ=Asia/Shanghai date +%Y-%m-%d)
-          YDAY_BJ=$(TZ=Asia/Shanghai date -d "yesterday" +%Y-%m-%d)
-          fetch_latest() {  # fetch_latest <workflow-name> <artifact-pattern> <min-bj-date>
-            local wf="$1" pattern="$2" mind="$3" raw rids
-            # 只取 min-date 之后完成的 run：防止 10:00 时今日 run 尚未完成，
-            # 一路回退拿昨日 run 的过期 artifact（retention 已过 → 下载失败/白名单丢弃）
-            raw=$(gh run list --workflow "$wf" --status completed --limit 10 \
-                  --json databaseId,createdAt --jq '.[] | [.databaseId, .createdAt] | @tsv' 2>/dev/null || true)
-            rids=$(printf '%s\n' "$raw" | python3 -c '
-          import sys, datetime as dt
-          tz = dt.timezone(dt.timedelta(hours=8))
-          mind = sys.argv[1]
-          for line in sys.stdin:
-              parts = line.rstrip("\n").split("\t")
-              if len(parts) != 2:
-                  continue
-              rid, created = parts
-              try:
-                  bj = dt.datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone(tz)
-              except ValueError:
-                  continue
-              if bj.strftime("%Y-%m-%d") >= mind:
-                  print(rid)
-          ' "$mind")
-            if [ -z "$rids" ]; then
-              echo "⚠️ $wf 在 $mind 起没有已完成的 run，跳过（期望清单会标红）"
-              return 0
-            fi
-            local tried=0 rid stage
-            for rid in $rids; do
-              tried=$((tried+1))
-              [ "$tried" -gt 3 ] && break
-              echo "⬇️ $wf（run $rid）: $pattern"
-              # gh run download 没有覆盖参数：直接解压进 .task_results 时，同名 artifact
-              #（旧矩阵 run 与专用 workflow run 共用 artifact 名）已存在的文件会使其整体
-              # 报错 "file exists"（ModelScope 红卡事故 2026-08-17）。
-              # 因此先落到隔离暂存目录，成功后再覆盖合并进 .task_results（新数据胜出）。
-              stage=".task_stage.$$"
-              rm -rf "$stage"
-              if gh run download "$rid" --pattern "$pattern" --dir "$stage"; then
-                file_count=$(find "$stage" -name "*.json" 2>/dev/null | wc -l)
-                if [ "$file_count" -eq 0 ]; then
-                  echo "⚠️ $wf run $rid 下载成功但未发现 .json 文件，尝试次新 run"
-                  rm -rf "$stage"
-                  continue
-                fi
-                mkdir -p .task_results
-                cp -rf "$stage"/. .task_results/
-                rm -rf "$stage"
-                echo "✅ $wf 结果已下载（$file_count 个 JSON）"
-                return 0
-              fi
-              rm -rf "$stage"
-              echo "⚠️ $wf run $rid 下载失败（保留期已过或网络错误），尝试次新 run"
-            done
-            echo "⚠️ $wf 全部候选 run 下载失败（期望清单会标红）"
-          }
-          # 用工作流文件名（.yml）而非显示名称查询：名称可改，文件名稳定。
-          # gh run list --workflow <文件名> 始终可用；显示名称曾改名导致 API 404 → 结果全红卡。
-          fetch_latest "checkin.yml" "task-result-*" "$TODAY_BJ"
-          fetch_latest "workbuddy.yml" "workbuddy-result-*" "$TODAY_BJ"
-          # ModelScope 单独 09:10 跑（魔粒奖励凌晨未开放，混在 00:50 矩阵必失败）
-          fetch_latest "modelscope.yml" "task-result-modelscope.py" "$TODAY_BJ"
-          # Latvi 固定 18:00 运行（24h 间隔约束），10:00 报告取最近一次（昨日）结果
-          fetch_latest "latvi.yml" "task-result-latvi.py" "$YDAY_BJ"
-
-      # 2. 兜底：从 cache 恢复（前缀命中最近一条单腿结果，仅作补充）
-      - name: Restore task results from cache (fallback)
-        if: steps.should_run.outputs.skip != 'true'
-        uses: actions/cache/restore@v4
-        with:
-          path: .task_results/
-          key: task-results-${{ env.TODAY }}-${{ github.run_id }}
-          restore-keys: |
-            task-result-
-        continue-on-error: true
-
-      - name: Verify collected result files
-        if: steps.should_run.outputs.skip != 'true'
-        run: |
-          count=$(find .task_results -name "*.json" 2>/dev/null | wc -l)
-          echo "📊 .task_results/ 目录共发现 $count 份任务结果 JSON"
-          if [ "$count" -eq 0 ]; then
-            echo "⚠️ 未发现任何任务结果文件"
-            exit 1
-          fi
-          echo "✅ 结果文件就绪，开始执行统一邮件汇总推送"
 
       - name: Send unified report
         id: send_report
@@ -279,12 +215,3 @@ jobs:
           else
             echo "⚠️ 自动重跑触发失败，请人工检查"
           fi
-
-      # always()：脚本有任务失败时 exit 1，但邮件已发出、标记已写，必须照常保存；
-      # hashFiles：无结果中止时标记不存在，跳过保存（让 10:30 兜底重试）
-      - name: Save report sent marker
-        if: always() && steps.should_run.outputs.skip != 'true' && hashFiles('.report_sent') != ''
-        uses: actions/cache/save@v4
-        with:
-          path: .report_sent
-          key: report-sent-${{ env.TODAY }}-${{ github.run_id }}

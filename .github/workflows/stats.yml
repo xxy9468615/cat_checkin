@@ -1,6 +1,11 @@
 name: Check-in Statistics & Periodic Analytics
 
 on:
+  schedule:
+    # 1. 自动周报：每周一 10:00 北京时间（UTC 02:00）自动汇总上周并推送
+    - cron: "0 2 * * 1"
+    # 2. 自动月报：每月 1 日 10:00 北京时间（UTC 02:00）自动汇总上月并推送
+    - cron: "0 2 1 * *"
   workflow_dispatch:
     inputs:
       period:
@@ -77,6 +82,18 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
         run: |
           set -uo pipefail
+
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            DAY_OF_MONTH=$(date +%d)
+            if [ "$DAY_OF_MONTH" = "01" ]; then
+              echo "📅 定时月报调度（每月 1 日）：汇总上月签到数据并推送邮件"
+              python3 scripts/stats.py --period last_month --push
+            else
+              echo "📅 定时周报调度（每周一）：汇总上周签到数据并推送邮件"
+              python3 scripts/stats.py --period last_week --push
+            fi
+            exit 0
+          fi
 
           ARGS=(--period "${{ inputs.period }}")
 

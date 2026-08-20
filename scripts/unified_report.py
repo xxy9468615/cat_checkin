@@ -21,7 +21,7 @@ ROOT_DIR = BASE_DIR.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from common import upstash_redis_pipeline  # noqa: E402
+from common import upstash_redis_command, upstash_redis_pipeline  # noqa: E402
 from daily_report import _extract_fields, build_report, send_email, send_resend  # noqa: E402
 from stats import aggregate_stats, fetch_records_from_redis, resolve_date_range  # noqa: E402
 
@@ -79,29 +79,74 @@ def collect_all_results(today: str, yesterday: str) -> Tuple[List[Tuple[bool, Pa
     """
     collected: Dict[str, dict] = {}
 
-    # 递归扫描 .task_results/（主路径：gh run download 会按 artifact 名建子目录，
-    # 如 .task_results/task-result-glados.py/glados.json，不能只扫顶层）
+    # === 1. 优先从 Upstash Redis 读取当日原始结果（Hash：field=result_name, value=JSON）===
+    url = os.getenv("UPSTASH_REDIS_REST_URL", "")
+    token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+    if url and token:
+        try:
+            prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
+            raw_key_today = f"{prefix}:raw:{today}"
+            ok, res = upstash_redis_command(["HGETALL", raw_key_today])
+            if ok and isinstance(res, dict):
+                raw_hash = res.get("result")
+                field_map = {}
+                if isinstance(raw_hash, dict):
+                    field_map = raw_hash
+                elif isinstance(raw_hash, list):
+                    for i in range(0, len(raw_hash), 2):
+                        if i + 1 < len(raw_hash):
+                            field_map[str(raw_hash[i])] = raw_hash[i + 1]
+
+                for field, value in field_map.items():
+                    try:
+                        data = json.loads(value) if isinstance(value, str) else value
+                        if isinstance(data, dict):
+                            date_val = data.get("date")
+                            dates = {today, yesterday} if field == LATVI_RESULT_FILE else {today}
+                            if date_val in dates:
+                                collected[field] = data
+                    except Exception:
+                        pass
+
+            # Latvi 24h 间隔约束：若今日 Redis 暂存中没有 latvi.json，尝试读取昨日
+            if LATVI_RESULT_FILE not in collected:
+                raw_key_yesterday = f"{prefix}:raw:{yesterday}"
+                ok2, res2 = upstash_redis_command(["HGET", raw_key_yesterday, LATVI_RESULT_FILE])
+                if ok2 and isinstance(res2, dict):
+                    lv_val = res2.get("result")
+                    if lv_val:
+                        try:
+                            lv_data = json.loads(lv_val) if isinstance(lv_val, str) else lv_val
+                            if isinstance(lv_data, dict) and lv_data.get("date") == yesterday:
+                                collected[LATVI_RESULT_FILE] = lv_data
+                        except Exception:
+                            pass
+            if collected:
+                print(f"📡 已从 Upstash Redis 汇聚 {len(collected)} 个任务结果")
+        except Exception as e:
+            print(f"⚠️ 从 Upstash Redis 读取任务结果异常（回退本地扫描）: {e}")
+
+    # === 2. 兜底/本地扫描：.task_results/ 目录（确保本地调试与未配置 Redis 时的可用性）===
     task_results_dir = Path(os.getenv("TASK_OUTPUT_DIR", ".task_results"))
     if task_results_dir.exists() and task_results_dir.is_dir():
         for json_file in sorted(task_results_dir.rglob("*.json")):
-            # 以唯一文件名作为 key，避免同一脚本的多账号结果被脚本名覆盖合并；
-            # sorted 字典序让 artifact 子目录（task-result-*）后遍历、覆盖 cache 恢复的同名旧文件
-            dates = {today, yesterday} if json_file.name == LATVI_RESULT_FILE else {today}
-            res = _load_single_result(json_file, dates)
-            if res:
-                collected[json_file.name] = res
+            if json_file.name not in collected:
+                dates = {today, yesterday} if json_file.name == LATVI_RESULT_FILE else {today}
+                res = _load_single_result(json_file, dates)
+                if res:
+                    collected[json_file.name] = res
 
-    # 期望清单比对：缺席任务合成显式失败卡片（红卡），让「任务没跑/结果丢失」可见
+    # === 3. 期望清单比对：缺席任务合成显式失败卡片（红卡），让「任务没跑/结果丢失」可见 ===
     for missing in sorted(set(EXPECTED_RESULTS) - set(collected)):
         print(f"⚠️ 期望结果缺失: {missing}")
         collected[missing] = {
             "ok": False,
             "script": EXPECTED_RESULTS[missing],
-            "output": "结果未收集到（任务未运行或 artifact/cache 丢失）",
+            "output": "结果未收集到（任务未运行或数据库中未暂存）",
             "elapsed": 0.0,
         }
 
-    # 转换为元组并按脚本名排序
+    # === 4. 转换为元组并按脚本名排序 ===
     out: List[Tuple[bool, Path, str, float]] = []
     for _key, data in sorted(collected.items()):
         ok = bool(data.get("ok"))
@@ -274,7 +319,35 @@ def main() -> None:
             json.dumps(marker, ensure_ascii=False),
             encoding="utf-8",
         )
-        print("🔖 已写入今日发送标记 .report_sent")
+        print("🔖 已写入今日本地发送标记 .report_sent")
+
+        # 写入 Upstash Redis 发送标记（TTL 7 天，跨 runner 强力去重）
+        url = os.getenv("UPSTASH_REDIS_REST_URL", "")
+        token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+        if url and token:
+            try:
+                prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
+                sent_key = f"{prefix}:sent:{today}"
+                ok_sent, d_sent = upstash_redis_pipeline([
+                    ["SET", sent_key, json.dumps(marker, ensure_ascii=False)],
+                    ["EXPIRE", sent_key, 604800],
+                ])
+                if ok_sent:
+                    print(f"🔖 已持久化今日发送标记 → Upstash Redis ({sent_key})")
+                else:
+                    print(f"⚠️ Redis 发送标记写入失败: {d_sent}")
+            except Exception as e:
+                print(f"⚠️ Redis 发送标记写入异常: {e}")
+
+        # 输出 resend_msg_id 到 GITHUB_OUTPUT（供 GitHub Actions 后续步骤使用）
+        gh_output = os.getenv("GITHUB_OUTPUT")
+        if gh_output and resend_msg_id:
+            try:
+                with open(gh_output, "a", encoding="utf-8") as fh:
+                    fh.write(f"resend_msg_id={resend_msg_id}\n")
+            except Exception:
+                pass
+
         # 报告送达后归档当日汇总（best-effort，失败仅警告）
         archive_daily_summary(collected, today)
         # 邮件已送达即视为本次运行成功（任务失败详情已在邮件正文的红卡片里）：
