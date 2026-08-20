@@ -128,7 +128,13 @@ def main():
     # 4. 验证登录状态与获取积分信息
     credit = h.request("GET", f"{BASE_URL}/home.php?mod=spacecp&ac=credit", headers=headers)
     if "访问我的空间" not in credit.text and "个人资料" not in credit.text and "退出" not in credit.text:
-        raise RuntimeError("登录态无效或失效：积分页未检测到用户信息（可能账号密码错误或被风控）")
+        # 回退尝试 bbs 域名
+        bbs_credit = h.request("GET", "https://bbs.pcbeta.com/home.php?mod=spacecp&ac=credit", headers=headers)
+        if "访问我的空间" in bbs_credit.text or "个人资料" in bbs_credit.text or "退出" in bbs_credit.text:
+            credit = bbs_credit
+        else:
+            snippet = strip_tags(credit.text[:300]).replace("\n", " ").strip()
+            raise RuntimeError(f"登录态无效或失效 (HTTP {credit.code})：{snippet or '积分页未检测到用户信息'}")
 
     nick = (
         find(r'访问我的空间">(.+?)<', credit.text)
