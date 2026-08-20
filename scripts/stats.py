@@ -41,19 +41,10 @@ if str(BASE_DIR) not in sys.path:
 
 from common import upstash_redis_command, upstash_redis_pipeline  # noqa: E402
 from daily_report import get_task_title, send_email, send_resend  # noqa: E402
+from task_registry import get_expected_results  # noqa: E402
 
-# 期望任务清单：结果文件名 → 真实脚本（与 unified_report 对齐）
-EXPECTED_RESULTS: Dict[str, str] = {
-    **{f"{name}.json": f"{name}.py" for name in (
-        "glados", "2libra", "bianjie_ai", "dji", "monkeycode",
-        "moxing_vip", "naixi_forum", "sophnet", "tencent_cloudstudio",
-        "ugnas_club", "ai_router", "pcbeta",
-    )},
-    "workbuddy-account-1.json": "workbuddy.py",
-    "workbuddy-account-2.json": "workbuddy.py",
-    "modelscope.json": "modelscope.py",
-    "latvi.json": "latvi.py",
-}
+# 期望任务清单：从统一 task_registry 读取
+EXPECTED_RESULTS: Dict[str, str] = get_expected_results()
 
 TEMPLATES_DIR = BASE_DIR / "templates"
 EMAIL_STATS_TEMPLATE_PATH = TEMPLATES_DIR / "email_stats.html"

@@ -1,15 +1,25 @@
-name: Daily Check-in
+name: Daily Check-in & Unified Task Queue
 
 run-name: >-
-  checkin: ${{ inputs.retry == true && 'auto-retry(report)' || (github.event_name == 'workflow_dispatch' && 'manual' || 'scheduled') }}
+  checkin: ${{ inputs.retry == true && 'auto-retry(report)' || (github.event_name == 'workflow_dispatch' && (inputs.tasks != '' && inputs.tasks || 'manual') || (github.event_name == 'repository_dispatch' && github.event.action || 'scheduled')) }}
 
 on:
   schedule:
-    - cron: "50 16 * * *"  # 北京时间 00:50（GitHub Actions 低谷期）
+    # 1. 晨间集中并发批次：北京时间 00:50（UTC 16:50，Actions 低谷期）执行 11 基础矩阵站点 + 2 WorkBuddy 账号
+    - cron: "50 16 * * *"
+    # 2. 魔粒奖励窗口批次：北京时间 09:10（UTC 01:10）执行 ModelScope 社区签到
+    - cron: "10 1 * * *"
+    # 3. Latvi 兜底锚点批次：北京时间 18:00（UTC 10:00）执行 Latvi 每日奖励及续期
+    - cron: "0 10 * * *"
+  repository_dispatch:
+    types:
+      - run_task
+      - latvi_next_sign
+      - workbuddy_travel_claim
   workflow_dispatch:
     inputs:
-      scripts:
-        description: '要执行的站点脚本，逗号分隔（留空 = 全部矩阵站点）'
+      tasks:
+        description: '要执行的任务ID或脚本，逗号分隔（可选: all, matrix, workbuddy, glados, modelscope 等；留空按当前上下文默认）'
         required: false
         default: ''
         type: string
@@ -21,48 +31,42 @@ on:
 
 permissions:
   contents: read
-  actions: read  # ai_router state 的 artifact 兜底恢复需读取历史 run 的 artifact
+  actions: read  # ai_router / latvi state 的 artifact 兜底恢复需读取历史 run 的 artifact
 
 concurrency:
-  group: checkin-${{ github.ref }}
+  group: checkin-${{ github.ref }}-${{ github.event_name }}-${{ github.event.action || github.event.schedule || inputs.tasks || 'manual' }}
   cancel-in-progress: false
 
 jobs:
   select:
-    # 矩阵选择：cron/手动留空 = 全量；report.yml 自动重跑时只跑指定失败站点。
-    # 站点清单在此维护（新增站点 = 此列表 + unified_report.py EXPECTED_RESULTS 两处同步）。
+    name: Resolve Task Queue
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.pick.outputs.matrix }}
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      task_count: ${{ steps.resolve.outputs.task_count }}
     steps:
-      - name: Pick matrix scripts
-        id: pick
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve execution queue
+        id: resolve
         env:
-          SCRIPTS_INPUT: ${{ inputs.scripts }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          CRON_EXPR: ${{ github.event.schedule }}
+          DISPATCH_TYPE: ${{ github.event.action }}
+          INPUT_TASKS: ${{ inputs.tasks }}
         run: |
-          python3 <<'EOF'
-          import json, os
-          # PCBeta 远景论坛因机房 IP / TLS 指纹 WAF 拦截 (403 异常请求验证) 暂时排除
-          full = ["glados.py", "2libra.py", "bianjie_ai.py", "dji.py", "monkeycode.py",
-                  "moxing_vip.py", "naixi_forum.py", "sophnet.py",
-                  "tencent_cloudstudio.py", "ugnas_club.py", "ai_router.py"]
-          sel = os.environ.get("SCRIPTS_INPUT", "").strip()
-          if sel:
-              wanted = {s.strip() for s in sel.split(",") if s.strip()}
-              picked = [s for s in full if s in wanted]
-              if not picked:
-                  raise SystemExit(f"❌ 输入脚本与矩阵站点无交集：{sel}（可用：{', '.join(full)}）")
-          else:
-              picked = full
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
-              fh.write("matrix=" + json.dumps({"script": picked}) + "\n")
-          print(f"▶️ 本次执行站点：{', '.join(picked)}")
-          EOF
+          python3 scripts/task_registry.py
 
   checkin-matrix:
     needs: select
+    if: needs.select.outputs.task_count != '0'
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.select.outputs.matrix) }}
@@ -72,14 +76,12 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"  # 与本地开发环境对齐，避免 3.12-only 语法只在 CI 爆
+          python-version: "3.12"
 
       - name: Set TODAY
         run: echo "TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_ENV"
 
-      # RTR 状态必须先恢复再跑签到脚本（actions/cache 在步骤执行时恢复、job 结束时保存；
-      # 若缓存步骤放在任务之后，脚本永远读不到恢复的 state，恢复还会覆盖脚本刚写的新链）。
-      # 唯一 run_id key + 前缀回退，与 latvi.yml 同款。
+      # --- AI-ROUTER RTR 状态恢复 ---
       - name: Restore AI-ROUTER token rotation state
         id: ai_state
         if: matrix.script == 'ai_router.py'
@@ -89,7 +91,6 @@ jobs:
           key: ai-router-state-${{ github.run_id }}
           restore-keys: ai-router-state-
 
-      # cache 静默丢失/保存失败的兜底：从最近完成 run 的 state artifact 恢复 RTR 链（扩大检索至前 20 个 run）
       - name: Restore AI-ROUTER state from artifact (fallback)
         if: matrix.script == 'ai_router.py' && steps.ai_state.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -103,11 +104,30 @@ jobs:
             fi
           done
 
-      - name: Run check-in task (${{ matrix.script }})
+      # --- Latvi 24h 冷却状态恢复 ---
+      - name: Restore Latvi state
+        if: matrix.script == 'latvi.py'
+        uses: actions/cache/restore@v4
+        with:
+          path: .latvi_state.json
+          key: latvi-state-${{ github.run_id }}
+          restore-keys: latvi-state-
+
+      # --- 核心任务执行（动态注入参数并毫秒级直写 Upstash Redis）---
+      - name: Execute Check-in Task (${{ matrix.id }})
         env:
           TZ: Asia/Shanghai
           TASK_OUTPUT_DIR: .task_results
-          # === 站点凭证 ===
+          TASK_RESULT_NAME: ${{ matrix.result }}
+          TASK_TIMEOUT: ${{ matrix.timeout }}
+          GITHUB_REPO: ${{ github.repository }}
+          # === 基础设施凭证 ===
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          QSTASH_URL: ${{ secrets.QSTASH_URL }}
+          QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          # === 站点凭证池 ===
           GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
           GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
           GLADOS_AUTO_EXCHANGE: "true"
@@ -139,19 +159,21 @@ jobs:
           AI_ROUTER_PASSWORD: ${{ secrets.AI_ROUTER_PASSWORD }}
           AI_ROUTER_COOKIE: ${{ secrets.AI_ROUTER_COOKIE }}
           AI_ROUTER_ACCOUNTS: ${{ secrets.AI_ROUTER_ACCOUNTS }}
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          # WorkBuddy 动态账号适配
+          WORKBUDDY_COOKIE: ${{ matrix.account == '2' && secrets.WORKBUDDY_COOKIE_2 || secrets.WORKBUDDY_COOKIE }}
+          WORKBUDDY_WAIT_TRAVEL: "true"
+          # ModelScope 双站凭证
+          MODELSCOPE_cookie: ${{ secrets.MODELSCOPE_COOKIE }}
+          MODELSCOPE_HOST: ${{ secrets.MODELSCOPE_HOST }}
+          MODELSCOPE_AI_COOKIE: ${{ secrets.MODELSCOPE_AI_COOKIE }}
+          # Latvi 凭证
+          LATVI_EMAIL: ${{ secrets.LATVI_EMAIL }}
+          LATVI_PASSWORD: ${{ secrets.LATVI_PASSWORD }}
+          LATVI_STATE_FILE: .latvi_state.json
         run: |
           python3 scripts/run_task.py "scripts/${{ matrix.script }}"
 
-      - name: Cache task result
-        if: always()
-        uses: actions/cache@v4
-        with:
-          path: .task_results/
-          key: task-result-${{ matrix.script }}-${{ env.TODAY }}
-
-      # hashFiles 守卫：state 文件不存在（脚本早夭）时跳过保存，避免 save 步骤报错
+      # --- 状态保存 ---
       - name: Save AI-ROUTER token rotation state
         if: always() && matrix.script == 'ai_router.py' && hashFiles('.ai_router_state.json') != ''
         uses: actions/cache/save@v4
@@ -159,22 +181,19 @@ jobs:
           path: .ai_router_state.json
           key: ai-router-state-${{ github.run_id }}
 
-      # state 双通道冗余（与任务结果 artifact 同思路）：防 cache 保存偶发静默失败断 RTR 链
-      - name: Upload AI-ROUTER state artifact
-        if: always() && matrix.script == 'ai_router.py' && hashFiles('.ai_router_state.json') != ''
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
+      - name: Save Latvi state
+        if: always() && matrix.script == 'latvi.py' && hashFiles('.latvi_state.json') != ''
+        uses: actions/cache/save@v4
         with:
-          name: ai-router-state
-          path: .ai_router_state.json
-          retention-days: 7
-          include-hidden-files: true
+          path: .latvi_state.json
+          key: latvi-state-${{ github.run_id }}
 
+      # --- 冗余备份 Artifact ---
       - name: Upload task result artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: task-result-${{ matrix.script }}
+          name: task-result-${{ matrix.id }}
           path: .task_results/
           retention-days: 1
           include-hidden-files: true

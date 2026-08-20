@@ -24,32 +24,17 @@ if str(BASE_DIR) not in sys.path:
 from common import upstash_redis_command, upstash_redis_pipeline  # noqa: E402
 from daily_report import _extract_fields, build_report, send_email, send_resend  # noqa: E402
 from stats import aggregate_stats, fetch_records_from_redis, resolve_date_range  # noqa: E402
+from task_registry import TASKS, get_expected_results  # noqa: E402
 
 # Latvi 的结果文件名（24h 间隔约束，18:00 运行，报告取昨日结果）
-# 注意 run_task.py 用 Path.stem 命名：latvi.py → latvi.json（.py 后缀被剥掉）
 LATVI_RESULT_FILE = "latvi.json"
 
-# 期望任务清单：结果文件名 → 真实脚本（卡片标题从脚本读取）。
-# 与 checkin.yml 矩阵 + 各独立 workflow 一一对应；新增站点/账号时同步维护。
-# 缺席的结果会合成显式失败卡片，杜绝「某站点结果丢失 → 邮件里静默少一张卡」。
-EXPECTED_RESULTS: Dict[str, str] = {
-    **{f"{name}.json": f"{name}.py" for name in (
-        "glados", "2libra", "bianjie_ai", "dji", "monkeycode",
-        "moxing_vip", "naixi_forum", "sophnet", "tencent_cloudstudio",
-        "ugnas_club", "ai_router",
-    )},
-    "workbuddy-account-1.json": "workbuddy.py",
-    "workbuddy-account-2.json": "workbuddy.py",
-    "modelscope.json": "modelscope.py",
-    "latvi.json": "latvi.py",
-}
+# 期望任务清单：从统一 task_registry 读取
+EXPECTED_RESULTS: Dict[str, str] = get_expected_results()
 
-# 有独立 workflow 与自身恢复机制的站点（不参与报告触发的自动重跑）：
-# workbuddy/modelscope/latvi 各有专属调度（QStash 接力 / 奖励窗口 / 24h 冷却锚点），
-# 自动 dispatch 反而可能干扰其接力链。其余站点由 checkin.yml 矩阵统一承载。
-NON_MATRIX_SCRIPTS = {"workbuddy.py", "modelscope.py", "latvi.py"}
+# 基础矩阵任务列表（用于报告失败时触发自动重跑）
 CHECKIN_MATRIX_SCRIPTS = sorted(
-    script for script in EXPECTED_RESULTS.values() if script not in NON_MATRIX_SCRIPTS
+    t["script"] for t in TASKS.values() if "matrix" in t.get("tags", [])
 )
 
 
