@@ -22,7 +22,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from common import upstash_redis_pipeline  # noqa: E402
-from daily_report import build_report, send_email, send_resend  # noqa: E402
+from daily_report import _extract_fields, build_report, send_email, send_resend  # noqa: E402
 
 # Latvi 的结果文件名（24h 间隔约束，18:00 运行，报告取昨日结果）
 # 注意 run_task.py 用 Path.stem 命名：latvi.py → latvi.json（.py 后缀被剥掉）
@@ -165,14 +165,18 @@ def archive_daily_summary(collected: Dict[str, dict], today: str) -> None:
     prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
     now = dt.datetime.now(dt.timezone(dt.timedelta(hours=8)))
     updated_at = now.isoformat()
-    sites = {
-        (key[:-5] if key.endswith(".json") else key): {
+    sites = {}
+    for key, d in sorted(collected.items()):
+        site_key = key[:-5] if key.endswith(".json") else key
+        output_str = str(d.get("output") or "")
+        extracted = _extract_fields(output_str) if output_str else {}
+        sites[site_key] = {
             "ok": bool(d.get("ok")),
             "elapsed": d.get("elapsed", 0),
             "script": d.get("script", ""),
+            "assets": extracted.get("assets", ""),
+            "reward": extracted.get("reward", ""),
         }
-        for key, d in sorted(collected.items())
-    }
     total = len(sites)
     success = sum(1 for s in sites.values() if s["ok"])
     summary = {

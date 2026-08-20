@@ -1,0 +1,97 @@
+name: Check-in Statistics & Periodic Analytics
+
+on:
+  workflow_dispatch:
+    inputs:
+      period:
+        description: '统计周期 (week / last_week / month / last_month / 7days / 30days / custom)'
+        required: true
+        type: choice
+        options:
+          - week
+          - last_week
+          - month
+          - last_month
+          - 7days
+          - 30days
+          - custom
+        default: week
+      start_date:
+        description: '自定义起始日期 (YYYY-MM-DD，仅 period=custom 时有效)'
+        required: false
+        type: string
+        default: ''
+      end_date:
+        description: '自定义结束日期 (YYYY-MM-DD，仅 period=custom 时有效)'
+        required: false
+        type: string
+        default: ''
+      days:
+        description: '自定义近 N 天天数 (留空则使用 period 设置)'
+        required: false
+        type: string
+        default: ''
+      push_email:
+        description: '是否推送统计邮件至邮箱'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stats-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  stats:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Syntax check (stdlib only)
+        run: python3 -m py_compile scripts/*.py
+
+      - name: Run Stats & Analytics Query
+        env:
+          TZ: Asia/Shanghai
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM: ${{ secrets.RESEND_FROM }}
+          RESEND_TO: ${{ secrets.RESEND_TO }}
+          QSTASH_URL: ${{ secrets.QSTASH_URL }}
+          QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
+          MAIL_HOST: ${{ secrets.MAIL_HOST }}
+          MAIL_PORT: ${{ secrets.MAIL_PORT }}
+          MAIL_USER: ${{ secrets.MAIL_USER }}
+          MAIL_PASS: ${{ secrets.MAIL_PASS }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: |
+          set -uo pipefail
+
+          ARGS=(--period "${{ inputs.period }}")
+
+          if [ -n "${{ inputs.start_date }}" ]; then
+            ARGS+=(--start "${{ inputs.start_date }}")
+          fi
+          if [ -n "${{ inputs.end_date }}" ]; then
+            ARGS+=(--end "${{ inputs.end_date }}")
+          fi
+          if [ -n "${{ inputs.days }}" ]; then
+            ARGS+=(--days "${{ inputs.days }}")
+          fi
+          if [ "${{ inputs.push_email }}" = "true" ]; then
+            ARGS+=(--push)
+          fi
+
+          echo "▶️ 执行统计查询: python3 scripts/stats.py ${ARGS[*]}"
+          python3 scripts/stats.py "${ARGS[@]}"
