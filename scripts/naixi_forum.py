@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # cron: 30 9 * * *
 # new Env("奶昔论坛签到")
-from common import Http, env, must_match, find, main_guard
+from common import Http, env, must_match, find, strip_tags, main_guard
 PREFIX = "NAIXI_"
 def main():
     print("【奶昔论坛 签到】")
@@ -16,7 +16,9 @@ def main():
     sign_r=h.request("GET",base+f"/plugin.php?id=k_misign%3Asign&operation=qiandao&format=global_usernav_extra&formhash={fh}&inajax=1&ajaxtarget=k_misign_topb")
     sign_msg=find(r'<!\[CDATA\[(.+?)\]\]>',sign_r.text,"").strip()
     if sign_msg:
-        print(f"签到响应：{sign_msg}")
+        sign_msg=strip_tags(sign_msg)
+        if sign_msg:
+            print(f"签到响应：{sign_msg}")
     page=h.request("GET",base+"/plugin.php?id=k_misign%3Asign")
     lxqd=find(r'id="lxdays" value="(\d+)',page.text,"?"); tdays=find(r'id="lxtdays" value="(\d+)',page.text,"?")
     if lxqd == "?":

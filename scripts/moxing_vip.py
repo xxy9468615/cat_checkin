@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # cron: 5 10 * * *
 # new Env("moxing.vip 签到")
-import hashlib, re
+import hashlib, json, re
 from common import Http, env, find, findall, strip_tags, main_guard, mask_str
 PREFIX = "MOXING_"
 NAV_URL = "https://moxing.vip/"  # 站点导航页：论坛本体迁移时此处列出最新可用域名
@@ -76,7 +76,13 @@ def main():
         k=find(r'y":"(\w+)"',cap); i=find(r'e":"(\w+)"',cap)
         if k and i:
             rr=h.request("POST",domain2+"/api/forum/check-in/sign",headers={**headers,"x-xsrf-token":xsrf},json_data={"captcha":i,"captcha_key":k})
-            msg=find(r'message":"([^"]+)"',rr.text,rr.text[:80])
+            msg=""
+            try:
+                _data=rr.json()
+                if isinstance(_data,dict) and "message" in _data:
+                    msg=str(_data["message"])
+            except Exception:
+                msg=find(r'message":"([^"]+)"',rr.text,rr.text[:80])
     t=find(r'(在线时间</em>\d+ 小时)',prof); u=find(r'<title>(.+)的个人资料',prof,username); g=find(r'用户组.+</a>',prof); j=find(r'积分.+</a>',prof); cr=find(r'威望.+',credit)
     masked_u = mask_str(strip_tags(u))
     print(f"用户名：{masked_u} {strip_tags(g)} {strip_tags(t)} {strip_tags(j)} {strip_tags(cr)} {msg}".strip())

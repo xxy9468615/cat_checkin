@@ -49,12 +49,19 @@ def get_task_title(path: Path) -> str:
 
 
 def _last_meaningful_line(text: str) -> str:
-    """取输出最后一行非空内容，作为失败任务的错误摘要。"""
-    for line in reversed(text.splitlines()):
-        line = line.strip()
-        if line:
+    """取失败任务的错误摘要：优先找含错误关键字的行，否则回退到末尾非汇总行。"""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    error_keywords = ("失败", "Error", "Exception", "失效", "错误", "401", "403", "超时", "无法")
+    skip_prefixes = ("成功 ", "失败 ", "签到总结", "========", "--- ", "国内站", "国际站")
+    for line in reversed(lines):
+        if any(kw in line for kw in error_keywords) and not line.startswith(skip_prefixes):
             return line
-    return ""
+    for line in reversed(lines):
+        if not line.startswith(skip_prefixes):
+            return line
+    return lines[-1]
 
 
 def build_report(results: Iterable[Tuple[bool, Path, str, float]]) -> Tuple[str, str, int]:
@@ -198,15 +205,20 @@ def _extract_fields(output: str) -> Dict[str, str]:
             fields.setdefault("exchange", val)
 
     # --- 成功/失败计数 ---
-    ok_match = re.findall(r"(?:成功|签到成功|已签到|✅)\s*(\d+)", out)
-    fail_match = re.findall(r"(?:失败|失败账号|签到失败|❌)\s*(\d+)", out)
+    # 仅匹配多账号汇总「成功 X/Y」(Y>1)，避免「成功N次」内联描述误触发
+    ok_match = re.findall(r"成功\s+(\d+)\s*/\s*(\d+)", out)
+    fail_match = re.findall(r"失败\s+(\d+)\s*/\s*(\d+)", out)
     if ok_match:
-        fields.setdefault("summary", f"✅ {ok_match[-1]}")
+        ok_num, total = ok_match[-1]
+        if int(total) > 1:
+            fields.setdefault("summary", f"✅ {ok_num}/{total}")
     if fail_match:
-        if "summary" in fields:
-            fields["summary"] += f" ❌ {fail_match[-1]}"
-        else:
-            fields.setdefault("summary", f"❌ {fail_match[-1]}")
+        fail_num, total = fail_match[-1]
+        if int(total) > 1:
+            if "summary" in fields:
+                fields["summary"] += f" ❌ {fail_num}/{total}"
+            else:
+                fields.setdefault("summary", f"❌ {fail_num}/{total}")
 
     return fields
 
@@ -218,6 +230,16 @@ def _truncate_output(text: str, max_length: int = 1200) -> str:
     if len(text) <= max_length:
         return text
     return "…（前文已截断）\n" + text[-max_length:]
+
+
+def _sanitize_output(text: str) -> str:
+    """清理脚本输出中的 HTML 标签和 Unicode 转义，用于卡片正文渲染前兜底。"""
+    text = re.sub(r"<!\[CDATA\[|\]\]>", "", text)
+    if "\\u" in text:
+        text = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), text)
+    text = re.sub(r"<img\b[^>]*\balt=[\"']([^\"']*)[\"'][^>]*>", r"\1", text, flags=re.I)
+    text = re.sub(r"<[^>]*>", "", text)
+    return _html.unescape(text).strip()
 
 
 def _build_task_card(ok: bool, path: Path, output: str, elapsed: float) -> str:
@@ -253,8 +275,8 @@ def _build_task_card(ok: bool, path: Path, output: str, elapsed: float) -> str:
     if fields.get("summary"):
         badges_html += badge("#fff7e6", "#b45309", fields["summary"])
 
-    # 截断输出用于卡片正文，保留原始换行符
-    body = _truncate_output(output, 1200)
+    # 截断 + 兜底清洗后渲染卡片正文，保留原始换行符
+    body = _sanitize_output(_truncate_output(output, 1200))
     body_html = _html.escape(body).replace("\n", "<br>")
 
     return f"""

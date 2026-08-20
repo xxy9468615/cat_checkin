@@ -316,7 +316,13 @@ def findall(pattern: str, text: str, flags: int = 0) -> list[str]:
     return out
 
 def strip_tags(s: Any) -> str:
-    return html.unescape(re.sub(r"<[^>]*>", "", str(s))).strip()
+    s = str(s)
+    # 移除 CDATA 标记，保留内容
+    s = re.sub(r"<!\[CDATA\[|\]\]>", "", s)
+    # 提取 <img> 的 alt/title 文本后再移除标签（否则 alt="今日已签" 会跟着标签一起消失）
+    s = re.sub(r"<img\b[^>]*\balt=[\"']([^\"']*)[\"'][^>]*>", r"\1", s, flags=re.I)
+    s = re.sub(r"<img\b[^>]*\btitle=[\"']([^\"']*)[\"'][^>]*>", r"\1", s, flags=re.I)
+    return html.unescape(re.sub(r"<[^>]*>", "", s)).strip()
 
 def mask_str(value: Any, keep_start: int | None = None, keep_end: int | None = None, mask_char: str = "*") -> str:
     """智能脱敏字符串（用户名、手机号、邮箱、账号 ID 等）。
