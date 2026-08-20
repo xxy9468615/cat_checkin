@@ -118,6 +118,9 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
+    # --- AgentRouter（暂时排除：CI 数据中心 IP 被 Aliyun WAF 滑块验证码拦截，登录=签到无法自动执行。
+    #      保留注册供报告追踪（未运行显示"待执行"而非红卡）与日后家庭网络/干净 IP 运行；
+    #      手动触发仍可用 INPUT_TASKS=agentrouter）---
     "agentrouter": {
         "id": "agentrouter",
         "script": "agentrouter.py",
@@ -125,7 +128,7 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "result": "agentrouter.json",
         "timeout": 300,
         "account": "",
-        "tags": ["00:50", "matrix", "daily"],
+        "tags": ["manual"],
     },
 
     # --- 多账号/延时接力站点（00:50 出发 + QStash 延时接力回访领奖） ---
