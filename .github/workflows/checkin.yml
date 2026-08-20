@@ -118,6 +118,7 @@ jobs:
           MOXING_Domain: https://moxing.chat
           MOXING_UA: ${{ secrets.MOXING_UA }}
           UGNAS_cookie: ${{ secrets.UGNAS_COOKIE }}
+          PCBETA_cookie: ${{ secrets.PCBETA_COOKIE }}
           PCBETA_username: ${{ secrets.PCBETA_USERNAME }}
           PCBETA_password: ${{ secrets.PCBETA_PASSWORD }}
           CLOUDSTUDIO_cookie: ${{ secrets.CLOUDSTUDIO_COOKIE }}

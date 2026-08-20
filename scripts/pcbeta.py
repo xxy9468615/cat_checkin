@@ -21,14 +21,25 @@ def _login(h: Http, username: str, password: str) -> None:
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         "Referer": f"{BASE_URL}/",
     }
-    # 1. 优先获取标准登录页面提取 formhash 与 loginhash
-    resp = h.request("GET", f"{BASE_URL}/member.php?mod=logging&action=login", headers=web_headers)
-    if resp.code != 200:
-        # 回退尝试主页
-        resp = h.request("GET", f"{BASE_URL}/", headers=web_headers)
+    # 1. 依次尝试个人中心与论坛主站获取登录页面
+    resp = None
+    urls_to_try = [
+        f"{BASE_URL}/member.php?mod=logging&action=login",
+        "https://bbs.pcbeta.com/member.php?mod=logging&action=login",
+        f"{BASE_URL}/",
+        "https://bbs.pcbeta.com/",
+    ]
+    for url in urls_to_try:
+        r = h.request("GET", url, headers=web_headers)
+        if r.code == 200 and ("formhash" in r.text or "loginform" in r.text):
+            resp = r
+            break
 
-    if resp.code != 200:
-        raise RuntimeError(f"获取登录表单失败：HTTP {resp.code}")
+    if not resp or resp.code != 200:
+        raise RuntimeError(
+            "获取登录表单失败（HTTP 403/受限）：远景论坛对海外机房 IP 启用了 WAF 访问控制，\n"
+            "账号密码自动登录受阻。建议登录浏览器复制 Cookie 并配置 GitHub Secret `PCBETA_COOKIE` 直接认证。"
+        )
 
     formhash = (
         find(r'name=["\']formhash["\']\s+value=["\']([a-zA-Z0-9_]+)["\']', resp.text)
