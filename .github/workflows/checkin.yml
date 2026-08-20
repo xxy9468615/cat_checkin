@@ -168,6 +168,7 @@ jobs:
           name: ai-router-state
           path: .ai_router_state.json
           retention-days: 7
+          include-hidden-files: true
 
       - name: Upload task result artifact
         if: always()
