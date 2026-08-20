@@ -243,11 +243,15 @@ def resolve_execution_queue(
         # 兜底默认全量 00:50 任务
         return [t for t in TASKS.values() if "00:50" in t["tags"]]
 
-    # 3. 动态接力调度 (repository_dispatch)
+    # 3. 动态接力与云端调度 (repository_dispatch)
     if event == "repository_dispatch" or dtype:
-        if dtype == "latvi_next_sign":
+        if dtype in ("checkin_morning", "morning", "daily_morning"):
+            return [t for t in TASKS.values() if "00:50" in t["tags"]]
+        if dtype in ("checkin_modelscope", "modelscope_window"):
+            return [TASKS["modelscope"]]
+        if dtype in ("checkin_latvi", "latvi_anchor", "latvi_next_sign"):
             return [TASKS["latvi"]]
-        if dtype == "workbuddy_travel_claim":
+        if dtype in ("workbuddy_travel_claim", "workbuddy_claim"):
             return [TASKS["workbuddy-account-1"], TASKS["workbuddy-account-2"]]
         if dtype in TASKS:
             return [TASKS[dtype]]

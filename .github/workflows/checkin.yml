@@ -14,6 +14,9 @@ on:
   repository_dispatch:
     types:
       - run_task
+      - checkin_morning
+      - checkin_modelscope
+      - checkin_latvi
       - latvi_next_sign
       - workbuddy_travel_claim
   workflow_dispatch:

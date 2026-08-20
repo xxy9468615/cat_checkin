@@ -5,6 +5,9 @@ on:
     # 北京时间 10:00（UTC 02:00）触发；
     # 此时 00:50 的 checkin/workbuddy（放风 ~05:00 完成）与 09:10 的 modelscope 均已完成
     - cron: "0 2 * * *"
+  repository_dispatch:
+    types:
+      - daily_report
   workflow_dispatch:
     inputs:
       force:

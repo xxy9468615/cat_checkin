@@ -2,10 +2,15 @@ name: Check-in Statistics & Periodic Analytics
 
 on:
   schedule:
-    # 1. 自动周报：每周一 10:00 北京时间（UTC 02:00）自动汇总上周并推送
-    - cron: "0 2 * * 1"
-    # 2. 自动月报：每月 1 日 10:00 北京时间（UTC 02:00）自动汇总上月并推送
-    - cron: "0 2 1 * *"
+    # 1. 自动周报：每周一 10:05 北京时间（UTC 02:05）自动汇总上周并推送
+    - cron: "5 2 * * 1"
+    # 2. 自动月报：每月 1 日 10:05 北京时间（UTC 02:05）自动汇总上月并推送
+    - cron: "5 2 1 * *"
+  repository_dispatch:
+    types:
+      - stats_weekly
+      - stats_monthly
+      - run_stats
   workflow_dispatch:
     inputs:
       period:
@@ -91,6 +96,21 @@ jobs:
             else
               echo "📅 定时周报调度（每周一）：汇总上周签到数据并推送邮件"
               python3 scripts/stats.py --period last_week --push
+            fi
+            exit 0
+          fi
+
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            ACTION="${{ github.event.action }}"
+            if [ "$ACTION" = "stats_monthly" ]; then
+              echo "📅 QStash 触发月报推送：汇总上月签到数据"
+              python3 scripts/stats.py --period last_month --push
+            elif [ "$ACTION" = "stats_weekly" ]; then
+              echo "📅 QStash 触发周报推送：汇总上周签到数据"
+              python3 scripts/stats.py --period last_week --push
+            else
+              echo "📅 QStash 触发默认统计查询"
+              python3 scripts/stats.py --period 7days
             fi
             exit 0
           fi
