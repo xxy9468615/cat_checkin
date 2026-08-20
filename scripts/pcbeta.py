@@ -15,16 +15,18 @@ DEFAULT_UA = (
 
 def _login(h: Http, username: str, password: str) -> None:
     """标准 Discuz! 登录流程：探测 formhash/loginhash 并提交登录表单。"""
-    headers = {
+    web_headers = {
         "User-Agent": DEFAULT_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         "Referer": f"{BASE_URL}/",
     }
-    # 1. 获取登录弹窗页面以提取 formhash 和 loginhash
-    login_url = (
-        f"{BASE_URL}/member.php?mod=logging&action=login"
-        "&infloat=yes&handlekey=login&inajax=1&ajaxtarget=fwin_content_login"
-    )
-    resp = h.request("GET", login_url, headers=headers)
+    # 1. 优先获取标准登录页面提取 formhash 与 loginhash
+    resp = h.request("GET", f"{BASE_URL}/member.php?mod=logging&action=login", headers=web_headers)
+    if resp.code != 200:
+        # 回退尝试主页
+        resp = h.request("GET", f"{BASE_URL}/", headers=web_headers)
+
     if resp.code != 200:
         raise RuntimeError(f"获取登录表单失败：HTTP {resp.code}")
 
@@ -42,11 +44,18 @@ def _login(h: Http, username: str, password: str) -> None:
     if not formhash:
         raise RuntimeError("登录表单解析失败：未找到 formhash")
 
-    # 2. 提交登录 POST
-    post_url = (
-        f"{BASE_URL}/member.php?mod=logging&action=login&loginsubmit=yes"
-        f"&handlekey=login&loginhash={loginhash or ''}&inajax=1"
-    )
+    # 2. 提交登录表单
+    post_url = f"{BASE_URL}/member.php?mod=logging&action=login&loginsubmit=yes"
+    if loginhash:
+        post_url += f"&loginhash={loginhash}"
+
+    post_headers = {
+        "User-Agent": DEFAULT_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Referer": f"{BASE_URL}/member.php?mod=logging&action=login",
+        "Origin": BASE_URL,
+    }
     form_data = {
         "formhash": formhash,
         "referer": f"{BASE_URL}/",
@@ -56,12 +65,16 @@ def _login(h: Http, username: str, password: str) -> None:
         "questionid": "0",
         "answer": "",
     }
-    login_resp = h.request("POST", post_url, headers=headers, form=form_data)
-    login_msg = find(r'<!\[CDATA\[([\s\S]+?)\]\]>', login_resp.text, "").strip()
+    login_resp = h.request("POST", post_url, headers=post_headers, form=form_data)
+    login_msg = (
+        find(r'<!\[CDATA\[([\s\S]+?)\]\]>', login_resp.text, "")
+        or find(r'class="c">([\s\S]+?)</div>', login_resp.text, "")
+        or find(r'id="messagetext">[\s\S]*?<p>([\s\S]+?)</p>', login_resp.text, "")
+    ).strip()
     clean_msg = strip_tags(login_msg).strip()
 
     # 若响应明确提示失败原因（如密码错误、登录次数超限、验证码等）
-    if clean_msg and ("密码错误" in clean_msg or "验证码" in clean_msg or "尝试次数过多" in clean_msg or "无法登录" in clean_msg):
+    if clean_msg and any(w in clean_msg for w in ["密码错误", "验证码", "尝试次数过多", "无法登录", "登录失败", "抱歉"]):
         raise RuntimeError(f"登录失败：{clean_msg}")
 
 
