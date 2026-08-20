@@ -116,6 +116,15 @@ jobs:
           key: latvi-state-${{ github.run_id }}
           restore-keys: latvi-state-
 
+      # --- AgentRouter 会话状态恢复 ---
+      - name: Restore AgentRouter state
+        if: matrix.script == 'agentrouter.py'
+        uses: actions/cache/restore@v4
+        with:
+          path: .agentrouter_state.json
+          key: agentrouter-state-${{ github.run_id }}
+          restore-keys: agentrouter-state-
+
       # --- 核心任务执行（动态注入参数并毫秒级直写 Upstash Redis）---
       - name: Execute Check-in Task (${{ matrix.id }})
         env:
@@ -162,6 +171,12 @@ jobs:
           AI_ROUTER_PASSWORD: ${{ secrets.AI_ROUTER_PASSWORD }}
           AI_ROUTER_COOKIE: ${{ secrets.AI_ROUTER_COOKIE }}
           AI_ROUTER_ACCOUNTS: ${{ secrets.AI_ROUTER_ACCOUNTS }}
+          # AgentRouter（New API 面板，签到=登录，邮箱密码必填）
+          AGENTROUTER_EMAIL: ${{ secrets.AGENTROUTER_EMAIL }}
+          AGENTROUTER_PASSWORD: ${{ secrets.AGENTROUTER_PASSWORD }}
+          AGENTROUTER_ACCOUNTS: ${{ secrets.AGENTROUTER_ACCOUNTS }}
+          AGENTROUTER_API_URL: https://ps.air-outer.com
+          AGENTROUTER_STATE_FILE: .agentrouter_state.json
           # WorkBuddy 动态账号适配
           WORKBUDDY_COOKIE: ${{ matrix.account == '2' && secrets.WORKBUDDY_COOKIE_2 || secrets.WORKBUDDY_COOKIE }}
           WORKBUDDY_WAIT_TRAVEL: "true"
@@ -190,6 +205,13 @@ jobs:
         with:
           path: .latvi_state.json
           key: latvi-state-${{ github.run_id }}
+
+      - name: Save AgentRouter state
+        if: always() && matrix.script == 'agentrouter.py' && hashFiles('.agentrouter_state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .agentrouter_state.json
+          key: agentrouter-state-${{ github.run_id }}
 
       # --- 冗余备份 Artifact ---
       - name: Upload task result artifact

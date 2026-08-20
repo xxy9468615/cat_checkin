@@ -118,6 +118,15 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
+    "agentrouter": {
+        "id": "agentrouter",
+        "script": "agentrouter.py",
+        "name": "AgentRouter 签到",
+        "result": "agentrouter.json",
+        "timeout": 300,
+        "account": "",
+        "tags": ["00:50", "matrix", "daily"],
+    },
 
     # --- 多账号/延时接力站点（00:50 出发 + QStash 延时接力回访领奖） ---
     "workbuddy-account-1": {
