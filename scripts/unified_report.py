@@ -34,7 +34,7 @@ LATVI_RESULT_FILE = "latvi.json"
 EXPECTED_RESULTS: Dict[str, str] = {
     **{f"{name}.json": f"{name}.py" for name in (
         "glados", "2libra", "bianjie_ai", "dji", "monkeycode",
-        "moxing_vip", "naixi_forum", "pcbeta", "sophnet", "tencent_cloudstudio",
+        "moxing_vip", "naixi_forum", "sophnet", "tencent_cloudstudio",
         "ugnas_club", "ai_router",
     )},
     "workbuddy-account-1.json": "workbuddy.py",

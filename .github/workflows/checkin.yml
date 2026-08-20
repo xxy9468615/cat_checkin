@@ -42,8 +42,9 @@ jobs:
         run: |
           python3 <<'EOF'
           import json, os
+          # PCBeta 远景论坛因机房 IP / TLS 指纹 WAF 拦截 (403 异常请求验证) 暂时排除
           full = ["glados.py", "2libra.py", "bianjie_ai.py", "dji.py", "monkeycode.py",
-                  "moxing_vip.py", "naixi_forum.py", "pcbeta.py", "sophnet.py",
+                  "moxing_vip.py", "naixi_forum.py", "sophnet.py",
                   "tencent_cloudstudio.py", "ugnas_club.py", "ai_router.py"]
           sel = os.environ.get("SCRIPTS_INPUT", "").strip()
           if sel:
@@ -133,8 +134,13 @@ jobs:
           SOPHNET_TOKENS: ${{ secrets.SOPHNET_TOKENS }}
           AI_ROUTER_TOKEN: ${{ secrets.AI_ROUTER_TOKEN }}
           AI_ROUTER_REFRESH_TOKEN: ${{ secrets.AI_ROUTER_REFRESH_TOKEN }}
+          AI_ROUTER_EMAIL: ${{ secrets.AI_ROUTER_EMAIL }}
+          AI_ROUTER_USERNAME: ${{ secrets.AI_ROUTER_USERNAME }}
+          AI_ROUTER_PASSWORD: ${{ secrets.AI_ROUTER_PASSWORD }}
           AI_ROUTER_COOKIE: ${{ secrets.AI_ROUTER_COOKIE }}
           AI_ROUTER_ACCOUNTS: ${{ secrets.AI_ROUTER_ACCOUNTS }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
         run: |
           python3 scripts/run_task.py "scripts/${{ matrix.script }}"
 
