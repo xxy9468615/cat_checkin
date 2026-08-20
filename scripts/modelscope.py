@@ -39,6 +39,12 @@ PREFIX = "MODELSCOPE_"
 RETRY_WAITS = [10, 20, 30, 45]
 
 
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
 def _default_host() -> str:
     return os.getenv("MODELSCOPE_HOST", "www.modelscope.cn").strip() or "www.modelscope.cn"
 
@@ -56,23 +62,43 @@ def _parse_cookies(raw: str) -> List[str]:
 
 def _headers(host: str, cookie: str) -> Dict[str, str]:
     """构造带浏览器上下文的请求头，避免被风控/埋点中间件忽略。"""
-    return {
-        "Cookie": cookie,
+    headers = {
         "Origin": f"https://{host}",
         "Referer": f"https://{host}/my/overview",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": DEFAULT_UA,
         "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     }
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
 
 
 def _touch_user(h: Http, cookie: str, host: str) -> Dict[str, Any]:
-    """触碰会话并验证登录态。GET /openapi/v1/users/me。
+    """全链路触碰会话并验证登录态。
 
-    成功返回用户信息 dict（可含 username/nickname/user_id）；cookie 失效时抛 RuntimeError。
+    1. 访问个人中心 Web 页面与首页，触发 Web 端活跃埋点中间件。
+    2. GET /openapi/v1/users/me 验证登录态并提取用户信息。
     """
+    web_headers = {
+        "User-Agent": DEFAULT_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": f"https://{host}/",
+    }
+    if cookie:
+        web_headers["Cookie"] = cookie
+
+    try:
+        h.request("GET", f"https://{host}/my/overview", headers=web_headers)
+        h.request("GET", f"https://{host}/", headers=web_headers)
+    except Exception:
+        pass
+
+    try:
+        h.request("GET", f"https://{host}/api/v1/models?page_number=1&page_size=1", headers=_headers(host, cookie))
+    except Exception:
+        pass
+
     resp = h.request(
         "GET",
         f"https://{host}/openapi/v1/users/me",
@@ -156,33 +182,34 @@ def _run_one(cookie: str, host: str) -> Tuple[bool, str]:
     today_used = daily_rule.get("today_used", 0)
     amount = daily_rule.get("amount", 200)
 
-    def _credit_ok(current_balance: Optional[int]) -> bool:
-        """双重到账判据：today_used > 0 或 余额较初始增长。"""
-        if bool(today_used):
-            return True
-        return (
-            current_balance is not None
-            and initial_balance is not None
-            and current_balance > initial_balance
-        )
-
     # 4. 渐进式退避复查：未到账时 touch 会话 + 递增等待 + 复查
     current_balance = initial_balance
+    current_today_used = today_used
+
+    def is_credited(used_val: int, bal_val: Optional[int]) -> bool:
+        if bool(used_val):
+            return True
+        return (
+            bal_val is not None
+            and initial_balance is not None
+            and bal_val > initial_balance
+        )
+
     for attempt, wait in enumerate(RETRY_WAITS, 1):
-        if _credit_ok(current_balance):
+        if is_credited(current_today_used, current_balance):
             break
-        print(f"  {user_tag} 今日奖励尚未到账（today_used=0），{wait}s 后第 {attempt}/{len(RETRY_WAITS)+1} 次复查（touch 会话激活中）...")
+        print(f"  {user_tag} 今日奖励尚未到账（today_used={current_today_used}），{wait}s 后第 {attempt}/{len(RETRY_WAITS)+1} 次复查（全链路 touch 会话激活中）...")
         time.sleep(wait)
         try:
             _touch_user(h, cookie, host)  # 复查前再次触碰，触发活跃事件
             daily_rule = _get_rules(h, cookie, host)
-            today_used = daily_rule.get("today_used", 0)
+            current_today_used = daily_rule.get("today_used", 0)
             current_balance = _get_balance(h, cookie, host)
         except Exception as e:
             return False, f"{user_tag} 复查失败：{e}"
 
     final_balance = current_balance if current_balance is not None else _get_balance(h, cookie, host)
-    credited = _credit_ok(final_balance)
+    credited = is_credited(current_today_used, final_balance)
 
     if credited:
         status = f"签到成功，今日已领取 {amount} 魔粒"

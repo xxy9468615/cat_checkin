@@ -88,14 +88,14 @@ jobs:
           key: ai-router-state-${{ github.run_id }}
           restore-keys: ai-router-state-
 
-      # cache 静默丢失/保存失败的兜底：从最近完成 run 的 state artifact 恢复 RTR 链
+      # cache 静默丢失/保存失败的兜底：从最近完成 run 的 state artifact 恢复 RTR 链（扩大检索至前 20 个 run）
       - name: Restore AI-ROUTER state from artifact (fallback)
         if: matrix.script == 'ai_router.py' && steps.ai_state.outputs.cache-hit != 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          for rid in $(gh run list --workflow checkin.yml --status completed --limit 5 --json databaseId --jq '.[].databaseId'); do
+          for rid in $(gh run list --workflow checkin.yml --status completed --limit 20 --json databaseId --jq '.[].databaseId'); do
             if gh run download "$rid" -n ai-router-state --dir . 2>/dev/null; then
               echo "✅ 已从 run $rid 的 artifact 恢复 AI-ROUTER state（cache 未命中兜底）"
               break

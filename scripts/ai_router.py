@@ -162,8 +162,10 @@ def _do_refresh(h: Http, refresh_token: str, api_url: str) -> tuple[str, str]:
         if resp.code in (400, 401) or (isinstance(data, dict) and data.get("code") in (400, 401)):
             raise RuntimeError(
                 f"Refresh Token 已失效/过期 (HTTP {resp.code}): {err_msg}\n"
-                f"请登录 https://ai-router.dev 重新获取 Refresh Token 并更新 GitHub Secrets / .env 中的 "
-                f"{PREFIX}REFRESH_TOKEN（rt_... 开头）后重试。"
+                f"⚠️ 原因分析：AI-ROUTER 实行严格的 RTR（Refresh Token 单次轮转），每个 Token 仅能消费一次。\n"
+                f"若缓存或 state 文件断链，静态 Secret 中的旧 Token 已被服务端作废。\n"
+                f"👉 解决办法：请登录 https://ai-router.dev 重新获取最新 Refresh Token（rt_... 开头），"
+                f"并更新 GitHub Secrets 或 .env 中的 {PREFIX}REFRESH_TOKEN。"
             )
         raise RuntimeError(f"Refresh Token 续期失败 (HTTP {resp.code}): {err_msg}")
 
