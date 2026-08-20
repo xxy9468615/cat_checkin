@@ -136,20 +136,27 @@ def collect_all_results(today: str, yesterday: str) -> Tuple[List[Tuple[bool, Pa
                 if res:
                     collected[json_file.name] = res
 
-    # === 3. 期望清单比对：缺席任务合成显式失败卡片（红卡），让「任务没跑/结果丢失」可见 ===
+    # === 3. 期望清单比对：缺席任务标记为待执行（pending），避免误判为失败红卡 ===
     for missing in sorted(set(EXPECTED_RESULTS) - set(collected)):
-        print(f"⚠️ 期望结果缺失: {missing}")
+        print(f"ℹ️ 期望任务尚未收集 (待执行或独立调度中): {missing}")
         collected[missing] = {
             "ok": False,
+            "status": "pending",
+            "is_pending": True,
             "script": EXPECTED_RESULTS[missing],
-            "output": "结果未收集到（任务未运行或数据库中未暂存）",
+            "output": "任务尚未执行（按计划调度中或数据库中未暂存）",
             "elapsed": 0.0,
         }
 
-    # === 4. 转换为元组并按脚本名排序 ===
-    out: List[Tuple[bool, Path, str, float]] = []
+    # === 4. 转换为元组并按脚本名排序 (status, path, output, elapsed) ===
+    out: List[Tuple[str, Path, str, float]] = []
     for _key, data in sorted(collected.items()):
-        ok = bool(data.get("ok"))
+        is_pending = bool(data.get("is_pending")) or data.get("status") == "pending"
+        if is_pending:
+            st = "pending"
+        else:
+            st = "ok" if bool(data.get("ok")) else "fail"
+
         # 卡片标题以结果内的 script 字段为准（如 workbuddy.py），而非去重的文件名 key
         script_name = data.get("script") or (_key[:-5] if _key.endswith(".json") else _key)
         path = BASE_DIR / script_name if (BASE_DIR / script_name).exists() else Path(script_name)
@@ -159,27 +166,34 @@ def collect_all_results(today: str, yesterday: str) -> Tuple[List[Tuple[bool, Pa
         except (TypeError, ValueError):
             elapsed = 0.0
         output = str(data.get("output") or "")
-        out.append((ok, path, output, elapsed))
+        out.append((st, path, output, elapsed))
 
     return out, collected
 
 
 def _emit_failed_sites(collected: Dict[str, dict]) -> List[str]:
-    """汇总失败/缺席站点并写入 GITHUB_OUTPUT（供 report.yml 自动重跑 step 使用）。
+    """汇总真实失败站点并写入 GITHUB_OUTPUT（供 report.yml 自动重跑 step 使用）。
 
     输出两个 step output：
-    - failed_sites  全部失败脚本名（含独立 workflow 站点，供日志/排查）
+    - failed_sites  全部真实失败脚本名（含独立 workflow 站点，供日志/排查）
     - failed_matrix 其中属于 checkin.yml 矩阵的脚本（自动重跑仅 dispatch 这些）
+    注意：待执行 (pending) 的站点不计入失败，不触发自动重跑。
     """
     failed_scripts = sorted(
-        {str(d.get("script")) for d in collected.values() if not d.get("ok")} - {""}
+        {
+            str(d.get("script"))
+            for d in collected.values()
+            if not d.get("ok") and not d.get("is_pending") and d.get("status") != "pending"
+        } - {""}
     )
     failed_matrix = [s for s in CHECKIN_MATRIX_SCRIPTS if s in failed_scripts]
     if failed_scripts:
         print(
-            f"🔴 失败站点：{', '.join(failed_scripts)}"
+            f"🔴 真实失败站点：{', '.join(failed_scripts)}"
             f"（可自动重跑的矩阵站点：{', '.join(failed_matrix) or '无'}）"
         )
+    else:
+        print("✅ 无真实失败站点（所有已运行任务均成功，待执行任务按计划等待）")
     gh_output = os.getenv("GITHUB_OUTPUT")
     if gh_output:
         with open(gh_output, "a", encoding="utf-8") as fh:
@@ -216,21 +230,28 @@ def archive_daily_summary(collected: Dict[str, dict], today: str) -> None:
         site_key = key[:-5] if key.endswith(".json") else key
         output_str = str(d.get("output") or "")
         extracted = _extract_fields(output_str) if output_str else {}
+        is_pending = bool(d.get("is_pending")) or d.get("status") == "pending"
+        st = "pending" if is_pending else ("ok" if bool(d.get("ok")) else "fail")
         sites[site_key] = {
             "ok": bool(d.get("ok")),
+            "status": st,
+            "is_pending": is_pending,
             "elapsed": d.get("elapsed", 0),
             "script": d.get("script", ""),
             "assets": extracted.get("assets", ""),
             "reward": extracted.get("reward", ""),
         }
     total = len(sites)
-    success = sum(1 for s in sites.values() if s["ok"])
+    success = sum(1 for s in sites.values() if s["status"] == "ok")
+    failed = sum(1 for s in sites.values() if s["status"] == "fail")
+    pending = sum(1 for s in sites.values() if s["status"] == "pending")
     summary = {
         "date": today,
         "updated_at": updated_at,
         "total": total,
         "success": success,
-        "failed": total - success,
+        "failed": failed,
+        "pending": pending,
         "sites": sites,
     }
     body = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))

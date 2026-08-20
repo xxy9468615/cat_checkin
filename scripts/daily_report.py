@@ -48,6 +48,18 @@ def get_task_title(path: Path) -> str:
     return path.stem
 
 
+def _normalize_status(val: Any) -> str:
+    """归一化任务状态为 'ok' | 'fail' | 'pending'。"""
+    if isinstance(val, str):
+        v = val.lower().strip()
+        if v in ("ok", "success", "true"):
+            return "ok"
+        if v in ("pending", "waiting", "scheduled", "uncollected"):
+            return "pending"
+        return "fail"
+    return "ok" if bool(val) else "fail"
+
+
 def _last_meaningful_line(text: str) -> str:
     """取失败任务的错误摘要：优先找含错误关键字的行，否则回退到末尾非汇总行。"""
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -64,26 +76,48 @@ def _last_meaningful_line(text: str) -> str:
     return lines[-1]
 
 
-def build_report(results: Iterable[Tuple[bool, Path, str, float]]) -> Tuple[str, str, int]:
-    rows = list(results)
-    ok_count = sum(1 for ok, *_ in rows if ok)
-    fail_count = len(rows) - ok_count
+def build_report(results: Iterable[Tuple[Any, Path, str, float]]) -> Tuple[str, str, int]:
+    rows: List[Tuple[str, Path, str, float]] = []
+    for item in results:
+        st = _normalize_status(item[0])
+        rows.append((st, item[1], item[2], item[3]))
+
+    ok_count = sum(1 for st, *_ in rows if st == "ok")
+    fail_count = sum(1 for st, *_ in rows if st == "fail")
+    pending_count = sum(1 for st, *_ in rows if st == "pending")
+    total_count = len(rows)
     today_str = datetime.date.today().strftime("%Y-%m-%d")
 
     if fail_count > 0:
         summary_header = f"📢 每日签到汇总 ({today_str}) [❌ {fail_count}项失败]"
+    elif pending_count > 0 and ok_count > 0:
+        summary_header = f"📢 每日签到汇总 ({today_str}) [⏳ {pending_count}项待执行]"
+    elif pending_count > 0 and ok_count == 0:
+        summary_header = f"📢 每日签到汇总 ({today_str}) [⏳ 全部待执行]"
     else:
         summary_header = f"📢 每日签到汇总 ({today_str})"
-    stat_line = f"📊 成功 {ok_count} | 失败 {fail_count} | 共 {len(rows)}"
+
+    if pending_count > 0:
+        stat_line = f"📊 成功 {ok_count} | 失败 {fail_count} | 待执行 {pending_count} | 共 {total_count}"
+    else:
+        stat_line = f"📊 成功 {ok_count} | 失败 {fail_count} | 共 {total_count}"
 
     lines = [summary_header, stat_line, ""]
-    for ok, path, output, elapsed in rows:
-        status = "✅" if ok else "❌"
+    for st, path, output, elapsed in rows:
         task_title = get_task_title(path)
-        # 成功只留一行(站点+耗时), 冗余详情不再进通知;
-        # 失败仅附最后一行错误原因, 排障足够又不臃肿。
-        lines.append(f"{status} {task_title} ({elapsed:.1f}s)")
-        if not ok:
+        if st == "ok":
+            status_icon = "✅"
+            lines.append(f"{status_icon} {task_title} ({elapsed:.1f}s)")
+        elif st == "pending":
+            status_icon = "⏳"
+            lines.append(f"{status_icon} {task_title} (待执行/调度中)")
+            if output and output.strip() and output.strip() != "结果未收集到（任务未运行或数据库中未暂存）":
+                lines.append(f"  {output.strip()}")
+            else:
+                lines.append("  任务尚未执行或处于独立调度窗口中")
+        else:
+            status_icon = "❌"
+            lines.append(f"{status_icon} {task_title} ({elapsed:.1f}s)")
             reason = _last_meaningful_line(output)
             if reason:
                 lines.append(f"  {reason}")
@@ -242,12 +276,22 @@ def _sanitize_output(text: str) -> str:
     return _html.unescape(text).strip()
 
 
-def _build_task_card(ok: bool, path: Path, output: str, elapsed: float) -> str:
+def _build_task_card(status: Any, path: Path, output: str, elapsed: float) -> str:
     """构造单个任务卡片。"""
     title = get_task_title(path)
-    status_color = "#228757" if ok else "#ce2b39"
-    status_text = "✅ 成功" if ok else "❌ 失败"
-    status_bg = "#e4f5ec" if ok else "#fce8e9"
+    st = _normalize_status(status)
+    if st == "ok":
+        status_color = "#228757"
+        status_text = "✅ 成功"
+        status_bg = "#e4f5ec"
+    elif st == "pending":
+        status_color = "#64748b"
+        status_text = "⏳ 待执行"
+        status_bg = "#f1f5f9"
+    else:
+        status_color = "#ce2b39"
+        status_text = "❌ 失败"
+        status_bg = "#fce8e9"
 
     fields = _extract_fields(output)
 
@@ -277,7 +321,11 @@ def _build_task_card(ok: bool, path: Path, output: str, elapsed: float) -> str:
 
     # 截断 + 兜底清洗后渲染卡片正文，保留原始换行符
     body = _sanitize_output(_truncate_output(output, 1200))
+    if not body and st == "pending":
+        body = "任务尚未执行或处于独立调度窗口中"
     body_html = _html.escape(body).replace("\n", "<br>")
+
+    elapsed_str = f"{elapsed:.1f}s" if st != "pending" else "调度中"
 
     return f"""
     <div style="margin:0 0 16px 0;border:1px solid #e3e6ea;border-left:3px solid {status_color};background:#fff;border-radius:6px;overflow:hidden;">
@@ -287,33 +335,41 @@ def _build_task_card(ok: bool, path: Path, output: str, elapsed: float) -> str:
           <span style="font-size:14px;font-weight:600;color:#2b2f36;">{ _html.escape(title) }</span>
           <span style="font-size:12px;color:#8a9099;direction:ltr;">{ _html.escape(path.name) }</span>
         </div>
-        <span style="font-size:12px;color:#8a9099;">{elapsed:.1f}s</span>
+        <span style="font-size:12px;color:#8a9099;">{elapsed_str}</span>
       </div>
       {('<div style="padding:8px 16px;font-size:12px;line-height:1.8;">' + badges_html + '</div>') if badges_html else ''}
       <div style="padding:10px 16px;font-size:12px;line-height:1.6;color:#2b2f36;white-space:pre-wrap;word-break:break-word;">{body_html}</div>
     </div>"""
 
 
-def build_email_html(results: List[Tuple[bool, Path, str, float]], stat_line: str, title: str) -> str:
+def build_email_html(results: List[Tuple[Any, Path, str, float]], stat_line: str, title: str) -> str:
     """渲染结构化签到结果为卡片式 HTML。"""
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     footer = f"由 cat_checkin 自动生成 · {now}"
 
-    # 按成功/失败排序：失败在前更醒目
-    sorted_results = list(results)
-    failed = [r for r in sorted_results if not r[0]]
-    succeeded = [r for r in sorted_results if r[0]]
+    # 按 失败 -> 待执行 -> 成功 排序
+    rows: List[Tuple[str, Path, str, float]] = []
+    for item in results:
+        st = _normalize_status(item[0])
+        rows.append((st, item[1], item[2], item[3]))
+
+    failed = [r for r in rows if r[0] == "fail"]
+    pending = [r for r in rows if r[0] == "pending"]
+    succeeded = [r for r in rows if r[0] == "ok"]
 
     cards_html = ""
     if failed:
-        cards_html += '<div style="margin:12px 0 6px 0;font-size:12px;color:#9aa4b0;">--- 失败任务 ---</div>'
-        for ok, path, output, elapsed in failed:
-            cards_html += _build_task_card(ok, path, output, elapsed)
+        cards_html += '<div style="margin:12px 0 6px 0;font-size:12px;color:#ce2b39;font-weight:600;">⚠️ 失败任务</div>'
+        for st, path, output, elapsed in failed:
+            cards_html += _build_task_card(st, path, output, elapsed)
+    if pending:
+        cards_html += '<div style="margin:12px 0 6px 0;font-size:12px;color:#64748b;font-weight:600;">⏳ 待执行 / 独立调度任务</div>'
+        for st, path, output, elapsed in pending:
+            cards_html += _build_task_card(st, path, output, elapsed)
     if succeeded:
-        if failed:
-            cards_html += '<div style="margin:12px 0 6px 0;font-size:12px;color:#9aa4b0;">--- 成功任务 ---</div>'
-        for ok, path, output, elapsed in succeeded:
-            cards_html += _build_task_card(ok, path, output, elapsed)
+        cards_html += '<div style="margin:12px 0 6px 0;font-size:12px;color:#228757;font-weight:600;">✅ 成功任务</div>'
+        for st, path, output, elapsed in succeeded:
+            cards_html += _build_task_card(st, path, output, elapsed)
 
     tpl = _template(
         TEMPLATE_DIR / "email_report.html",

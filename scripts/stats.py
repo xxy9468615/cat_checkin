@@ -268,19 +268,23 @@ def aggregate_stats(records: Dict[str, Optional[dict]], dates: List[str], period
             "total": 0,
             "success": 0,
             "failed": 0,
+            "pending": 0,
             "rate": 0.0,
         }
         if rec:
             d_sites = rec.get("sites", {})
             d_total = rec.get("total", len(d_sites))
-            d_succ = rec.get("success", sum(1 for v in d_sites.values() if v.get("ok")))
-            d_fail = rec.get("failed", d_total - d_succ)
+            d_succ = rec.get("success", sum(1 for v in d_sites.values() if (v.get("ok") or v.get("status") == "ok") and not v.get("is_pending") and v.get("status") != "pending"))
+            d_pend = rec.get("pending", sum(1 for v in d_sites.values() if v.get("is_pending") or v.get("status") == "pending"))
+            d_fail = rec.get("failed", sum(1 for v in d_sites.values() if not v.get("ok") and not v.get("is_pending") and v.get("status") != "pending"))
+            d_executed = d_succ + d_fail
             d_summary["total"] = d_total
             d_summary["success"] = d_succ
             d_summary["failed"] = d_fail
-            d_summary["rate"] = round((d_succ / d_total * 100) if d_total > 0 else 0.0, 1)
+            d_summary["pending"] = d_pend
+            d_summary["rate"] = round((d_succ / d_executed * 100) if d_executed > 0 else 0.0, 1)
 
-            total_executions += d_total
+            total_executions += d_executed
             total_successes += d_succ
             total_failures += d_fail
 
@@ -288,14 +292,18 @@ def aggregate_stats(records: Dict[str, Optional[dict]], dates: List[str], period
                 st = site_stats[s]
                 s_data = d_sites.get(s) or d_sites.get(f"{s}.json")
                 if s_data:
-                    st["total_runs"] += 1
-                    is_ok = bool(s_data.get("ok"))
+                    is_pending = bool(s_data.get("is_pending")) or s_data.get("status") == "pending"
+                    is_ok = (bool(s_data.get("ok")) or s_data.get("status") == "ok") and not is_pending
                     elapsed = float(s_data.get("elapsed") or 0.0)
                     assets_str = str(s_data.get("assets") or "")
-                    if is_ok:
+                    if is_pending:
+                        st["history"].append({"date": d, "status": "pending", "elapsed": 0.0, "assets": assets_str})
+                    elif is_ok:
+                        st["total_runs"] += 1
                         st["success_runs"] += 1
                         st["history"].append({"date": d, "status": "ok", "elapsed": elapsed, "assets": assets_str})
                     else:
+                        st["total_runs"] += 1
                         st["failed_runs"] += 1
                         st["failed_dates"].append(d)
                         st["history"].append({"date": d, "status": "fail", "elapsed": elapsed, "assets": assets_str})
