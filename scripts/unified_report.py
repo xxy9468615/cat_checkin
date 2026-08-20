@@ -23,6 +23,7 @@ if str(BASE_DIR) not in sys.path:
 
 from common import upstash_redis_pipeline  # noqa: E402
 from daily_report import _extract_fields, build_report, send_email, send_resend  # noqa: E402
+from stats import aggregate_stats, fetch_records_from_redis, resolve_date_range  # noqa: E402
 
 # Latvi 的结果文件名（24h 间隔约束，18:00 运行，报告取昨日结果）
 # 注意 run_task.py 用 Path.stem 命名：latvi.py → latvi.json（.py 后缀被剥掉）
@@ -198,11 +199,36 @@ def archive_daily_summary(collected: Dict[str, dict], today: str) -> None:
         ["SET", f"{prefix}:latest", body],
     ]
 
+    # 预聚合统计视图写入 Upstash Redis（让外部 API / 前端 / 机器人只需单条 GET 即可秒级获取周报与月报）
+    try:
+        # 1. 最近 7 天周报预聚合
+        dates_7d, desc_7d = resolve_date_range(period="7days")
+        records_7d = fetch_records_from_redis(dates_7d)
+        records_7d[today] = summary  # 将今日最新数据置入
+        stats_7d = aggregate_stats(records_7d, dates_7d, desc_7d)
+        commands.append(["SET", f"{prefix}:stats:latest_7days", json.dumps(stats_7d, ensure_ascii=False)])
+
+        # 2. 最近 30 天月度概览预聚合
+        dates_30d, desc_30d = resolve_date_range(period="30days")
+        records_30d = fetch_records_from_redis(dates_30d)
+        records_30d[today] = summary
+        stats_30d = aggregate_stats(records_30d, dates_30d, desc_30d)
+        commands.append(["SET", f"{prefix}:stats:latest_30days", json.dumps(stats_30d, ensure_ascii=False)])
+
+        # 3. 当月自然月统计预聚合
+        dates_month, desc_month = resolve_date_range(period="month")
+        records_month = fetch_records_from_redis(dates_month)
+        records_month[today] = summary
+        stats_month = aggregate_stats(records_month, dates_month, desc_month)
+        commands.append(["SET", f"{prefix}:stats:current_month", json.dumps(stats_month, ensure_ascii=False)])
+    except Exception as e:
+        print(f"⚠️ 预聚合统计计算异常（不影响基础归档）: {e}")
+
     try:
         ok, detail = upstash_redis_pipeline(commands)
         if ok:
             print(
-                f"🗂️ 当日汇总已归档 → Upstash Redis（{prefix}:daily:{today}，"
+                f"🗂️ 当日汇总与预聚合视图已归档 → Upstash Redis（{prefix}:daily:{today}，"
                 f"{success}/{total} 成功）"
             )
         else:

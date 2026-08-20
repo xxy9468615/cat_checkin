@@ -39,9 +39,21 @@ ROOT_DIR = BASE_DIR.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from common import upstash_redis_pipeline  # noqa: E402
+from common import upstash_redis_command, upstash_redis_pipeline  # noqa: E402
 from daily_report import get_task_title, send_email, send_resend  # noqa: E402
-from unified_report import EXPECTED_RESULTS  # noqa: E402
+
+# 期望任务清单：结果文件名 → 真实脚本（与 unified_report 对齐）
+EXPECTED_RESULTS: Dict[str, str] = {
+    **{f"{name}.json": f"{name}.py" for name in (
+        "glados", "2libra", "bianjie_ai", "dji", "monkeycode",
+        "moxing_vip", "naixi_forum", "sophnet", "tencent_cloudstudio",
+        "ugnas_club", "ai_router", "pcbeta",
+    )},
+    "workbuddy-account-1.json": "workbuddy.py",
+    "workbuddy-account-2.json": "workbuddy.py",
+    "modelscope.json": "modelscope.py",
+    "latvi.json": "latvi.py",
+}
 
 TEMPLATES_DIR = BASE_DIR / "templates"
 EMAIL_STATS_TEMPLATE_PATH = TEMPLATES_DIR / "email_stats.html"
@@ -52,6 +64,18 @@ BEIJING_TZ = dt.timezone(dt.timedelta(hours=8))
 def get_beijing_today() -> dt.date:
     """获取当前北京时间日期。"""
     return dt.datetime.now(BEIJING_TZ).date()
+
+
+def fetch_cached_stats(cache_name: str) -> Optional[dict]:
+    """从 Upstash Redis 获取预计算好的统计视图（秒级响应）。"""
+    prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
+    ok, res = upstash_redis_command(["GET", f"{prefix}:stats:{cache_name}"])
+    if ok and res:
+        try:
+            return json.loads(res) if isinstance(res, str) else res
+        except Exception:
+            return None
+    return None
 
 
 def resolve_date_range(
@@ -648,18 +672,35 @@ def main() -> None:
     parser.add_argument("--markdown", action="store_true", help="输出 GitHub Markdown 格式")
     parser.add_argument("--html", help="导出 HTML 文件路径 (如 --html report.html)")
     parser.add_argument("--push", action="store_true", help="发送邮件通知 (Resend / SMTP)")
+    parser.add_argument(
+        "--cached",
+        action="store_true",
+        help="优先尝试从 Redis 读取预计算好的统计视图 (latest_7days / current_month / latest_30days)",
+    )
 
     args = parser.parse_args()
 
-    dates, period_desc = resolve_date_range(
-        period=args.period,
-        start_date=args.start,
-        end_date=args.end,
-        days=args.days,
-    )
+    stats = None
+    if args.cached and not args.start and not args.end and not args.days:
+        cache_map = {
+            "7days": "latest_7days",
+            "week": "latest_7days",
+            "30days": "latest_30days",
+            "month": "current_month",
+        }
+        cache_name = cache_map.get(args.period)
+        if cache_name:
+            stats = fetch_cached_stats(cache_name)
 
-    records = fetch_records_from_redis(dates)
-    stats = aggregate_stats(records, dates, period_desc)
+    if not stats:
+        dates, period_desc = resolve_date_range(
+            period=args.period,
+            start_date=args.start,
+            end_date=args.end,
+            days=args.days,
+        )
+        records = fetch_records_from_redis(dates)
+        stats = aggregate_stats(records, dates, period_desc)
 
     if args.json:
         print(json.dumps(stats, ensure_ascii=False, indent=2))
