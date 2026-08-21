@@ -82,11 +82,27 @@ def retry(times: int = 2, backoff: float = 3.0, retry_codes: tuple = (-1, 429, 5
     return decorator
 
 class Http:
-    def __init__(self, follow_redirects: bool = False):
+    def __init__(self, follow_redirects: bool = False, proxy: str = ""):
         self.jar = CookieJar()
         handlers = [urllib.request.HTTPCookieProcessor(self.jar)]
         if not follow_redirects:
             handlers.insert(0, NoRedirectHandler())
+        if proxy:
+            # SOCKS5 出口：urllib 原生不支持 socks:// scheme，
+            # 用 pysocks 全局 monkey-patch socket 让进程内所有连接走代理。
+            # 仅当调用方显式传入 proxy 时启用，其它脚本不受影响。
+            try:
+                import socks
+                import socket
+            except ImportError:
+                raise RuntimeError(
+                    "检测到 AGENTROUTER_PROXY 但缺少 pysocks 依赖，请 pip install pysocks"
+                )
+            parts = proxy.removeprefix("socks5://").removeprefix("socks5h://").split(":")
+            host, port = parts[0], int(parts[1]) if len(parts) > 1 else 1080
+            # rdns=True：目标域名交由代理端解析（与出口 IP 一致，避免本地 DNS 污染）
+            socks.set_default_proxy(socks.SOCKS5, host, port, rdns=True)
+            socket.socket = socks.socksocket
         self.opener = urllib.request.build_opener(*handlers)
     @retry()
     def request(self, method: str, url: str, *, headers: Optional[Dict[str,str]]=None,

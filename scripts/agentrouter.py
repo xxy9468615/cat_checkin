@@ -29,6 +29,9 @@
   AGENTROUTER_ACCOUNTS   多账号，换行或 && 分隔，格式 email:password
   AGENTROUTER_API_URL    接口基础地址（默认 https://ps.air-outer.com，可改回 https://agentrouter.org）
   AGENTROUTER_STATE_FILE 本地 state 文件（默认 .agentrouter_state.json）
+  AGENTROUTER_PROXY      SOCKS5 代理出口（如 socks5://127.0.0.1:1080），
+                         用于绕过 CI 数据中心 IP 被 Aliyun WAF 滑块拦截的问题；
+                         需配合 pip install pysocks 使用
   说明：本部署签到只能通过登录触发；如需展示余额，登录后自动用 session 查询 /api/user/self，
   无需额外配置。session 与 uid 会持久化到本地 + Upstash Redis 供诊断。
 """
@@ -153,12 +156,12 @@ def _login(h: Http, username: str, password: str, base: str) -> tuple[bool, str,
         text = resp.text[:500] if resp.text else ""
         hint = ""
 
-        # ① Aliyun WAF 挑战页（滑块验证码）——数据中心/风控 IP 无法程序化绕过
+        # ① Aliyun WAF 挑战页（滑块验证码）——代理出口 IP 仍被标记
         if "aliyun_waf" in text or "aliyunCaptcha" in text or "访问验证" in text:
             hint = (
-                "（Aliyun WAF 滑块验证码挑战页，无法程序化绕过。"
-                "该站点签到必须密码登录，而数据中心/风控 IP 登录会被 WAF 挑战拦截。"
-                "建议：1) 在家庭网络/干净 IP 上运行本任务；2) 或改用真实浏览器自动化(Playwright)尝试过 JS 挑战）"
+                "（Aliyun WAF 滑块验证码挑战页，当前出口 IP 仍被 WAF 标记。"
+                "已配置 AGENTROUTER_PROXY 时请检查代理 IP 是否干净；"
+                "未配置代理时请确认 SS 代理已启用并正确配置）"
             )
         elif "Turnstile" in err_msg or "turnstile" in text.lower():
             hint = "（站点已启用 Turnstile 挑战校验，需要有效 turnstile token，无法自动登录）"
@@ -239,7 +242,8 @@ def _run_one(idx: int, total: int, account: dict, base: str) -> str:
     if not (username and password):
         raise RuntimeError(f"账号{idx} 缺少邮箱或密码，请配置 {PREFIX}EMAIL / {PREFIX}PASSWORD 或 {PREFIX}ACCOUNTS")
 
-    h = Http()
+    proxy = os.getenv(f"{PREFIX}PROXY", "").strip()
+    h = Http(proxy=proxy)
 
     # --- 1. 登录 = 签到 ---
     sign_confirmed, checked_in, uid, session, token = _login(h, username, password, base)

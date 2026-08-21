@@ -125,6 +125,75 @@ jobs:
           key: agentrouter-state-${{ github.run_id }}
           restore-keys: agentrouter-state-
 
+      # --- AgentRouter SS 代理出口（绕过 Aliyun WAF 滑块；仅 agentrouter 腿） ---
+      - name: Setup SS proxy for AgentRouter
+        if: matrix.script == 'agentrouter.py'
+        run: |
+          set -euo pipefail
+
+          # 1. 下载静态编译 sslocal（shadowsocks-rust v1.23.4 musl；tarball 为扁平结构，二进制在根）
+          curl -sL -o /tmp/ss.tar.xz \
+            https://github.com/shadowsocks/shadowsocks-rust/releases/download/v1.23.4/shadowsocks-v1.23.4.x86_64-unknown-linux-musl.tar.xz
+          tar xf /tmp/ss.tar.xz -C /tmp
+          test -x /tmp/sslocal || { echo "❌ sslocal 二进制缺失"; exit 1; }
+
+          # 2. 安装 obfs-local（simple-obfs，GLaDOS 等 obfs=tls 节点必需；apt 自动解析 libev/libcork 依赖）
+          command -v obfs-local >/dev/null 2>&1 || \
+            sudo apt-get install -y -qq simple-obfs >/dev/null 2>&1
+          command -v obfs-local >/dev/null || { echo "❌ obfs-local 安装失败"; exit 1; }
+
+          # 3. 写入 SS 配置（secret AGENTROUTER_SS_CONFIG，可直贴 GLaDOS/客户端导出原始 JSON）
+          cat > /tmp/ss-config.json <<'EOF'
+          ${{ secrets.AGENTROUTER_SS_CONFIG }}
+          EOF
+          test -s /tmp/ss-config.json || { echo "❌ AGENTROUTER_SS_CONFIG 未配置或为空"; exit 1; }
+
+          # 3b. 归一化：sslocal 强制要求 local_address/local_port，缺失时补默认 127.0.0.1:1080；
+          #      plugin 裸名 → 解析为绝对路径（防 PATH 查找失败，实测必须）
+          python3 - <<'PY'
+          import json, shutil, sys
+          p = "/tmp/ss-config.json"
+          try:
+              cfg = json.load(open(p, encoding="utf-8"))
+          except Exception as e:
+              print(f"❌ AGENTROUTER_SS_CONFIG 不是合法 JSON: {e}")
+              sys.exit(1)
+          cfg["local_address"] = "127.0.0.1"
+          cfg["local_port"] = 1080
+          if cfg.get("plugin"):
+              resolved = shutil.which(str(cfg["plugin"])) or str(cfg["plugin"])
+              cfg["plugin"] = resolved
+          json.dump(cfg, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+          PY
+
+          # 4. 安装 pysocks（urllib 原生不支持 socks:// scheme，需 socket monkey-patch）
+          pip install -q pysocks
+
+          # 5. 后台启动 sslocal
+          /tmp/sslocal -c /tmp/ss-config.json &
+          SSPID=$!
+          echo "SSPID=$SSPID" >> "$GITHUB_ENV"
+
+          # 6. 等待 SOCKS5 端口就绪 + 功能校验（真实建连穿过节点，防「端口在听但隧道不通」）
+          SSPORT=$(grep -oE '"local_port"[[:space:]]*:[[:space:]]*[0-9]+' /tmp/ss-config.json | grep -oE '[0-9]+$' || true)
+          SSPORT=${SSPORT:-1080}
+          echo "Waiting for SS proxy on port $SSPORT..."
+          for i in $(seq 1 20); do
+            if ss -tln 2>/dev/null | grep -q ":$SSPORT "; then
+              break
+            fi
+            sleep 0.5
+          done
+          for i in 1 2 3; do
+            if curl -sS -x "socks5://127.0.0.1:$SSPORT" -m 8 -o /dev/null https://api.ipify.org; then
+              echo "✅ SS proxy ready (pid $SSPID, port $SSPORT)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "❌ SS proxy 启动失败（检查 AGENTROUTER_SS_CONFIG 的 server/server_port/password/method/plugin；或节点/出口 IP 已被封）"
+          exit 1
+
       # --- 核心任务执行（动态注入参数并毫秒级直写 Upstash Redis）---
       - name: Execute Check-in Task (${{ matrix.id }})
         env:
@@ -177,6 +246,8 @@ jobs:
           AGENTROUTER_ACCOUNTS: ${{ secrets.AGENTROUTER_ACCOUNTS }}
           AGENTROUTER_API_URL: https://ps.air-outer.com
           AGENTROUTER_STATE_FILE: .agentrouter_state.json
+          # SOCKS5 出口仅 agentrouter 腿生效（proxy 由 Setup SS proxy 步骤启动）
+          AGENTROUTER_PROXY: ${{ matrix.script == 'agentrouter.py' && 'socks5://127.0.0.1:1080' || '' }}
           # WorkBuddy 动态账号适配
           WORKBUDDY_COOKIE: ${{ matrix.account == '2' && secrets.WORKBUDDY_COOKIE_2 || secrets.WORKBUDDY_COOKIE }}
           WORKBUDDY_WAIT_TRAVEL: "true"
@@ -212,6 +283,12 @@ jobs:
         with:
           path: .agentrouter_state.json
           key: agentrouter-state-${{ github.run_id }}
+
+      - name: Cleanup SS proxy
+        if: always() && matrix.script == 'agentrouter.py'
+        run: |
+          kill "${SSPID:-}" 2>/dev/null || true
+          pkill -f '[s]slocal' 2>/dev/null || true
 
       # --- 冗余备份 Artifact ---
       - name: Upload task result artifact

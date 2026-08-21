@@ -1,1 +1,4 @@
-# 签到脚本全部使用 Python 标准库，CI 无额外依赖。
+# 签到脚本全部使用 Python 标准库；仅 agentrouter 的 SS 代理出口（AGENTROUTER_PROXY）
+# 需要 pysocks（urllib 原生不支持 socks:// scheme）。CI 在 Setup SS proxy 步骤内联
+# pip install pysocks，此处仅供本地调试参考。
+pysocks>=1.7.1
