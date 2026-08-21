@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 # === 全量任务元数据注册表 ===
 TASKS: Dict[str, Dict[str, Any]] = {
-    # --- 晨间常规矩阵站点（每日 00:50 BJT 低谷期并发执行） ---
+    # --- 常规矩阵站点（单 run 阶段 A 内联并发，BATCH_PARALLEL=4） ---
     "glados": {
         "id": "glados",
         "script": "glados.py",
@@ -129,7 +129,7 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "tags": ["00:50", "matrix", "daily"],
     },
 
-    # --- 多账号/延时接力站点（00:50 出发 + QStash 延时接力回访领奖） ---
+    # --- 多账号站点（单 run 阶段 A 内联并发；旧 QStash 回程接力已退役） ---
     "workbuddy-account-1": {
         "id": "workbuddy-account-1",
         "script": "workbuddy.py",
@@ -149,7 +149,7 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "tags": ["00:50", "workbuddy", "relay", "daily"],
     },
 
-    # --- 特殊窗口站点（09:10 BJT 奖励窗口开启后触发） ---
+    # --- 特殊窗口站点（09:10 BJT 窗口；单 run 中 max(now,09:10) 零等待） ---
     "modelscope": {
         "id": "modelscope",
         "script": "modelscope.py",
@@ -160,7 +160,7 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "tags": ["09:10", "modelscope", "daily"],
     },
 
-    # --- 24小时动态冷却站点（18:00 BJT 兜底锚点 + QStash 动态延时接力） ---
+    # --- 24h 动态冷却站点（Latvi：last_sign_ts+24h 状态驱动，硬墙前 2min 进场） ---
     "latvi": {
         "id": "latvi",
         "script": "latvi.py",
@@ -238,9 +238,9 @@ def resolve_execution_queue(
             return matched
         raise ValueError(f"指定任务 '{raw_tasks}' 未匹配到任何有效注册任务（可选: {', '.join(TASKS.keys())}）")
 
-    # 2. 定时调度 (schedule cron)
+    # 2. 定时调度 (schedule cron) — 旧三 cron 映射保留作兼容，主流程由 daily_orchestrator 排布
     if event == "schedule" or cron_expr:
-        # 晨间主批次：00:50 BJT (UTC 16:50) -> 12 矩阵 + 2 WorkBuddy
+        # 晨间主批次（兼容旧调度）：00:50 BJT (UTC 16:50) -> 12 矩阵 + 2 WorkBuddy
         if "16:50" in cron_expr or "50 16" in cron_expr or cron_expr == "50 16 * * *":
             return [t for t in TASKS.values() if "00:50" in t["tags"]]
         # 魔粒奖励窗口：09:10 BJT (UTC 01:10) -> ModelScope

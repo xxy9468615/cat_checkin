@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-# cron: 0 2 * * *
 # new Env("每日统一通知汇总")
-"""统一汇总报告：自动扫描并汇聚各异步/独立签到任务结果，Resend/SMTP 统一邮件推送。
+"""统一汇总报告：汇聚当日签到结果，构建 HTML 邮件并经 Resend/SMTP 推送。
 
-由 report.yml 在每天 02:00 UTC（10:00 北京时间）触发。
-从 .task_results/ 目录或 GitHub Actions cache/artifact 收集所有当天完成的任务结果 JSON。
-Latvi 因 24h 签到间隔约束固定在 18:00 运行，10:00 报告取其昨日结果（最近一次签到）。
+由 checkin.yml 的 unified（内联，orchestrator 结束后）与 report-fallback（20:30 兜底）
+两个 job 触发。优先从 Upstash Redis `cat_checkin:raw:<TODAY>`（HGETALL）汇聚，
+兜底扫描 `.task_results/` 本地 JSON；Latvi 若今日无结果则回退昨日（24h 冷却跨日）。
 """
 from __future__ import annotations
 
@@ -32,9 +31,9 @@ LATVI_RESULT_FILE = "latvi.json"
 # 期望任务清单：从统一 task_registry 读取
 EXPECTED_RESULTS: Dict[str, str] = get_expected_results()
 
-# 基础矩阵任务列表（用于报告失败时触发自动重跑）
+# 重跑候选脚本列表（单 run 模式下放宽为全部 daily 任务，均幂等安全）
 CHECKIN_MATRIX_SCRIPTS = sorted(
-    t["script"] for t in TASKS.values() if "matrix" in t.get("tags", [])
+    {t["script"] for t in TASKS.values() if "daily" in t.get("tags", [])}
 )
 
 
@@ -157,7 +156,7 @@ def collect_all_results(today: str, yesterday: str) -> Tuple[List[Tuple[bool, Pa
 
 
 def _emit_failed_sites(collected: Dict[str, dict]) -> List[str]:
-    """汇总真实失败站点并写入 GITHUB_OUTPUT（供 report.yml 自动重跑 step 使用）。
+    """汇总真实失败站点并写入 GITHUB_OUTPUT（供 checkin.yml 自动重跑 step 使用）。
 
     输出两个 step output：
     - failed_sites  全部真实失败脚本名（含独立 workflow 站点，供日志/排查）
@@ -301,7 +300,7 @@ def main() -> None:
         sys.exit(1)
 
     # 尽早输出失败清单（GITHUB_OUTPUT）：即使后续邮件通道全失败（exit 1），
-    # report.yml 的自动重跑 step（if: always()）也能拿到 failed_matrix
+    # checkin.yml 的自动重跑 step（if: always()）也能拿到 failed_matrix
     _emit_failed_sites(collected)
 
     title, report, fail_count = build_report(results)
@@ -315,7 +314,7 @@ def main() -> None:
         if not (sent_smtp or sent_resend):
             print("❌ 所有邮件通道推送失败：不写发送标记并退出非零，等待 10:30 兜底重试")
             sys.exit(1)
-        # 邮件已送达或已交接 QStash（至少一个通道）才写当日标记：report.yml 靠它去重。
+        # 邮件已送达或已交接 QStash（至少一个通道）才写当日标记：checkin.yml 兜底去重靠它。
         # resend_msg_id 可为空（SMTP-only / 直发失败 / QStash publish 失败回退直发但 Resend 未返回 id），
         # 有值时 10:30 兜底 run 可查询 QStash /v2/logs 确认投递状态。
         marker = {"date": today, "sent_at": dt.datetime.now(tz).isoformat()}
@@ -357,7 +356,7 @@ def main() -> None:
         # 报告送达后归档当日汇总（best-effort，失败仅警告）
         archive_daily_summary(collected, today)
         # 邮件已送达即视为本次运行成功（任务失败详情已在邮件正文的红卡片里）：
-        # exit 0 让 run 结论为 success，report.yml 的 API 去重（只认 success run）
+        # exit 0 让 run 结论为 success，checkin.yml 兜底的 API 去重（只认 success run）
         # 才能兜住 marker cache 保存静默失败时的重复发送场景
         return
 

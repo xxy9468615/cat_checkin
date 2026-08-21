@@ -14,15 +14,19 @@ from common import Http, env, must_match, find, main_guard, schedule_repo_dispat
 # 需要记录上次成功签到时间，下次在 +24h 之后才能再签。
 # 状态持久化：优先 Upstash Redis（cat_checkin:state:latvi），本地 /data/latvi_state.json 或 .latvi_state.json 兜底备份。
 #
-# 接力调度（对齐 workbuddy 放风模式）：签到成功后按「本次时间 + 24h + 3~5 分钟」
-# 通过 QStash 延时触发 repository_dispatch（latvi_next_sign），下一个 run 在签到
-# 窗口打开的瞬间启动、几十秒完成——不阻塞 Runner，也无任务超时风险。
-# 每日 18:00 的 cron 保留为兜底锚点：链活着时被幂等闸门快速放行；链断裂时当天补签重锚。
+# 单 run 全内联（2026-08-22 起）：由 daily_orchestrator 按 last_sign_ts+24h 动态推算
+# 当日窗口并提前 ~2min 进场，脚本侧仅原地等待 + 冷却重试循环精确收尾（LATVI_NO_RELAY=1）。
+# 旧 QStash 延时接力（+24h+3~5min dispatch latvi_next_sign / 18:00 cron 兜底锚点）
+# 已退役，仅在未设 LATVI_NO_RELAY 时保留兼容。
 
 PREFIX = "LATVI_"
 BJT = timezone(timedelta(hours=8))
 STATE_FILE = Path(os.getenv("LATVI_STATE_FILE", "/data/latvi_state.json"))
 LATVI_REDIS_KEY = f"{os.getenv('CAT_CHECKIN_REDIS_PREFIX', 'cat_checkin:').rstrip(':')}:state:latvi"
+
+def _is_no_relay() -> bool:
+    return os.getenv("LATVI_NO_RELAY", "").lower() in ("1", "true", "yes")
+
 
 # QStash 接力调度的事件名（latvi.yml 的 repository_dispatch 类型）
 DISPATCH_EVENT = "latvi_next_sign"
@@ -111,7 +115,16 @@ def _calc_wait_seconds() -> int:
 
 
 def _schedule_next_sign(delay_seconds: int) -> None:
-    """调度下一次接力签到；失败不影响本次结果，由每日 18:00 定时任务兜底重锚。"""
+    """调度下一次接力签到；失败不影响本次结果，由每日 18:00 定时任务兜底重锚。
+
+    内联模式（LATVI_NO_RELAY=1）下仅打印明日窗口预期，不调度接力。
+    """
+    if _is_no_relay():
+        eta = datetime.now(BJT) + timedelta(seconds=delay_seconds)
+        # last_sign 在签到成功后写入；此处打印以当前时刻推算的明日窗口
+        # 实际窗口以脚本输出的今日签到时刻 + 24h 为准
+        print(f"📅 明日窗口预计开启于 {eta.strftime('%Y-%m-%d %H:%M:%S')} BJT（内联模式，无接力调度）")
+        return
     ok, detail = schedule_repo_dispatch(DISPATCH_EVENT, delay_seconds)
     if ok:
         eta = datetime.now(BJT) + timedelta(seconds=delay_seconds)
@@ -134,9 +147,15 @@ def main():
 
     # 计算等待时间（24h 冷却 + 随机余量）
     wait_sec = _calc_wait_seconds()
-    if wait_sec > INLINE_WAIT_MAX:
-        # 距窗口尚远（18:00 cron 抢跑 / 链顺延后）：不阻塞 Runner，
-        # 调度 QStash 在窗口打开约 1 分钟后 dispatch 接力签到，本次 run 直接结束
+    if _is_no_relay():
+        # 内联模式：orchestrator 已按 last_sign+24h 精确排布进场时刻（提前 ~2min），
+        # 此处 wait 通常 ≤ 130s，直接原地等待让冷却重试循环精确收尾
+        if wait_sec > INLINE_WAIT_MAX:
+            hh, rem = divmod(wait_sec, 3600)
+            mm, ss = divmod(rem, 60)
+            print(f"ℹ️ 内联模式：距窗口尚有 {hh}小时{mm}分{ss}秒，原地等待（不调度接力）")
+    elif wait_sec > INLINE_WAIT_MAX:
+        # 旧接力/兜底模式：距窗口尚远不阻塞 Runner，调度 QStash 接力
         schedule_delay = wait_sec + 60
         ok, detail = schedule_repo_dispatch(DISPATCH_EVENT, schedule_delay)
         if ok:

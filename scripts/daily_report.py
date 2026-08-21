@@ -3,8 +3,8 @@
 # new Env("每日签到统一汇总推送")
 """每日报告函数库：报告文本构建 + HTML 邮件卡片 + SMTP/Resend 双通道发送。
 
-由 unified_report.py（report.yml 每日 10:00 调用）import 使用；
-任务执行与结果落盘由 run_task.py 在各签到 workflow 内完成，本模块不再执行任务。
+由 unified_report.py（checkin.yml#unified 内联 / #report-fallback 兜底）import 使用；
+任务执行与结果落盘由 run_task.py（经 daily_orchestrator 统一调度）完成，本模块不再执行任务。
 
 Environment（邮件通道）：
   SMTP: MAIL_HOST / MAIL_PORT(默认465) / MAIL_USER / MAIL_PASS / MAIL_FROM / MAIL_TO / MAIL_SSL

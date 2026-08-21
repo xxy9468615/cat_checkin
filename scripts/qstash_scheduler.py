@@ -14,10 +14,6 @@ if BASE_DIR not in sys.path:
 from common import Http
 
 STANDARD_SCHEDULES = [
-    {"name": "checkin_morning", "cron": "50 16 * * *", "desc": "晨间签到主批次 (00:50 BJT)", "event_type": "checkin_morning"},
-    {"name": "checkin_modelscope", "cron": "10 1 * * *", "desc": "ModelScope 魔粒奖励窗口 (09:10 BJT)", "event_type": "checkin_modelscope"},
-    {"name": "daily_report", "cron": "0 2 * * *", "desc": "每日统一汇聚报告与推送 (10:00 BJT)", "event_type": "daily_report"},
-    {"name": "checkin_latvi", "cron": "0 10 * * *", "desc": "Latvi 签到兜底锚点 (18:00 BJT)", "event_type": "checkin_latvi"},
     {"name": "stats_weekly", "cron": "5 2 * * 1", "desc": "自动周度统计分析报告 (周一 10:05 BJT)", "event_type": "stats_weekly"},
     {"name": "stats_monthly", "cron": "5 2 1 * *", "desc": "自动月度统计总结报告 (每月1日 10:05 BJT)", "event_type": "stats_monthly"},
 ]
@@ -96,12 +92,22 @@ def sync_all_schedules() -> None:
             print(f"  ➕ 创建调度 [{spec['name']}]: {spec['desc']}")
         ok, detail = create_or_update_schedule(spec)
         print(f"     {'✅ 成功' if ok else '❌ 失败'}: {detail}")
+
+    # 清理已退役的旧调度（单 run 全内联后不再需要）
+    retired = {"checkin_morning", "checkin_modelscope", "daily_report", "checkin_latvi",
+               "checkin_latvi_anchor", "latvi_next_sign", "workbuddy_travel_claim"}
+    for etype, sid in list(existing_map.items()):
+        if etype not in {s["event_type"] for s in STANDARD_SCHEDULES} and etype in retired:
+            if delete_schedule(sid):
+                print(f"  🗑️ 已清理退役调度: {etype} ({sid})")
+            else:
+                print(f"  ⚠️ 清理退役调度失败: {etype} ({sid})")
     print("\n✨ QStash 云端调度同步完成！")
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="QStash Scheduler CLI")
     parser.add_argument("--list", action="store_true", help="列出所有调度")
-    parser.add_argument("--sync", action="store_true", help="同步6大标准调度")
+    parser.add_argument("--sync", action="store_true", help="同步 QStash 云端调度")
     args = parser.parse_args()
     if args.sync:
         sync_all_schedules()

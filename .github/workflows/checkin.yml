@@ -5,12 +5,10 @@ run-name: >-
 
 on:
   schedule:
-    # 1. 晨间集中并发批次：北京时间 00:50（UTC 16:50，Actions 低谷期）执行 11 基础矩阵站点 + 2 WorkBuddy 账号
-    - cron: "50 16 * * *"
-    # 2. 魔粒奖励窗口批次：北京时间 09:10（UTC 01:10）执行 ModelScope 社区签到
-    - cron: "10 1 * * *"
-    # 3. Latvi 兜底锚点批次：北京时间 18:00（UTC 10:00）执行 Latvi 每日奖励及续期
-    - cron: "0 10 * * *"
+    # 主流水线：北京时间 14:00（UTC 06:00）单 run 全内联（稳态 ~18:1x 结束，硬墙 20:00）
+    - cron: "0 6 * * *"
+    # 报告兜底：北京时间 20:30（UTC 12:30，晚于硬墙 20:00），仅走报告分支
+    - cron: "30 12 * * *"
   repository_dispatch:
     types:
       - run_task
@@ -19,10 +17,11 @@ on:
       - checkin_latvi
       - latvi_next_sign
       - workbuddy_travel_claim
+      - daily_report
   workflow_dispatch:
     inputs:
       tasks:
-        description: '要执行的任务ID或脚本，逗号分隔（可选: all, matrix, workbuddy, glados, modelscope 等；留空按当前上下文默认）'
+        description: '要执行的任务ID或脚本，逗号分隔（可选: all, matrix, workbuddy, glados, modelscope 等；留空按当日时间线默认）'
         required: false
         default: ''
         type: string
@@ -33,46 +32,86 @@ on:
         type: boolean
 
 permissions:
-  contents: read
-  actions: read  # ai_router / latvi state 的 artifact 兜底恢复需读取历史 run 的 artifact
+  contents: write
+  actions: write
 
-concurrency:
-  group: checkin-${{ github.ref }}-${{ github.event_name }}-${{ github.event.action || github.event.schedule || inputs.tasks || 'manual' }}
-  cancel-in-progress: false
-
+# ============================================================
+# Job 1 — 统一编排主流水线（14:00 主 cron / 手动 / 旧接力兼容）
+# ============================================================
 jobs:
-  select:
-    name: Resolve Task Queue
+  unified:
+    if: >-
+      ${{ !(github.event_name == 'schedule' && github.event.schedule == '30 12 * * *')
+          && github.event.action != 'daily_report' }}
     runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.resolve.outputs.matrix }}
-      task_count: ${{ steps.resolve.outputs.task_count }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Resolve execution queue
-        id: resolve
-        env:
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
-          CRON_EXPR: ${{ github.event.schedule }}
-          DISPATCH_TYPE: ${{ github.event.action }}
-          INPUT_TASKS: ${{ inputs.tasks }}
-        run: |
-          python3 scripts/task_registry.py
-
-  checkin-matrix:
-    needs: select
-    if: needs.select.outputs.task_count != '0'
-    name: ${{ matrix.name }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.select.outputs.matrix) }}
+    timeout-minutes: 360
+    concurrency:
+      group: unified-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      TZ: Asia/Shanghai
+      TASK_OUTPUT_DIR: .task_results
+      GITHUB_REPO: ${{ github.repository }}
+      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+      QSTASH_URL: ${{ secrets.QSTASH_URL }}
+      QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
+      GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
+      GLADOS_AUTO_EXCHANGE: "true"
+      GLADOS_DOMAINS: glados.cloud
+      "2LIBRA_COOKIES": ${{ secrets.TWO_LIBRA_COOKIES }}
+      BIANJIE_AI_ACCOUNTS: ${{ secrets.BIANJIE_AI_ACCOUNTS }}
+      MOXING_username: ${{ secrets.MOXING_USERNAME }}
+      MOXING_password: ${{ secrets.MOXING_PASSWORD }}
+      MOXING_Domain: https://moxing.chat
+      MOXING_UA: ${{ secrets.MOXING_UA }}
+      UGNAS_cookie: ${{ secrets.UGNAS_COOKIE }}
+      PCBETA_cookie: ${{ secrets.PCBETA_COOKIE }}
+      PCBETA_username: ${{ secrets.PCBETA_USERNAME }}
+      PCBETA_password: ${{ secrets.PCBETA_PASSWORD }}
+      CLOUDSTUDIO_cookie: ${{ secrets.CLOUDSTUDIO_COOKIE }}
+      CLOUDSTUDIO_xsrf: ${{ secrets.CLOUDSTUDIO_XSRF }}
+      NAIXI_username: ${{ secrets.NAIXI_USERNAME }}
+      NAIXI_PASSWORD: ${{ secrets.NAIXI_PASSWORD }}
+      DJI_cookie: ${{ secrets.DJI_COOKIE }}
+      MONKEYCODE_ACCOUNTS: ${{ secrets.MONKEYCODE_ACCOUNTS }}
+      MONKEYCODE_cookie: ${{ secrets.MONKEYCODE_COOKIE }}
+      MONKEYCODE_email: ${{ secrets.MONKEYCODE_EMAIL }}
+      MONKEYCODE_password: ${{ secrets.MONKEYCODE_PASSWORD }}
+      SOPHNET_TOKENS: ${{ secrets.SOPHNET_TOKENS }}
+      AI_ROUTER_TOKEN: ${{ secrets.AI_ROUTER_TOKEN }}
+      AI_ROUTER_REFRESH_TOKEN: ${{ secrets.AI_ROUTER_REFRESH_TOKEN }}
+      AI_ROUTER_EMAIL: ${{ secrets.AI_ROUTER_EMAIL }}
+      AI_ROUTER_USERNAME: ${{ secrets.AI_ROUTER_USERNAME }}
+      AI_ROUTER_PASSWORD: ${{ secrets.AI_ROUTER_PASSWORD }}
+      AI_ROUTER_COOKIE: ${{ secrets.AI_ROUTER_COOKIE }}
+      AI_ROUTER_ACCOUNTS: ${{ secrets.AI_ROUTER_ACCOUNTS }}
+      AGENTROUTER_EMAIL: ${{ secrets.AGENTROUTER_EMAIL }}
+      AGENTROUTER_PASSWORD: ${{ secrets.AGENTROUTER_PASSWORD }}
+      AGENTROUTER_ACCOUNTS: ${{ secrets.AGENTROUTER_ACCOUNTS }}
+      AGENTROUTER_API_URL: https://ps.air-outer.com
+      AGENTROUTER_STATE_FILE: .agentrouter_state.json
+      AGENTROUTER_PROXY: socks5://127.0.0.1:1080
+      WORKBUDDY_COOKIE: ${{ secrets.WORKBUDDY_COOKIE }}
+      WORKBUDDY_COOKIE_2: ${{ secrets.WORKBUDDY_COOKIE_2 }}
+      WORKBUDDY_WAIT_TRAVEL: "true"
+      MODELSCOPE_cookie: ${{ secrets.MODELSCOPE_COOKIE }}
+      MODELSCOPE_HOST: ${{ secrets.MODELSCOPE_HOST }}
+      MODELSCOPE_AI_COOKIE: ${{ secrets.MODELSCOPE_AI_COOKIE }}
+      LATVI_EMAIL: ${{ secrets.LATVI_EMAIL }}
+      LATVI_PASSWORD: ${{ secrets.LATVI_PASSWORD }}
+      LATVI_STATE_FILE: .latvi_state.json
+      RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+      RESEND_FROM: ${{ secrets.RESEND_FROM }}
+      RESEND_TO: ${{ secrets.RESEND_TO }}
+      MAIL_HOST: ${{ secrets.MAIL_HOST }}
+      MAIL_PORT: ${{ secrets.MAIL_PORT }}
+      MAIL_USER: ${{ secrets.MAIL_USER }}
+      MAIL_PASS: ${{ secrets.MAIL_PASS }}
+      MAIL_FROM: ${{ secrets.MAIL_FROM }}
+      MAIL_TO: ${{ secrets.MAIL_TO }}
 
     steps:
       - uses: actions/checkout@v4
@@ -84,79 +123,57 @@ jobs:
       - name: Set TODAY
         run: echo "TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_ENV"
 
-      # --- AI-ROUTER RTR 状态恢复 ---
-      - name: Restore AI-ROUTER token rotation state
-        id: ai_state
-        if: matrix.script == 'ai_router.py'
+      - name: Restore unified states
         uses: actions/cache/restore@v4
         with:
-          path: .ai_router_state.json
-          key: ai-router-state-${{ github.run_id }}
-          restore-keys: ai-router-state-
+          path: |
+            .ai_router_state.json
+            .latvi_state.json
+            .agentrouter_state.json
+          key: unified-states-${{ github.run_id }}
+          restore-keys: |
+            unified-states-
+            ai-router-state-
+            latvi-state-
+            agentrouter-state-
 
       - name: Restore AI-ROUTER state from artifact (fallback)
-        if: matrix.script == 'ai_router.py' && steps.ai_state.outputs.cache-hit != 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [ -s .ai_router_state.json ]; then
+            echo "AI-ROUTER state already restored via cache"
+            exit 0
+          fi
           for rid in $(gh run list --workflow checkin.yml --status completed --limit 20 --json databaseId --jq '.[].databaseId'); do
             if gh run download "$rid" -n ai-router-state --dir . 2>/dev/null; then
-              echo "✅ 已从 run $rid 的 artifact 恢复 AI-ROUTER state（cache 未命中兜底）"
+              echo "Restored AI-ROUTER state from run $rid (cache miss fallback)"
               break
             fi
           done
 
-      # --- Latvi 24h 冷却状态恢复 ---
-      - name: Restore Latvi state
-        if: matrix.script == 'latvi.py'
-        uses: actions/cache/restore@v4
-        with:
-          path: .latvi_state.json
-          key: latvi-state-${{ github.run_id }}
-          restore-keys: latvi-state-
-
-      # --- AgentRouter 会话状态恢复 ---
-      - name: Restore AgentRouter state
-        if: matrix.script == 'agentrouter.py'
-        uses: actions/cache/restore@v4
-        with:
-          path: .agentrouter_state.json
-          key: agentrouter-state-${{ github.run_id }}
-          restore-keys: agentrouter-state-
-
-      # --- AgentRouter SS 代理出口（绕过 Aliyun WAF 滑块；仅 agentrouter 腿） ---
       - name: Setup SS proxy for AgentRouter
-        if: matrix.script == 'agentrouter.py'
         run: |
           set -euo pipefail
-
-          # 1. 下载静态编译 sslocal（shadowsocks-rust v1.23.4 musl；tarball 为扁平结构，二进制在根）
           curl -sL -o /tmp/ss.tar.xz \
             https://github.com/shadowsocks/shadowsocks-rust/releases/download/v1.23.4/shadowsocks-v1.23.4.x86_64-unknown-linux-musl.tar.xz
           tar xf /tmp/ss.tar.xz -C /tmp
-          test -x /tmp/sslocal || { echo "❌ sslocal 二进制缺失"; exit 1; }
-
-          # 2. 安装 obfs-local（simple-obfs，GLaDOS 等 obfs=tls 节点必需；apt 自动解析 libev/libcork 依赖）
+          test -x /tmp/sslocal || { echo "sslocal missing"; exit 1; }
           command -v obfs-local >/dev/null 2>&1 || \
             sudo apt-get install -y -qq simple-obfs >/dev/null 2>&1
-          command -v obfs-local >/dev/null || { echo "❌ obfs-local 安装失败"; exit 1; }
-
-          # 3. 写入 SS 配置（secret AGENTROUTER_SS_CONFIG，可直贴 GLaDOS/客户端导出原始 JSON）
+          command -v obfs-local >/dev/null || { echo "obfs-local install failed"; exit 1; }
           cat > /tmp/ss-config.json <<'EOF'
           ${{ secrets.AGENTROUTER_SS_CONFIG }}
           EOF
-          test -s /tmp/ss-config.json || { echo "❌ AGENTROUTER_SS_CONFIG 未配置或为空"; exit 1; }
-
-          # 3b. 归一化：sslocal 强制要求 local_address/local_port，缺失时补默认 127.0.0.1:1080；
-          #      plugin 裸名 → 解析为绝对路径（防 PATH 查找失败，实测必须）
+          test -s /tmp/ss-config.json || { echo "AGENTROUTER_SS_CONFIG empty, SS proxy cannot start (agentrouter will fail)"; exit 0; }
           python3 - <<'PY'
           import json, shutil, sys
           p = "/tmp/ss-config.json"
           try:
               cfg = json.load(open(p, encoding="utf-8"))
           except Exception as e:
-              print(f"❌ AGENTROUTER_SS_CONFIG 不是合法 JSON: {e}")
+              print(f"AGENTROUTER_SS_CONFIG not valid JSON: {e}")
               sys.exit(1)
           cfg["local_address"] = "127.0.0.1"
           cfg["local_port"] = 1080
@@ -165,16 +182,10 @@ jobs:
               cfg["plugin"] = resolved
           json.dump(cfg, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
           PY
-
-          # 4. 安装 pysocks（urllib 原生不支持 socks:// scheme，需 socket monkey-patch）
           pip install -q pysocks
-
-          # 5. 后台启动 sslocal
           /tmp/sslocal -c /tmp/ss-config.json &
           SSPID=$!
           echo "SSPID=$SSPID" >> "$GITHUB_ENV"
-
-          # 6. 等待 SOCKS5 端口就绪 + 功能校验（真实建连穿过节点，防「端口在听但隧道不通」）
           SSPORT=$(grep -oE '"local_port"[[:space:]]*:[[:space:]]*[0-9]+' /tmp/ss-config.json | grep -oE '[0-9]+$' || true)
           SSPORT=${SSPORT:-1080}
           echo "Waiting for SS proxy on port $SSPORT..."
@@ -186,116 +197,282 @@ jobs:
           done
           for i in 1 2 3; do
             if curl -sS -x "socks5://127.0.0.1:$SSPORT" -m 8 -o /dev/null https://api.ipify.org; then
-              echo "✅ SS proxy ready (pid $SSPID, port $SSPORT)"
+              echo "SS proxy ready (pid $SSPID, port $SSPORT)"
               exit 0
             fi
             sleep 1
           done
-          echo "❌ SS proxy 启动失败（检查 AGENTROUTER_SS_CONFIG 的 server/server_port/password/method/plugin；或节点/出口 IP 已被封）"
-          exit 1
+          echo "SS proxy failed (check AGENTROUTER_SS_CONFIG); continuing without proxy"
 
-      # --- 核心任务执行（动态注入参数并毫秒级直写 Upstash Redis）---
-      - name: Execute Check-in Task (${{ matrix.id }})
-        env:
-          TZ: Asia/Shanghai
-          TASK_OUTPUT_DIR: .task_results
-          TASK_RESULT_NAME: ${{ matrix.result }}
-          TASK_TIMEOUT: ${{ matrix.timeout }}
-          GITHUB_REPO: ${{ github.repository }}
-          # === 基础设施凭证 ===
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-          QSTASH_URL: ${{ secrets.QSTASH_URL }}
-          QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
-          GH_PAT: ${{ secrets.GH_PAT }}
-          # === 站点凭证池 ===
-          GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
-          GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
-          GLADOS_AUTO_EXCHANGE: "true"
-          GLADOS_DOMAINS: glados.cloud
-          "2LIBRA_COOKIES": ${{ secrets.TWO_LIBRA_COOKIES }}
-          BIANJIE_AI_ACCOUNTS: ${{ secrets.BIANJIE_AI_ACCOUNTS }}
-          MOXING_username: ${{ secrets.MOXING_USERNAME }}
-          MOXING_password: ${{ secrets.MOXING_PASSWORD }}
-          MOXING_Domain: https://moxing.chat
-          MOXING_UA: ${{ secrets.MOXING_UA }}
-          UGNAS_cookie: ${{ secrets.UGNAS_COOKIE }}
-          PCBETA_cookie: ${{ secrets.PCBETA_COOKIE }}
-          PCBETA_username: ${{ secrets.PCBETA_USERNAME }}
-          PCBETA_password: ${{ secrets.PCBETA_PASSWORD }}
-          CLOUDSTUDIO_cookie: ${{ secrets.CLOUDSTUDIO_COOKIE }}
-          CLOUDSTUDIO_xsrf: ${{ secrets.CLOUDSTUDIO_XSRF }}
-          NAIXI_username: ${{ secrets.NAIXI_USERNAME }}
-          NAIXI_PASSWORD: ${{ secrets.NAIXI_PASSWORD }}
-          DJI_cookie: ${{ secrets.DJI_COOKIE }}
-          MONKEYCODE_ACCOUNTS: ${{ secrets.MONKEYCODE_ACCOUNTS }}
-          MONKEYCODE_cookie: ${{ secrets.MONKEYCODE_COOKIE }}
-          MONKEYCODE_email: ${{ secrets.MONKEYCODE_EMAIL }}
-          MONKEYCODE_password: ${{ secrets.MONKEYCODE_PASSWORD }}
-          SOPHNET_TOKENS: ${{ secrets.SOPHNET_TOKENS }}
-          AI_ROUTER_TOKEN: ${{ secrets.AI_ROUTER_TOKEN }}
-          AI_ROUTER_REFRESH_TOKEN: ${{ secrets.AI_ROUTER_REFRESH_TOKEN }}
-          AI_ROUTER_EMAIL: ${{ secrets.AI_ROUTER_EMAIL }}
-          AI_ROUTER_USERNAME: ${{ secrets.AI_ROUTER_USERNAME }}
-          AI_ROUTER_PASSWORD: ${{ secrets.AI_ROUTER_PASSWORD }}
-          AI_ROUTER_COOKIE: ${{ secrets.AI_ROUTER_COOKIE }}
-          AI_ROUTER_ACCOUNTS: ${{ secrets.AI_ROUTER_ACCOUNTS }}
-          # AgentRouter（New API 面板，签到=登录，邮箱密码必填）
-          AGENTROUTER_EMAIL: ${{ secrets.AGENTROUTER_EMAIL }}
-          AGENTROUTER_PASSWORD: ${{ secrets.AGENTROUTER_PASSWORD }}
-          AGENTROUTER_ACCOUNTS: ${{ secrets.AGENTROUTER_ACCOUNTS }}
-          AGENTROUTER_API_URL: https://ps.air-outer.com
-          AGENTROUTER_STATE_FILE: .agentrouter_state.json
-          # SOCKS5 出口仅 agentrouter 腿生效（proxy 由 Setup SS proxy 步骤启动）
-          AGENTROUTER_PROXY: ${{ matrix.script == 'agentrouter.py' && 'socks5://127.0.0.1:1080' || '' }}
-          # WorkBuddy 动态账号适配
-          WORKBUDDY_COOKIE: ${{ matrix.account == '2' && secrets.WORKBUDDY_COOKIE_2 || secrets.WORKBUDDY_COOKIE }}
-          WORKBUDDY_WAIT_TRAVEL: "true"
-          # ModelScope 双站凭证
-          MODELSCOPE_cookie: ${{ secrets.MODELSCOPE_COOKIE }}
-          MODELSCOPE_HOST: ${{ secrets.MODELSCOPE_HOST }}
-          MODELSCOPE_AI_COOKIE: ${{ secrets.MODELSCOPE_AI_COOKIE }}
-          # Latvi 凭证
-          LATVI_EMAIL: ${{ secrets.LATVI_EMAIL }}
-          LATVI_PASSWORD: ${{ secrets.LATVI_PASSWORD }}
-          LATVI_STATE_FILE: .latvi_state.json
+      - name: Resolve dispatch compat -> ORCH_TASKS
+        id: orch_tasks
         run: |
-          python3 scripts/run_task.py "scripts/${{ matrix.script }}"
+          # workflow_dispatch explicit tasks take precedence
+          if [ -n "${{ inputs.tasks }}" ]; then
+            echo "tasks=${{ inputs.tasks }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          case "${{ github.event.action }}" in
+            latvi_next_sign|checkin_latvi) echo "tasks=latvi" >> "$GITHUB_OUTPUT" ;;
+            workbuddy_travel_claim)        echo "tasks=workbuddy" >> "$GITHUB_OUTPUT" ;;
+            checkin_modelscope)            echo "tasks=modelscope" >> "$GITHUB_OUTPUT" ;;
+            checkin_morning)               echo "tasks=matrix,workbuddy" >> "$GITHUB_OUTPUT" ;;
+            *) echo "tasks=" >> "$GITHUB_OUTPUT" ;;
+          esac
 
-      # --- 状态保存 ---
-      - name: Save AI-ROUTER token rotation state
-        if: always() && matrix.script == 'ai_router.py' && hashFiles('.ai_router_state.json') != ''
+      - name: Execute daily orchestrator
+        id: orchestrator
+        run: |
+          if [ -n "${{ steps.orch_tasks.outputs.tasks }}" ]; then
+            python3 scripts/daily_orchestrator.py --tasks "${{ steps.orch_tasks.outputs.tasks }}"
+          else
+            python3 scripts/daily_orchestrator.py
+          fi
+
+      - name: Send unified report
+        id: send_report
+        if: always() && inputs.retry != true
+        env:
+          DAILY_PUSH: "true"
+        run: python3 scripts/unified_report.py
+
+      - name: Auto-retry failed sites
+        if: always() && steps.send_report.outputs.failed_matrix != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          FAILED_MATRIX: ${{ steps.send_report.outputs.failed_matrix }}
+        run: |
+          set -uo pipefail
+          RETRIED=$(python3 - <<'EOF'
+          import datetime as dt, json, subprocess
+          tz = dt.timezone(dt.timedelta(hours=8))
+          today = dt.datetime.now(tz).strftime("%Y-%m-%d")
+          try:
+              out = subprocess.check_output(
+                  ["gh", "run", "list", "--workflow", "checkin.yml", "--event", "workflow_dispatch",
+                   "--limit", "10", "--json", "createdAt"], text=True)
+              runs = json.loads(out)
+          except Exception:
+              print("unknown", flush=True)
+          else:
+              hit = any(
+                  dt.datetime.fromisoformat(r["createdAt"].replace("Z", "+00:00"))
+                  .astimezone(tz).strftime("%Y-%m-%d") == today
+                  for r in runs)
+              print("true" if hit else "false", flush=True)
+          EOF
+          )
+          if [ "$RETRIED" != "false" ]; then
+            echo "Today already has a workflow_dispatch checkin run ($RETRIED), skip auto-retry"
+            exit 0
+          fi
+          echo "Auto-retry failed sites: $FAILED_MATRIX"
+          if gh workflow run checkin.yml --ref "${GITHUB_REF_NAME:-main}" -f scripts="$FAILED_MATRIX" -f retry=true; then
+            echo "Retry dispatched"
+          else
+            echo "Retry dispatch failed, please check manually"
+          fi
+
+      - name: Save unified states
+        if: always()
         uses: actions/cache/save@v4
         with:
-          path: .ai_router_state.json
-          key: ai-router-state-${{ github.run_id }}
-
-      - name: Save Latvi state
-        if: always() && matrix.script == 'latvi.py' && hashFiles('.latvi_state.json') != ''
-        uses: actions/cache/save@v4
-        with:
-          path: .latvi_state.json
-          key: latvi-state-${{ github.run_id }}
-
-      - name: Save AgentRouter state
-        if: always() && matrix.script == 'agentrouter.py' && hashFiles('.agentrouter_state.json') != ''
-        uses: actions/cache/save@v4
-        with:
-          path: .agentrouter_state.json
-          key: agentrouter-state-${{ github.run_id }}
+          path: |
+            .ai_router_state.json
+            .latvi_state.json
+            .agentrouter_state.json
+          key: unified-states-${{ github.run_id }}
 
       - name: Cleanup SS proxy
-        if: always() && matrix.script == 'agentrouter.py'
+        if: always()
         run: |
           kill "${SSPID:-}" 2>/dev/null || true
           pkill -f '[s]slocal' 2>/dev/null || true
 
-      # --- 冗余备份 Artifact ---
-      - name: Upload task result artifact
+      - name: Upload unified results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: task-result-${{ matrix.id }}
+          name: unified-results
           path: .task_results/
           retention-days: 1
           include-hidden-files: true
+
+  # ============================================================
+  # Job 2 — 报告兜底（20:30 晚于硬墙，仅当主 run 未发报告时补发）
+  # ============================================================
+  report-fallback:
+    if: >-
+      ${{ github.event_name == 'schedule' && github.event.schedule == '30 12 * * *'
+          || github.event.action == 'daily_report' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: report-fallback-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Syntax check
+        run: python3 -m py_compile scripts/*.py
+
+      - name: Set TODAY
+        run: echo "TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Check if report sent today (Redis marker)
+        id: check_sent
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          TODAY: ${{ env.TODAY }}
+        run: |
+          python3 <<'EOF'
+          import os, json, sys, urllib.request
+          url = (os.getenv("UPSTASH_REDIS_REST_URL") or "").rstrip("/")
+          token = os.getenv("UPSTASH_REDIS_REST_TOKEN") or ""
+          today = os.getenv("TODAY", "")
+          gh_output = os.getenv("GITHUB_OUTPUT")
+          prefix = (os.getenv("CAT_CHECKIN_REDIS_PREFIX") or "cat_checkin:").rstrip(":")
+          marker_key = f"{prefix}:sent:{today}"
+          if not url or not token:
+              if gh_output:
+                  open(gh_output, "a", encoding="utf-8").write("sent=false\n")
+              sys.exit(0)
+          req = urllib.request.Request(f"{url}/get/{marker_key}", headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+          try:
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  data = json.loads(resp.read().decode())
+                  res = data.get("result")
+                  if res:
+                      marker = json.loads(res) if isinstance(res, str) else res
+                      if isinstance(marker, dict) and marker.get("date") == today:
+                          print(f"Redis marker hit: {marker_key} (sent_at={marker.get('sent_at')})")
+                          if gh_output:
+                              open(gh_output, "a", encoding="utf-8").write("sent=true\n")
+                              if marker.get("resend_msg_id"):
+                                  open(gh_output, "a", encoding="utf-8").write(f"resend_msg_id={marker.get('resend_msg_id')}\n")
+                          sys.exit(0)
+          except Exception as e:
+              print(f"check Redis marker error: {e}", file=sys.stderr)
+          open(gh_output, "a", encoding="utf-8").write("sent=false\n")
+          EOF
+
+      - name: Verify QStash email delivery
+        id: delivery
+        env:
+          QSTASH_URL: ${{ secrets.QSTASH_URL }}
+          QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
+        run: python3 scripts/check_qstash_delivery.py
+
+      - name: Determine if execution is needed
+        id: should_run
+        env:
+          TODAY: ${{ env.TODAY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "manual force, ignore marker"
+            exit 0
+          fi
+          if [ "${{ steps.check_sent.outputs.sent }}" = "true" ]; then
+            if [ "${{ steps.delivery.outputs.delivery }}" = "failed" ]; then
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              echo "QStash delivery failed, retry"
+              exit 0
+            fi
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Report already sent today (Redis marker), skip"
+            exit 0
+          fi
+          API_SENT=$(python3 -c "
+          import json, subprocess, sys, datetime as dt
+          try:
+              out = subprocess.check_output(['gh', 'run', 'list', '--workflow', 'checkin.yml', '--status', 'success', '--json', 'databaseId,createdAt', '--limit', '10'], text=True)
+              runs = json.loads(out)
+              tz = dt.timezone(dt.timedelta(hours=8))
+              today = dt.datetime.now(tz).strftime('%Y-%m-%d')
+              sent = False
+              for r in runs:
+                  created_utc = dt.datetime.fromisoformat(r['createdAt'].replace('Z', '+00:00'))
+                  created_bj = created_utc.astimezone(tz).strftime('%Y-%m-%d')
+                  if created_bj == today:
+                      sent = True
+                      break
+              print('true' if sent else 'false', flush=True)
+          except Exception as e:
+              import traceback; traceback.print_exc(file=sys.stderr)
+              print('false', flush=True)
+          ")
+          if [ "$API_SENT" = "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Report already sent today (API check), skip"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send unified report
+        id: send_report
+        if: steps.should_run.outputs.skip != 'true'
+        env:
+          TZ: Asia/Shanghai
+          DAILY_PUSH: "true"
+          TASK_OUTPUT_DIR: .task_results
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM: ${{ secrets.RESEND_FROM }}
+          RESEND_TO: ${{ secrets.RESEND_TO }}
+          QSTASH_URL: ${{ secrets.QSTASH_URL }}
+          QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          MAIL_HOST: ${{ secrets.MAIL_HOST }}
+          MAIL_PORT: ${{ secrets.MAIL_PORT }}
+          MAIL_USER: ${{ secrets.MAIL_USER }}
+          MAIL_PASS: ${{ secrets.MAIL_PASS }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: python3 scripts/unified_report.py
+
+      - name: Auto-retry failed sites
+        if: always() && steps.should_run.outputs.skip != 'true' && steps.send_report.outputs.failed_matrix != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          FAILED_MATRIX: ${{ steps.send_report.outputs.failed_matrix }}
+        run: |
+          set -uo pipefail
+          RETRIED=$(python3 - <<'EOF'
+          import datetime as dt, json, subprocess
+          tz = dt.timezone(dt.timedelta(hours=8))
+          today = dt.datetime.now(tz).strftime("%Y-%m-%d")
+          try:
+              out = subprocess.check_output(
+                  ["gh", "run", "list", "--workflow", "checkin.yml", "--event", "workflow_dispatch",
+                   "--limit", "10", "--json", "createdAt"], text=True)
+              runs = json.loads(out)
+          except Exception:
+              print("unknown", flush=True)
+          else:
+              hit = any(
+                  dt.datetime.fromisoformat(r["createdAt"].replace("Z", "+00:00"))
+                  .astimezone(tz).strftime("%Y-%m-%d") == today
+                  for r in runs)
+              print("true" if hit else "false", flush=True)
+          EOF
+          )
+          if [ "$RETRIED" != "false" ]; then
+            echo "Today already has a workflow_dispatch checkin run ($RETRIED), skip auto-retry"
+            exit 0
+          fi
+          echo "Auto-retry failed sites: $FAILED_MATRIX"
+          if gh workflow run checkin.yml --ref "${GITHUB_REF_NAME:-main}" -f scripts="$FAILED_MATRIX" -f retry=true; then
+            echo "Retry dispatched"
+          else
+            echo "Retry dispatch failed"
+          fi

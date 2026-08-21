@@ -7,11 +7,12 @@
 1. 算力中心每日签到与专享礼包：
    - 每日调用 `POST /billing/meter/daily-checkin` 领取每日算力与累计连签天数。
    - 自动检测并领取 `POST /billing/meter/check-gift-claimed` 专享算力礼包（如 +1500 算力）。
-2. 动态放风跟踪与延时接力领奖：
+2. 动态放风跟踪与回程领奖：
    - 不依赖硬编码的 4 小时，完全基于服务端返回的真实 `arrive_at` 与 `server_now` 动态计算。
-   - 放风出发后或已在放风中时，不再长时间阻塞等待——提取剩余秒数后通过 QStash 延时 Webhook
-     触发 `repository_dispatch`，由下一轮 workbuddy.yml 接力发现 `arrived` 状态后自动领奖，
-     完赛后若额度未用完继续派遣下一场，直到当天放风次数达上限。
+   - 单 run 全内联（2026-08-22 起）：放风进行中时打印 `TRAVEL_EVENT` 机器行，由
+     `daily_orchestrator` 在 `arrive_at+60s` 定时回访领奖（受 Latvi 进场截止线约束，超线
+     留次日领）；旧 QStash 延时接力（`workbuddy_travel_claim`）已退役，未设
+     `WORKBUDDY_NO_RELAY` 时仍兼容旧行为。
 3. 连登兑换与抽奖追踪：
    - 自动核算当月连登天数，符合 7d/14d/28d 档位时自动兑换奖励与抽奖机会。
    - 追踪当前剩余抽奖次数，>0 时自动循环抽奖并统计获得的奖品。
@@ -690,13 +691,25 @@ def _claim_travel_reward(h: Http, headers: Dict[str, str], travel_data: Dict[str
     return True, f"已领取【{loc_name}】放风奖励（+{credit} 积分{letter_info}）"
 
 
+def _is_no_relay() -> bool:
+    return os.getenv("WORKBUDDY_NO_RELAY", "").lower() in ("1", "true", "yes")
+
+
 def _schedule_travel_claim(remaining_seconds: int) -> str:
     """通过 QStash 延时 Webhook 触发 repository_dispatch，调度下一轮工作流接力领取放风奖励。
 
     不在本地阻塞等待放风时长——改为提取剩余秒数后通过 QStash 延时发布，
     由下一轮 workbuddy.yml 接力发现 arrived 状态后自动领奖，避免长时间占用 Runner。
     （QStash publish URL 拼接 / 鉴权透传统一在 common.schedule_repo_dispatch）
+
+    内联模式（WORKBUDDY_NO_RELAY=1，orchestrator 注入）：不再调度接力，改为打印
+    TRAVEL_EVENT 机器行供 orchestrator 解析后排入回程领奖事件。
     """
+    if _is_no_relay():
+        # orchestrator 解析此行后按 arrive_at+60s 排入 claim 事件
+        arrive_at = int(time.time()) + remaining_seconds
+        print(f"TRAVEL_EVENT state=traveling arrive_at={arrive_at}")
+        return "已记录放风回程（内联模式，等待 orchestrator 定时回访）"
     delay = remaining_seconds + 300  # 5 分钟缓冲，防止时钟/接口延迟导致提前到达
     ok, detail = schedule_repo_dispatch("workbuddy_travel_claim", delay)
     if ok:
