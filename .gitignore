@@ -53,7 +53,7 @@ test_data/
 *.bak
 *.backup
 *.old
-
+s5.txt
 # 项目存档/旧版
 archive/
 old/
