@@ -7,7 +7,7 @@ import os
 import re
 import sys
 
-from common import Http, env, find, bj_time_from_iso_z, main_guard, mask_str
+from common import Http, env, find, is_already_signed, bj_time_from_iso_z, main_guard, mask_str
 
 PREFIX = "2LIBRA_"
 
@@ -62,7 +62,7 @@ def _run_one(cookie: str, auth: str) -> str:
     msg = find(r'(?<="m":").*?(?=")', sign.text)
     if sign.code == 200 and coins:
         first = f"签到成功，签到时间为：{d} {t}，本次签到获得 {coins} 金币"
-    elif msg and (any(k in msg for k in ("已签", "已经", "重复")) or "already" in msg.lower() or "sign" in msg.lower()):
+    elif msg and is_already_signed(msg, ("已签", "重复")):
         # 幂等放行：仅当 msg 明确是「已签到」类语义；其余错误消息（未登录/风控等）必须红卡
         first = msg
     elif msg:
@@ -100,4 +100,5 @@ def main():
         sys.exit(1)
 
 
-main_guard(main)
+if __name__ == "__main__":
+    main_guard(main)

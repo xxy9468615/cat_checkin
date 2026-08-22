@@ -5,9 +5,9 @@ run-name: >-
 
 on:
   schedule:
-    # 主流水线：北京时间 14:00（UTC 06:00）单 run 全内联（稳态 ~18:1x 结束，硬墙 20:00）
+    # 主流水线：北京时间 14:00（UTC 06:00）单 run 全内联（稳态 ~18:1x 结束，硬墙 19:55（ORCH_HARD_DEADLINE））
     - cron: "0 6 * * *"
-    # 报告兜底：北京时间 20:30（UTC 12:30，晚于硬墙 20:00），仅走报告分支
+    # 报告兜底：北京时间 20:30（UTC 12:30，晚于硬墙 19:55（ORCH_HARD_DEADLINE）），仅走报告分支
     - cron: "30 12 * * *"
   repository_dispatch:
     types:

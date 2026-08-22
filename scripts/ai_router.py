@@ -43,7 +43,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from common import Http, env, main_guard, mask_str, upstash_redis_command
+from common import Http, env, load_kv_state, main_guard, mask_str, save_kv_state
 
 PREFIX = "AI_ROUTER_"
 DEFAULT_API_URL = "https://api.ai-router.dev/api/v1"
@@ -55,54 +55,15 @@ REDIS_KEY = f"{os.getenv('CAT_CHECKIN_REDIS_PREFIX', 'cat_checkin:')}ai_router:s
 
 def _load_state() -> dict:
     """从 Upstash Redis 与本地 state 文件双层加载持久化的 token 轮转映射"""
-    state: dict = {}
-
-    # 1. 尝试从本地 state 文件读取
-    if STATE_FILE.exists():
-        try:
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                state.update(data)
-        except Exception:
-            pass
-
-    # 2. 尝试从 Upstash Redis 远程存储读取（跨 CI runner 永不丢失）
-    try:
-        ok, res = upstash_redis_command(["GET", REDIS_KEY])
-        if ok and isinstance(res, dict):
-            raw_val = res.get("result")
-            if raw_val and isinstance(raw_val, str):
-                remote_data = json.loads(raw_val)
-                if isinstance(remote_data, dict):
-                    # 远程 Redis 数据权威性高于本地临时 runner 文件
-                    state.update(remote_data)
-    except Exception as e:
-        print(f"⚠️ 从 Redis 读取 RTR 状态异常: {e}")
-
+    state = load_kv_state(REDIS_KEY, STATE_FILE)
     # 清理已废弃的全局最新 rt 标记（多账号场景串号根源，2026-08-22 移除）
     state.pop("_latest_rt", None)
-
     return state
 
 
 def _save_state(state: dict) -> None:
     """持久化 token 映射到本地 state 文件与 Upstash Redis（双通道备份）"""
-    if not isinstance(state, dict):
-        return
-
-    # 1. 保存到本地文件
-    try:
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-    except Exception as e:
-        print(f"⚠️ 保存本地 state 失败: {e}")
-
-    # 2. 同步保存到 Upstash Redis
-    try:
-        ok, res = upstash_redis_command(["SET", REDIS_KEY, json.dumps(state, ensure_ascii=False)])
-        if ok and isinstance(res, dict) and res.get("result") == "OK":
-            print(f"☁️ Token 轮转链已实时同步至 Upstash Redis")
-    except Exception as e:
-        print(f"⚠️ 同步 state 到 Redis 异常: {e}")
+    save_kv_state(REDIS_KEY, STATE_FILE, state)
 
 
 def _resolve_rtr(refresh_token: str, state: dict) -> tuple[str, bool]:

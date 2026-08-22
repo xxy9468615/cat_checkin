@@ -49,4 +49,5 @@ def main():
     masked_user = mask_str(username)
     masked_uid = mask_str(uid)
     print(f"【个人信息】\n用户：【{masked_user}】 UID：【{masked_uid}】\n任务情况：【{'已签到' if signed=='true' else '本次执行'}】 连签天数：【{days}】\n\n【任务情况】\n签到：【{'已签到' if signed=='true' else '成功'}】 +{sign_points}\n个人空间：【{'成功' if own_ok else '失败'}】\n他人空间：【成功{other_ok}次】\n\n【积分情况】\n积分变化：【{start} -> {final_credits}】")
-main_guard(main)
+if __name__ == "__main__":
+    main_guard(main)

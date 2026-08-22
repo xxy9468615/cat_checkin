@@ -147,4 +147,5 @@ def main():
         sys.exit(1)
     print(f"\n✅ Sophnet 签到总结：{len(accounts)}/{len(accounts)} 全部成功")
 
-main_guard(main)
+if __name__ == "__main__":
+    main_guard(main)

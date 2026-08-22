@@ -96,4 +96,5 @@ def main():
     t=find(r'(在线时间</em>\d+ 小时)',prof); u=find(r'<title>(.+)的个人资料',prof,username); g=find(r'用户组.+</a>',prof); j=find(r'积分.+</a>',prof); cr=find(r'威望.+',credit)
     masked_u = mask_str(strip_tags(u))
     print(f"用户名：{masked_u} {strip_tags(g)} {strip_tags(t)} {strip_tags(j)} {strip_tags(cr)} {msg}".strip())
-main_guard(main)
+if __name__ == "__main__":
+    main_guard(main)

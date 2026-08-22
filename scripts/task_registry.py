@@ -178,103 +178,65 @@ def get_expected_results() -> Dict[str, str]:
     return {cfg["result"]: cfg["script"] for cfg in TASKS.values()}
 
 
-def resolve_execution_queue(
-    event_name: str = "",
-    cron: str = "",
-    dispatch_type: str = "",
-    input_tasks: str = "",
-) -> List[Dict[str, Any]]:
-    """根据触发上下文解析应执行的任务队列列表。"""
-    event = (event_name or "").strip().lower()
-    cron_expr = (cron or "").strip()
-    dtype = (dispatch_type or "").strip()
+def resolve_execution_queue(input_tasks: str = "") -> List[Dict[str, Any]]:
+    """解析显式指定的任务队列（唯一调用方：daily_orchestrator --tasks）。
+
+    支持：逗号分隔的 task_id / 脚本名 / 结果文件名精确匹配，及分组别名
+    all / matrix / workbuddy。旧的 schedule-cron 与 repository_dispatch
+    映射分支已删除——checkin.yml 的 Resolve 步骤自行做 dispatch->tasks 映射，
+    且原 cron 匹配用带冒号写法（"16:50"）永远匹配不到 GitHub cron 格式，属死代码。
+    """
     raw_tasks = (input_tasks or "").strip()
 
-    # 1. 优先解析显式指定的 tasks 参数（手动触发 / 报告自动重跑 / 外部调用）
-    if raw_tasks:
-        wanted_keys = [k.strip() for k in raw_tasks.replace(" ", ",").split(",") if k.strip()]
-        matched: List[Dict[str, Any]] = []
-        matched_keys: set[str] = set()
+    wanted_keys = [k.strip() for k in raw_tasks.replace(" ", ",").split(",") if k.strip()]
+    matched: List[Dict[str, Any]] = []
+    matched_keys: set[str] = set()
 
-        for key in wanted_keys:
-            # 关键字全选 / 分组别名
-            if key.lower() in ("all", "full", "all_tasks"):
-                for t in TASKS.values():
-                    if t["id"] not in matched_keys:
-                        matched_keys.add(t["id"])
-                        matched.append(t)
-                continue
-            if key.lower() in ("matrix", "basic_matrix"):
-                for t in TASKS.values():
-                    if "matrix" in t["tags"] and t["id"] not in matched_keys:
-                        matched_keys.add(t["id"])
-                        matched.append(t)
-                continue
-            if key.lower() in ("workbuddy", "workbuddy_all"):
-                for t in TASKS.values():
-                    if "workbuddy" in t["tags"] and t["id"] not in matched_keys:
-                        matched_keys.add(t["id"])
-                        matched.append(t)
-                continue
+    for key in wanted_keys:
+        # 关键字全选 / 分组别名
+        if key.lower() in ("all", "full", "all_tasks"):
+            for t in TASKS.values():
+                if t["id"] not in matched_keys:
+                    matched_keys.add(t["id"])
+                    matched.append(t)
+            continue
+        if key.lower() in ("matrix", "basic_matrix"):
+            for t in TASKS.values():
+                if "matrix" in t["tags"] and t["id"] not in matched_keys:
+                    matched_keys.add(t["id"])
+                    matched.append(t)
+            continue
+        if key.lower() in ("workbuddy", "workbuddy_all"):
+            for t in TASKS.values():
+                if "workbuddy" in t["tags"] and t["id"] not in matched_keys:
+                    matched_keys.add(t["id"])
+                    matched.append(t)
+            continue
 
-            # 按 task_id、script_name 或 result_name 精准或前缀匹配
-            found = False
-            for tid, tcfg in TASKS.items():
-                target_keys = (
-                    tid,
-                    tcfg["script"],
-                    tcfg["result"],
-                    tcfg["script"][:-3] if tcfg["script"].endswith(".py") else "",
-                )
-                if key in target_keys:
-                    if tid not in matched_keys:
-                        matched_keys.add(tid)
-                        matched.append(tcfg)
-                    found = True
-            if not found:
-                print(f"⚠️ 未找到匹配的任务定义: {key}", file=sys.stderr)
+        # 按 task_id / 脚本名 / 结果文件名 / 去扩展名脚本名 精确匹配
+        found = False
+        for tid, tcfg in TASKS.items():
+            target_keys = (
+                tid,
+                tcfg["script"],
+                tcfg["result"],
+                tcfg["script"][:-3] if tcfg["script"].endswith(".py") else "",
+            )
+            if key in target_keys:
+                if tid not in matched_keys:
+                    matched_keys.add(tid)
+                    matched.append(tcfg)
+                found = True
+        if not found:
+            print(f"⚠️ 未找到匹配的任务定义: {key}", file=sys.stderr)
 
-        if matched:
-            return matched
-        raise ValueError(f"指定任务 '{raw_tasks}' 未匹配到任何有效注册任务（可选: {', '.join(TASKS.keys())}）")
-
-    # 2. 定时调度 (schedule cron) — 旧三 cron 映射保留作兼容，主流程由 daily_orchestrator 排布
-    if event == "schedule" or cron_expr:
-        # 晨间主批次（兼容旧调度）：00:50 BJT (UTC 16:50) -> 12 矩阵 + 2 WorkBuddy
-        if "16:50" in cron_expr or "50 16" in cron_expr or cron_expr == "50 16 * * *":
-            return [t for t in TASKS.values() if "00:50" in t["tags"]]
-        # 魔粒奖励窗口：09:10 BJT (UTC 01:10) -> ModelScope
-        if "01:10" in cron_expr or "10 1" in cron_expr or cron_expr == "10 1 * * *":
-            return [t for t in TASKS.values() if "09:10" in t["tags"]]
-        # Latvi 兜底锚点：18:00 BJT (UTC 10:00) -> Latvi
-        if "10:00" in cron_expr or "0 10" in cron_expr or cron_expr == "0 10 * * *":
-            return [t for t in TASKS.values() if "18:00" in t["tags"]]
-
-        # 兜底默认全量 00:50 任务
-        return [t for t in TASKS.values() if "00:50" in t["tags"]]
-
-    # 3. 动态接力与云端调度 (repository_dispatch)
-    if event == "repository_dispatch" or dtype:
-        if dtype in ("checkin_morning", "morning", "daily_morning"):
-            return [t for t in TASKS.values() if "00:50" in t["tags"]]
-        if dtype in ("checkin_modelscope", "modelscope_window"):
-            return [TASKS["modelscope"]]
-        if dtype in ("checkin_latvi", "latvi_anchor", "latvi_next_sign"):
-            return [TASKS["latvi"]]
-        if dtype in ("workbuddy_travel_claim", "workbuddy_claim"):
-            return [TASKS["workbuddy-account-1"], TASKS["workbuddy-account-2"]]
-        if dtype in TASKS:
-            return [TASKS[dtype]]
-
-    # 4. 手动默认全量矩阵站点
-    return [t for t in TASKS.values() if "matrix" in t["tags"]]
+    if matched:
+        return matched
+    raise ValueError(f"指定任务 '{raw_tasks}' 未匹配到任何有效注册任务（可选: {', '.join(TASKS.keys())}）")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Task Registry & Execution Queue Resolver")
-    parser.add_argument("--event", type=str, default="", help="GitHub event name (schedule, repository_dispatch, workflow_dispatch)")
-    parser.add_argument("--cron", type=str, default="", help="Cron expression for schedule event")
-    parser.add_argument("--type", type=str, default="", help="Dispatch type for repository_dispatch event")
     parser.add_argument("--tasks", type=str, default="", help="Specified task names, comma-separated")
     parser.add_argument("--list", action="store_true", help="List all registered tasks")
     parser.add_argument("--json", action="store_true", help="Output execution queue as raw JSON")
@@ -286,12 +248,7 @@ def main() -> None:
             print(f"  • {tid:<22} -> 脚本: {tcfg['script']:<22} 超时: {tcfg['timeout']:<5}s 标签: {tcfg['tags']}")
         sys.exit(0)
 
-    queue = resolve_execution_queue(
-        event_name=args.event or os.getenv("GITHUB_EVENT_NAME", ""),
-        cron=args.cron or os.getenv("CRON_EXPR", ""),
-        dispatch_type=args.type or os.getenv("DISPATCH_TYPE", ""),
-        input_tasks=args.tasks or os.getenv("INPUT_TASKS", ""),
-    )
+    queue = resolve_execution_queue(input_tasks=args.tasks or os.getenv("INPUT_TASKS", ""))
 
     if args.json:
         print(json.dumps(queue, ensure_ascii=False, indent=2))

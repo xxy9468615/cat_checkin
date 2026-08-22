@@ -153,4 +153,5 @@ def main():
     print(f"用户：{mask_str(nick)} | {pb or '积分获取成功'}\n{task_summary}")
 
 
-main_guard(main)
+if __name__ == "__main__":
+    main_guard(main)

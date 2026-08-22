@@ -6,9 +6,9 @@ import os
 import random
 import re
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from pathlib import Path
-from common import Http, env, must_match, find, main_guard, schedule_repo_dispatch, upstash_redis_command
+from common import BJT, Http, env, env_bool, is_already_signed, must_match, find, main_guard, schedule_repo_dispatch, upstash_redis_command
 
 # Latvi 是 24 小时冷却制，不是每天固定时间刷新。
 # 需要记录上次成功签到时间，下次在 +24h 之后才能再签。
@@ -20,12 +20,11 @@ from common import Http, env, must_match, find, main_guard, schedule_repo_dispat
 # 已退役，仅在未设 LATVI_NO_RELAY 时保留兼容。
 
 PREFIX = "LATVI_"
-BJT = timezone(timedelta(hours=8))
 STATE_FILE = Path(os.getenv("LATVI_STATE_FILE", "/data/latvi_state.json"))
 LATVI_REDIS_KEY = f"{os.getenv('CAT_CHECKIN_REDIS_PREFIX', 'cat_checkin:').rstrip(':')}:state:latvi"
 
 def _is_no_relay() -> bool:
-    return os.getenv("LATVI_NO_RELAY", "").lower() in ("1", "true", "yes")
+    return env_bool("LATVI_NO_RELAY")
 
 
 # QStash 接力调度的事件名（latvi.yml 的 repository_dispatch 类型）
@@ -234,11 +233,7 @@ def main():
             # 无冷却消息：可能为「今日已签到」（状态缓存丢失后的重复触发），也可能是真实错误。
             # 匹配词必须精确到 ≥2 字词组：单字符「已」会命中「账户已被封禁」等错误 → 假成功 + 状态污染，
             # 错误状态写盘会导致次日真实跳过签到（宁可红卡、由次日重锚恢复，不可假绿）
-            is_already = bool(msg) and (
-                any(k in msg for k in ("已签到", "已领取", "已经签到", "今日已签"))
-                or "already" in msg.lower()
-            )
-            if is_already:
+            if is_already_signed(msg):
                 now = datetime.now(BJT)
                 _set_last_sign_time(now)
                 sign_success = True
@@ -292,4 +287,5 @@ def main():
     if not sign_success:
         raise RuntimeError(f"签到失败：未能完成每日签到（当前余额 {before}）")
 
-main_guard(main)
+if __name__ == "__main__":
+    main_guard(main)

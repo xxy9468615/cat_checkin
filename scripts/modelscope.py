@@ -281,4 +281,5 @@ def main():
         print("\n⚠️ 国际站签到异常（通常为 cookie 需手动刷新，不影响国内站）")
 
 
-main_guard(main)
+if __name__ == "__main__":
+    main_guard(main)

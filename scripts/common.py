@@ -23,6 +23,76 @@ DEFAULT_UA = (
     or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
+# 北京时间统一常量（此前 7+ 个脚本各自定义 timezone(timedelta(hours=8))）
+BJT = dt.timezone(dt.timedelta(hours=8))
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    """解析布尔型环境变量（"1"/"true"/"yes" 为真，其余为假）。"""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes")
+
+
+def is_already_signed(msg: str, extra_phrases: tuple = ()) -> bool:
+    """「今日已签到」幂等判定：只认明确词组，杜绝单字符「已」类假成功。
+
+    默认词组覆盖中文「已签到/已领取/已经签到/今日已签」与英文 already/claimed/signed；
+    站点有专属文案时经 extra_phrases 追加（词长必须 ≥2，防误报）。
+    """
+    if not msg:
+        return False
+    phrases = ("已签到", "已领取", "已经签到", "今日已签") + tuple(extra_phrases)
+    if any(p in msg for p in phrases if len(p) >= 2):
+        return True
+    low = msg.lower()
+    return "already" in low or "claimed" in low
+
+
+def load_kv_state(redis_key: str, state_file: str | os.PathLike) -> dict:
+    """本地 JSON + Upstash Redis 双层加载 KV 状态（远端权威性高于本地）。
+
+    ai_router / agentrouter 的 token 链与 session 状态共用此模式；
+    任一层缺失/损坏都静默降级为空 dict，由调用方走重登兜底。
+    """
+    state: dict = {}
+    try:
+        if os.path.exists(state_file):
+            data = json.loads(open(state_file, encoding="utf-8").read())
+            if isinstance(data, dict):
+                state.update(data)
+    except Exception as e:
+        print(f"⚠️ 读取本地 state 失败（{state_file}）: {e}")
+    try:
+        ok, res = upstash_redis_command(["GET", redis_key])
+        if ok and isinstance(res, dict):
+            raw_val = res.get("result")
+            if raw_val and isinstance(raw_val, str):
+                remote = json.loads(raw_val)
+                if isinstance(remote, dict):
+                    state.update(remote)
+    except Exception as e:
+        print(f"⚠️ 从 Redis 读取 state 异常: {e}")
+    return state
+
+
+def save_kv_state(redis_key: str, state_file: str | os.PathLike, state: dict) -> None:
+    """持久化 KV 状态到本地文件与 Upstash Redis（双通道，失败仅警告）。"""
+    if not isinstance(state, dict):
+        return
+    try:
+        with open(state_file, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(state, ensure_ascii=False))
+    except Exception as e:
+        print(f"⚠️ 保存本地 state 失败: {e}")
+    try:
+        ok, res = upstash_redis_command(["SET", redis_key, json.dumps(state, ensure_ascii=False)])
+        if ok and isinstance(res, dict) and res.get("result") == "OK":
+            print(f"☁️ state 已实时同步至 Upstash Redis（{redis_key}）")
+    except Exception as e:
+        print(f"⚠️ 同步 state 到 Redis 异常: {e}")
+
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -76,7 +146,8 @@ def retry(times: int = 2, backoff: float = 3.0, retry_codes: tuple = (-1, 429, 5
                 if code is None or code not in retry_codes:
                     return last
                 if attempt < max(1, times):
-                    time.sleep(backoff)
+                    # 指数退避：backoff, 2*backoff, 4*backoff...（上限 60s，防长退避横跨兜底核查点）
+                    time.sleep(min(backoff * (2 ** (attempt - 1)), 60.0))
             return last
         return wrapper
     return decorator
@@ -302,9 +373,8 @@ def env(prefix: str, name: str, default: str = "", required: bool = True) -> str
         f"QL_{clean_prefix}{name.upper()}",
         f"{prefix}{name}",
         f"{prefix}{name.upper()}",
-        name,
-        name.upper(),
     ]
+    # 不回退裸 {name}/{NAME}：任何同名的全局环境变量都会静默劫持站点配置（凭证串 env 风险）
     seen = set()
     ordered_keys = [k for k in keys if not (k in seen or seen.add(k))]
     for key in ordered_keys:
@@ -312,7 +382,8 @@ def env(prefix: str, name: str, default: str = "", required: bool = True) -> str
         if value not in (None, ""):
             return value
     if required and default == "":
-        raise SystemExit(f"缺少环境变量：{clean_prefix}{name}")
+        # RuntimeError（而非 SystemExit）：main_guard 的 except Exception 能统一格式化输出
+        raise RuntimeError(f"缺少环境变量：{clean_prefix}{name}")
     return default
 
 def must_match(pattern: str, text: str, label: str, flags: int = 0) -> str:
@@ -376,15 +447,14 @@ def mask_str(value: Any, keep_start: int | None = None, keep_end: int | None = N
     n = len(s)
     if n <= 1:
         return mask_char
-    if n == 2:
-        return f"{s[0]}{mask_char}"
-
     if keep_start is not None and keep_end is not None:
         ks = max(0, min(keep_start, n))
         ke = max(0, min(keep_end, n - ks))
         if ks == 0 and ke == 0:
             return mask_char * 3
         return f"{s[:ks]}***{s[n - ke:] if ke > 0 else ''}"
+    if n == 2:
+        return f"{s[0]}{mask_char}"
 
     if n < 10:
         return f"{s[0]}***{s[-1]}"

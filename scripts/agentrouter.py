@@ -46,7 +46,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from common import Http, main_guard, mask_str, upstash_redis_command
+from common import Http, load_kv_state, main_guard, mask_str, save_kv_state
 
 PREFIX = "AGENTROUTER_"
 DEFAULT_API_URL = "https://ps.air-outer.com"
@@ -64,48 +64,12 @@ _UA = (
 
 def _load_state() -> dict:
     """从 Upstash Redis 与本地 state 文件双层加载持久化的 session/uid 映射"""
-    state: dict = {}
-
-    # 1. 本地 state 文件
-    if STATE_FILE.exists():
-        try:
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                state.update(data)
-        except Exception:
-            pass
-
-    # 2. Upstash Redis（跨 CI runner 权威源）
-    try:
-        ok, res = upstash_redis_command(["GET", REDIS_KEY])
-        if ok and isinstance(res, dict):
-            raw_val = res.get("result")
-            if raw_val and isinstance(raw_val, str):
-                remote_data = json.loads(raw_val)
-                if isinstance(remote_data, dict):
-                    state.update(remote_data)
-    except Exception as e:
-        print(f"⚠️ 从 Redis 读取 AgentRouter 状态异常: {e}")
-
-    return state
+    return load_kv_state(REDIS_KEY, STATE_FILE)
 
 
 def _save_state(state: dict) -> None:
     """持久化 session/uid 映射到本地 state 文件与 Upstash Redis（双通道）"""
-    if not isinstance(state, dict):
-        return
-
-    try:
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-    except Exception as e:
-        print(f"⚠️ 保存本地 state 失败: {e}")
-
-    try:
-        ok, res = upstash_redis_command(["SET", REDIS_KEY, json.dumps(state, ensure_ascii=False)])
-        if ok and isinstance(res, dict) and res.get("result") == "OK":
-            print("☁️ 会话状态已实时同步至 Upstash Redis")
-    except Exception as e:
-        print(f"⚠️ 同步 state 到 Redis 异常: {e}")
+    save_kv_state(REDIS_KEY, STATE_FILE, state)
 
 
 def _session_from_jar(h: Http) -> str:

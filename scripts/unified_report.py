@@ -20,7 +20,7 @@ ROOT_DIR = BASE_DIR.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from common import upstash_redis_command, upstash_redis_pipeline  # noqa: E402
+from common import env_bool, upstash_redis_command, upstash_redis_pipeline  # noqa: E402
 from daily_report import _extract_fields, build_report, send_email, send_resend  # noqa: E402
 from task_registry import TASKS, get_expected_results  # noqa: E402
 
@@ -276,7 +276,7 @@ def main() -> None:
     # 尽早输出失败清单（GITHUB_OUTPUT）：即使后续邮件通道全失败（exit 1），
     # checkin.yml 的自动重跑 step（if: always()）也能拿到 failed_matrix。
     # 重跑 run（RETRY_REPORT=1）不发 failed_matrix：防循环守卫之外再设一道闸。
-    retry_report = os.getenv("RETRY_REPORT", "").lower() in ("1", "true", "yes")
+    retry_report = env_bool("RETRY_REPORT")
     if not retry_report:
         _emit_failed_sites(collected)
 

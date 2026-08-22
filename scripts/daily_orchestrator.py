@@ -4,16 +4,15 @@
 from __future__ import annotations
 import argparse, heapq, json, os, re, signal, subprocess, sys, time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait as wait_futures
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 BASE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BASE_DIR.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
-from common import upstash_redis_command
+from common import BJT, upstash_redis_command
 from task_registry import TASKS, resolve_execution_queue
-BJT = timezone(timedelta(hours=8))
 TRAVEL_EVENT_RE = re.compile(r"TRAVEL_EVENT\s+state=(\w+)\s+arrive_at=(\d+)")
 MAX_CLAIM_ROUNDS, CLAIM_MARGIN_SEC, LATVI_ENTER_EARLY_SEC = 3, 15*60, 120
 def bjt_now() -> datetime:

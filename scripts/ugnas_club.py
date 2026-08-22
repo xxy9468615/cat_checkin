@@ -9,4 +9,5 @@ def main():
     r=Http().request("GET","https://club.ugnas.com/forum.php",headers={"Cookie":cookie})
     # cookie 失效时页面无积分信息：必须显式失败，否则报告假成功
     print(must_match(r'积分:\s*\d+',r.text,"积分（未提取到，可能 cookie 失效）"))
-main_guard(main)
+if __name__ == "__main__":
+    main_guard(main)

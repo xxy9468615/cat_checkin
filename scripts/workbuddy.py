@@ -41,7 +41,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Tuple
 
-from common import Http, env, main_guard, mask_str, schedule_repo_dispatch
+from common import Http, env, env_bool, is_already_signed, main_guard, mask_str, schedule_repo_dispatch
 
 PREFIX = "WORKBUDDY_"
 BASE_URL = "https://www.workbuddy.cn"
@@ -66,7 +66,7 @@ def _parse_cookies(raw: str) -> List[str]:
 # 过程日志治理：stdout 会原样进入每日邮件卡片，请求头 dump / 轮询心跳等
 # 调试信息默认只缓冲不输出（成功时丢弃），账号失败时才随错误一起输出便于排查；
 # WORKBUDDY_DEBUG=1 可恢复实时打印（本地调试用）。
-_DEBUG = os.getenv("WORKBUDDY_DEBUG", "").lower() in ("1", "true", "yes")
+_DEBUG = env_bool("WORKBUDDY_DEBUG")
 _DEBUG_LINES: List[str] = []
 
 
@@ -677,12 +677,7 @@ def _claim_travel_reward(h: Http, headers: Dict[str, str], travel_data: Dict[str
     if cj.get("code") != 0:
         msg = str(cj.get("msg", ""))
         # 匹配词必须精确：单字符「已」/裸「重复」会命中「今日次数已达上限」等错误 → 假成功、奖励静默丢失
-        is_already = (
-            any(k in msg for k in ("已领取", "已经领取", "重复领取", "已领过"))
-            or "already" in msg.lower()
-            or "claimed" in msg.lower()
-        )
-        if is_already:
+        if is_already_signed(msg, ("已经领取", "重复领取", "已领过")):
             return True, "放风奖励（已领取，无需重复领取）"
         return False, f"回访领奖失败：{msg or cj.get('code')}"
     c_data = cj.get("data", {}) or {}
@@ -700,7 +695,7 @@ def _claim_travel_reward(h: Http, headers: Dict[str, str], travel_data: Dict[str
 
 
 def _is_no_relay() -> bool:
-    return os.getenv("WORKBUDDY_NO_RELAY", "").lower() in ("1", "true", "yes")
+    return env_bool("WORKBUDDY_NO_RELAY")
 
 
 def _schedule_travel_claim(remaining_seconds: int) -> str:

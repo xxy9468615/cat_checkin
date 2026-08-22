@@ -109,4 +109,5 @@ def main():
         sys.exit(1)
 
 
-main_guard(main)
+if __name__ == "__main__":
+    main_guard(main)
