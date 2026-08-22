@@ -94,21 +94,10 @@ def main():
     }
     h = Http()
 
-    # === 1. 登录态校验（401/302 = cookie 失效） ===
-    u = h.request("GET", f"{BASE}/user/info", headers=headers)
-    if u.code in (301, 302, 303, 307, 308) or u.code == 401:
-        raise RuntimeError(
-            f"Cookie 已失效（user/info HTTP {u.code}），请在浏览器重新登录后更新 CLOUDSTUDIO_cookie"
-        )
-    if u.code >= 400 or u.code < 0:
-        raise RuntimeError(f"用户信息接口响应异常 HTTP {u.code}: {u.text[:120]}")
-    ujson = u.json({})
-    if not isinstance(ujson, dict) or not isinstance(ujson.get("data"), dict):
-        raise RuntimeError(f"用户信息解析失败: {u.text[:120]}")
-    auth = ujson["data"].get("authenticationUserInfo") or {}
-    nick = auth.get("nickName") or find(r'"nickName":"(.*?)"', u.text, "?")
-
-    # === 2. 签到两段式：先查今日记录，再决定是否领取 ===
+    # === 1. 签到两段式：先查今日记录，再决定是否领取 ===
+    # 不用 /user/info 预判登录态：该端点对 CI 的 session/IP 可能 401，但签到 API 用同一
+    # session 可成功（2026-08-22 事故：user/info 401 误判把真实签到 POST 永久跳过，与
+    # ai_router「GET 预判字段恒 true 跳过发奖」同型坑）。以签到 API 自身响应为准。
     today = bj_now_str()[:10]
     q = h.request("GET", f"{BASE}/billing/activityTask/{ACTIVITY}?lastRecord=true", headers=headers)
     status, record = "", {}
@@ -135,7 +124,12 @@ def main():
             "POST", f"{BASE}/billing/activityTask/{ACTIVITY}/_reward",
             headers=headers, json_data={},
         )
-        if s.code >= 400:
+        if s.code in (401, 403) or s.code in (301, 302, 303, 307, 308):
+            # 签到 API 本身 401/302 才算 session 真失效（非 user/info 预判）
+            raise RuntimeError(
+                f"Cookie 已失效（签到接口 HTTP {s.code}），请在浏览器重新登录后更新 CLOUDSTUDIO_cookie"
+            )
+        if s.code >= 400 or s.code < 0:
             msg = find(r'"msg":"(.*?)"', s.text, s.text[:120])
             raise RuntimeError(f"签到接口 HTTP {s.code}: {msg}")
         sjson = s.json({}) or {}
@@ -149,6 +143,14 @@ def main():
             status_line = "今日已签到过"
         else:
             raise RuntimeError(f"签到未到账: status={rec.get('status')} {fail_msg}"[:160])
+
+    # nick 仅用于报告展示:签到成功后带同 cookie 再探 user/info,非阻断(401/失败不中断)
+    nick = "?"
+    u = h.request("GET", f"{BASE}/user/info", headers=headers)
+    if u.code == 200:
+        ujson = u.json({})
+        auth = (ujson.get("data") or {}).get("authenticationUserInfo") or {} if isinstance(ujson, dict) else {}
+        nick = auth.get("nickName") or find(r'"nickName":"(.*?)"', u.text, "?")
 
     # === 3. 资源汇总 + 明细 ===
     p_resp = h.request(
