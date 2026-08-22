@@ -152,10 +152,23 @@ class Orchestrator:
                 self._submit(kind, cfg)
             if not self.heap and not self.futures:
                 break
-            timeout: Optional[float] = None
-            if self.heap and self.heap[0][0] <= self.hard_deadline:
-                timeout = max(0.0, self.heap[0][0] - time.time())
-            done, _ = wait_futures(list(self.futures), timeout=timeout, return_when=FIRST_COMPLETED)
+            if self.futures:
+                timeout: Optional[float] = None
+                if self.heap and self.heap[0][0] <= self.hard_deadline:
+                    timeout = max(0.0, self.heap[0][0] - time.time())
+                done, _ = wait_futures(list(self.futures), timeout=timeout, return_when=FIRST_COMPLETED)
+            else:
+                # concurrent.futures.wait 对空集合立即返回（忽略 timeout），
+                # futures 为空时必须 sleep 等堆顶事件，否则主循环 100% CPU 忙等数小时
+                top = self.heap[0][0]
+                if top > self.hard_deadline:
+                    # 堆有序：堆顶越硬墙则剩余事件全部必被丢弃，直接清堆退出
+                    while self.heap:
+                        fire, _, kind, cfg = heapq.heappop(self.heap)
+                        print(f"dropping event [{self._label(kind, cfg)}] past hard wall")
+                    break
+                time.sleep(min(top - time.time(), 60.0))
+                continue
             for fut in done:
                 kind, cfg = self.futures.pop(fut)
                 try:

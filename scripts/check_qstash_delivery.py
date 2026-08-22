@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """QStash 邮件投递状态核查。
 
-读取 .report_sent 中的 resend_msg_id，查询 QStash /v2/logs 获取投递状态，
-输出到 $GITHUB_OUTPUT（CI 使用）或 stdout（本地调试）。
+读取发送标记（优先 env：SENT_MARKER_JSON 全量 marker JSON / RESEND_MSG_ID 单值；
+回退本地 MARKER_PATH 文件——CI 跨 job 不传递，仅本地调试可用），查询 QStash
+/v2/logs 获取投递状态，输出到 $GITHUB_OUTPUT（CI 使用）或 stdout（本地调试）。
 
 输出 delivery= 五态之一：
   ok      — QStash 已成功投递到 Resend（DELIVERED）
@@ -16,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from typing import Optional
 
 
 def _qstash_base_url() -> str:
@@ -30,18 +32,31 @@ def _qstash_base_url() -> str:
     return url.rstrip("/")
 
 
-def check_delivery() -> str:
+def _load_marker() -> Optional[dict]:
+    """标记来源：env 优先（CI：check_sent 步骤从 Redis marker 导出），本地文件兜底。"""
+    raw = os.getenv("SENT_MARKER_JSON", "").strip()
+    if raw:
+        try:
+            marker = json.loads(raw)
+            if isinstance(marker, dict):
+                return marker
+        except (json.JSONDecodeError, ValueError):
+            print("⚠️ SENT_MARKER_JSON 解析失败，回退本地文件")
+    msg_id = os.getenv("RESEND_MSG_ID", "").strip()
+    if msg_id:
+        return {"resend_msg_id": msg_id}
     marker_path = os.getenv("MARKER_PATH", ".report_sent")
     try:
         raw = open(marker_path, encoding="utf-8").read()
-    except FileNotFoundError:
-        return "none"
-    try:
         marker = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return "none"
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    return marker if isinstance(marker, dict) else None
 
-    if not isinstance(marker, dict):
+
+def check_delivery() -> str:
+    marker = _load_marker()
+    if not marker:
         return "none"
 
     today = os.getenv("TODAY", "")
@@ -75,8 +90,6 @@ def check_delivery() -> str:
     except Exception as exc:
         print(f"⚠️ QStash logs 查询失败: {exc}")
         # 输出控制台链接供人工排查
-        import re
-        domain = re.sub(r"https?://", "", base.split("/")[0] if "/" in base else base)
         print(f"   控制台: https://console.upstash.com/qstash/logs?messageId={msg_id}")
         return "unknown"
 

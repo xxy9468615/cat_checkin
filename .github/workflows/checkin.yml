@@ -270,7 +270,7 @@ jobs:
             exit 0
           fi
           echo "Auto-retry failed sites: $FAILED_MATRIX"
-          if gh workflow run checkin.yml --ref "${GITHUB_REF_NAME:-main}" -f scripts="$FAILED_MATRIX" -f retry=true; then
+          if gh workflow run checkin.yml --ref "${GITHUB_REF_NAME:-main}" -f tasks="$FAILED_MATRIX" -f retry=true; then
             echo "Retry dispatched"
           else
             echo "Retry dispatch failed, please check manually"
@@ -372,6 +372,7 @@ jobs:
         env:
           QSTASH_URL: ${{ secrets.QSTASH_URL }}
           QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
+          RESEND_MSG_ID: ${{ steps.check_sent.outputs.resend_msg_id }}
         run: python3 scripts/check_qstash_delivery.py
 
       - name: Determine if execution is needed
@@ -474,7 +475,7 @@ jobs:
             exit 0
           fi
           echo "Auto-retry failed sites: $FAILED_MATRIX"
-          if gh workflow run checkin.yml --ref "${GITHUB_REF_NAME:-main}" -f scripts="$FAILED_MATRIX" -f retry=true; then
+          if gh workflow run checkin.yml --ref "${GITHUB_REF_NAME:-main}" -f tasks="$FAILED_MATRIX" -f retry=true; then
             echo "Retry dispatched"
           else
             echo "Retry dispatch failed"
