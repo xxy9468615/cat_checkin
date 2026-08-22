@@ -271,11 +271,10 @@ def _run_one(idx: int, total: int, account: dict, base: str) -> str:
                 except (TypeError, ValueError):
                     quota_desc = ""
 
-            # 持久化 session/uid（诊断与后续展示用）
+            # 持久化 session/uid（诊断与后续展示用）；键名脱敏——明文邮箱不进 Redis/本地文件
             state = _load_state()
-            state[f"login:{username}"] = session
-            state[f"uid:{username}"] = uid
-            state["_latest_session"] = session
+            state[f"login:{mask_str(username)}"] = session
+            state[f"uid:{mask_str(username)}"] = uid
             _save_state(state)
         except Exception as e:
             print(f"ℹ️ 余额展示跳过: {e}")

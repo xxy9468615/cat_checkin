@@ -144,7 +144,8 @@ class GladosAPI:
         code = data.get("code")
         if code != 0:
             msg = data.get("message") or f"code={code}"
-            raise RuntimeError(f"GLaDOS 登录失败 ({email}): {msg}")
+            # 异常文本会进 CI 日志/邮件，邮箱必须脱敏
+            raise RuntimeError(f"GLaDOS 登录失败 ({mask_str(email)}): {msg}")
 
         cookies = [f"{c.name}={c.value}" for c in self.http.jar]
         if not cookies:

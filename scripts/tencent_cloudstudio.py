@@ -82,8 +82,8 @@ def main():
     session = extract_session(raw_cookie)
     if not session:
         raise RuntimeError("CLOUDSTUDIO_cookie 为空，请填入 cloudstudio-session 的值")
-    # 提取结果诊断(脱敏前缀),便于 401 时判断 session 格式是否异常
-    print(f"session 提取: 长度 {len(session)}，前缀 {session[:6]}...")
+    # 提取结果诊断（仅长度，不打印前缀——session 片段也属凭证）
+    print(f"session 提取: 长度 {len(session)}")
 
     xsrf = env(PREFIX, "xsrf", required=False) or derive_xsrf(session)
     headers = {

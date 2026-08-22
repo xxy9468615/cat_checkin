@@ -231,16 +231,21 @@ def main():
             print(f"⏳ 第{attempt}次：{msg}，等待 {cooldown_sec} 秒后重试...")
             time.sleep(cooldown_sec)
         else:
-            # 无冷却消息：多为「今日已签到」（状态缓存丢失后的重复触发）。
-            # 服务端确认已签也算当日达成：回写状态并照常续链，避免接力链断裂
-            if msg and ("已" in msg or "already" in msg.lower()):
+            # 无冷却消息：可能为「今日已签到」（状态缓存丢失后的重复触发），也可能是真实错误。
+            # 匹配词必须精确到 ≥2 字词组：单字符「已」会命中「账户已被封禁」等错误 → 假成功 + 状态污染，
+            # 错误状态写盘会导致次日真实跳过签到（宁可红卡、由次日重锚恢复，不可假绿）
+            is_already = bool(msg) and (
+                any(k in msg for k in ("已签到", "已领取", "已经签到", "今日已签"))
+                or "already" in msg.lower()
+            )
+            if is_already:
                 now = datetime.now(BJT)
                 _set_last_sign_time(now)
                 sign_success = True
                 print(f"ℹ️ 今日已签到（服务端：{msg}），已回写状态")
                 _schedule_next_sign(24 * 3600 + random.randint(MARGIN_MIN, MARGIN_MAX) * 60)
             else:
-                print(f"ℹ️ 签到结果：{msg}（当前余额 {before}）")
+                print(f"ℹ️ 签到结果：{msg}（当前余额 {before}）——未识别为已签到，不回写状态")
             break
     else:
         print(f"❌ 签到失败：超过最大重试次数，当前余额 {before}")

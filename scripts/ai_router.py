@@ -79,6 +79,9 @@ def _load_state() -> dict:
     except Exception as e:
         print(f"⚠️ 从 Redis 读取 RTR 状态异常: {e}")
 
+    # 清理已废弃的全局最新 rt 标记（多账号场景串号根源，2026-08-22 移除）
+    state.pop("_latest_rt", None)
+
     return state
 
 
@@ -209,9 +212,8 @@ def _load_accounts():
             if traced:
                 acc["refresh_token"] = new_rt
                 print(f"📦 账号 {mask_str(acc_user or acc_rt)} 从持久化存储恢复最新 Refresh Token")
-            elif state.get("_latest_rt") and acc_rt != state.get("_latest_rt"):
-                acc["refresh_token"] = state.get("_latest_rt")
-                print(f"📦 账号 {mask_str(acc_user or acc_rt)} 使用存储中的全局最新 Refresh Token")
+            # 不做「全局最新 rt」兜底：多账号时会串号（B 拿到 A 的 rt，以 A 身份签到、
+            # 污染 B 的轮转链）；追溯失败保持原 rt，401 时由账密重登兜底
 
     return accounts
 
@@ -243,7 +245,6 @@ def _do_login(h: Http, username: str, password: str, api_url: str) -> tuple[str,
     state = _load_state()
     if new_rt:
         state[f"login:{username}"] = new_rt
-        state[new_rt] = new_rt
     _save_state(state)
 
     print(f"🔑 账号 {mask_str(username)} 密码登录成功，已自动刷新并持久化 Token")
@@ -277,7 +278,6 @@ def _do_refresh(h: Http, refresh_token: str, api_url: str) -> tuple[str, str]:
     if new_rt != refresh_token:
         state = _load_state()
         state[refresh_token] = new_rt
-        state["_latest_rt"] = new_rt
         _save_state(state)
         print(f"🔄 Refresh Token 已轮转，new rt = {mask_str(new_rt)}")
 

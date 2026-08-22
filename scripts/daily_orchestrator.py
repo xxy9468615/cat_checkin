@@ -66,8 +66,13 @@ def build_task_env(cfg: Dict[str, Any]) -> Dict[str, str]:
         n = cfg["account"]
         if n != "1":
             cookie = os.getenv(f"WORKBUDDY_COOKIE_{n}", "")
-            if cookie:
-                env["WORKBUDDY_COOKIE"] = cookie
+            if not cookie:
+                # 缺失时若静默继承父进程的账号 1 cookie：两个并发子进程踩同一账号、
+                # 结果还写进账号 n 的 JSON 名下（张冠李戴且无告警）——必须显式失败
+                raise RuntimeError(
+                    f"workbuddy 账号 {n} 缺少 WORKBUDDY_COOKIE_{n}（secret 未配置或为空），拒绝继承账号 1 的 cookie"
+                )
+            env["WORKBUDDY_COOKIE"] = cookie
         env["WORKBUDDY_WAIT_TRAVEL"] = "true"
         env["WORKBUDDY_NO_RELAY"] = "1"
         env["TASK_RESULT_NAME"] = cfg["result"]
@@ -76,10 +81,10 @@ def build_task_env(cfg: Dict[str, Any]) -> Dict[str, str]:
         env.setdefault("LATVI_STATE_FILE", ".latvi_state.json")
     return env
 def run_task_subprocess(cfg: Dict[str, Any]) -> Tuple[bool, str]:
-    env = build_task_env(cfg)
-    cmd = [sys.executable, str(BASE_DIR / "run_task.py"), cfg["script"]]
     cap = cfg["timeout"] + 120
     try:
+        env = build_task_env(cfg)
+        cmd = [sys.executable, str(BASE_DIR / "run_task.py"), cfg["script"]]
         proc = subprocess.Popen(cmd, cwd=str(ROOT_DIR), env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
     except Exception as exc:
         return False, f"failed to spawn: {exc}"

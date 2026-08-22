@@ -56,7 +56,9 @@ def _run_one(h, username, password):
     access = find(r'"access_token":"(.*?)"', login.text)
     uid = find(r'"id":(\d+)', login.text)
     if not (token and access and uid):
-        raise RuntimeError(f"登录失败: {login.text[:200]}")
+        # 响应体可能含 token（正则未命中时原文回显会泄漏进日志/邮件），默认不打印
+        detail = login.text[:200] if os.getenv("DEBUG") else "（响应体含敏感字段，DEBUG=true 时打印）"
+        raise RuntimeError(f"登录失败（账号 {mask_str(username)}，HTTP {login.code}）: {detail}")
     headers = {"access-token": access, "uid": uid, "token": token}
 
     # 签到。站点没有独立的签到查询接口（GET/POST 同 URL 都是签到动作），

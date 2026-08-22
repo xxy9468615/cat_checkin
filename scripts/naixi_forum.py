@@ -12,12 +12,14 @@ def main():
     loginhash=must_match(r'loginhash=(.+?)"',login_page.text,"loginhash")
     login_resp=h.request("POST",base+f"/member.php?mod=logging&action=login&loginsubmit=yes&handlekey=login&loginhash={loginhash}&inajax=1",form={"formhash":formhash,"referer":base+"/","username":username,"password":password,"questionid":"0","answer":""})
     # 校验登录成功：Discuz inajax 登录成功响应含 succeedhandle/欢迎回来/location.href 跳转，否则视为失败
+    # （不能匹配裸词 "location"——错误页脚本/任意含该词的文案都会误判登录成功）
     lt=login_resp.text or ""
-    if "succeedhandle" not in lt and "欢迎回来" not in lt and "location.href" not in lt and "location" not in lt.lower():
+    if "succeedhandle" not in lt and "欢迎回来" not in lt and "location.href" not in lt:
         raise RuntimeError(f"登录失败，响应片段: {lt.replace(chr(10),' ')[:300]}")
     page=h.request("GET",base+"/plugin.php?id=k_misign%3Asign")
     # 幂等检测：已签到时签到按钮不渲染（无 formhash），页面显示「已签到」类字样 → 放行
-    already_markers=("您今日已签到","今日已签","已签到","already","签到成功")
+    # （匹配词须精确：裸「已签到」会命中统计文案「今日已签到 XX 人」→ 整体跳过真实签到）
+    already_markers=("您今日已签到","今日已签到","已经签到","already")
     if any(m in page.text for m in already_markers):
         print("今日已签到（幂等放行）")
     else:

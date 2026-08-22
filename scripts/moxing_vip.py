@@ -57,9 +57,19 @@ def main():
     page=h.request("GET",domain+"/plugin.php?id=k_misign%3Asign",headers=headers).text
     q=find(r'(plugin.php.+qiandao.+\w+)',page)
     if not q:
-        print("ℹ️ 未找到签到入口（可能今日已签到或插件变动）")
+        # 无签到入口：已签到日按钮不渲染且页面带「已签到」类字样 → 幂等放行；
+        # 无任何标记则属插件变动/被风控，不能当成功上报
+        if any(m in page for m in ("您今日已签到","今日已签到","已经签到","already")):
+            print("ℹ️ 今日已签到（幂等放行）")
+        else:
+            raise RuntimeError("签到页无签到入口且无已签到标记（插件变动或被风控），无法确认签到状态")
     else:
-        h.request("GET",domain+"/"+q,headers=headers)
+        sign_r=h.request("GET",domain+"/"+q,headers=headers)
+        sign_msg=strip_tags(find(r'<!\[CDATA\[(.+?)\]\]>',sign_r.text,"")).strip()
+        if sign_msg:
+            print(f"签到响应：{sign_msg}")
+            if "失败" in sign_msg:
+                raise RuntimeError(f"签到失败：{sign_msg}")
     prof=h.request("GET",domain+"/home.php?mod=space",headers=headers).text
     # 登录失败时个人资料页是游客/跳转页：显式失败，否则报告假成功
     if "个人资料" not in prof:

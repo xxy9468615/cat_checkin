@@ -676,7 +676,13 @@ def _claim_travel_reward(h: Http, headers: Dict[str, str], travel_data: Dict[str
     cj = claim_resp.json({})
     if cj.get("code") != 0:
         msg = str(cj.get("msg", ""))
-        if "已" in msg or "重复" in msg or "claimed" in msg.lower():
+        # 匹配词必须精确：单字符「已」/裸「重复」会命中「今日次数已达上限」等错误 → 假成功、奖励静默丢失
+        is_already = (
+            any(k in msg for k in ("已领取", "已经领取", "重复领取", "已领过"))
+            or "already" in msg.lower()
+            or "claimed" in msg.lower()
+        )
+        if is_already:
             return True, "放风奖励（已领取，无需重复领取）"
         return False, f"回访领奖失败：{msg or cj.get('code')}"
     c_data = cj.get("data", {}) or {}
