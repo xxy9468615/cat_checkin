@@ -231,13 +231,19 @@ jobs:
 
       - name: Send unified report
         id: send_report
-        if: always() && inputs.retry != true
+        if: >-
+          always() && inputs.retry != true
+          && !(github.event_name == 'repository_dispatch'
+               && contains(fromJSON('["latvi_next_sign","checkin_latvi","checkin_morning","checkin_modelscope","workbuddy_travel_claim"]'), github.event.action))
         env:
           DAILY_PUSH: "true"
         run: python3 scripts/unified_report.py
 
       - name: Auto-retry failed sites
-        if: always() && steps.send_report.outputs.failed_matrix != ''
+        if: >-
+          always() && steps.send_report.outputs.failed_matrix != ''
+          && !(github.event_name == 'repository_dispatch'
+               && contains(fromJSON('["latvi_next_sign","checkin_latvi","checkin_morning","checkin_modelscope","workbuddy_travel_claim"]'), github.event.action))
         env:
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           FAILED_MATRIX: ${{ steps.send_report.outputs.failed_matrix }}

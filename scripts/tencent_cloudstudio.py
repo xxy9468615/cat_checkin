@@ -42,13 +42,21 @@ def derive_xsrf(session: str) -> str:
 
 
 def extract_session(raw_cookie: str) -> str:
-    """兼容两种配置：裸 session 值，或包含 cloudstudio-session= 的整串 Cookie。"""
+    """兼容裸 session 值 或 含 cloudstudio-session= 的整串 Cookie。"""
     raw = raw_cookie.strip()
     m = re.search(r"cloudstudio-session=([^;\s]+)", raw)
     if m:
         return m.group(1)
-    # 整串里没有该键时，假定用户直接贴了 session 值
-    return raw.split(";")[0].strip()
+    # 无 cloudstudio-session 键:区分「裸 session 值」与「贴了其他键值对」
+    if "=" not in raw:
+        # 裸 session 值(无等号),直接当 session 用
+        return raw
+    # 含键值对但无 cloudstudio-session 键 → 明确报错指引,避免静默构造错误 Cookie(如把 cloudstudio-session-team=xxx 整体当 session → 401)
+    keys = [p.split("=", 1)[0].strip() for p in raw.split(";") if "=" in p and p.strip()]
+    raise RuntimeError(
+        f"CLOUDSTUDIO_cookie 未找到 cloudstudio-session 键（现有键: {keys}）。"
+        f"请只贴 cloudstudio-session 的值,或确保整串含 cloudstudio-session=...。"
+    )
 
 
 def bj_now_str() -> str:
@@ -74,6 +82,8 @@ def main():
     session = extract_session(raw_cookie)
     if not session:
         raise RuntimeError("CLOUDSTUDIO_cookie 为空，请填入 cloudstudio-session 的值")
+    # 提取结果诊断(脱敏前缀),便于 401 时判断 session 格式是否异常
+    print(f"session 提取: 长度 {len(session)}，前缀 {session[:6]}...")
 
     xsrf = env(PREFIX, "xsrf", required=False) or derive_xsrf(session)
     headers = {

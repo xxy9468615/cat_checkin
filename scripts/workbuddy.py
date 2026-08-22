@@ -124,8 +124,10 @@ def _get_account_info(h: Http, cookie: str) -> Tuple[str, str]:
     resp = h.request("GET", f"{BASE_URL}/console/accounts", headers=headers)
     if resp.code in (401, 403):
         raise RuntimeError(f"Cookie 已失效（HTTP {resp.code}），请重新登录并更新 Cookie")
-    if resp.code == 302:
-        raise RuntimeError("Cookie 已失效（HTTP 302 重定向至登录页），请重新登录并更新 Cookie")
+    if resp.code in (301, 302, 303, 307, 308):
+        # 补重定向目标(仅路径,去 query 防泄露 token),便于确认是被导向登录页而非其他异常端点
+        loc = (resp.headers.get("Location", "?") or "?").split("?")[0]
+        raise RuntimeError(f"Cookie 已失效（HTTP {resp.code} 重定向至 {loc}），请重新登录并更新 Cookie")
     if resp.code != 200:
         raise RuntimeError(f"获取账号信息失败：HTTP {resp.code}")
 

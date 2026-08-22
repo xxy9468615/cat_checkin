@@ -318,7 +318,11 @@ def env(prefix: str, name: str, default: str = "", required: bool = True) -> str
 def must_match(pattern: str, text: str, label: str, flags: int = 0) -> str:
     m = re.search(pattern, text, flags)
     if not m:
-        raise RuntimeError(f"未提取到 {label}")
+        # 失败时附响应片段(截断 300 字、去换行),便于诊断服务端返回了什么(重定向/风控/模板变更)
+        snippet = (text or "").replace("\n", " ")[:300]
+        if text:
+            raise RuntimeError(f"未提取到 {label}（响应片段: {snippet}）")
+        raise RuntimeError(f"未提取到 {label}（空响应）")
     return m.group(1) if m.groups() else m.group(0)
 
 def find(pattern: str, text: str, default: str = "", flags: int = 0) -> str:
