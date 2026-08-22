@@ -111,6 +111,7 @@ class Orchestrator:
         self.executor = ThreadPoolExecutor(max_workers=int(os.getenv("BATCH_PARALLEL", "4")))
         self.futures: Dict[Future, Tuple[str, Optional[Dict[str, Any]]]] = {}
         self.latvi_fire_at: Optional[float] = None
+        self.dropped = 0
     def push(self, fire_at: float, kind: str, cfg: Optional[Dict[str, Any]] = None) -> None:
         heapq.heappush(self.heap, (fire_at, self.seq, kind, cfg))
         self.seq += 1
@@ -153,6 +154,7 @@ class Orchestrator:
                 fire, _, kind, cfg = heapq.heappop(self.heap)
                 if fire > self.hard_deadline:
                     print(f"dropping event [{self._label(kind, cfg)}] past hard wall")
+                    self.dropped += 1
                     continue
                 self._submit(kind, cfg)
             if not self.heap and not self.futures:
@@ -171,6 +173,7 @@ class Orchestrator:
                     while self.heap:
                         fire, _, kind, cfg = heapq.heappop(self.heap)
                         print(f"dropping event [{self._label(kind, cfg)}] past hard wall")
+                        self.dropped += 1
                     break
                 time.sleep(min(top - time.time(), 60.0))
                 continue
@@ -183,6 +186,11 @@ class Orchestrator:
                 if cfg:
                     self._on_task_done(cfg, ok, out)
         print(f"\n{'#'*60}\nOrchestrator done: {len(self.results)} task instances")
+        if not self.results and self.dropped:
+            # 硬墙后启动的 run 全部事件被 drop 却 exit 0 → workflow 绿色但什么都没干，必须显式失败
+            print(f"WARNING: no tasks executed — {self.dropped} event(s) dropped past hard wall "
+                  f"{os.getenv('ORCH_HARD_DEADLINE', '19:55')} BJT（run 启动过晚）")
+            return 1
         failed = [k for k, v in self.results.items() if not v]
         for tid, ok in self.results.items():
             print(f"  {'OK' if ok else 'FAIL'} {tid}")

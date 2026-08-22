@@ -274,8 +274,11 @@ def main() -> None:
         sys.exit(1)
 
     # 尽早输出失败清单（GITHUB_OUTPUT）：即使后续邮件通道全失败（exit 1），
-    # checkin.yml 的自动重跑 step（if: always()）也能拿到 failed_matrix
-    _emit_failed_sites(collected)
+    # checkin.yml 的自动重跑 step（if: always()）也能拿到 failed_matrix。
+    # 重跑 run（RETRY_REPORT=1）不发 failed_matrix：防循环守卫之外再设一道闸。
+    retry_report = os.getenv("RETRY_REPORT", "").lower() in ("1", "true", "yes")
+    if not retry_report:
+        _emit_failed_sites(collected)
 
     title, report, fail_count = build_report(results)
     print("\n========== 每日统一汇总 ==========")
@@ -283,11 +286,23 @@ def main() -> None:
 
     push_enabled = os.getenv("DAILY_PUSH", "true").lower() not in {"0", "false", "no"}
     if push_enabled:
-        sent_smtp = send_email(title, report, results)
+        if retry_report:
+            title = f"[重跑] {title}"
+        # Resend 为主通道；仅当主通道失败才回退 SMTP（备选语义，双通道同时配置时不再双发）
         sent_resend, resend_msg_id = send_resend(title, report, results)
+        sent_smtp = False
+        if not sent_resend:
+            print("⚠️ Resend 主通道失败，回退 SMTP 备选通道")
+            sent_smtp = send_email(title, report, results)
         if not (sent_smtp or sent_resend):
             print("❌ 所有邮件通道推送失败：不写发送标记并退出非零，等待 10:30 兜底重试")
             sys.exit(1)
+        if retry_report:
+            # 重跑补充邮件：不写当日 sent marker（不挡 20:30 兜底、不冒充主报告），
+            # 只把重跑后的最新结果再归档一次（raw hash 已含全量，覆盖为最新状态）
+            print("🔁 重跑补充报告已发送（不写当日发送标记）")
+            archive_daily_summary(collected, today)
+            return
         # 邮件已送达或已交接 QStash（至少一个通道）才写当日标记：checkin.yml 兜底去重靠它。
         # resend_msg_id 可为空（SMTP-only / 直发失败 / QStash publish 失败回退直发但 Resend 未返回 id），
         # 有值时 10:30 兜底 run 可查询 QStash /v2/logs 确认投递状态。

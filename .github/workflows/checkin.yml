@@ -11,7 +11,6 @@ on:
     - cron: "30 12 * * *"
   repository_dispatch:
     types:
-      - run_task
       - checkin_morning
       - checkin_modelscope
       - checkin_latvi
@@ -134,35 +133,30 @@ jobs:
             latvi-state-
             agentrouter-state-
 
-      - name: Restore AI-ROUTER state from artifact (fallback)
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if [ -s .ai_router_state.json ]; then
-            echo "AI-ROUTER state already restored via cache"
-            exit 0
-          fi
-          for rid in $(gh run list --workflow checkin.yml --status completed --limit 20 --json databaseId --jq '.[].databaseId'); do
-            if gh run download "$rid" -n ai-router-state --dir . 2>/dev/null; then
-              echo "Restored AI-ROUTER state from run $rid (cache miss fallback)"
-              break
-            fi
-          done
-
       - name: Setup SS proxy for AgentRouter
+        env:
+          AGENTROUTER_SS_CONFIG: ${{ secrets.AGENTROUTER_SS_CONFIG }}
+          AGENTROUTER_SS_SHA256: ${{ secrets.AGENTROUTER_SS_SHA256 }}
         run: |
           set -euo pipefail
-          curl -sL -o /tmp/ss.tar.xz \
-            https://github.com/shadowsocks/shadowsocks-rust/releases/download/v1.23.4/shadowsocks-v1.23.4.x86_64-unknown-linux-musl.tar.xz
+          # 可选组件全程软失败：代理起不来只让 agentrouter 红卡（公平失败），
+          # 不能杀死整条主流水线让 16 个签到任务全部不跑
+          curl -sL --max-time 60 -o /tmp/ss.tar.xz \
+            https://github.com/shadowsocks/shadowsocks-rust/releases/download/v1.23.4/shadowsocks-v1.23.4.x86_64-unknown-linux-musl.tar.xz \
+            || { echo "sslocal download failed; continuing without proxy"; exit 0; }
+          # 供应链校验：配置了 AGENTROUTER_SS_SHA256 secret 时强制核对（未配置则跳过）
+          if [ -n "$AGENTROUTER_SS_SHA256" ]; then
+            echo "$AGENTROUTER_SS_SHA256  /tmp/ss.tar.xz" | sha256sum -c - \
+              || { echo "sslocal checksum MISMATCH; continuing without proxy"; exit 0; }
+          fi
           tar xf /tmp/ss.tar.xz -C /tmp
-          test -x /tmp/sslocal || { echo "sslocal missing"; exit 1; }
-          command -v obfs-local >/dev/null 2>&1 || \
-            sudo apt-get install -y -qq simple-obfs >/dev/null 2>&1
-          command -v obfs-local >/dev/null || { echo "obfs-local install failed"; exit 1; }
-          cat > /tmp/ss-config.json <<'EOF'
-          ${{ secrets.AGENTROUTER_SS_CONFIG }}
-          EOF
+          test -x /tmp/sslocal || { echo "sslocal missing; continuing without proxy"; exit 0; }
+          if ! command -v obfs-local >/dev/null 2>&1; then
+            sudo apt-get install -y -qq simple-obfs >/dev/null 2>&1 \
+              || echo "obfs-local install failed; SS proxy may not work with obfs nodes"
+          fi
+          # printf 而非 heredoc：quoted heredoc 不展开变量，且 secret 中的反斜杠/引号可原样落盘
+          printf '%s' "$AGENTROUTER_SS_CONFIG" > /tmp/ss-config.json
           test -s /tmp/ss-config.json || { echo "AGENTROUTER_SS_CONFIG empty, SS proxy cannot start (agentrouter will fail)"; exit 0; }
           python3 - <<'PY'
           import json, shutil, sys
@@ -179,12 +173,11 @@ jobs:
               cfg["plugin"] = resolved
           json.dump(cfg, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
           PY
-          pip install -q pysocks
+          pip install -q pysocks || { echo "pysocks install failed; continuing without proxy"; exit 0; }
           /tmp/sslocal -c /tmp/ss-config.json &
           SSPID=$!
           echo "SSPID=$SSPID" >> "$GITHUB_ENV"
-          SSPORT=$(grep -oE '"local_port"[[:space:]]*:[[:space:]]*[0-9]+' /tmp/ss-config.json | grep -oE '[0-9]+$' || true)
-          SSPORT=${SSPORT:-1080}
+          SSPORT=1080
           echo "Waiting for SS proxy on port $SSPORT..."
           for i in $(seq 1 20); do
             if ss -tln 2>/dev/null | grep -q ":$SSPORT "; then
@@ -203,13 +196,17 @@ jobs:
 
       - name: Resolve dispatch compat -> ORCH_TASKS
         id: orch_tasks
+        env:
+          # 输入经 env 间接传递，避免 ${{ }} 直接内插 shell（引号/命令注入面）
+          INPUT_TASKS: ${{ inputs.tasks }}
+          EVENT_ACTION: ${{ github.event.action }}
         run: |
           # workflow_dispatch explicit tasks take precedence
-          if [ -n "${{ inputs.tasks }}" ]; then
-            echo "tasks=${{ inputs.tasks }}" >> "$GITHUB_OUTPUT"
+          if [ -n "$INPUT_TASKS" ]; then
+            echo "tasks=$INPUT_TASKS" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          case "${{ github.event.action }}" in
+          case "$EVENT_ACTION" in
             latvi_next_sign|checkin_latvi) echo "tasks=latvi" >> "$GITHUB_OUTPUT" ;;
             workbuddy_travel_claim)        echo "tasks=workbuddy" >> "$GITHUB_OUTPUT" ;;
             checkin_modelscope)            echo "tasks=modelscope" >> "$GITHUB_OUTPUT" ;;
@@ -219,9 +216,11 @@ jobs:
 
       - name: Execute daily orchestrator
         id: orchestrator
+        env:
+          ORCH_TASKS: ${{ steps.orch_tasks.outputs.tasks }}
         run: |
-          if [ -n "${{ steps.orch_tasks.outputs.tasks }}" ]; then
-            python3 scripts/daily_orchestrator.py --tasks "${{ steps.orch_tasks.outputs.tasks }}"
+          if [ -n "$ORCH_TASKS" ]; then
+            python3 scripts/daily_orchestrator.py --tasks "$ORCH_TASKS"
           else
             python3 scripts/daily_orchestrator.py
           fi
@@ -229,11 +228,13 @@ jobs:
       - name: Send unified report
         id: send_report
         if: >-
-          always() && inputs.retry != true
+          always()
           && !(github.event_name == 'repository_dispatch'
                && contains(fromJSON('["latvi_next_sign","checkin_latvi","checkin_morning","checkin_modelscope","workbuddy_travel_claim"]'), github.event.action))
         env:
           DAILY_PUSH: "true"
+          # 重跑 run 发送「[重跑]」补充邮件（不写当日 marker、不再触发递归重试）
+          RETRY_REPORT: ${{ inputs.retry == true && '1' || '0' }}
         run: python3 scripts/unified_report.py
 
       - name: Auto-retry failed sites
@@ -381,11 +382,6 @@ jobs:
           TODAY: ${{ env.TODAY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "manual force, ignore marker"
-            exit 0
-          fi
           if [ "${{ steps.check_sent.outputs.sent }}" = "true" ]; then
             if [ "${{ steps.delivery.outputs.delivery }}" = "failed" ]; then
               echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -399,12 +395,16 @@ jobs:
           API_SENT=$(python3 -c "
           import json, subprocess, sys, datetime as dt
           try:
-              out = subprocess.check_output(['gh', 'run', 'list', '--workflow', 'checkin.yml', '--status', 'success', '--json', 'databaseId,createdAt', '--limit', '10'], text=True)
+              out = subprocess.check_output(['gh', 'run', 'list', '--workflow', 'checkin.yml', '--status', 'success', '--json', 'databaseId,createdAt,event', '--limit', '20'], text=True)
               runs = json.loads(out)
               tz = dt.timezone(dt.timedelta(hours=8))
               today = dt.datetime.now(tz).strftime('%Y-%m-%d')
               sent = False
               for r in runs:
+                  # 只认可能发过报告的 run：主 cron（schedule）与手动非重试（workflow_dispatch）；
+                  # repository_dispatch 接力 run 从不发报告，不能拿来推断「报告已发」
+                  if r.get('event') == 'repository_dispatch':
+                      continue
                   created_utc = dt.datetime.fromisoformat(r['createdAt'].replace('Z', '+00:00'))
                   created_bj = created_utc.astimezone(tz).strftime('%Y-%m-%d')
                   if created_bj == today:
