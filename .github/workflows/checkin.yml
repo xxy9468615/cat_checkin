@@ -137,28 +137,34 @@ jobs:
         env:
           AGENTROUTER_SS_CONFIG: ${{ secrets.AGENTROUTER_SS_CONFIG }}
           AGENTROUTER_SS_SHA256: ${{ secrets.AGENTROUTER_SS_SHA256 }}
+          AGENTROUTER_BACKUP_PROXIES: ${{ secrets.AGENTROUTER_BACKUP_PROXIES }}
         run: |
           set -euo pipefail
-          # 可选组件全程软失败：代理起不来只让 agentrouter 红卡（公平失败），
-          # 不能杀死整条主流水线让 16 个签到任务全部不跑
-          curl -sL --max-time 60 -o /tmp/ss.tar.xz \
-            https://github.com/shadowsocks/shadowsocks-rust/releases/download/v1.23.4/shadowsocks-v1.23.4.x86_64-unknown-linux-musl.tar.xz \
-            || { echo "sslocal download failed; continuing without proxy"; exit 0; }
-          # 供应链校验：配置了 AGENTROUTER_SS_SHA256 secret 时强制核对（未配置则跳过）
-          if [ -n "$AGENTROUTER_SS_SHA256" ]; then
-            echo "$AGENTROUTER_SS_SHA256  /tmp/ss.tar.xz" | sha256sum -c - \
-              || { echo "sslocal checksum MISMATCH; continuing without proxy"; exit 0; }
-          fi
-          tar xf /tmp/ss.tar.xz -C /tmp
-          test -x /tmp/sslocal || { echo "sslocal missing; continuing without proxy"; exit 0; }
-          if ! command -v obfs-local >/dev/null 2>&1; then
-            sudo apt-get install -y -qq simple-obfs >/dev/null 2>&1 \
-              || echo "obfs-local install failed; SS proxy may not work with obfs nodes"
-          fi
-          # printf 而非 heredoc：quoted heredoc 不展开变量，且 secret 中的反斜杠/引号可原样落盘
-          printf '%s' "$AGENTROUTER_SS_CONFIG" > /tmp/ss-config.json
-          test -s /tmp/ss-config.json || { echo "AGENTROUTER_SS_CONFIG empty, SS proxy cannot start (agentrouter will fail)"; exit 0; }
-          python3 - <<'PY'
+          # 可选组件全程软失败：主 SS 出口与备用代理全部不可用时只让 agentrouter
+          # 红卡（公平失败），不能杀死整条主流水线让 16 个签到任务全部不跑。
+          # AGENTROUTER_BACKUP_PROXIES：每行一条 socks5:// 或 http(s):// 代理，
+          # 支持 user:pass@host:port 与行内 # 注释；仅在本地 sslocal 不可用时
+          # 按序探测，取第一条能通 AgentRouter API 的，经 GITHUB_ENV 覆盖 job 级
+          # 默认 AGENTROUTER_PROXY=socks5://127.0.0.1:1080。
+          setup_ss() {
+            curl -sL --max-time 60 -o /tmp/ss.tar.xz \
+              https://github.com/shadowsocks/shadowsocks-rust/releases/download/v1.23.4/shadowsocks-v1.23.4.x86_64-unknown-linux-musl.tar.xz \
+              || { echo "sslocal download failed"; return 1; }
+            # 供应链校验：配置了 AGENTROUTER_SS_SHA256 secret 时强制核对（未配置则跳过）
+            if [ -n "$AGENTROUTER_SS_SHA256" ]; then
+              echo "$AGENTROUTER_SS_SHA256  /tmp/ss.tar.xz" | sha256sum -c - \
+                || { echo "sslocal checksum MISMATCH"; return 1; }
+            fi
+            tar xf /tmp/ss.tar.xz -C /tmp
+            test -x /tmp/sslocal || { echo "sslocal missing"; return 1; }
+            if ! command -v obfs-local >/dev/null 2>&1; then
+              sudo apt-get install -y -qq simple-obfs >/dev/null 2>&1 \
+                || echo "obfs-local install failed; SS proxy may not work with obfs nodes"
+            fi
+            # printf 而非 heredoc：quoted heredoc 不展开变量，且 secret 中的反斜杠/引号可原样落盘
+            printf '%s' "$AGENTROUTER_SS_CONFIG" > /tmp/ss-config.json
+            test -s /tmp/ss-config.json || { echo "AGENTROUTER_SS_CONFIG empty"; return 1; }
+            python3 - <<'PY' || return 1
           import json, shutil, sys
           p = "/tmp/ss-config.json"
           try:
@@ -173,26 +179,46 @@ jobs:
               cfg["plugin"] = resolved
           json.dump(cfg, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
           PY
-          pip install -q pysocks || { echo "pysocks install failed; continuing without proxy"; exit 0; }
-          /tmp/sslocal -c /tmp/ss-config.json &
-          SSPID=$!
-          echo "SSPID=$SSPID" >> "$GITHUB_ENV"
-          SSPORT=1080
-          echo "Waiting for SS proxy on port $SSPORT..."
-          for i in $(seq 1 20); do
-            if ss -tln 2>/dev/null | grep -q ":$SSPORT "; then
-              break
-            fi
-            sleep 0.5
-          done
-          for i in 1 2 3; do
-            if curl -sS -x "socks5://127.0.0.1:$SSPORT" -m 8 -o /dev/null https://api.ipify.org; then
-              echo "SS proxy ready (pid $SSPID, port $SSPORT)"
+            pip install -q pysocks || { echo "pysocks install failed"; return 1; }
+            /tmp/sslocal -c /tmp/ss-config.json &
+            SSPID=$!
+            echo "SSPID=$SSPID" >> "$GITHUB_ENV"
+            SSPORT=1080
+            echo "Waiting for SS proxy on port $SSPORT..."
+            for i in $(seq 1 20); do
+              if ss -tln 2>/dev/null | grep -q ":$SSPORT "; then
+                break
+              fi
+              sleep 0.5
+            done
+            for i in 1 2 3; do
+              if curl -sS -x "socks5://127.0.0.1:$SSPORT" -m 8 -o /dev/null https://api.ipify.org; then
+                echo "SS proxy ready (pid $SSPID, port $SSPORT)"
+                return 0
+              fi
+              sleep 1
+            done
+            echo "SS proxy failed (check AGENTROUTER_SS_CONFIG)"
+            return 1
+          }
+
+          if setup_ss; then
+            exit 0
+          fi
+
+          echo "SS proxy unavailable; trying backup proxies..."
+          while IFS= read -r line; do
+            p="${line%%#*}"
+            p="$(printf '%s' "$p" | tr -d '[:space:]')"
+            [ -n "$p" ] || continue
+            if curl -sS -x "$p" -m 12 -o /dev/null https://ps.air-outer.com; then
+              echo "AGENTROUTER_PROXY=$p" >> "$GITHUB_ENV"
+              echo "backup proxy OK: ${p##*@}"
               exit 0
             fi
-            sleep 1
-          done
-          echo "SS proxy failed (check AGENTROUTER_SS_CONFIG); continuing without proxy"
+            echo "backup proxy unreachable: ${p##*@}"
+          done <<< "$AGENTROUTER_BACKUP_PROXIES"
+          echo "no backup proxy available; agentrouter will fail (red card by design)"
 
       - name: Resolve dispatch compat -> ORCH_TASKS
         id: orch_tasks

@@ -159,21 +159,35 @@ class Http:
         if not follow_redirects:
             handlers.insert(0, NoRedirectHandler())
         if proxy:
-            # SOCKS5 出口：urllib 原生不支持 socks:// scheme，
-            # 用 pysocks 全局 monkey-patch socket 让进程内所有连接走代理。
-            # 仅当调用方显式传入 proxy 时启用，其它脚本不受影响。
-            try:
-                import socks
-                import socket
-            except ImportError:
-                raise RuntimeError(
-                    "检测到 AGENTROUTER_PROXY 但缺少 pysocks 依赖，请 pip install pysocks"
+            # 代理出口：仅当调用方显式传入 proxy 时启用，其它脚本不受影响。
+            # - http(s):// 走 urllib 原生 ProxyHandler（HTTPS 经 CONNECT 隧道）
+            # - socks5(h):// 或裸 host:port 走 pysocks 全局 monkey-patch socket
+            #   （urllib 原生不支持 socks scheme），支持 user:pass@host:port userinfo
+            if proxy.lower().startswith(("http://", "https://")):
+                handlers.append(
+                    urllib.request.ProxyHandler({"http": proxy, "https": proxy})
                 )
-            parts = proxy.removeprefix("socks5://").removeprefix("socks5h://").split(":")
-            host, port = parts[0], int(parts[1]) if len(parts) > 1 else 1080
-            # rdns=True：目标域名交由代理端解析（与出口 IP 一致，避免本地 DNS 污染）
-            socks.set_default_proxy(socks.SOCKS5, host, port, rdns=True)
-            socket.socket = socks.socksocket
+            else:
+                try:
+                    import socks
+                    import socket
+                except ImportError:
+                    raise RuntimeError(
+                        "检测到 AGENTROUTER_PROXY(socks5) 但缺少 pysocks 依赖，请 pip install pysocks"
+                    )
+                u = urllib.parse.urlparse(
+                    proxy if "://" in proxy else f"socks5://{proxy}"
+                )
+                # rdns=True：目标域名交由代理端解析（与出口 IP 一致，避免本地 DNS 污染）
+                socks.set_default_proxy(
+                    socks.SOCKS5,
+                    u.hostname or "",
+                    u.port or 1080,
+                    rdns=True,
+                    username=urllib.parse.unquote(u.username) if u.username else None,
+                    password=urllib.parse.unquote(u.password) if u.password else None,
+                )
+                socket.socket = socks.socksocket
         self.opener = urllib.request.build_opener(*handlers)
     @retry()
     def request(self, method: str, url: str, *, headers: Optional[Dict[str,str]]=None,
