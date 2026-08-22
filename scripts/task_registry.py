@@ -3,8 +3,8 @@
 # new Env("统一任务注册表与调度队列")
 """统一任务注册表与调度队列管理器。
 
-定义项目中全部 15 个签到任务的元数据（脚本、结果文件、超时、账号、调度标签），
-作为统一执行引擎（checkin.yml）、统一报告（unified_report.py）和周期统计（stats.py）
+定义项目中全部 16 个签到任务的元数据（脚本、结果文件、超时、账号、调度标签），
+作为统一执行引擎（checkin.yml）与统一报告（unified_report.py）
 的唯一事实来源（Single Source of Truth）。
 """
 
@@ -174,7 +174,7 @@ TASKS: Dict[str, Dict[str, Any]] = {
 
 
 def get_expected_results() -> Dict[str, str]:
-    """返回期望结果文件名到脚本名的映射表（供 unified_report.py 和 stats.py 使用）。"""
+    """返回期望结果文件名到脚本名的映射表（供 unified_report.py 使用）。"""
     return {cfg["result"]: cfg["script"] for cfg in TASKS.values()}
 
 
