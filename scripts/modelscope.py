@@ -95,7 +95,8 @@ def _touch_user(h: Http, cookie: str, host: str) -> Dict[str, Any]:
         pass
 
     try:
-        h.request("GET", f"https://{host}/api/v1/models?page_number=1&page_size=1", headers=_headers(host, cookie))
+        h.request("GET", f"https://{host}/openapi/v1/models?page_number=1&page_size=5", headers=_headers(host, cookie))
+        h.request("GET", f"https://{host}/openapi/v1/datasets?page_number=1&page_size=5", headers=_headers(host, cookie))
     except Exception:
         pass
 
@@ -154,7 +155,12 @@ def _get_balance(h: Http, cookie: str, host: str) -> Optional[int]:
 
 def _run_one(cookie: str, host: str) -> Tuple[bool, str]:
     """执行单个账号的签到逻辑。返回 (成功, 描述)。"""
-    h = Http()
+    proxy = (
+        os.getenv("MODELSCOPE_PROXY", "").strip()
+        or os.getenv("HTTPS_PROXY", "").strip()
+        or os.getenv("https_proxy", "").strip()
+    )
+    h = Http(proxy=proxy)
 
     # 1. 会话触碰 + 登录态验证 + 账号脱敏（该请求同时是「日活」触发的活跃信号）
     try:

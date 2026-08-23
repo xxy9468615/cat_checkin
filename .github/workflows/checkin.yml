@@ -137,6 +137,7 @@ jobs:
       MODELSCOPE_COOKIE_1: ${{ secrets.MODELSCOPE_COOKIE_1 || secrets.MODELSCOPE_COOKIE }}
       MODELSCOPE_COOKIE_2: ${{ secrets.MODELSCOPE_COOKIE_2 }}
       MODELSCOPE_HOST: ${{ secrets.MODELSCOPE_HOST }}
+      MODELSCOPE_PROXY: socks5://127.0.0.1:1080
       MODELSCOPE_AI_COOKIE: ${{ secrets.MODELSCOPE_AI_COOKIE }}
       MODELSCOPE_AI_COOKIE_1: ${{ secrets.MODELSCOPE_AI_COOKIE_1 || secrets.MODELSCOPE_AI_COOKIE }}
       MODELSCOPE_AI_COOKIE_2: ${{ secrets.MODELSCOPE_AI_COOKIE_2 }}
@@ -257,6 +258,7 @@ jobs:
             [ -n "$p" ] || continue
             if curl -sS -x "$p" -m 12 -o /dev/null https://ps.air-outer.com; then
               echo "AGENTROUTER_PROXY=$p" >> "$GITHUB_ENV"
+              echo "MODELSCOPE_PROXY=$p" >> "$GITHUB_ENV"
               echo "backup proxy OK: ${p##*@}"
               exit 0
             fi
