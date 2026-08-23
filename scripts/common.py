@@ -387,6 +387,12 @@ def env(prefix: str, name: str, default: str = "", required: bool = True) -> str
         f"QL_{clean_prefix}{name.upper()}",
         f"{prefix}{name}",
         f"{prefix}{name.upper()}",
+        f"{clean_prefix}{name}_1",
+        f"{clean_prefix}{name.upper()}_1",
+        f"QL_{clean_prefix}{name}_1",
+        f"QL_{clean_prefix}{name.upper()}_1",
+        f"{prefix}{name}_1",
+        f"{prefix}{name.upper()}_1",
     ]
     # 不回退裸 {name}/{NAME}：任何同名的全局环境变量都会静默劫持站点配置（凭证串 env 风险）
     seen = set()
@@ -399,6 +405,65 @@ def env(prefix: str, name: str, default: str = "", required: bool = True) -> str
         # RuntimeError（而非 SystemExit）：main_guard 的 except Exception 能统一格式化输出
         raise RuntimeError(f"缺少环境变量：{clean_prefix}{name}")
     return default
+
+
+def env_seq(prefix: str, name: str, default: list[str] | None = None, required: bool = True) -> list[str]:
+    """获取多账号序列环境变量（统一支持 <PREFIX>_<NAME>_1, <PREFIX>_<NAME>_2 序列）。
+
+    检索策略：
+    1. 优先扫描序号序列：依次查找 <prefix><name>_1, <prefix><name>_2, ...
+       （通过 env() 的变体查找规则），直到遇到第一个不存在的序号停止。
+       若元素中包含 && 或换行（例如 Secret 回退链注入），自动切分展平。
+    2. 若未配置序号（未找到 _1），回退探测未编号的单变量 <prefix><name>：
+       - 若单变量存在且包含 && 或换行（兼容过渡期残留），则自动切分。
+       - 否则作为单元素列表返回。
+    3. 若均未找到：
+       - 当 required=True 且 default 为 None 时，抛出 RuntimeError。
+       - 否则返回 default if default is not None else []。
+    """
+    clean_prefix = prefix.removeprefix("QL_")
+    results = []
+    idx = 1
+    while True:
+        # 直接查找精确的 _idx 序号变量
+        exact_keys = [
+            f"{clean_prefix}{name}_{idx}",
+            f"{clean_prefix}{name.upper()}_{idx}",
+            f"QL_{clean_prefix}{name}_{idx}",
+            f"QL_{clean_prefix}{name.upper()}_{idx}",
+            f"{prefix}{name}_{idx}",
+            f"{prefix}{name.upper()}_{idx}",
+        ]
+        seen = set()
+        ordered_keys = [k for k in exact_keys if not (k in seen or seen.add(k))]
+        found = ""
+        for k in ordered_keys:
+            val = os.getenv(k)
+            if val not in (None, ""):
+                found = val
+                break
+        if found:
+            for piece in re.split(r"\n|&&", found):
+                p = piece.strip()
+                if p:
+                    results.append(p)
+            idx += 1
+        else:
+            break
+
+    if results:
+        return results
+
+    # 回退探测未编号单变量
+    fallback_val = env(prefix, name, default="", required=False)
+    if fallback_val:
+        parts = [x.strip() for x in re.split(r"\n|&&", fallback_val) if x.strip()]
+        if parts:
+            return parts
+
+    if required and default is None:
+        raise RuntimeError(f"缺少环境变量：{clean_prefix}{name}_1 或 {clean_prefix}{name}")
+    return default if default is not None else []
 
 def must_match(pattern: str, text: str, label: str, flags: int = 0) -> str:
     m = re.search(pattern, text, flags)

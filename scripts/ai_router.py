@@ -43,7 +43,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from common import Http, env, load_kv_state, main_guard, mask_str, save_kv_state
+from common import Http, env, env_seq, load_kv_state, main_guard, mask_str, save_kv_state
 
 PREFIX = "AI_ROUTER_"
 DEFAULT_API_URL = "https://api.ai-router.dev/api/v1"
@@ -83,78 +83,102 @@ def _resolve_rtr(refresh_token: str, state: dict) -> tuple[str, bool]:
     return current, current != refresh_token
 
 
+def _parse_account_chunk(chunk: str) -> dict | None:
+    chunk = chunk.strip()
+    if not chunk:
+        return None
+    # 支持 email:password 或 username:password 格式
+    if ":" in chunk and not chunk.startswith("http") and not chunk.startswith("rt_") and "eyJ" not in chunk:
+        user_part, _, pass_part = chunk.partition(":")
+        return {
+            "username": user_part.strip(),
+            "password": pass_part.strip(),
+            "token": "",
+            "refresh_token": "",
+            "cookie": "",
+        }
+    elif "|" in chunk:
+        part1, _, part2 = chunk.partition("|")
+        p1, p2 = part1.strip(), part2.strip()
+        if p1.startswith("rt_"):
+            return {"token": p2 if not p2.startswith("rt_") else "", "refresh_token": p1, "cookie": "", "username": "", "password": ""}
+        elif p2.startswith("rt_"):
+            return {"token": p1 if not p1.startswith("rt_") else "", "refresh_token": p2, "cookie": "", "username": "", "password": ""}
+        elif ":" in p1:
+            u, _, p = p1.partition(":")
+            return {"username": u.strip(), "password": p.strip(), "token": "", "refresh_token": p2, "cookie": ""}
+        else:
+            return {"token": p1, "refresh_token": p2, "cookie": "", "username": "", "password": ""}
+    else:
+        if chunk.startswith("rt_"):
+            return {"token": "", "refresh_token": chunk, "cookie": "", "username": "", "password": ""}
+        elif "eyJ" in chunk or chunk.startswith("Bearer "):
+            return {"token": chunk, "refresh_token": "", "cookie": "", "username": "", "password": ""}
+        else:
+            return {"token": "", "refresh_token": "", "cookie": chunk, "username": "", "password": ""}
+
+
 def _load_accounts():
     """解析并返回账号凭据列表 [{'token': ..., 'refresh_token': ..., 'cookie': ..., 'username': ..., 'password': ...}, ...]"""
-    raw = os.getenv(f"{PREFIX}ACCOUNTS", "").strip() or os.getenv(f"QL_{PREFIX}ACCOUNTS", "").strip() or os.getenv(f"{PREFIX}accounts", "").strip()
     accounts = []
     state = _load_state()
 
-    if raw:
-        for chunk in re.split(r"\n|&&", raw):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            # 支持 email:password 或 username:password 格式
-            if ":" in chunk and not chunk.startswith("http") and not chunk.startswith("rt_") and "eyJ" not in chunk:
-                user_part, _, pass_part = chunk.partition(":")
-                accounts.append({
-                    "username": user_part.strip(),
-                    "password": pass_part.strip(),
-                    "token": "",
-                    "refresh_token": "",
-                    "cookie": "",
-                })
-            elif "|" in chunk:
-                part1, _, part2 = chunk.partition("|")
-                p1, p2 = part1.strip(), part2.strip()
-                if p1.startswith("rt_"):
-                    accounts.append({"token": p2 if not p2.startswith("rt_") else "", "refresh_token": p1, "cookie": "", "username": "", "password": ""})
-                elif p2.startswith("rt_"):
-                    accounts.append({"token": p1 if not p1.startswith("rt_") else "", "refresh_token": p2, "cookie": "", "username": "", "password": ""})
-                elif ":" in p1:
-                    u, _, p = p1.partition(":")
-                    accounts.append({"username": u.strip(), "password": p.strip(), "token": "", "refresh_token": p2, "cookie": ""})
-                else:
-                    accounts.append({"token": p1, "refresh_token": p2, "cookie": "", "username": "", "password": ""})
-            else:
-                if chunk.startswith("rt_"):
-                    accounts.append({"token": "", "refresh_token": chunk, "cookie": "", "username": "", "password": ""})
-                elif "eyJ" in chunk or chunk.startswith("Bearer "):
-                    accounts.append({"token": chunk, "refresh_token": "", "cookie": "", "username": "", "password": ""})
-                else:
-                    accounts.append({"token": "", "refresh_token": "", "cookie": chunk, "username": "", "password": ""})
+    # 1. 优先扫描配对的 EMAIL_1 / PASSWORD_1 序号序列
+    emails = env_seq(PREFIX, "email", required=False) or env_seq(PREFIX, "username", required=False)
+    passwords = env_seq(PREFIX, "password", required=False)
+    for u, p in zip(emails, passwords):
+        if u.strip() and p.strip():
+            accounts.append({
+                "username": u.strip(),
+                "password": p.strip(),
+                "token": "",
+                "refresh_token": "",
+                "cookie": "",
+            })
 
-    # 单账号兼容
-    email = os.getenv(f"{PREFIX}EMAIL", "").strip() or os.getenv(f"{PREFIX}email", "").strip() or os.getenv(f"QL_{PREFIX}EMAIL", "").strip()
-    username = os.getenv(f"{PREFIX}USERNAME", "").strip() or os.getenv(f"{PREFIX}username", "").strip() or os.getenv(f"QL_{PREFIX}USERNAME", "").strip()
-    user_login = email or username
-    password = os.getenv(f"{PREFIX}PASSWORD", "").strip() or os.getenv(f"{PREFIX}password", "").strip() or os.getenv(f"QL_{PREFIX}PASSWORD", "").strip()
+    # 2. 扫描 TOKEN_1 / REFRESH_TOKEN_1 序号序列
+    tokens = env_seq(PREFIX, "token", required=False)
+    ref_tokens = env_seq(PREFIX, "refresh_token", required=False)
+    max_t_len = max(len(tokens), len(ref_tokens))
+    for i in range(max_t_len):
+        t = tokens[i] if i < len(tokens) else ""
+        rt = ref_tokens[i] if i < len(ref_tokens) else ""
+        if t or rt:
+            accounts.append({
+                "token": t,
+                "refresh_token": rt,
+                "cookie": "",
+                "username": "",
+                "password": "",
+            })
 
-    token = os.getenv(f"{PREFIX}TOKEN", "").strip() or os.getenv(f"{PREFIX}token", "").strip() or os.getenv(f"QL_{PREFIX}TOKEN", "").strip()
-    ref_token = os.getenv(f"{PREFIX}REFRESH_TOKEN", "").strip() or os.getenv(f"{PREFIX}refresh_token", "").strip() or os.getenv(f"QL_{PREFIX}REFRESH_TOKEN", "").strip()
-    cookie = os.getenv(f"{PREFIX}COOKIE", "").strip() or os.getenv(f"{PREFIX}cookie", "").strip() or os.getenv(f"QL_{PREFIX}COOKIE", "").strip()
+    # 3. 扫描 COOKIE_1, COOKIE_2 序号序列
+    cookies = env_seq(PREFIX, "cookie", required=False)
+    for c in cookies:
+        c = c.strip()
+        if not c:
+            continue
+        if c.startswith("rt_"):
+            accounts.append({"token": "", "refresh_token": c, "cookie": "", "username": "", "password": ""})
+        elif "eyJ" in c:
+            token_val = c.split("Bearer ", 1)[-1].strip()
+            accounts.append({"token": token_val, "refresh_token": "", "cookie": "", "username": "", "password": ""})
+        else:
+            accounts.append({"token": "", "refresh_token": "", "cookie": c, "username": "", "password": ""})
 
-    # 处理从 cookie 里误传 token 的情况
-    if cookie and cookie.startswith("rt_") and not ref_token:
-        ref_token = cookie
-        cookie = ""
-    elif cookie and "eyJ" in cookie and not token:
-        token = cookie.split("Bearer ", 1)[-1].strip()
+    # 4. 扫描 ACCOUNTS 序列或兼容旧 ACCOUNTS 变量（换行 / && 切分）
+    raw_accs = env_seq(PREFIX, "accounts", required=False) or env_seq(PREFIX, "account", required=False)
+    for chunk in raw_accs:
+        acc = _parse_account_chunk(chunk)
+        if acc and acc not in accounts:
+            accounts.append(acc)
 
-    if (token or ref_token or cookie or (user_login and password)) and not accounts:
-        accounts.append({
-            "token": token,
-            "refresh_token": ref_token,
-            "cookie": cookie,
-            "username": user_login,
-            "password": password,
-        })
-    elif user_login and password:
-        # 若已有 accounts 但匹配到单账号用户名密码，补充凭据
-        for acc in accounts:
-            if not acc.get("username") and not acc.get("password"):
-                acc["username"] = user_login
-                acc["password"] = password
+    # 去重且保持插入顺序
+    deduped_accounts = []
+    for acc in accounts:
+        if acc not in deduped_accounts:
+            deduped_accounts.append(acc)
+    accounts = deduped_accounts
 
     # 对所有账号应用持久化的 RTR 链追溯与登录凭据关联恢复
     for acc in accounts:

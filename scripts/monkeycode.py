@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from common import Http, env, ensure, main_guard, mask_str
+from common import Http, ensure, env, env_seq, main_guard, mask_str
 
 PREFIX = "MONKEYCODE_"
 BASE = "https://monkeycode-ai.com"
@@ -257,71 +257,56 @@ def get_wallet_info_lines(h, headers) -> List[str]:
 
 def _load_accounts() -> List[Dict[str, Optional[str]]]:
     """解析并汇总多账号凭证列表。"""
-    raw_accounts = os.getenv(f"{PREFIX}ACCOUNTS", "") or os.getenv(f"QL_{PREFIX}ACCOUNTS", "")
     accounts: List[Dict[str, Optional[str]]] = []
     seen_keys = set()
 
-    if raw_accounts:
-        for chunk in re.split(r"\n|&&", raw_accounts):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            if ":" in chunk:
-                u, _, p = chunk.partition(":")
-            elif "---" in chunk:
-                u, _, p = chunk.partition("---")
-            elif "," in chunk:
-                u, _, p = chunk.partition(",")
-            else:
-                u, p = chunk, ""
-            u, p = u.strip(), p.strip()
-            if u:
-                key = u.lower()
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    if p:
-                        accounts.append({"cookie": None, "email": u, "password": p})
-                    else:
-                        accounts.append({"cookie": u, "email": None, "password": None})
-
-    raw_cookies = os.getenv(f"{PREFIX}COOKIES", "") or os.getenv(f"QL_{PREFIX}COOKIES", "")
-    if raw_cookies:
-        for chunk in re.split(r"\n|&&", raw_cookies):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            key = chunk[:32]
+    # 1. 优先扫描序号配对的 EMAIL_1 / PASSWORD_1 序列
+    emails = env_seq(PREFIX, "email", required=False)
+    passwords = env_seq(PREFIX, "password", required=False)
+    for u, p in zip(emails, passwords):
+        u, p = u.strip(), p.strip()
+        if u and p:
+            key = u.lower()
             if key not in seen_keys:
                 seen_keys.add(key)
-                accounts.append({"cookie": chunk, "email": None, "password": None})
+                accounts.append({"cookie": None, "email": u, "password": p})
 
-    # 兼容单账号环境变量
-    single_email = (
-        os.getenv(f"{PREFIX}email", "")
-        or os.getenv(f"{PREFIX}EMAIL", "")
-        or os.getenv(f"QL_{PREFIX}email", "")
-        or os.getenv(f"QL_{PREFIX}EMAIL", "")
-    ).strip()
-    single_pwd = (
-        os.getenv(f"{PREFIX}password", "")
-        or os.getenv(f"{PREFIX}PASSWORD", "")
-        or os.getenv(f"QL_{PREFIX}password", "")
-        or os.getenv(f"QL_{PREFIX}PASSWORD", "")
-    ).strip()
-    single_cookie = (
-        os.getenv(f"{PREFIX}cookie", "")
-        or os.getenv(f"{PREFIX}COOKIE", "")
-        or os.getenv(f"QL_{PREFIX}cookie", "")
-        or os.getenv(f"QL_{PREFIX}COOKIE", "")
-    ).strip()
+    # 2. 扫描 COOKIE_1, COOKIE_2 序列（回退至 COOKIES）
+    cookies = env_seq(PREFIX, "cookie", required=False)
+    if not cookies:
+        cookies = env_seq(PREFIX, "cookies", required=False)
+    for c in cookies:
+        c = c.strip()
+        if not c:
+            continue
+        key = c[:32]
+        if key not in seen_keys:
+            seen_keys.add(key)
+            accounts.append({"cookie": c, "email": None, "password": None})
 
-    if single_email and single_pwd:
-        if single_email.lower() not in seen_keys:
-            seen_keys.add(single_email.lower())
-            accounts.append({"cookie": single_cookie or None, "email": single_email, "password": single_pwd})
-    elif single_cookie and single_cookie[:32] not in seen_keys:
-        seen_keys.add(single_cookie[:32])
-        accounts.append({"cookie": single_cookie, "email": None, "password": None})
+    # 3. 扫描 ACCOUNTS 序列或兼容旧 ACCOUNTS 变量（换行 / && 切分）
+    raw_accounts = env_seq(PREFIX, "accounts", required=False) or env_seq(PREFIX, "account", required=False)
+    for chunk in raw_accounts:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" in chunk:
+            u, _, p = chunk.partition(":")
+        elif "---" in chunk:
+            u, _, p = chunk.partition("---")
+        elif "," in chunk:
+            u, _, p = chunk.partition(",")
+        else:
+            u, p = chunk, ""
+        u, p = u.strip(), p.strip()
+        if u:
+            key = u.lower()
+            if key not in seen_keys:
+                seen_keys.add(key)
+                if p:
+                    accounts.append({"cookie": None, "email": u, "password": p})
+                else:
+                    accounts.append({"cookie": u, "email": None, "password": None})
 
     return accounts
 

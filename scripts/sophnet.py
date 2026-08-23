@@ -4,40 +4,43 @@
 import os
 import re
 import sys
-from common import Http, env, main_guard, mask_str
+from common import Http, env, env_seq, main_guard, mask_str
 
 PREFIX = "SOPHNET_"
 
 def load_accounts():
-    """支持单账号与多账号格式:
-    1. 多账号: SOPHNET_TOKENS="token1|ref_token1\ntoken2|ref_token2" (或仅填 ref_token)
-    2. 单账号: SOPHNET_token 与 SOPHNET_refresh_token
+    """支持序号序列与兼容旧格式:
+    1. 序号序列: SOPHNET_TOKEN_1, SOPHNET_REFRESH_TOKEN_1, SOPHNET_TOKEN_2, SOPHNET_REFRESH_TOKEN_2...
+    2. 多账号旧格式: SOPHNET_TOKENS="token1|ref_token1\ntoken2|ref_token2" (或仅填 ref_token)
+    3. 单账号: SOPHNET_token 与 SOPHNET_refresh_token
     """
-    raw_tokens = os.getenv(f"{PREFIX}TOKENS", "").strip() or os.getenv("SOPHNET_TOKENS", "").strip()
-    if raw_tokens:
-        lines = [x.strip() for x in re.split(r"\n|&&", raw_tokens) if x.strip()]
-        accounts = []
-        for line in lines:
-            if "|" in line:
-                t, r = line.split("|", 1)
-                accounts.append((t.strip(), r.strip()))
-            else:
-                accounts.append(("", line.strip()))
-        return accounts
+    accounts = []
 
-    token = (
-        os.getenv(f"{PREFIX}token", "").strip()
-        or os.getenv(f"{PREFIX}TOKEN", "").strip()
-        or os.getenv("SOPHNET_token", "").strip()
-    )
-    ref_token = (
-        os.getenv(f"{PREFIX}refresh_token", "").strip()
-        or os.getenv(f"{PREFIX}REFRESH_TOKEN", "").strip()
-        or os.getenv("SOPHNET_refresh_token", "").strip()
-    )
-    if token or ref_token:
-        return [(token, ref_token)]
-    return []
+    # 1. 优先扫描序号配对的 TOKEN_1 / REFRESH_TOKEN_1 序列
+    tokens = env_seq(PREFIX, "token", required=False)
+    ref_tokens = env_seq(PREFIX, "refresh_token", required=False)
+    max_len = max(len(tokens), len(ref_tokens))
+    for i in range(max_len):
+        t = tokens[i].strip() if i < len(tokens) else ""
+        rt = ref_tokens[i].strip() if i < len(ref_tokens) else ""
+        if t or rt:
+            accounts.append((t, rt))
+
+    # 2. 扫描 TOKENS 序列或兼容旧 TOKENS 变量（换行 / && 切分）
+    raw_tokens = env_seq(PREFIX, "tokens", required=False)
+    for line in raw_tokens:
+        line = line.strip()
+        if not line:
+            continue
+        if "|" in line:
+            t, r = line.split("|", 1)
+            item = (t.strip(), r.strip())
+        else:
+            item = ("", line.strip())
+        if item not in accounts:
+            accounts.append(item)
+
+    return accounts
 
 def run_account(idx: int, token: str, refresh_token: str, h: Http) -> None:
     print(f"\n--- 处理第 {idx} 个 Sophnet 账号 ---")

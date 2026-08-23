@@ -7,7 +7,7 @@ import os
 import re
 import sys
 
-from common import Http, env, find, is_already_signed, bj_time_from_iso_z, main_guard, mask_str
+from common import Http, env, env_seq, find, is_already_signed, bj_time_from_iso_z, main_guard, mask_str
 
 PREFIX = "2LIBRA_"
 
@@ -15,28 +15,40 @@ PREFIX = "2LIBRA_"
 def _load_cookies() -> list[dict]:
     """返回 [{"cookie": ..., "auth": ...}, ...]。
 
-    多账号（推荐）：QL_2LIBRA_COOKIES，& 或换行或 && 分隔，每条带可选的 Authorization：
+    序号序列（推荐）：2LIBRA_COOKIE_1, 2LIBRA_COOKIE_2...（可选配对 2LIBRA_AUTHORIZATION_1...）
+    多账号旧格式：2LIBRA_COOKIES，换行或 && 分隔，每条带可选的 Authorization：
         格式为 cookie[|authorization]，如：
           cookie1
           cookie2|token2
     兼容单账号：
-        QL_2LIBRA_cookie（可选配对 QL_2LIBRA_Authorization）
+        2LIBRA_cookie（可选配对 2LIBRA_Authorization）
     """
-    raw = os.getenv(f"{PREFIX}COOKIES", "").strip()
-    accounts = []
-    if raw:
-        for chunk in re.split(r"\n|&&", raw):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            parts = chunk.split("|", 1)
-            accounts.append({"cookie": parts[0].strip(), "auth": parts[1].strip() if len(parts) > 1 else ""})
+    accounts: list[dict] = []
 
-    # 兼容单账号环境变量
-    cookie = env(PREFIX, "cookie", required=False)
-    if cookie and not any(a["cookie"] == cookie for a in accounts):
-        auth = env(PREFIX, "Authorization", default="", required=False)
-        accounts.append({"cookie": cookie, "auth": auth})
+    # 1. 优先扫描序号配对的 COOKIE_1 / AUTHORIZATION_1 序列
+    cookies = env_seq(PREFIX, "cookie", required=False)
+    auths = env_seq(PREFIX, "authorization", required=False)
+    for i in range(len(cookies)):
+        c = cookies[i].strip()
+        if not c:
+            continue
+        a = auths[i].strip() if i < len(auths) else ""
+        if "|" in c:
+            c_part, a_part = c.split("|", 1)
+            accounts.append({"cookie": c_part.strip(), "auth": a_part.strip() or a})
+        else:
+            accounts.append({"cookie": c, "auth": a})
+
+    # 2. 扫描 COOKIES 序列或兼容旧 COOKIES 变量（换行 / && 切分）
+    raw_cookies = env_seq(PREFIX, "cookies", required=False)
+    for chunk in raw_cookies:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split("|", 1)
+        item = {"cookie": parts[0].strip(), "auth": parts[1].strip() if len(parts) > 1 else ""}
+        if not any(a["cookie"] == item["cookie"] for a in accounts):
+            accounts.append(item)
 
     return accounts
 

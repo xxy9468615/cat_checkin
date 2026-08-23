@@ -91,12 +91,12 @@ def _login(h: Http, username: str, password: str) -> None:
 
 def main():
     print("【PCBeta 远景论坛 签到】")
-    cookie = os.getenv(f"{PREFIX}cookie", "").strip() or os.getenv(f"{PREFIX}COOKIE", "").strip() or os.getenv(f"QL_{PREFIX}cookie", "").strip()
-    username = os.getenv(f"{PREFIX}username", "").strip() or os.getenv(f"{PREFIX}USERNAME", "").strip() or os.getenv(f"QL_{PREFIX}username", "").strip()
-    password = os.getenv(f"{PREFIX}password", "").strip() or os.getenv(f"{PREFIX}PASSWORD", "").strip() or os.getenv(f"QL_{PREFIX}password", "").strip()
+    cookie = env(PREFIX, "cookie", default="", required=False)
+    username = env(PREFIX, "username", default="", required=False)
+    password = env(PREFIX, "password", default="", required=False)
 
     if not cookie and not (username and password):
-        raise RuntimeError(f"缺少凭据：请配置 {PREFIX}cookie 或 {PREFIX}username 与 {PREFIX}password")
+        raise RuntimeError(f"缺少凭据：请配置 {PREFIX}cookie（或 {PREFIX}COOKIE_1）或 {PREFIX}username 与 {PREFIX}password")
 
     h = Http()
     headers = {

@@ -46,7 +46,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from common import Http, load_kv_state, main_guard, mask_str, save_kv_state
+from common import Http, env, env_seq, load_kv_state, main_guard, mask_str, save_kv_state
 
 PREFIX = "AGENTROUTER_"
 DEFAULT_API_URL = "https://ps.air-outer.com"
@@ -175,25 +175,29 @@ def _fetch_self(h: Http, base: str, uid: str, token: str = "") -> dict:
 
 def _load_accounts() -> list[dict]:
     """解析账号凭据列表（email:password）。"""
-    raw = os.getenv(f"{PREFIX}ACCOUNTS", "").strip() or os.getenv(f"QL_{PREFIX}ACCOUNTS", "").strip()
     accounts = []
 
-    if raw:
-        for chunk in re.split(r"\n|&&", raw):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            if ":" in chunk:
-                user_part, _, pass_part = chunk.partition(":")
-                accounts.append({"username": user_part.strip(), "password": pass_part.strip()})
-            else:
-                print(f"⚠️ 忽略无法解析的账号条目（需 email:password 格式）: {mask_str(chunk)}")
+    # 1. 优先扫描序号配对的 EMAIL_1 / PASSWORD_1 序列
+    emails = env_seq(PREFIX, "email", required=False) or env_seq(PREFIX, "username", required=False)
+    passwords = env_seq(PREFIX, "password", required=False)
+    for u, p in zip(emails, passwords):
+        u, p = u.strip(), p.strip()
+        if u and p:
+            accounts.append({"username": u, "password": p})
 
-    # 单账号兼容
-    email = os.getenv(f"{PREFIX}EMAIL", "").strip() or os.getenv(f"{PREFIX}email", "").strip()
-    password = os.getenv(f"{PREFIX}PASSWORD", "").strip() or os.getenv(f"{PREFIX}password", "").strip()
-    if (email and password) and not accounts:
-        accounts.append({"username": email, "password": password})
+    # 2. 扫描 ACCOUNTS 序列或兼容旧 ACCOUNTS 变量（换行 / && 切分）
+    raw_accs = env_seq(PREFIX, "accounts", required=False) or env_seq(PREFIX, "account", required=False)
+    for chunk in raw_accs:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" in chunk:
+            user_part, _, pass_part = chunk.partition(":")
+            item = {"username": user_part.strip(), "password": pass_part.strip()}
+            if item not in accounts:
+                accounts.append(item)
+        else:
+            print(f"⚠️ 忽略无法解析的账号条目（需 email:password 格式）: {mask_str(chunk)}")
 
     return accounts
 

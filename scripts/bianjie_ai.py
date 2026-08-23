@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # cron: 40 9 * * *
 # new Env("边界 AI 签到")
-from common import Http, env, find, main_guard, mask_str
+from common import Http, env, env_seq, find, main_guard, mask_str
 import os
 import re
 import sys
@@ -17,35 +17,41 @@ POINTS_URL = "https://api.ai1foo.com/api/v1/user/points"
 def _load_accounts():
     """返回 [(username, password), ...]。
 
-    多账号（推荐）：QL_BIANJIE_AI_ACCOUNTS，每行一个账号，
+    序号序列（推荐）：BIANJIE_AI_USERNAME_1 / BIANJIE_AI_PASSWORD_1, BIANJIE_AI_USERNAME_2 / BIANJIE_AI_PASSWORD_2...
+    多账号旧格式：BIANJIE_AI_ACCOUNTS，每行一个账号，
         分隔符支持 "user:pass" / "user---pass" / "user,pass"，
         账号之间用换行或 && 分隔。
-    单账号（兼容）：QL_BIANJIE_AI_username + QL_BIANJIE_AI_password。
+    单账号（兼容）：BIANJIE_AI_username + BIANJIE_AI_password。
     """
-    raw = os.getenv(f"{PREFIX}ACCOUNTS", "").strip()
     accounts = []
-    if raw:
-        for chunk in re.split(r"\n|&&", raw):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            # 优先 ":"，其次 "---"，再次 ","
-            if ":" in chunk:
-                user, _, pwd = chunk.partition(":")
-            elif "---" in chunk:
-                user, _, pwd = chunk.partition("---")
-            elif "," in chunk:
-                user, _, pwd = chunk.partition(",")
-            else:
-                continue
-            user, pwd = user.strip(), pwd.strip()
-            if user and pwd:
-                accounts.append((user, pwd))
-    # 兼容单账号环境变量
-    user = os.getenv(f"{PREFIX}username", "").strip()
-    pwd = os.getenv(f"{PREFIX}password", "").strip()
-    if user and pwd and (user, pwd) not in accounts:
-        accounts.append((user, pwd))
+
+    # 1. 优先扫描序号配对的 USERNAME_1 / PASSWORD_1 序列
+    users = env_seq(PREFIX, "username", required=False)
+    pwds = env_seq(PREFIX, "password", required=False)
+    for u, p in zip(users, pwds):
+        u, p = u.strip(), p.strip()
+        if u and p and (u, p) not in accounts:
+            accounts.append((u, p))
+
+    # 2. 扫描 ACCOUNTS 序列或兼容旧 ACCOUNTS 变量（换行 / && 切分）
+    raw_accs = env_seq(PREFIX, "accounts", required=False) or env_seq(PREFIX, "account", required=False)
+    for chunk in raw_accs:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        # 优先 ":"，其次 "---"，再次 ","
+        if ":" in chunk:
+            user, _, pwd = chunk.partition(":")
+        elif "---" in chunk:
+            user, _, pwd = chunk.partition("---")
+        elif "," in chunk:
+            user, _, pwd = chunk.partition(",")
+        else:
+            continue
+        user, pwd = user.strip(), pwd.strip()
+        if user and pwd and (user, pwd) not in accounts:
+            accounts.append((user, pwd))
+
     return accounts
 
 

@@ -41,7 +41,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Tuple
 
-from common import Http, env, env_bool, is_already_signed, main_guard, mask_str, schedule_repo_dispatch
+from common import Http, env, env_bool, env_seq, is_already_signed, main_guard, mask_str, schedule_repo_dispatch
 
 PREFIX = "WORKBUDDY_"
 BASE_URL = "https://www.workbuddy.cn"
@@ -57,7 +57,7 @@ BASE_HEADERS = {
 
 
 def _parse_cookies(raw: str) -> List[str]:
-    """解析多账号 Cookie，支持换行或 && 分隔。"""
+    """解析多账号 Cookie，支持序列变量、换行或 && 分隔。"""
     if not raw:
         return []
     return [x.strip() for x in raw.replace("&&", "\n").splitlines() if x.strip()]
@@ -1026,10 +1026,9 @@ def _run_one(cookie: str, idx: int, total: int, wait_travel: bool) -> Tuple[bool
 
 def main():
     print("【WorkBuddy 签到与成长中心】")
-    raw_cookie = env(PREFIX, "cookie")
-    cookies = _parse_cookies(raw_cookie)
+    cookies = env_seq(PREFIX, "cookie", required=True)
     if not cookies:
-        raise RuntimeError(f"未配置有效 Cookie，请检查 {PREFIX}COOKIE")
+        raise RuntimeError(f"未配置有效 Cookie，请检查 {PREFIX}COOKIE_1 或 {PREFIX}COOKIE")
 
     # 默认开启动态放风跟踪与自动回访领奖
     wait_travel = os.getenv("WORKBUDDY_WAIT_TRAVEL", "true").lower() in ("true", "1", "yes")

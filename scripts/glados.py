@@ -24,7 +24,7 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
-from common import Http, main_guard, mask_str
+from common import Http, env, env_seq, main_guard, mask_str
 
 
 class Emoji:
@@ -83,28 +83,31 @@ class Config:
         self.verbose = self._bool_env("GLADOS_VERBOSE", False)
 
     def _load_accounts(self) -> List[Tuple[str, str]]:
-        raw = os.getenv("GLADOS_ACCOUNTS", "").strip() or os.getenv("QL_GLADOS_ACCOUNTS", "").strip()
-        accounts = []
-        if raw:
-            for chunk in re.split(r"\n|&&", raw):
-                chunk = chunk.strip()
-                if ":" in chunk:
-                    u, _, p = chunk.partition(":")
-                    if u.strip() and p.strip():
-                        accounts.append((u.strip(), p.strip()))
-        email = os.getenv("GLADOS_email", "").strip() or os.getenv("QL_GLADOS_email", "").strip()
-        pwd = os.getenv("GLADOS_password", "").strip() or os.getenv("QL_GLADOS_password", "").strip()
-        if email and pwd and (email, pwd) not in accounts:
-            accounts.append((email, pwd))
+        accounts: List[Tuple[str, str]] = []
+        # 1. 优先扫描序号配对的 EMAIL_1 / PASSWORD_1 序列
+        emails = env_seq("GLADOS_", "email", required=False)
+        passwords = env_seq("GLADOS_", "password", required=False)
+        for u, p in zip(emails, passwords):
+            if u.strip() and p.strip() and (u.strip(), p.strip()) not in accounts:
+                accounts.append((u.strip(), p.strip()))
+
+        # 2. 扫描 ACCOUNT_1 / ACCOUNTS_1 或旧单变量 email:password 列表
+        raw_accounts = env_seq("GLADOS_", "accounts", required=False) or env_seq("GLADOS_", "account", required=False)
+        for chunk in raw_accounts:
+            chunk = chunk.strip()
+            if ":" in chunk:
+                u, _, p = chunk.partition(":")
+                if u.strip() and p.strip() and (u.strip(), p.strip()) not in accounts:
+                    accounts.append((u.strip(), p.strip()))
+
         return accounts
 
     def _load_cookies(self) -> List[str]:
-        raw = os.getenv("GLADOS_COOKIES", "").strip()
-        if not raw:
-            raw = os.getenv("QL_GLADOS_cookie", "").strip()
-        if not raw:
-            return []
-        return [x.strip() for x in re.split(r"\n|&&|(?<!;)&", raw) if x.strip()]
+        # 优先扫描 COOKIE_1, COOKIE_2 序列，回退至 COOKIES / cookie (含 && 切分)
+        cookies = env_seq("GLADOS_", "cookie", required=False)
+        if not cookies:
+            cookies = env_seq("GLADOS_", "cookies", required=False)
+        return [c.strip() for c in cookies if c.strip()]
 
     def _load_domains(self) -> List[str]:
         raw = os.getenv("GLADOS_DOMAINS", "glados.cloud,railgun.info")

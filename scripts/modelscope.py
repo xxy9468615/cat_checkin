@@ -31,7 +31,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from common import Http, env, main_guard, mask_str
+from common import Http, env, env_seq, main_guard, mask_str
 
 PREFIX = "MODELSCOPE_"
 
@@ -252,17 +252,15 @@ def main():
     print("【ModelScope 签到】")
 
     # 国内站
-    cn_raw = env(PREFIX, "cookie", required=False)
+    cn_cookies = env_seq(PREFIX, "cookie", required=False)
     # 国际站
-    ai_raw = env(PREFIX, "AI_COOKIE", required=False)
-    if not cn_raw and not ai_raw:
-        raise RuntimeError(f"缺少环境变量：{PREFIX}COOKIE（国内站）或 {PREFIX}AI_COOKIE（国际站）")
+    ai_cookies = env_seq(PREFIX, "AI_COOKIE", required=False)
+    if not cn_cookies and not ai_cookies:
+        raise RuntimeError(f"缺少环境变量：{PREFIX}COOKIE（或 {PREFIX}COOKIE_1，国内站）或 {PREFIX}AI_COOKIE（国际站）")
 
     cn_host = _default_host()
     ai_host = _ai_host()
 
-    cn_cookies = _parse_cookies(cn_raw)
-    ai_cookies = _parse_cookies(ai_raw)
     print(f"共 {len(cn_cookies) + len(ai_cookies)} 个账号（国内 {len(cn_cookies)}，国际 {len(ai_cookies)}）\n")
 
     # 分开运行，互不影响
