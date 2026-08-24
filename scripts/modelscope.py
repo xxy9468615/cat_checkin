@@ -89,14 +89,14 @@ def _touch_user(h: Http, cookie: str, host: str) -> Dict[str, Any]:
         web_headers["Cookie"] = cookie
 
     try:
-        h.request("GET", f"https://{host}/my/overview", headers=web_headers)
-        h.request("GET", f"https://{host}/", headers=web_headers)
+        h.request("GET", f"https://{host}/my/overview", headers=web_headers, timeout=15)
+        h.request("GET", f"https://{host}/", headers=web_headers, timeout=15)
     except Exception:
         pass
 
     try:
-        h.request("GET", f"https://{host}/openapi/v1/models?page_number=1&page_size=5", headers=_headers(host, cookie))
-        h.request("GET", f"https://{host}/openapi/v1/datasets?page_number=1&page_size=5", headers=_headers(host, cookie))
+        h.request("GET", f"https://{host}/openapi/v1/models?page_number=1&page_size=5", headers=_headers(host, cookie), timeout=15)
+        h.request("GET", f"https://{host}/openapi/v1/datasets?page_number=1&page_size=5", headers=_headers(host, cookie), timeout=15)
     except Exception:
         pass
 
@@ -104,6 +104,7 @@ def _touch_user(h: Http, cookie: str, host: str) -> Dict[str, Any]:
         "GET",
         f"https://{host}/openapi/v1/users/me",
         headers=_headers(host, cookie),
+        timeout=20,
     )
     data = resp.json({})
     if resp.code in (401, 403) or (isinstance(data, dict) and data.get("code") in (401, 403)):
@@ -122,6 +123,7 @@ def _get_rules(h: Http, cookie: str, host: str) -> Dict[str, Any]:
         "GET",
         f"https://{host}/openapi/v1/magicubes/earn/rules",
         headers=_headers(host, cookie),
+        timeout=20,
     )
     if resp.code != 200:
         raise RuntimeError(f"earn/rules 请求失败：HTTP {resp.code}")
@@ -140,6 +142,7 @@ def _get_balance(h: Http, cookie: str, host: str) -> Optional[int]:
         "GET",
         f"https://{host}/openapi/v1/magicubes/balance",
         headers=_headers(host, cookie),
+        timeout=20,
     )
     if resp.code != 200:
         return None
