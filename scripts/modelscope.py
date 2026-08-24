@@ -8,19 +8,20 @@
 接口路径已变更：magic_cube → magicubes（2026-08 前后迁移）。
 判断字段：today_used > 0 表示今日已领取；余额增长为辅助判据。
 
-稳定性要点（2026-08-19 深度修复）：
-1. 会话触碰：直接调 earn/rules 属轻量查询，服务端可能不触发「日活/登录」事件。
-   先 GET /openapi/v1/users/me 验证登录态并触碰会话，模拟真实活跃。
-2. 请求头补齐浏览器上下文（Origin / Referer / UA），避免被埋点/风控中间件忽略。
-3. Cookie 失效前置判定：users/me 401/403 → 明确报错提示重新获取，而非盲目重试。
-4. 渐进式退避复查（10s→20s→30s→45s），复查前再 touch，双判据（today_used / 余额增长）。
-
-国内站（.cn）运行稳定；国际站（.ai）因 cookie 刷新/时区差异偶发 today_used=0，
-单独报告不影响国内站结果。
+多认证与长效支持（2026-08 升级）：
+1. SDK 访问令牌（Access Token / API Token）直连：
+   支持 MODELSCOPE_TOKEN / MODELSCOPE_TOKEN_1 等，通过 Authorization: Bearer 头鉴权，
+   有效期长，无需担心 Cookie 频繁过期。
+2. Cookie 滑动续期与持久化：
+   对于使用 MODELSCOPE_COOKIE 的账号，自动捕获服务端 Set-Cookie 并通过 Upstash Redis
+   及本地 state 进行每日滚动续期（解决 source 1 天过期问题）。
+3. 会话触碰：访问 personal overview 与模型/数据集接口，触发「日活」埋点。
+4. 渐进式退避复查（8s→15s→25s），双判据保障。
 
 环境变量：
-  MODELSCOPE_cookie 普通格式：多账号 && 或换行分隔（国内站）
-  MODELSCOPE_AI_COOKIE：国际站专用 cookie，独立运行
+  MODELSCOPE_TOKEN / MODELSCOPE_TOKEN_1, _2...：SDK 访问令牌（国内站，推荐）
+  MODELSCOPE_COOKIE / MODELSCOPE_COOKIE_1, _2...：Cookie（国内站）
+  MODELSCOPE_AI_TOKEN / MODELSCOPE_AI_COOKIE：国际站专用 Token / Cookie
   MODELSCOPE_HOST：国内站主机（默认 www.modelscope.cn）
   MODELSCOPE_AI_HOST：国际站主机（默认 www.modelscope.ai）
 """
@@ -31,7 +32,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from common import Http, env, env_seq, main_guard, mask_str
+from common import Http, env, env_seq, load_kv_state, main_guard, mask_str, save_kv_state
 
 PREFIX = "MODELSCOPE_"
 
@@ -53,15 +54,25 @@ def _ai_host() -> str:
     return os.getenv(f"{PREFIX}AI_HOST", "www.modelscope.ai").strip() or "www.modelscope.ai"
 
 
-def _parse_cookies(raw: str) -> List[str]:
-    """解析多账号 Cookie，支持换行或 && 分隔。"""
-    if not raw:
-        return []
-    return [x.strip() for x in raw.replace("&&", "\n").splitlines() if x.strip()]
+def _merge_cookies(existing_cookie: Optional[str], jar: Any) -> str:
+    """合并已有 Cookie 与 urllib CookieJar 中的最新 Set-Cookie。"""
+    cookie_dict: Dict[str, str] = {}
+    if existing_cookie:
+        for part in existing_cookie.split(";"):
+            if "=" in part:
+                k, v = part.strip().split("=", 1)
+                if k.strip():
+                    cookie_dict[k.strip()] = v.strip()
+    for c in jar:
+        if getattr(c, "name", None):
+            cookie_dict[c.name] = c.value
+    return "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
 
 
-def _headers(host: str, cookie: str) -> Dict[str, str]:
-    """构造带浏览器上下文的请求头，避免被风控/埋点中间件忽略。"""
+def _headers(
+    host: str, token: Optional[str] = None, cookie: Optional[str] = None
+) -> Dict[str, str]:
+    """构造带浏览器上下文或 Token 鉴权的请求头，避免被风控/埋点中间件忽略。"""
     headers = {
         "Origin": f"https://{host}",
         "Referer": f"https://{host}/my/overview",
@@ -69,46 +80,70 @@ def _headers(host: str, cookie: str) -> Dict[str, str]:
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        headers["OpenAPI-Token"] = token
+        headers["X-Modelfun-Token"] = token
     if cookie:
         headers["Cookie"] = cookie
     return headers
 
 
-def _touch_user(h: Http, cookie: str, host: str) -> Dict[str, Any]:
+def _touch_user(
+    h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None
+) -> Dict[str, Any]:
     """全链路触碰会话并验证登录态。
 
-    1. 访问个人中心 Web 页面与首页，触发 Web 端活跃埋点中间件。
-    2. GET /openapi/v1/users/me 验证登录态并提取用户信息。
+    1. 若有 Cookie，访问个人中心 Web 页面与首页，触发 Web 端活跃埋点中间件。
+    2. 访问 OpenAPI 模型与数据集轻量端点，激活用户活动。
+    3. GET /openapi/v1/users/me 验证登录态并提取用户信息。
     """
-    web_headers = {
-        "User-Agent": DEFAULT_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": f"https://{host}/",
-    }
     if cookie:
-        web_headers["Cookie"] = cookie
+        web_headers = {
+            "User-Agent": DEFAULT_UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": f"https://{host}/",
+            "Cookie": cookie,
+        }
+        try:
+            h.request("GET", f"https://{host}/my/overview", headers=web_headers, timeout=15)
+            h.request("GET", f"https://{host}/", headers=web_headers, timeout=15)
+        except Exception:
+            pass
 
+    hdrs = _headers(host, token=token, cookie=cookie)
     try:
-        h.request("GET", f"https://{host}/my/overview", headers=web_headers, timeout=15)
-        h.request("GET", f"https://{host}/", headers=web_headers, timeout=15)
-    except Exception:
-        pass
-
-    try:
-        h.request("GET", f"https://{host}/openapi/v1/models?page_number=1&page_size=5", headers=_headers(host, cookie), timeout=15)
-        h.request("GET", f"https://{host}/openapi/v1/datasets?page_number=1&page_size=5", headers=_headers(host, cookie), timeout=15)
+        h.request(
+            "GET",
+            f"https://{host}/openapi/v1/models?page_number=1&page_size=5",
+            headers=hdrs,
+            timeout=15,
+        )
+        h.request(
+            "GET",
+            f"https://{host}/openapi/v1/datasets?page_number=1&page_size=5",
+            headers=hdrs,
+            timeout=15,
+        )
     except Exception:
         pass
 
     resp = h.request(
         "GET",
         f"https://{host}/openapi/v1/users/me",
-        headers=_headers(host, cookie),
+        headers=hdrs,
         timeout=20,
     )
     data = resp.json({})
     if resp.code in (401, 403) or (isinstance(data, dict) and data.get("code") in (401, 403)):
-        raise RuntimeError(f"Cookie 已失效/未登录 (HTTP {resp.code})，请重新获取 {host} 的 cookie")
+        auth_type = (
+            "Token"
+            if token and not cookie
+            else ("Cookie" if cookie and not token else "Token / Cookie")
+        )
+        raise RuntimeError(
+            f"{auth_type} 已失效/未登录 (HTTP {resp.code})，请重新获取 {host} 的访问凭证"
+        )
     if not data or not data.get("success"):
         raise RuntimeError(f"users/me 返回异常：{resp.text[:200]}")
     user = data.get("data", {})
@@ -117,12 +152,14 @@ def _touch_user(h: Http, cookie: str, host: str) -> Dict[str, Any]:
     return user
 
 
-def _get_rules(h: Http, cookie: str, host: str) -> Dict[str, Any]:
+def _get_rules(
+    h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None
+) -> Dict[str, Any]:
     """获取 earn 规则，返回 daily_active 规则字典。"""
     resp = h.request(
         "GET",
         f"https://{host}/openapi/v1/magicubes/earn/rules",
-        headers=_headers(host, cookie),
+        headers=_headers(host, token=token, cookie=cookie),
         timeout=20,
     )
     if resp.code != 200:
@@ -136,12 +173,14 @@ def _get_rules(h: Http, cookie: str, host: str) -> Dict[str, Any]:
     raise RuntimeError("未找到 daily_active 规则")
 
 
-def _get_balance(h: Http, cookie: str, host: str) -> Optional[int]:
+def _get_balance(
+    h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None
+) -> Optional[int]:
     """查询魔粒余额（int），失败返回 None。"""
     resp = h.request(
         "GET",
         f"https://{host}/openapi/v1/magicubes/balance",
-        headers=_headers(host, cookie),
+        headers=_headers(host, token=token, cookie=cookie),
         timeout=20,
     )
     if resp.code != 200:
@@ -156,8 +195,156 @@ def _get_balance(h: Http, cookie: str, host: str) -> Optional[int]:
         return None
 
 
-def _run_one(cookie: str, host: str) -> Tuple[bool, str]:
+def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
+    """加载指定站点（cn / ai）的所有账号凭证，支持 Token 与 Cookie 混合、多账号索引扫描及 Redis 滚动状态。"""
+    accounts: List[Dict[str, Any]] = []
+    seen = set()
+
+    if site == "cn":
+        prefixes = [PREFIX, f"QL_{PREFIX}"]
+        token_keys = ["TOKEN", "API_TOKEN", "ACCESS_TOKEN", "SDK_TOKEN"]
+        cookie_keys = ["COOKIE", "COOKIES"]
+    else:
+        prefixes = [
+            f"{PREFIX}AI_",
+            f"{PREFIX}ai_",
+            f"QL_{PREFIX}AI_",
+            f"QL_{PREFIX}ai_",
+        ]
+        token_keys = ["TOKEN", "API_TOKEN", "ACCESS_TOKEN", "SDK_TOKEN"]
+        cookie_keys = ["COOKIE", "COOKIES"]
+
+    # 1. 扫描 1..20 显式序号
+    for idx in range(1, 21):
+        token_val = ""
+        cookie_val = ""
+
+        # 先查环境变量中的 Token 与 Cookie
+        for pfx in prefixes:
+            if not token_val:
+                for k in token_keys:
+                    token_val = (
+                        os.getenv(f"{pfx}{k}_{idx}")
+                        or os.getenv(f"{pfx}{k.lower()}_{idx}")
+                        or ""
+                    ).strip()
+                    if token_val:
+                        break
+            if not cookie_val:
+                for k in cookie_keys:
+                    cookie_val = (
+                        os.getenv(f"{pfx}{k}_{idx}")
+                        or os.getenv(f"{pfx}{k.lower()}_{idx}")
+                        or ""
+                    ).strip()
+                    if cookie_val:
+                        break
+
+        # 若未配置 Token 且配置了 Cookie（或使用纯 Cookie），读取 Redis/本地持久化的滚动 Cookie
+        if not token_val:
+            state_file = f".modelscope_{site}_state_{idx}.json"
+            redis_key = f"cat_checkin:state:modelscope_{site}_{idx}"
+            saved_state = load_kv_state(redis_key, state_file)
+            if isinstance(saved_state, dict) and saved_state.get("cookie"):
+                cookie_val = str(saved_state.get("cookie", "")).strip()
+
+        token_val, cookie_val = token_val.strip(), cookie_val.strip()
+        if token_val or cookie_val:
+            ident = token_val or cookie_val[:40]
+            if ident not in seen:
+                seen.add(ident)
+                accounts.append(
+                    {
+                        "token": token_val or None,
+                        "cookie": (cookie_val or None) if not token_val else None,
+                        "index": idx,
+                        "site": site,
+                    }
+                )
+
+    # 2. 如果未扫描到序号 1，回退扫描非序号变量
+    if not accounts:
+        token_val = ""
+        cookie_val = ""
+
+        for pfx in prefixes:
+            if not token_val:
+                for k in token_keys:
+                    token_val = (
+                        os.getenv(f"{pfx}{k}")
+                        or os.getenv(f"{pfx}{k.lower()}")
+                        or ""
+                    ).strip()
+                    if token_val:
+                        break
+            if not cookie_val:
+                for k in cookie_keys:
+                    cookie_val = (
+                        os.getenv(f"{pfx}{k}")
+                        or os.getenv(f"{pfx}{k.lower()}")
+                        or ""
+                    ).strip()
+                    if cookie_val:
+                        break
+
+        if not token_val:
+            state_file = f".modelscope_{site}_state_1.json"
+            redis_key = f"cat_checkin:state:modelscope_{site}_1"
+            saved_state = load_kv_state(redis_key, state_file)
+            if isinstance(saved_state, dict) and saved_state.get("cookie"):
+                cookie_val = str(saved_state.get("cookie", "")).strip()
+
+        # 针对单变量 && 或换行切分多账号
+        if cookie_val and ("&&" in cookie_val or "\n" in cookie_val):
+            raw_cookies = [
+                x.strip()
+                for x in cookie_val.replace("&&", "\n").splitlines()
+                if x.strip()
+            ]
+            for sub_idx, c_item in enumerate(raw_cookies, 1):
+                accounts.append(
+                    {
+                        "token": None,
+                        "cookie": c_item,
+                        "index": sub_idx,
+                        "site": site,
+                    }
+                )
+        elif token_val and ("&&" in token_val or "\n" in token_val):
+            raw_tokens = [
+                x.strip()
+                for x in token_val.replace("&&", "\n").splitlines()
+                if x.strip()
+            ]
+            for sub_idx, t_item in enumerate(raw_tokens, 1):
+                accounts.append(
+                    {
+                        "token": t_item,
+                        "cookie": None,
+                        "index": sub_idx,
+                        "site": site,
+                    }
+                )
+        elif token_val or cookie_val:
+            accounts.append(
+                {
+                    "token": token_val or None,
+                    "cookie": cookie_val or None,
+                    "index": 1,
+                    "site": site,
+                }
+            )
+
+    return accounts
+
+
+def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str]:
     """执行单个账号的签到逻辑。返回 (成功, 描述)。"""
+    token = account.get("token")
+    cookie = account.get("cookie")
+    idx = account.get("index", 1)
+    site = account.get("site", "cn")
+
     proxy = (
         os.getenv("MODELSCOPE_PROXY", "").strip()
         or os.getenv("HTTPS_PROXY", "").strip()
@@ -167,9 +354,10 @@ def _run_one(cookie: str, host: str) -> Tuple[bool, str]:
 
     # 1. 会话触碰 + 登录态验证 + 账号脱敏（该请求同时是「日活」触发的活跃信号）
     try:
-        user = _touch_user(h, cookie, host)
+        user = _touch_user(h, host, token=token, cookie=cookie)
     except Exception as e:
         return False, f"登录态验证失败：{e}"
+
     name = user.get("nickname") or user.get("username") or ""
     uid = user.get("user_id") or user.get("id")
     parts = []
@@ -177,14 +365,16 @@ def _run_one(cookie: str, host: str) -> Tuple[bool, str]:
         parts.append(mask_str(str(name)))
     if uid:
         parts.append(f"UID:{mask_str(str(uid))}")
+    auth_tag = "Token" if token else "Cookie"
+    parts.append(f"[{auth_tag}]")
     user_tag = " ".join(parts) or "未知用户"
 
     # 2. 记录初始余额（辅助判据：余额增长 = 到账）
-    initial_balance = _get_balance(h, cookie, host)
+    initial_balance = _get_balance(h, host, token=token, cookie=cookie)
 
     # 3. 首次查询 earn/rules
     try:
-        daily_rule = _get_rules(h, cookie, host)
+        daily_rule = _get_rules(h, host, token=token, cookie=cookie)
     except Exception as e:
         return False, f"{user_tag} 查询失败：{e}"
 
@@ -207,53 +397,80 @@ def _run_one(cookie: str, host: str) -> Tuple[bool, str]:
     for attempt, wait in enumerate(RETRY_WAITS, 1):
         if is_credited(current_today_used, current_balance):
             break
-        print(f"  {user_tag} 今日奖励尚未到账（today_used={current_today_used}），{wait}s 后第 {attempt}/{len(RETRY_WAITS)+1} 次复查（全链路 touch 会话激活中）...")
+        print(
+            f"  {user_tag} 今日奖励尚未到账（today_used={current_today_used}），"
+            f"{wait}s 后第 {attempt}/{len(RETRY_WAITS)+1} 次复查（全链路 touch 会话激活中）..."
+        )
         time.sleep(wait)
         try:
-            _touch_user(h, cookie, host)  # 复查前再次触碰，触发活跃事件
-            daily_rule = _get_rules(h, cookie, host)
+            _touch_user(h, host, token=token, cookie=cookie)  # 复查前再次触碰，触发活跃事件
+            daily_rule = _get_rules(h, host, token=token, cookie=cookie)
             current_today_used = daily_rule.get("today_used", 0)
-            current_balance = _get_balance(h, cookie, host)
+            current_balance = _get_balance(h, host, token=token, cookie=cookie)
         except Exception as e:
             return False, f"{user_tag} 复查失败：{e}"
 
-    final_balance = current_balance if current_balance is not None else _get_balance(h, cookie, host)
+    final_balance = (
+        current_balance
+        if current_balance is not None
+        else _get_balance(h, host, token=token, cookie=cookie)
+    )
     credited = is_credited(current_today_used, final_balance)
+
+    # 5. 持久化并滚动更新 Cookie（仅针对纯 Cookie 账号，Token 账号本身长期有效无需滚动）
+    if cookie and not token:
+        updated_cookie = _merge_cookies(cookie, h.jar)
+        if updated_cookie:
+            state_file = f".modelscope_{site}_state_{idx}.json"
+            redis_key = f"cat_checkin:state:modelscope_{site}_{idx}"
+            save_kv_state(
+                redis_key,
+                state_file,
+                {
+                    "cookie": updated_cookie,
+                    "updated_at": int(time.time()),
+                    "user_tag": user_tag,
+                },
+            )
 
     if credited:
         status = f"签到成功，今日已领取 {amount} 魔粒"
     else:
-        status = f"今日奖励未到账（{len(RETRY_WAITS)+1} 次复查后仍无增长，可能 cookie 未刷新或未到重置时间）"
+        status = f"今日奖励未到账（{len(RETRY_WAITS)+1} 次复查后仍无增长，可能凭证未刷新或未到重置时间）"
 
-    balance_desc = "当前余额：？" if final_balance is None else f"当前余额：{final_balance} 魔粒"
+    balance_desc = (
+        "当前余额：？"
+        if final_balance is None
+        else f"当前余额：{final_balance} 魔粒"
+    )
     return credited, f"{user_tag} {status}，{balance_desc}"
 
 
 def _run_site(
-    cookies: List[str], host: str, site: str, title: str
+    accounts: List[Dict[str, Any]], host: str, site: str, title: str
 ) -> Tuple[bool, List[str]]:
     """运行单个站点的所有账号。返回 (全部成功, 各行输出)。"""
     print(f"【{title}】")
-    if not cookies:
-        print(f"  未提供 {title} cookie，跳过")
+    if not accounts:
+        print(f"  未提供 {title} 凭证（Token / Cookie），跳过")
         return True, []
 
-    print(f"  {len(cookies)} 个账号 @ {host}")
+    print(f"  {len(accounts)} 个账号 @ {host}")
     results = []
-    for idx, cookie in enumerate(cookies, 1):
+    for idx, acc in enumerate(accounts, 1):
         try:
-            ok, msg = _run_one(cookie, host)
-            line = f"  [{idx}/{len(cookies)}] {msg}"
+            ok, msg = _run_one(acc, host)
+            line = f"  [{idx}/{len(accounts)}] {msg}"
             print(line)
             results.append((ok, line))
         except Exception as e:
-            line = f"  [{idx}/{len(cookies)}] 签到失败：{e}"
+            line = f"  [{idx}/{len(accounts)}] 签到失败：{e}"
             print(line)
             results.append((False, line))
 
     ok_count = sum(1 for ok, _ in results if ok)
-    all_ok = ok_count == len(cookies)
-    print(f"  {title} 总结：成功 {ok_count}/{len(cookies)}")
+    all_ok = ok_count == len(accounts)
+    print(f"  {title} 总结：成功 {ok_count}/{len(accounts)}")
     return all_ok, [line for _, line in results]
 
 
@@ -261,31 +478,37 @@ def main():
     print("【ModelScope 签到】")
 
     # 国内站
-    cn_cookies = env_seq(PREFIX, "cookie", required=False)
+    cn_accounts = _load_accounts("cn")
     # 国际站
-    ai_cookies = env_seq(PREFIX, "AI_COOKIE", required=False)
-    if not cn_cookies and not ai_cookies:
-        raise RuntimeError(f"缺少环境变量：{PREFIX}COOKIE（或 {PREFIX}COOKIE_1，国内站）或 {PREFIX}AI_COOKIE（国际站）")
+    ai_accounts = _load_accounts("ai")
+    if not cn_accounts and not ai_accounts:
+        raise RuntimeError(
+            f"缺少环境变量：{PREFIX}TOKEN（或 {PREFIX}TOKEN_1 / {PREFIX}COOKIE_1，国内站）"
+            f" 或 {PREFIX}AI_TOKEN / {PREFIX}AI_COOKIE（国际站）"
+        )
 
     cn_host = _default_host()
     ai_host = _ai_host()
 
-    print(f"共 {len(cn_cookies) + len(ai_cookies)} 个账号（国内 {len(cn_cookies)}，国际 {len(ai_cookies)}）\n")
+    print(
+        f"共 {len(cn_accounts) + len(ai_accounts)} 个账号"
+        f"（国内 {len(cn_accounts)}，国际 {len(ai_accounts)}）\n"
+    )
 
     # 分开运行，互不影响
-    cn_ok, cn_lines = _run_site(cn_cookies, cn_host, "cn", "ModelScope 国内站 签到")
+    cn_ok, cn_lines = _run_site(cn_accounts, cn_host, "cn", "ModelScope 国内站 签到")
     print()
-    ai_ok, ai_lines = _run_site(ai_cookies, ai_host, "ai", "ModelScope 国际站 签到")
+    ai_ok, ai_lines = _run_site(ai_accounts, ai_host, "ai", "ModelScope 国际站 签到")
 
     print(f"\n国内站：{'✅ 成功' if cn_ok else '❌ 失败'}")
     print(f"国际站：{'✅ 成功' if ai_ok else '❌ 失败'}")
 
-    # 国内站失败 → 整体失败（国际站因 cookie 偶发问题不阻塞整体）
+    # 国内站失败 → 整体失败（国际站因凭证/时区偶发问题不阻塞整体）
     if not cn_ok:
         sys.exit(1)
     # 国际站失败时，打印警告但不退出（避免误报影响整体）
     if not ai_ok:
-        print("\n⚠️ 国际站签到异常（通常为 cookie 需手动刷新，不影响国内站）")
+        print("\n⚠️ 国际站签到异常（通常为凭证需手动刷新，不影响国内站）")
 
 
 if __name__ == "__main__":
