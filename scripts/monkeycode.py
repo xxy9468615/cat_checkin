@@ -260,31 +260,32 @@ def _load_accounts() -> List[Dict[str, Optional[str]]]:
     accounts: List[Dict[str, Optional[str]]] = []
     seen_keys = set()
 
-    # 1. 优先扫描序号配对的 EMAIL_1 / PASSWORD_1 序列
+    # 1. 优先扫描按序号对齐的 EMAIL_i / PASSWORD_i 与 COOKIE_i 序列
     emails = env_seq(PREFIX, "email", required=False)
     passwords = env_seq(PREFIX, "password", required=False)
-    for u, p in zip(emails, passwords):
-        u, p = u.strip(), p.strip()
-        if u and p:
-            key = u.lower()
-            if key not in seen_keys:
-                seen_keys.add(key)
-                accounts.append({"cookie": None, "email": u, "password": p})
-
-    # 2. 扫描 COOKIE_1, COOKIE_2 序列（回退至 COOKIES）
     cookies = env_seq(PREFIX, "cookie", required=False)
     if not cookies:
         cookies = env_seq(PREFIX, "cookies", required=False)
-    for c in cookies:
-        c = c.strip()
-        if not c:
-            continue
-        key = c[:32]
-        if key not in seen_keys:
-            seen_keys.add(key)
-            accounts.append({"cookie": c, "email": None, "password": None})
 
-    # 3. 扫描 ACCOUNTS 序列或兼容旧 ACCOUNTS 变量（换行 / && 切分）
+    max_len = max(len(emails), len(cookies))
+    for i in range(max_len):
+        u = emails[i].strip() if i < len(emails) else ""
+        p = passwords[i].strip() if i < len(passwords) else ""
+        c = cookies[i].strip() if i < len(cookies) else ""
+
+        if not c and not (u and p):
+            continue
+
+        key = u.lower() if u else (c[:32] if c else "")
+        if key and key not in seen_keys:
+            seen_keys.add(key)
+            accounts.append({
+                "cookie": c or None,
+                "email": u or None,
+                "password": p or None,
+            })
+
+    # 2. 扫描 ACCOUNTS 序列或兼容旧 ACCOUNTS 变量（换行 / && 切分）
     raw_accounts = env_seq(PREFIX, "accounts", required=False) or env_seq(PREFIX, "account", required=False)
     for chunk in raw_accounts:
         chunk = chunk.strip()

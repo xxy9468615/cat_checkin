@@ -3,7 +3,10 @@
 # new Env("远景论坛 签到")
 import os
 import re
-from common import Http, env, find, must_match, strip_tags, main_guard, mask_str
+import sys
+from typing import Dict, List, Optional, Tuple
+
+from common import Http, env_seq, find, must_match, strip_tags, main_guard, mask_str
 
 PREFIX = "PCBETA_"
 BASE_URL = "https://i.pcbeta.com"
@@ -89,11 +92,27 @@ def _login(h: Http, username: str, password: str) -> None:
         raise RuntimeError(f"登录失败：{clean_msg}")
 
 
-def main():
-    print("【PCBeta 远景论坛 签到】")
-    cookie = env(PREFIX, "cookie", default="", required=False)
-    username = env(PREFIX, "username", default="", required=False)
-    password = env(PREFIX, "password", default="", required=False)
+def _load_accounts() -> List[Dict[str, Optional[str]]]:
+    accounts: List[Dict[str, Optional[str]]] = []
+    cookies = env_seq(PREFIX, "cookie", required=False)
+    usernames = env_seq(PREFIX, "username", required=False)
+    passwords = env_seq(PREFIX, "password", required=False)
+
+    max_len = max(len(cookies), len(usernames), len(passwords))
+    for i in range(max_len):
+        c = cookies[i].strip() if i < len(cookies) else ""
+        u = usernames[i].strip() if i < len(usernames) else ""
+        p = passwords[i].strip() if i < len(passwords) else ""
+        if c or (u and p):
+            accounts.append({"cookie": c or None, "username": u or None, "password": p or None})
+
+    return accounts
+
+
+def _run_one(acc: Dict[str, Optional[str]], idx: int, total: int) -> Tuple[bool, str]:
+    cookie = acc.get("cookie")
+    username = acc.get("username")
+    password = acc.get("password")
 
     if not cookie and not (username and password):
         raise RuntimeError(f"缺少凭据：请配置 {PREFIX}cookie（或 {PREFIX}COOKIE_1）或 {PREFIX}username 与 {PREFIX}password")
@@ -150,7 +169,36 @@ def main():
             pb = "，".join(f"{k}: {v}" for k, v in credits_list)
 
     task_summary = f"任务响应：{'；'.join(msgs)}" if msgs else "任务已申请/领取"
-    print(f"用户：{mask_str(nick)} | {pb or '积分获取成功'}\n{task_summary}")
+    prefix_label = f"[{idx}/{total}] " if total > 1 else ""
+    return True, f"{prefix_label}用户：{mask_str(nick)} | {pb or '积分获取成功'}\n{task_summary}"
+
+
+def main():
+    print("【PCBeta 远景论坛 签到】")
+    accounts = _load_accounts()
+    if not accounts:
+        raise RuntimeError(f"缺少凭据：请配置 {PREFIX}cookie（或 {PREFIX}COOKIE_1）或 {PREFIX}username 与 {PREFIX}password")
+
+    total = len(accounts)
+    results: List[Tuple[bool, str]] = []
+
+    for idx, acc in enumerate(accounts, 1):
+        try:
+            ok, msg = _run_one(acc, idx, total)
+            print(msg)
+            results.append((ok, msg))
+        except Exception as e:
+            prefix_label = f"[{idx}/{total}] " if total > 1 else ""
+            err_msg = f"{prefix_label}签到失败：{e}"
+            print(err_msg)
+            results.append((False, err_msg))
+
+    ok_count = sum(1 for ok, _ in results if ok)
+    if total > 1:
+        print(f"\n========== 签到总结 ==========\n成功 {ok_count}/{total}")
+
+    if ok_count != total:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

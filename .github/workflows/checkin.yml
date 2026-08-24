@@ -59,6 +59,7 @@ jobs:
       GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
       GLADOS_COOKIE_1: ${{ secrets.GLADOS_COOKIE_1 || secrets.GLADOS_COOKIES }}
       GLADOS_COOKIE_2: ${{ secrets.GLADOS_COOKIE_2 }}
+      GLADOS_COOKIE_3: ${{ secrets.GLADOS_COOKIE_3 }}
       GLADOS_ACCOUNTS: ${{ secrets.GLADOS_ACCOUNTS }}
       GLADOS_ACCOUNT_1: ${{ secrets.GLADOS_ACCOUNT_1 || secrets.GLADOS_ACCOUNTS }}
       GLADOS_ACCOUNT_2: ${{ secrets.GLADOS_ACCOUNT_2 }}
@@ -68,26 +69,45 @@ jobs:
       "2LIBRA_COOKIES": ${{ secrets.TWO_LIBRA_COOKIES }}
       "2LIBRA_COOKIE_1": ${{ secrets.TWO_LIBRA_COOKIE_1 || secrets.TWO_LIBRA_COOKIES }}
       "2LIBRA_COOKIE_2": ${{ secrets.TWO_LIBRA_COOKIE_2 }}
+      "2LIBRA_COOKIE_3": ${{ secrets.TWO_LIBRA_COOKIE_3 }}
       BIANJIE_AI_ACCOUNTS: ${{ secrets.BIANJIE_AI_ACCOUNTS }}
       BIANJIE_AI_USERNAME_1: ${{ secrets.BIANJIE_AI_USERNAME_1 || secrets.BIANJIE_AI_USERNAME }}
       BIANJIE_AI_PASSWORD_1: ${{ secrets.BIANJIE_AI_PASSWORD_1 || secrets.BIANJIE_AI_PASSWORD }}
       BIANJIE_AI_USERNAME_2: ${{ secrets.BIANJIE_AI_USERNAME_2 }}
       BIANJIE_AI_PASSWORD_2: ${{ secrets.BIANJIE_AI_PASSWORD_2 }}
-      MOXING_username: ${{ secrets.MOXING_USERNAME }}
-      MOXING_password: ${{ secrets.MOXING_PASSWORD }}
+      MOXING_username: ${{ secrets.MOXING_USERNAME_1 || secrets.MOXING_USERNAME }}
+      MOXING_password: ${{ secrets.MOXING_PASSWORD_1 || secrets.MOXING_PASSWORD }}
+      MOXING_USERNAME_1: ${{ secrets.MOXING_USERNAME_1 || secrets.MOXING_USERNAME }}
+      MOXING_PASSWORD_1: ${{ secrets.MOXING_PASSWORD_1 || secrets.MOXING_PASSWORD }}
+      MOXING_USERNAME_2: ${{ secrets.MOXING_USERNAME_2 }}
+      MOXING_PASSWORD_2: ${{ secrets.MOXING_PASSWORD_2 }}
       MOXING_Domain: https://moxing.chat
       MOXING_UA: ${{ secrets.MOXING_UA }}
-      UGNAS_cookie: ${{ secrets.UGNAS_COOKIE }}
-      CLOUDSTUDIO_cookie: ${{ secrets.CLOUDSTUDIO_COOKIE }}
+      UGNAS_cookie: ${{ secrets.UGNAS_COOKIE_1 || secrets.UGNAS_COOKIE }}
+      UGNAS_COOKIE_1: ${{ secrets.UGNAS_COOKIE_1 || secrets.UGNAS_COOKIE }}
+      UGNAS_COOKIE_2: ${{ secrets.UGNAS_COOKIE_2 }}
+      CLOUDSTUDIO_cookie: ${{ secrets.CLOUDSTUDIO_COOKIE_1 || secrets.CLOUDSTUDIO_COOKIE }}
+      CLOUDSTUDIO_COOKIE_1: ${{ secrets.CLOUDSTUDIO_COOKIE_1 || secrets.CLOUDSTUDIO_COOKIE }}
+      CLOUDSTUDIO_COOKIE_2: ${{ secrets.CLOUDSTUDIO_COOKIE_2 }}
       CLOUDSTUDIO_xsrf: ${{ secrets.CLOUDSTUDIO_XSRF }}
-      NAIXI_username: ${{ secrets.NAIXI_USERNAME }}
-      NAIXI_PASSWORD: ${{ secrets.NAIXI_PASSWORD }}
+      NAIXI_username: ${{ secrets.NAIXI_USERNAME_1 || secrets.NAIXI_USERNAME }}
+      NAIXI_PASSWORD: ${{ secrets.NAIXI_PASSWORD_1 || secrets.NAIXI_PASSWORD }}
       NAIXI_USERNAME_1: ${{ secrets.NAIXI_USERNAME_1 || secrets.NAIXI_USERNAME }}
       NAIXI_PASSWORD_1: ${{ secrets.NAIXI_PASSWORD_1 || secrets.NAIXI_PASSWORD }}
       NAIXI_USERNAME_2: ${{ secrets.NAIXI_USERNAME_2 }}
       NAIXI_PASSWORD_2: ${{ secrets.NAIXI_PASSWORD_2 }}
-      DJI_cookie: ${{ secrets.DJI_COOKIE }}
-      PCBETA_cookie: ${{ secrets.PCBETA_COOKIE }}
+      DJI_cookie: ${{ secrets.DJI_COOKIE_1 || secrets.DJI_COOKIE }}
+      DJI_COOKIE_1: ${{ secrets.DJI_COOKIE_1 || secrets.DJI_COOKIE }}
+      DJI_COOKIE_2: ${{ secrets.DJI_COOKIE_2 }}
+      PCBETA_cookie: ${{ secrets.PCBETA_COOKIE_1 || secrets.PCBETA_COOKIE }}
+      PCBETA_COOKIE_1: ${{ secrets.PCBETA_COOKIE_1 || secrets.PCBETA_COOKIE }}
+      PCBETA_COOKIE_2: ${{ secrets.PCBETA_COOKIE_2 }}
+      PCBETA_username: ${{ secrets.PCBETA_USERNAME_1 || secrets.PCBETA_USERNAME }}
+      PCBETA_USERNAME_1: ${{ secrets.PCBETA_USERNAME_1 || secrets.PCBETA_USERNAME }}
+      PCBETA_password: ${{ secrets.PCBETA_PASSWORD_1 || secrets.PCBETA_PASSWORD }}
+      PCBETA_PASSWORD_1: ${{ secrets.PCBETA_PASSWORD_1 || secrets.PCBETA_PASSWORD }}
+      PCBETA_USERNAME_2: ${{ secrets.PCBETA_USERNAME_2 }}
+      PCBETA_PASSWORD_2: ${{ secrets.PCBETA_PASSWORD_2 }}
       MONKEYCODE_ACCOUNTS: ${{ secrets.MONKEYCODE_ACCOUNTS }}
       MONKEYCODE_cookie: ${{ secrets.MONKEYCODE_COOKIE }}
       MONKEYCODE_COOKIE_1: ${{ secrets.MONKEY_CODE_COOKIE_1 || secrets.MONKEYCODE_COOKIE_1 || secrets.MONKEY_CODE_COOKIE || secrets.MONKEYCODE_COOKIE }}
@@ -133,16 +153,20 @@ jobs:
       WORKBUDDY_COOKIE_2: ${{ secrets.WORKBUDDY_COOKIE_2 }}
       WORKBUDDY_COOKIE_3: ${{ secrets.WORKBUDDY_COOKIE_3 }}
       WORKBUDDY_WAIT_TRAVEL: "true"
-      MODELSCOPE_cookie: ${{ secrets.MODELSCOPE_COOKIE }}
+      MODELSCOPE_cookie: ${{ secrets.MODELSCOPE_COOKIE_1 || secrets.MODELSCOPE_COOKIE }}
       MODELSCOPE_COOKIE_1: ${{ secrets.MODELSCOPE_COOKIE_1 || secrets.MODELSCOPE_COOKIE }}
       MODELSCOPE_COOKIE_2: ${{ secrets.MODELSCOPE_COOKIE_2 }}
+      MODELSCOPE_COOKIE_3: ${{ secrets.MODELSCOPE_COOKIE_3 }}
       MODELSCOPE_HOST: ${{ secrets.MODELSCOPE_HOST }}
       MODELSCOPE_PROXY: socks5://127.0.0.1:1080
-      MODELSCOPE_AI_COOKIE: ${{ secrets.MODELSCOPE_AI_COOKIE }}
+      MODELSCOPE_AI_COOKIE: ${{ secrets.MODELSCOPE_AI_COOKIE_1 || secrets.MODELSCOPE_AI_COOKIE }}
       MODELSCOPE_AI_COOKIE_1: ${{ secrets.MODELSCOPE_AI_COOKIE_1 || secrets.MODELSCOPE_AI_COOKIE }}
       MODELSCOPE_AI_COOKIE_2: ${{ secrets.MODELSCOPE_AI_COOKIE_2 }}
-      LATVI_EMAIL: ${{ secrets.LATVI_EMAIL }}
-      LATVI_PASSWORD: ${{ secrets.LATVI_PASSWORD }}
+      MODELSCOPE_AI_COOKIE_3: ${{ secrets.MODELSCOPE_AI_COOKIE_3 }}
+      LATVI_EMAIL: ${{ secrets.LATVI_EMAIL_1 || secrets.LATVI_EMAIL }}
+      LATVI_PASSWORD: ${{ secrets.LATVI_PASSWORD_1 || secrets.LATVI_PASSWORD }}
+      LATVI_EMAIL_1: ${{ secrets.LATVI_EMAIL_1 || secrets.LATVI_EMAIL }}
+      LATVI_PASSWORD_1: ${{ secrets.LATVI_PASSWORD_1 || secrets.LATVI_PASSWORD }}
       LATVI_STATE_FILE: .latvi_state.json
       RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
       RESEND_FROM: ${{ secrets.RESEND_FROM }}

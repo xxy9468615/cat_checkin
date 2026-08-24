@@ -20,13 +20,16 @@
   明细列表沿用 GET /api/billing/resource/package?pageNumber=0&pageSize=10。
 
 支持环境变量：
-  CLOUDSTUDIO_cookie  cloudstudio-session 完整值（或含它的整串 Cookie，必填）
-  CLOUDSTUDIO_xsrf    X-XSRF-TOKEN 覆盖值（可选；缺省自动按 Vq() 派生）
+  CLOUDSTUDIO_cookie    cloudstudio-session 完整值（或含它的整串 Cookie，必填）
+  CLOUDSTUDIO_COOKIE_1  序列多账号
+  CLOUDSTUDIO_xsrf      X-XSRF-TOKEN 覆盖值（可选；缺省自动按 Vq() 派生）
 """
 import datetime as dt
 import re
+import sys
+from typing import List, Tuple
 
-from common import Http, env, find, findall, main_guard, mask_str
+from common import Http, env_seq, find, findall, main_guard, mask_str
 
 PREFIX = "CLOUDSTUDIO_"
 BASE = "https://cloudstudio.net/api"
@@ -76,16 +79,12 @@ def bj_date_of_iso(value: str) -> str:
         return ""
 
 
-def main():
-    print("【Tencent CloudStudio 签到】")
-    raw_cookie = env(PREFIX, "cookie")
+def _run_one(raw_cookie: str, xsrf_override: str, idx: int, total: int) -> Tuple[bool, str]:
     session = extract_session(raw_cookie)
     if not session:
         raise RuntimeError("CLOUDSTUDIO_cookie 为空，请填入 cloudstudio-session 的值")
-    # 提取结果诊断（仅长度，不打印前缀——session 片段也属凭证）
-    print(f"session 提取: 长度 {len(session)}")
 
-    xsrf = env(PREFIX, "xsrf", required=False) or derive_xsrf(session)
+    xsrf = xsrf_override or derive_xsrf(session)
     headers = {
         "Cookie": f"cloudstudio-session={session}",
         "X-XSRF-TOKEN": xsrf,
@@ -95,9 +94,6 @@ def main():
     h = Http()
 
     # === 1. 签到两段式：先查今日记录，再决定是否领取 ===
-    # 不用 /user/info 预判登录态：该端点对 CI 的 session/IP 可能 401，但签到 API 用同一
-    # session 可成功（2026-08-22 事故：user/info 401 误判把真实签到 POST 永久跳过，与
-    # ai_router「GET 预判字段恒 true 跳过发奖」同型坑）。以签到 API 自身响应为准。
     today = bj_now_str()[:10]
     q = h.request("GET", f"{BASE}/billing/activityTask/{ACTIVITY}?lastRecord=true", headers=headers)
     status, record = "", {}
@@ -125,7 +121,6 @@ def main():
             headers=headers, json_data={},
         )
         if s.code in (401, 403) or s.code in (301, 302, 303, 307, 308):
-            # 签到 API 本身 401/302 才算 session 真失效（非 user/info 预判）
             raise RuntimeError(
                 f"Cookie 已失效（签到接口 HTTP {s.code}），请在浏览器重新登录后更新 CLOUDSTUDIO_cookie"
             )
@@ -144,7 +139,7 @@ def main():
         else:
             raise RuntimeError(f"签到未到账: status={rec.get('status')} {fail_msg}"[:160])
 
-    # nick 仅用于报告展示:签到成功后带同 cookie 再探 user/info,非阻断(401/失败不中断)
+    # nick 仅用于报告展示
     nick = "?"
     u = h.request("GET", f"{BASE}/user/info", headers=headers)
     if u.code == 200:
@@ -178,7 +173,8 @@ def main():
 
     # === 4. 报告输出 ===
     bj_now = bj_now_str()
-    lines = [f"用户 {mask_str(nick)} {status_line}"]
+    prefix_label = f"[{idx}/{total}] " if total > 1 else ""
+    lines = [f"{prefix_label}用户 {mask_str(nick)} {status_line}"]
     if not pkg_list:
         lines.append("暂无可用资源包")
     else:
@@ -186,15 +182,15 @@ def main():
         total_rem_sum = 0.0
         total_cap_sum = 0.0
         for item in pkg_list:
-            name, total, used, exp = item["name"], item["total"], item["used"], item["exp"]
-            rem = max(0.0, total - used)
+            name, total_val, used_val, exp = item["name"], item["total"], item["used"], item["exp"]
+            rem = max(0.0, total_val - used_val)
             total_rem_sum += rem
-            total_cap_sum += total
+            total_cap_sum += total_val
             g = groups.setdefault(name, {"count": 0, "total": 0.0, "used": 0.0,
                                          "exps": [], "active_exps": []})
             g["count"] += 1
-            g["total"] += total
-            g["used"] += used
+            g["total"] += total_val
+            g["used"] += used_val
             if exp:
                 g["exps"].append(exp)
                 if rem > 0 and exp >= bj_now:
@@ -219,7 +215,38 @@ def main():
             tot_str = f"{int(tot)}" if tot.is_integer() else f"{tot:.2f}"
             lines.append(f"• {name} ({count}个包): 剩余 {rem:.2f}/{tot_str} 机时{exp_info}")
 
-    print("\n".join(lines))
+    return True, "\n".join(lines)
+
+
+def main():
+    print("【Tencent CloudStudio 签到】")
+    cookies = env_seq(PREFIX, "cookie")
+    xsrfs = env_seq(PREFIX, "xsrf", required=False)
+
+    total = len(cookies)
+    results: List[Tuple[bool, str]] = []
+
+    for idx, c in enumerate(cookies, 1):
+        c = c.strip()
+        if not c:
+            continue
+        xsrf = xsrfs[idx - 1].strip() if (idx - 1) < len(xsrfs) else ""
+        try:
+            ok, msg = _run_one(c, xsrf, idx, total)
+            print(msg)
+            results.append((ok, msg))
+        except Exception as e:
+            prefix_label = f"[{idx}/{total}] " if total > 1 else ""
+            err_msg = f"{prefix_label}签到失败：{e}"
+            print(err_msg)
+            results.append((False, err_msg))
+
+    ok_count = sum(1 for ok, _ in results if ok)
+    if total > 1:
+        print(f"\n========== 签到总结 ==========\n成功 {ok_count}/{total}")
+
+    if ok_count != total:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
