@@ -35,8 +35,8 @@ from common import Http, env, env_seq, main_guard, mask_str
 
 PREFIX = "MODELSCOPE_"
 
-# daily_active 奖励未到账时的渐进式复查间隔（秒）：逐次递增，避免盲等 90s
-RETRY_WAITS = [10, 20, 30, 45]
+# daily_active 奖励未到账时的渐进式复查间隔（秒）：逐次递增，控制多账号总等待时间
+RETRY_WAITS = [8, 15, 25]
 
 
 DEFAULT_UA = (
