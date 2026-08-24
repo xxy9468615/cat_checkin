@@ -3,14 +3,17 @@
 # new Env("Tencent CloudStudio 签到")
 """Tencent CloudStudio (cloudstudio.net) 每日签到脚本。
 
-协议逆向结论（2026-08-22，HAR + main-*.js 前端包分析）：
-- 认证仍是 Cookie 会话：cloudstudio-session（服务端签发）+ cloudstudio-session-team。
-  登录走 Keycloak OIDC（腾讯云/微信/GitHub/手机号验证码），无账密直登接口可程序化复现，
-  因此 cookie 过期仍需手动更新 —— 但只需提供 session 一个值。
+协议逆向结论（2026-08-24，HAR + main-*.js 前端包分析）：
+- 认证体系：业务活动与账单端点强制依赖 Cookie 会话（cloudstudio-session）。
+  控制台生成的个人访问令牌（API Key / OpenToken）归属于 Open API 开放生态/应用管理体系，
+  传入业务接口会被网关判定为工作空间容器专用的 Workspace Token 而报 1044 错误，无法用于活动签到。
+- Keycloak SSO 自动换票与续期链（2026-08-25 升级）：
+  当环境变量传入完整 Cookie（包含 KEYCLOAK_IDENTITY 长期 SSO 票据）时，若 session 过期，
+  脚本将自动请求 /api/public/login 重定向至 Keycloak OIDC 端点无感换取最新 session，
+  并通过 Upstash Redis（cat_checkin:state:cloudstudio_{idx}）与本地 JSON 状态跨 CI 自动滚动续期。
 - X-XSRF-TOKEN 无需人工复制：前端拦截器对每个请求自动计算
   Vq() = djb2 变体哈希（t=5381; t+=(t<<5)+charCode）& 0x7fffffff，
-  输入取 cookie skey || cloudstudio-session。本脚本按同算法派生，
-  CLOUDSTUDIO_xsrf 仅作为可选覆盖保留（兼容旧配置）。
+  输入取 cookie skey || cloudstudio-session。本脚本按同算法派生。
 - 签到两段式（与前端一致）：
   1. GET  /api/billing/activityTask/SIGN_IN_2025Q3?lastRecord=true 查记录状态
      （NOT_STARTED/IN_PROGRESS/COMPLETED/FAILED/REWARDING/REWARDED/REWARD_FAILED）
@@ -20,16 +23,16 @@
   明细列表沿用 GET /api/billing/resource/package?pageNumber=0&pageSize=10。
 
 支持环境变量：
-  CLOUDSTUDIO_cookie    cloudstudio-session 完整值（或含它的整串 Cookie，必填）
+  CLOUDSTUDIO_cookie    cloudstudio-session 完整值（或包含它的完整浏览器 Cookie，必填）
   CLOUDSTUDIO_COOKIE_1  序列多账号
   CLOUDSTUDIO_xsrf      X-XSRF-TOKEN 覆盖值（可选；缺省自动按 Vq() 派生）
 """
 import datetime as dt
 import re
 import sys
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
-from common import Http, env_seq, find, findall, main_guard, mask_str
+from common import Http, env_seq, find, findall, load_kv_state, main_guard, mask_str, save_kv_state
 
 PREFIX = "CLOUDSTUDIO_"
 BASE = "https://cloudstudio.net/api"
@@ -50,16 +53,27 @@ def extract_session(raw_cookie: str) -> str:
     m = re.search(r"cloudstudio-session=([^;\s]+)", raw)
     if m:
         return m.group(1)
-    # 无 cloudstudio-session 键:区分「裸 session 值」与「贴了其他键值对」
     if "=" not in raw:
-        # 裸 session 值(无等号),直接当 session 用
         return raw
-    # 含键值对但无 cloudstudio-session 键 → 明确报错指引,避免静默构造错误 Cookie(如把 cloudstudio-session-team=xxx 整体当 session → 401)
-    keys = [p.split("=", 1)[0].strip() for p in raw.split(";") if "=" in p and p.strip()]
-    raise RuntimeError(
-        f"CLOUDSTUDIO_cookie 未找到 cloudstudio-session 键（现有键: {keys}）。"
-        f"请只贴 cloudstudio-session 的值,或确保整串含 cloudstudio-session=...。"
-    )
+    return ""
+
+
+def try_keycloak_sso(raw_cookie: str) -> Tuple[bool, str]:
+    """尝试利用包含 KEYCLOAK_IDENTITY / 会话票据的完整 Cookie 重换 session。"""
+    if not raw_cookie or "=" not in raw_cookie:
+        return False, ""
+    h = Http(follow_redirects=True)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://cloudstudio.net/",
+        "Cookie": raw_cookie,
+    }
+    url = "https://cloudstudio.net/api/public/login?client_id=cloudstudio-apiserver-club"
+    r = h.request("GET", url, headers=headers)
+    for c in h.jar:
+        if c.name == "cloudstudio-session" and c.value:
+            return True, c.value
+    return False, ""
 
 
 def bj_now_str() -> str:
@@ -79,11 +93,7 @@ def bj_date_of_iso(value: str) -> str:
         return ""
 
 
-def _run_one(raw_cookie: str, xsrf_override: str, idx: int, total: int) -> Tuple[bool, str]:
-    session = extract_session(raw_cookie)
-    if not session:
-        raise RuntimeError("CLOUDSTUDIO_cookie 为空，请填入 cloudstudio-session 的值")
-
+def _do_checkin_and_query(session: str, xsrf_override: str) -> Tuple[bool, str, Http]:
     xsrf = xsrf_override or derive_xsrf(session)
     headers = {
         "Cookie": f"cloudstudio-session={session}",
@@ -96,9 +106,16 @@ def _run_one(raw_cookie: str, xsrf_override: str, idx: int, total: int) -> Tuple
     # === 1. 签到两段式：先查今日记录，再决定是否领取 ===
     today = bj_now_str()[:10]
     q = h.request("GET", f"{BASE}/billing/activityTask/{ACTIVITY}?lastRecord=true", headers=headers)
+
+    if q.code in (401, 403) or q.code in (301, 302, 303, 307, 308):
+        return False, f"AUTH_EXPIRED_{q.code}", h
+    qjson = q.json({}) or {}
+    if qjson.get("code") in (1022, 1044):
+        return False, f"AUTH_EXPIRED_{qjson.get('code')}", h
+
     status, record = "", {}
     if q.code == 200:
-        data = (q.json({}) or {}).get("data") or {}
+        data = qjson.get("data") or {}
         records = data.get("records") or []
         if records:
             record = records[0]
@@ -121,13 +138,13 @@ def _run_one(raw_cookie: str, xsrf_override: str, idx: int, total: int) -> Tuple
             headers=headers, json_data={},
         )
         if s.code in (401, 403) or s.code in (301, 302, 303, 307, 308):
-            raise RuntimeError(
-                f"Cookie 已失效（签到接口 HTTP {s.code}），请在浏览器重新登录后更新 CLOUDSTUDIO_cookie"
-            )
+            return False, f"AUTH_EXPIRED_{s.code}", h
+        sjson = s.json({}) or {}
+        if sjson.get("code") in (1022, 1044):
+            return False, f"AUTH_EXPIRED_{sjson.get('code')}", h
         if s.code >= 400 or s.code < 0:
             msg = find(r'"msg":"(.*?)"', s.text, s.text[:120])
             raise RuntimeError(f"签到接口 HTTP {s.code}: {msg}")
-        sjson = s.json({}) or {}
         records = ((sjson.get("data") or {}).get("records")) or []
         rec = records[0] if records else {}
         reward = float(rec.get("rewardNum", 0) or 0) / 100000000
@@ -173,8 +190,7 @@ def _run_one(raw_cookie: str, xsrf_override: str, idx: int, total: int) -> Tuple
 
     # === 4. 报告输出 ===
     bj_now = bj_now_str()
-    prefix_label = f"[{idx}/{total}] " if total > 1 else ""
-    lines = [f"{prefix_label}用户 {mask_str(nick)} {status_line}"]
+    lines = [f"用户 {mask_str(nick)} {status_line}"]
     if not pkg_list:
         lines.append("暂无可用资源包")
     else:
@@ -215,7 +231,55 @@ def _run_one(raw_cookie: str, xsrf_override: str, idx: int, total: int) -> Tuple
             tot_str = f"{int(tot)}" if tot.is_integer() else f"{tot:.2f}"
             lines.append(f"• {name} ({count}个包): 剩余 {rem:.2f}/{tot_str} 机时{exp_info}")
 
-    return True, "\n".join(lines)
+    return True, "\n".join(lines), h
+
+
+def _run_one(raw_cookie: str, xsrf_override: str, idx: int, total: int) -> Tuple[bool, str]:
+    state_file = f".cloudstudio_state_{idx}.json"
+    redis_key = f"cat_checkin:state:cloudstudio_{idx}"
+    saved_state = load_kv_state(redis_key, state_file) or {}
+    saved_session = str(saved_state.get("session") or "").strip()
+
+    session = saved_session or extract_session(raw_cookie)
+    if not session:
+        # 无直接 session，尝试从 raw_cookie 进行 Keycloak SSO 换票
+        sso_ok, sso_session = try_keycloak_sso(raw_cookie)
+        if sso_ok:
+            session = sso_session
+            print(f"[{idx}/{total}] 🔑 通过 Keycloak SSO 初始化换取到最新 session: {session[:12]}***")
+            save_kv_state(redis_key, state_file, {"session": session, "updated_at": bj_now_str()})
+
+    if not session:
+        raise RuntimeError(
+            "CLOUDSTUDIO_cookie 未找到 cloudstudio-session，且无法通过 SSO 自动登录。"
+            "请在浏览器重新登录后更新 CLOUDSTUDIO_cookie（建议粘贴包含 KEYCLOAK_IDENTITY 的整串 Cookie 以支持长期免维护）"
+        )
+
+    ok, report, h = _do_checkin_and_query(session, xsrf_override)
+    if not ok and report.startswith("AUTH_EXPIRED"):
+        # Session 过期，尝试通过 Keycloak SSO 续期
+        print(f"[{idx}/{total}] 🔄 session 已过期（{report}），正在尝试通过 Keycloak SSO 自动换取新 session...")
+        sso_ok, new_session = try_keycloak_sso(raw_cookie)
+        if sso_ok and new_session != session:
+            session = new_session
+            print(f"[{idx}/{total}] 🔑 SSO 续期成功，获取到新 session: {session[:12]}***，正在重新签到...")
+            save_kv_state(redis_key, state_file, {"session": session, "updated_at": bj_now_str()})
+            ok, report, h = _do_checkin_and_query(session, xsrf_override)
+
+    if not ok:
+        raise RuntimeError(
+            "Cookie 已失效，请在浏览器重新登录并更新 CLOUDSTUDIO_cookie。"
+            "（提示：在浏览器 Network 请求头中复制整串 Cookie 填入 Secrets，即可永久启用 Keycloak SSO 自动续期）"
+        )
+
+    # 检查服务端是否在本次请求中下发了最新的 Set-Cookie
+    for c in h.jar:
+        if c.name == "cloudstudio-session" and c.value and c.value != session:
+            session = c.value
+            save_kv_state(redis_key, state_file, {"session": session, "updated_at": bj_now_str()})
+
+    prefix_label = f"[{idx}/{total}] " if total > 1 else ""
+    return True, f"{prefix_label}{report}"
 
 
 def main():
