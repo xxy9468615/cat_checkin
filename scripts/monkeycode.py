@@ -256,16 +256,66 @@ def get_wallet_info_lines(h, headers) -> List[str]:
 
 
 def _load_accounts() -> List[Dict[str, Optional[str]]]:
-    """解析并汇总多账号凭证列表。"""
+    """解析并汇总多账号凭证列表。支持：
+    1. 序号独立变量：MONKEYCODE_EMAIL_1/PASSWORD_1, MONKEYCODE_EMAIL_2/PASSWORD_2, MONKEYCODE_COOKIE_1, ...
+       （同时兼容 MONKEY_CODE_ 别名前缀）
+    2. 单变量序列/多账号切分：MONKEYCODE_EMAIL, MONKEYCODE_PASSWORD (&&/换行切分), MONKEYCODE_COOKIE, ...
+    3. 组合字符串：MONKEYCODE_ACCOUNTS / MONKEYCODE_ACCOUNT (email:pass 格式)
+    """
     accounts: List[Dict[str, Optional[str]]] = []
     seen_keys = set()
 
-    # 1. 优先扫描按序号对齐的 EMAIL_i / PASSWORD_i 与 COOKIE_i 序列
-    emails = env_seq(PREFIX, "email", required=False)
-    passwords = env_seq(PREFIX, "password", required=False)
-    cookies = env_seq(PREFIX, "cookie", required=False)
-    if not cookies:
-        cookies = env_seq(PREFIX, "cookies", required=False)
+    # 1. 扫描 1..20 序号独立配置（避免某账号只配 Cookie 导致索引对齐断裂）
+    prefixes = [PREFIX, "MONKEY_CODE_", "QL_MONKEYCODE_", "QL_MONKEY_CODE_"]
+    for idx in range(1, 21):
+        c = ""
+        u = ""
+        p = ""
+        for pfx in prefixes:
+            if not c:
+                c = os.getenv(f"{pfx}COOKIE_{idx}") or os.getenv(f"{pfx}cookie_{idx}") or ""
+            if not u:
+                u = (
+                    os.getenv(f"{pfx}EMAIL_{idx}")
+                    or os.getenv(f"{pfx}email_{idx}")
+                    or os.getenv(f"{pfx}USERNAME_{idx}")
+                    or os.getenv(f"{pfx}username_{idx}")
+                    or ""
+                )
+            if not p:
+                p = os.getenv(f"{pfx}PASSWORD_{idx}") or os.getenv(f"{pfx}password_{idx}") or ""
+            if not (c or (u and p)):
+                acc_str = (
+                    os.getenv(f"{pfx}ACCOUNT_{idx}")
+                    or os.getenv(f"{pfx}account_{idx}")
+                    or os.getenv(f"{pfx}ACCOUNTS_{idx}")
+                    or os.getenv(f"{pfx}accounts_{idx}")
+                    or ""
+                )
+                if acc_str and ":" in acc_str:
+                    u_acc, _, p_acc = acc_str.partition(":")
+                    u, p = u_acc.strip(), p_acc.strip()
+
+        c, u, p = c.strip(), u.strip(), p.strip()
+        if c or (u and p):
+            key = u.lower() if u else (c[:32] if c else "")
+            if key and key not in seen_keys:
+                seen_keys.add(key)
+                accounts.append({
+                    "cookie": c or None,
+                    "email": u or None,
+                    "password": p or None,
+                })
+
+    # 2. 扫描通用 env_seq 序列（支持未编号单变量 && / \n 切分）
+    emails = env_seq(PREFIX, "email", required=False) or env_seq("MONKEY_CODE_", "email", required=False)
+    passwords = env_seq(PREFIX, "password", required=False) or env_seq("MONKEY_CODE_", "password", required=False)
+    cookies = (
+        env_seq(PREFIX, "cookie", required=False)
+        or env_seq(PREFIX, "cookies", required=False)
+        or env_seq("MONKEY_CODE_", "cookie", required=False)
+        or env_seq("MONKEY_CODE_", "cookies", required=False)
+    )
 
     max_len = max(len(emails), len(cookies))
     for i in range(max_len):
@@ -285,8 +335,13 @@ def _load_accounts() -> List[Dict[str, Optional[str]]]:
                 "password": p or None,
             })
 
-    # 2. 扫描 ACCOUNTS 序列或兼容旧 ACCOUNTS 变量（换行 / && 切分）
-    raw_accounts = env_seq(PREFIX, "accounts", required=False) or env_seq(PREFIX, "account", required=False)
+    # 3. 扫描 ACCOUNTS 组合配置（如 email:password）
+    raw_accounts = (
+        env_seq(PREFIX, "accounts", required=False)
+        or env_seq(PREFIX, "account", required=False)
+        or env_seq("MONKEY_CODE_", "accounts", required=False)
+        or env_seq("MONKEY_CODE_", "account", required=False)
+    )
     for chunk in raw_accounts:
         chunk = chunk.strip()
         if not chunk:
