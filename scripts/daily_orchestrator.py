@@ -242,13 +242,27 @@ def main() -> None:
     parser.add_argument("--tasks", type=str, default="", help="comma-separated task list (explicit mode)")
     args = parser.parse_args()
     print(f"Daily orchestrator start @ {bjt_now().strftime('%Y-%m-%d %H:%M:%S')} BJT")
-    hard_deadline = _hm_today_ts(os.getenv("ORCH_HARD_DEADLINE", "19:55"))
+    is_explicit = bool(args.tasks.strip())
+    now_ts = time.time()
+    if is_explicit:
+        hard_deadline = now_ts + 86400
+        hard_wall_str = "None (explicit task mode)"
+    else:
+        configured_wall = os.getenv("ORCH_HARD_DEADLINE", "19:55")
+        wall_ts = _hm_today_ts(configured_wall)
+        if wall_ts <= now_ts:
+            hard_deadline = now_ts + 6 * 3600
+            hard_wall_str = f"{configured_wall} BJT (past wall -> relaxed to +6h: {_fmt_bjt(hard_deadline)})"
+        else:
+            hard_deadline = wall_ts
+            hard_wall_str = f"{configured_wall} BJT"
+
     orch = Orchestrator(hard_deadline)
-    if args.tasks.strip():
+    if is_explicit:
         build_explicit_timeline(orch, args.tasks)
     else:
         build_default_timeline(orch)
-    print(f"Hard wall: {os.getenv('ORCH_HARD_DEADLINE','19:55')} BJT\n")
+    print(f"Hard wall: {hard_wall_str}\n")
     sys.exit(orch.run())
 if __name__ == "__main__":
     main()
