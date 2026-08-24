@@ -48,12 +48,16 @@ def derive_xsrf(session: str) -> str:
 
 
 def extract_session(raw_cookie: str) -> str:
-    """兼容裸 session 值 或 含 cloudstudio-session= 的整串 Cookie。"""
+    """兼容裸 session 值、含 cloudstudio-session= 的键值对 或 完整浏览器 Cookie 字符串。"""
     raw = raw_cookie.strip()
-    m = re.search(r"cloudstudio-session=([^;\s]+)", raw)
+    if not raw:
+        return ""
+    m = re.search(r"cloudstudio-session=([^;\s]+)", raw, re.IGNORECASE)
     if m:
-        return m.group(1)
-    if "=" not in raw:
+        return m.group(1).rstrip(";")
+    if raw.startswith("s:") or raw.startswith("s%3A"):
+        return raw.split(";")[0].strip()
+    if ";" not in raw and not re.search(r"^[a-zA-Z0-9_-]+=", raw):
         return raw
     return ""
 
@@ -239,8 +243,9 @@ def _run_one(raw_cookie: str, xsrf_override: str, idx: int, total: int) -> Tuple
     redis_key = f"cat_checkin:state:cloudstudio_{idx}"
     saved_state = load_kv_state(redis_key, state_file) or {}
     saved_session = str(saved_state.get("session") or "").strip()
+    raw_session = extract_session(raw_cookie)
 
-    session = saved_session or extract_session(raw_cookie)
+    session = saved_session or raw_session
     if not session:
         # 无直接 session，尝试从 raw_cookie 进行 Keycloak SSO 换票
         sso_ok, sso_session = try_keycloak_sso(raw_cookie)
@@ -251,32 +256,43 @@ def _run_one(raw_cookie: str, xsrf_override: str, idx: int, total: int) -> Tuple
 
     if not session:
         raise RuntimeError(
-            "CLOUDSTUDIO_cookie 未找到 cloudstudio-session，且无法通过 SSO 自动登录。"
-            "请在浏览器重新登录后更新 CLOUDSTUDIO_cookie（建议粘贴包含 KEYCLOAK_IDENTITY 的整串 Cookie 以支持长期免维护）"
+            "CLOUDSTUDIO_cookie 未找到 cloudstudio-session，且无法自动登录。"
+            "请在浏览器重新登录后更新 CLOUDSTUDIO_cookie（格式如 cloudstudio-session=... 或直接粘贴完整 Cookie）"
         )
 
     ok, report, h = _do_checkin_and_query(session, xsrf_override)
     if not ok and report.startswith("AUTH_EXPIRED"):
-        # Session 过期，尝试通过 Keycloak SSO 续期
-        print(f"[{idx}/{total}] 🔄 session 已过期（{report}），正在尝试通过 Keycloak SSO 自动换取新 session...")
-        sso_ok, new_session = try_keycloak_sso(raw_cookie)
-        if sso_ok and new_session != session:
-            session = new_session
-            print(f"[{idx}/{total}] 🔑 SSO 续期成功，获取到新 session: {session[:12]}***，正在重新签到...")
-            save_kv_state(redis_key, state_file, {"session": session, "updated_at": bj_now_str()})
-            ok, report, h = _do_checkin_and_query(session, xsrf_override)
+        # 若使用的是 saved_session 但失败，先回退尝试 raw_session
+        if raw_session and raw_session != session:
+            print(f"[{idx}/{total}] 🔄 缓存 session 失效，尝试使用环境变量最新配置的 session...")
+            ok, report, h = _do_checkin_and_query(raw_session, xsrf_override)
+            if ok:
+                session = raw_session
+                save_kv_state(redis_key, state_file, {"session": session, "updated_at": bj_now_str()})
+
+        # 若仍失败，尝试通过 Keycloak SSO 续期
+        if not ok and report.startswith("AUTH_EXPIRED"):
+            print(f"[{idx}/{total}] 🔄 session 已过期（{report}），正在尝试通过 Keycloak SSO 自动换取新 session...")
+            sso_ok, new_session = try_keycloak_sso(raw_cookie)
+            if sso_ok and new_session != session:
+                session = new_session
+                print(f"[{idx}/{total}] 🔑 SSO 续期成功，获取到新 session: {session[:12]}***，正在重新签到...")
+                save_kv_state(redis_key, state_file, {"session": session, "updated_at": bj_now_str()})
+                ok, report, h = _do_checkin_and_query(session, xsrf_override)
 
     if not ok:
         raise RuntimeError(
             "Cookie 已失效，请在浏览器重新登录并更新 CLOUDSTUDIO_cookie。"
-            "（提示：在浏览器 Network 请求头中复制整串 Cookie 填入 Secrets，即可永久启用 Keycloak SSO 自动续期）"
+            "（提示：在浏览器 Application -> Cookies 或 Network 中复制 cloudstudio-session=... 填入 Secrets）"
         )
 
-    # 检查服务端是否在本次请求中下发了最新的 Set-Cookie
+    # 签到成功后，若有新下发的 Set-Cookie 优先更新；否则保存当前成功使用的 session
+    updated_session = session
     for c in h.jar:
-        if c.name == "cloudstudio-session" and c.value and c.value != session:
-            session = c.value
-            save_kv_state(redis_key, state_file, {"session": session, "updated_at": bj_now_str()})
+        if c.name == "cloudstudio-session" and c.value:
+            updated_session = c.value
+            break
+    save_kv_state(redis_key, state_file, {"session": updated_session, "updated_at": bj_now_str()})
 
     prefix_label = f"[{idx}/{total}] " if total > 1 else ""
     return True, f"{prefix_label}{report}"

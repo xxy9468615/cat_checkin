@@ -24,6 +24,8 @@ docs
 .latvi_state.json
 .ai_router_state.json
 .agentrouter_state.json
+.cloudstudio_state*.json
+.modelscope_state*.json
 
 # WSL2 metadata
 *:Zone.Identifier
