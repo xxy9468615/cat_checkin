@@ -195,8 +195,32 @@ def _get_balance(
         return None
 
 
+def _resolve_cookie(env_cookie: str, idx: int, site: str) -> Tuple[str, str]:
+    """解析某账号的最终 Cookie：滚动 state（远端权威、每日刷新 source）优先于环境变量。
+
+    返回 (cookie, cookie来源标签)；state 与 env 皆空时返回 ("", "")。
+    优先级依据：state 里的 Cookie 是上一次 run 合并 Set-Cookie 后的最新滚动版本，
+    比人工粘贴的 env Cookie 更新鲜。
+    """
+    state_file = f".modelscope_{site}_state_{idx}.json"
+    redis_key = f"cat_checkin:state:modelscope_{site}_{idx}"
+    saved_state = load_kv_state(redis_key, state_file)
+    state_cookie = str((saved_state or {}).get("cookie", "") or "").strip()
+    if state_cookie:
+        return state_cookie, "state"
+    if env_cookie:
+        return env_cookie, "env"
+    return "", ""
+
+
 def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
-    """加载指定站点（cn / ai）的所有账号凭证，支持 Token 与 Cookie 混合、多账号索引扫描及 Redis 滚动状态。"""
+    """加载指定站点（cn / ai）的所有账号凭证，支持 Token 与 Cookie 混合、多账号索引扫描及 Redis 滚动状态。
+
+    凭证优先级：**Cookie 优先，Token 回退**（2026-08-25 修复）。
+    实测 Bearer Token 虽能通过 OpenAPI 鉴权，但 OpenAPI 调用不计入「日活」，
+    daily_active 每日魔粒不会发放；只有 Web 会话（Cookie）活动才触发奖励。
+    故同时配置 Token 与 Cookie 时，一律走 Cookie（state 滚动续期版本优先）。
+    """
     accounts: List[Dict[str, Any]] = []
     seen = set()
 
@@ -217,9 +241,9 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
     # 1. 扫描 1..20 显式序号
     for idx in range(1, 21):
         token_val = ""
-        cookie_val = ""
+        env_cookie_val = ""
 
-        # 先查环境变量中的 Token 与 Cookie
+        # 同时收集环境变量中的 Token 与 Cookie（不再因 Token 存在而跳过 Cookie）
         for pfx in prefixes:
             if not token_val:
                 for k in token_keys:
@@ -230,42 +254,47 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
                     ).strip()
                     if token_val:
                         break
-            if not cookie_val:
+            if not env_cookie_val:
                 for k in cookie_keys:
-                    cookie_val = (
+                    env_cookie_val = (
                         os.getenv(f"{pfx}{k}_{idx}")
                         or os.getenv(f"{pfx}{k.lower()}_{idx}")
                         or ""
                     ).strip()
-                    if cookie_val:
+                    if env_cookie_val:
                         break
 
-        # 若未配置 Token 且配置了 Cookie（或使用纯 Cookie），读取 Redis/本地持久化的滚动 Cookie
-        if not token_val:
-            state_file = f".modelscope_{site}_state_{idx}.json"
-            redis_key = f"cat_checkin:state:modelscope_{site}_{idx}"
-            saved_state = load_kv_state(redis_key, state_file)
-            if isinstance(saved_state, dict) and saved_state.get("cookie"):
-                cookie_val = str(saved_state.get("cookie", "")).strip()
-
-        token_val, cookie_val = token_val.strip(), cookie_val.strip()
+        # Cookie 解析：滚动 state（远端权威）优先于 env（详见 _resolve_cookie）
+        cookie_val, _src = _resolve_cookie(env_cookie_val, idx, site)
+        token_val = token_val.strip()
         if token_val or cookie_val:
-            ident = token_val or cookie_val[:40]
+            ident = cookie_val or token_val
             if ident not in seen:
                 seen.add(ident)
-                accounts.append(
-                    {
-                        "token": token_val or None,
-                        "cookie": (cookie_val or None) if not token_val else None,
-                        "index": idx,
-                        "site": site,
-                    }
-                )
+                # Cookie 优先：Bearer Token 不触发 daily_active 日活奖励（见函数 docstring）
+                if cookie_val:
+                    accounts.append(
+                        {
+                            "token": None,
+                            "cookie": cookie_val,
+                            "index": idx,
+                            "site": site,
+                        }
+                    )
+                else:
+                    accounts.append(
+                        {
+                            "token": token_val,
+                            "cookie": None,
+                            "index": idx,
+                            "site": site,
+                        }
+                    )
 
     # 2. 如果未扫描到序号 1，回退扫描非序号变量
     if not accounts:
         token_val = ""
-        cookie_val = ""
+        env_cookie_val = ""
 
         for pfx in prefixes:
             if not token_val:
@@ -277,24 +306,20 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
                     ).strip()
                     if token_val:
                         break
-            if not cookie_val:
+            if not env_cookie_val:
                 for k in cookie_keys:
-                    cookie_val = (
+                    env_cookie_val = (
                         os.getenv(f"{pfx}{k}")
                         or os.getenv(f"{pfx}{k.lower()}")
                         or ""
                     ).strip()
-                    if cookie_val:
+                    if env_cookie_val:
                         break
 
-        if not token_val:
-            state_file = f".modelscope_{site}_state_1.json"
-            redis_key = f"cat_checkin:state:modelscope_{site}_1"
-            saved_state = load_kv_state(redis_key, state_file)
-            if isinstance(saved_state, dict) and saved_state.get("cookie"):
-                cookie_val = str(saved_state.get("cookie", "")).strip()
+        cookie_val, _src = _resolve_cookie(env_cookie_val, 1, site)
+        token_val = token_val.strip()
 
-        # 针对单变量 && 或换行切分多账号
+        # 针对单变量 && 或换行切分多账号（Cookie 优先：Token 不触发日活奖励）
         if cookie_val and ("&&" in cookie_val or "\n" in cookie_val):
             raw_cookies = [
                 x.strip()
@@ -326,9 +351,10 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
                     }
                 )
         elif token_val or cookie_val:
+            # Cookie 优先（同序号分支注释）；Token 仅作为无 Cookie 时的回退
             accounts.append(
                 {
-                    "token": token_val or None,
+                    "token": None if cookie_val else token_val,
                     "cookie": cookie_val or None,
                     "index": 1,
                     "site": site,
@@ -435,8 +461,16 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str]:
 
     if credited:
         status = f"签到成功，今日已领取 {amount} 魔粒"
+    elif token and not cookie:
+        # 2026-08-25 实测：Bearer Token 能通过 OpenAPI 鉴权，但 OpenAPI 调用不计入
+        # 「日活」，daily_active 奖励永不发放——红卡必须直指根因，不再猜「重置时间」
+        status = (
+            f"今日奖励未到账（{len(RETRY_WAITS)+1} 次复查后仍无增长）："
+            f"Bearer Token 不触发 daily_active 日活奖励，"
+            f"请配置浏览器 Cookie 环境变量 {PREFIX}COOKIE_{idx}（{site} 站）"
+        )
     else:
-        status = f"今日奖励未到账（{len(RETRY_WAITS)+1} 次复查后仍无增长，可能凭证未刷新或未到重置时间）"
+        status = f"今日奖励未到账（{len(RETRY_WAITS)+1} 次复查后仍无增长，Cookie 可能已失效需手动刷新）"
 
     balance_desc = (
         "当前余额：？"
