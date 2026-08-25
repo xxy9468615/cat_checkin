@@ -108,6 +108,7 @@ def _touch_user(
         try:
             h.request("GET", f"https://{host}/my/overview", headers=web_headers, timeout=15)
             h.request("GET", f"https://{host}/", headers=web_headers, timeout=15)
+            h.request("GET", f"https://{host}/home", headers=web_headers, timeout=15)
         except Exception:
             pass
 
@@ -122,6 +123,12 @@ def _touch_user(
         h.request(
             "GET",
             f"https://{host}/openapi/v1/datasets?page_number=1&page_size=5",
+            headers=hdrs,
+            timeout=15,
+        )
+        h.request(
+            "GET",
+            f"https://{host}/openapi/v1/studios?page_number=1&page_size=5",
             headers=hdrs,
             timeout=15,
         )
@@ -464,10 +471,11 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str]:
     elif token and not cookie:
         # 2026-08-25 实测：Bearer Token 能通过 OpenAPI 鉴权，但 OpenAPI 调用不计入
         # 「日活」，daily_active 奖励永不发放——红卡必须直指根因，不再猜「重置时间」
+        cookie_var = f"{PREFIX}COOKIE_{idx}" if site == "cn" else f"{PREFIX}AI_COOKIE_{idx}"
         status = (
             f"今日奖励未到账（{len(RETRY_WAITS)+1} 次复查后仍无增长）："
             f"Bearer Token 不触发 daily_active 日活奖励，"
-            f"请配置浏览器 Cookie 环境变量 {PREFIX}COOKIE_{idx}（{site} 站）"
+            f"请配置浏览器 Cookie 环境变量 {cookie_var}（{site} 站）"
         )
     else:
         status = f"今日奖励未到账（{len(RETRY_WAITS)+1} 次复查后仍无增长，Cookie 可能已失效需手动刷新）"

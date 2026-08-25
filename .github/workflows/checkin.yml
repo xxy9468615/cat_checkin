@@ -210,7 +210,7 @@ jobs:
             .latvi_state.json
             .agentrouter_state.json
             .cloudstudio_state*.json
-            .modelscope_state*.json
+            .modelscope_*.json
           key: unified-states-${{ github.run_id }}
           restore-keys: |
             unified-states-
@@ -397,7 +397,7 @@ jobs:
             .latvi_state.json
             .agentrouter_state.json
             .cloudstudio_state*.json
-            .modelscope_state*.json
+            .modelscope_*.json
           key: unified-states-${{ github.run_id }}
 
       - name: Cleanup SS proxy
