@@ -6,7 +6,8 @@
 
 机制：登录奖励（每日 200 魔粒）在用户产生活跃会话后被动发放。
 接口路径已变更：magic_cube → magicubes（2026-08 前后迁移）。
-判断字段：today_used > 0 表示今日已领取；余额增长为辅助判据。
+判断方式：直查交易记录接口，`rule_key == "daily_active"` 且 `gmt_created == 今日`
+即视为已领取，无需余额增长推算或退避轮询。
 
 多认证与长效支持（2026-08 升级）：
 1. SDK 访问令牌（Access Token / API Token）直连：
@@ -16,7 +17,6 @@
    对于使用 MODELSCOPE_COOKIE 的账号，自动捕获服务端 Set-Cookie 并通过 Upstash Redis
    及本地 state 进行每日滚动续期（解决 source 1 天过期问题）。
 3. 会话触碰：访问 personal overview 与模型/数据集接口，触发「日活」埋点。
-4. 渐进式退避复查（8s→15s→25s），双判据保障。
 
 环境变量：
   MODELSCOPE_TOKEN / MODELSCOPE_TOKEN_1, _2...：SDK 访问令牌（国内站，推荐）
@@ -30,14 +30,12 @@ from __future__ import annotations
 import os
 import sys
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from common import Http, env, env_seq, load_kv_state, main_guard, mask_str, save_kv_state
+from common import BJT, Http, env, env_seq, load_kv_state, main_guard, mask_str, save_kv_state
 
 PREFIX = "MODELSCOPE_"
-
-# daily_active 奖励未到账时的渐进式复查间隔（秒）：逐次递增，控制多账号总等待时间
-RETRY_WAITS = [8, 15, 25]
 
 
 DEFAULT_UA = (
@@ -159,47 +157,30 @@ def _touch_user(
     return user
 
 
-def _get_rules(
+def _get_today_daily_active(
     h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None
-) -> Dict[str, Any]:
-    """获取 earn 规则，返回 daily_active 规则字典。"""
+) -> Optional[Dict[str, Any]]:
+    """查询每日签到（daily_active）奖励交易记录。返回今日记录 dict 或 None。
+
+    直查交易记录接口，`rule_key == "daily_active"` 且 `gmt_created == 今日 BJT 日期`
+    即视为今日已领取，不再依赖 today_used 或余额增长推算。
+    """
+    today = datetime.now(BJT).strftime("%Y-%m-%d")
     resp = h.request(
         "GET",
-        f"https://{host}/openapi/v1/magicubes/earn/rules",
+        f"https://{host}/openapi/v1/magicubes/transactions?type=EARN&page=1&page_size=10",
         headers=_headers(host, token=token, cookie=cookie),
         timeout=20,
     )
     if resp.code != 200:
-        raise RuntimeError(f"earn/rules 请求失败：HTTP {resp.code}")
-    data = resp.json()
+        raise RuntimeError(f"transactions 请求失败：HTTP {resp.code}")
+    data = resp.json({})
     if not data or not data.get("success"):
-        raise RuntimeError(f"earn/rules 返回异常：{resp.text[:200]}")
-    for r in data.get("data", []):
-        if r.get("rule_key") == "daily_active":
-            return r
-    raise RuntimeError("未找到 daily_active 规则")
-
-
-def _get_balance(
-    h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None
-) -> Optional[int]:
-    """查询魔粒余额（int），失败返回 None。"""
-    resp = h.request(
-        "GET",
-        f"https://{host}/openapi/v1/magicubes/balance",
-        headers=_headers(host, token=token, cookie=cookie),
-        timeout=20,
-    )
-    if resp.code != 200:
-        return None
-    bal_data = resp.json()
-    if not bal_data or not bal_data.get("success"):
-        return None
-    raw = bal_data.get("data", {}).get("available_balance")
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return None
+        raise RuntimeError(f"transactions 返回异常：{resp.text[:200]}")
+    for rec in (data.get("data") or {}).get("records") or []:
+        if rec.get("rule_key") == "daily_active" and rec.get("gmt_created") == today:
+            return rec
+    return None
 
 
 def _resolve_cookie(env_cookie: str, idx: int, site: str) -> Tuple[str, str]:
@@ -402,55 +383,17 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str]:
     parts.append(f"[{auth_tag}]")
     user_tag = " ".join(parts) or "未知用户"
 
-    # 2. 记录初始余额（辅助判据：余额增长 = 到账）
-    initial_balance = _get_balance(h, host, token=token, cookie=cookie)
-
-    # 3. 首次查询 earn/rules
+    # 2. 一次查询交易记录，直接判定今日签到是否到账
     try:
-        daily_rule = _get_rules(h, host, token=token, cookie=cookie)
+        record = _get_today_daily_active(h, host, token=token, cookie=cookie)
     except Exception as e:
         return False, f"{user_tag} 查询失败：{e}"
 
-    today_used = daily_rule.get("today_used", 0)
-    amount = daily_rule.get("amount", 200)
+    credited = record is not None
+    amount = (record or {}).get("total_amount", 200)
+    expire_at = (record or {}).get("expire_at") or ""
 
-    # 4. 渐进式退避复查：未到账时 touch 会话 + 递增等待 + 复查
-    current_balance = initial_balance
-    current_today_used = today_used
-
-    def is_credited(used_val: int, bal_val: Optional[int]) -> bool:
-        if bool(used_val):
-            return True
-        return (
-            bal_val is not None
-            and initial_balance is not None
-            and bal_val > initial_balance
-        )
-
-    for attempt, wait in enumerate(RETRY_WAITS, 1):
-        if is_credited(current_today_used, current_balance):
-            break
-        print(
-            f"  {user_tag} 今日奖励尚未到账（today_used={current_today_used}），"
-            f"{wait}s 后第 {attempt}/{len(RETRY_WAITS)+1} 次复查（全链路 touch 会话激活中）..."
-        )
-        time.sleep(wait)
-        try:
-            _touch_user(h, host, token=token, cookie=cookie)  # 复查前再次触碰，触发活跃事件
-            daily_rule = _get_rules(h, host, token=token, cookie=cookie)
-            current_today_used = daily_rule.get("today_used", 0)
-            current_balance = _get_balance(h, host, token=token, cookie=cookie)
-        except Exception as e:
-            return False, f"{user_tag} 复查失败：{e}"
-
-    final_balance = (
-        current_balance
-        if current_balance is not None
-        else _get_balance(h, host, token=token, cookie=cookie)
-    )
-    credited = is_credited(current_today_used, final_balance)
-
-    # 5. 持久化并滚动更新 Cookie（仅针对纯 Cookie 账号，Token 账号本身长期有效无需滚动）
+    # 3. 持久化并滚动更新 Cookie（仅针对纯 Cookie 账号，Token 账号本身长期有效无需滚动）
     if cookie and not token:
         updated_cookie = _merge_cookies(cookie, h.jar)
         if updated_cookie:
@@ -467,25 +410,21 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str]:
             )
 
     if credited:
-        status = f"签到成功，今日已领取 {amount} 魔粒"
+        exp_desc = f"，{expire_at} 过期" if expire_at else ""
+        status = f"签到成功，今日已领取 {amount} 魔粒{exp_desc}"
     elif token and not cookie:
         # 2026-08-25 实测：Bearer Token 能通过 OpenAPI 鉴权，但 OpenAPI 调用不计入
         # 「日活」，daily_active 奖励永不发放——红卡必须直指根因，不再猜「重置时间」
         cookie_var = f"{PREFIX}COOKIE_{idx}" if site == "cn" else f"{PREFIX}AI_COOKIE_{idx}"
         status = (
-            f"今日奖励未到账（{len(RETRY_WAITS)+1} 次复查后仍无增长）："
+            f"交易记录无今日 daily_active："
             f"Bearer Token 不触发 daily_active 日活奖励，"
             f"请配置浏览器 Cookie 环境变量 {cookie_var}（{site} 站）"
         )
     else:
-        status = f"今日奖励未到账（{len(RETRY_WAITS)+1} 次复查后仍无增长，Cookie 可能已失效需手动刷新）"
+        status = "交易记录无今日 daily_active（Cookie 可能已失效需手动刷新）"
 
-    balance_desc = (
-        "当前余额：？"
-        if final_balance is None
-        else f"当前余额：{final_balance} 魔粒"
-    )
-    return credited, f"{user_tag} {status}，{balance_desc}"
+    return credited, f"{user_tag} {status}"
 
 
 def _run_site(
