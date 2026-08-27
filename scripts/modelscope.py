@@ -94,8 +94,9 @@ def _touch_user(
     """全链路触碰会话并验证登录态。
 
     1. 若有 Cookie，访问个人中心 Web 页面与首页，触发 Web 端活跃埋点中间件。
-    2. 访问 OpenAPI 模型与数据集轻量端点，激活用户活动。
-    3. GET /openapi/v1/users/me 验证登录态并提取用户信息。
+    2. 访问 magicubes 任务规则与余额端点，激活每日签到奖励系统。
+    3. 访问 OpenAPI 模型与数据集轻量端点，激活用户活动。
+    4. GET /openapi/v1/users/me 验证登录态并提取用户信息。
     """
     if cookie:
         web_headers = {
@@ -108,11 +109,25 @@ def _touch_user(
             h.request("GET", f"https://{host}/my/overview", headers=web_headers, timeout=15)
             h.request("GET", f"https://{host}/", headers=web_headers, timeout=15)
             h.request("GET", f"https://{host}/home", headers=web_headers, timeout=15)
+            h.request("GET", f"https://{host}/my/tasks", headers=web_headers, timeout=15)
         except Exception:
             pass
 
     hdrs = _headers(host, token=token, cookie=cookie)
     try:
+        # 激活魔粒日常任务与余额系统
+        h.request(
+            "GET",
+            f"https://{host}/openapi/v1/magicubes/earn/rules",
+            headers=hdrs,
+            timeout=15,
+        )
+        h.request(
+            "GET",
+            f"https://{host}/openapi/v1/magicubes/balance",
+            headers=hdrs,
+            timeout=15,
+        )
         h.request(
             "GET",
             f"https://{host}/openapi/v1/models?page_number=1&page_size=5",
@@ -161,26 +176,63 @@ def _touch_user(
 def _get_today_daily_active(
     h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
-    """查询每日签到（daily_active）奖励交易记录。返回今日记录 dict 或 None。
+    """查询每日签到（daily_active）奖励交易记录或任务完成状态。返回今日记录 dict 或 None。
 
-    直查交易记录接口，`rule_key == "daily_active"` 且 `gmt_created == 今日 BJT 日期`
-    即视为今日已领取，不再依赖 today_used 或余额增长推算。
+    双判据保障：
+    1. 直查交易记录接口，`rule_key == "daily_active"` 且 `gmt_created` 日期命中今日 BJT。
+    2. 若交易记录未落库，查询 earn/rules 的 `daily_active` 规则中的 `today_used > 0`。
     """
     today = datetime.now(BJT).strftime("%Y-%m-%d")
-    resp = h.request(
-        "GET",
-        f"https://{host}/openapi/v1/magicubes/transactions?type=EARN&page=1&page_size=10",
-        headers=_headers(host, token=token, cookie=cookie),
-        timeout=20,
-    )
-    if resp.code != 200:
-        raise RuntimeError(f"transactions 请求失败：HTTP {resp.code}")
-    data = resp.json({})
-    if not data or not data.get("success"):
-        raise RuntimeError(f"transactions 返回异常：{resp.text[:200]}")
-    for rec in (data.get("data") or {}).get("records") or []:
-        if rec.get("rule_key") == "daily_active" and rec.get("gmt_created") == today:
-            return rec
+    hdrs = _headers(host, token=token, cookie=cookie)
+
+    # 判据 1：交易记录直查
+    try:
+        resp = h.request(
+            "GET",
+            f"https://{host}/openapi/v1/magicubes/transactions?type=EARN&page=1&page_size=10",
+            headers=hdrs,
+            timeout=20,
+        )
+        if resp.code == 200:
+            data = resp.json({})
+            if data and data.get("success"):
+                for rec in (data.get("data") or {}).get("records") or []:
+                    rule_match = rec.get("rule_key") == "daily_active"
+                    created_str = str(
+                        rec.get("gmt_created")
+                        or rec.get("gmt_create")
+                        or rec.get("created_at")
+                        or ""
+                    )
+                    if rule_match and (created_str.startswith(today) or today in created_str):
+                        return rec
+    except Exception:
+        pass
+
+    # 判据 2：earn/rules 状态查询（若交易记录存在异步落库延迟，earn/rules 的 today_used 可作即时状态确认）
+    try:
+        resp_rules = h.request(
+            "GET",
+            f"https://{host}/openapi/v1/magicubes/earn/rules",
+            headers=hdrs,
+            timeout=20,
+        )
+        if resp_rules.code == 200:
+            data_rules = resp_rules.json({})
+            if data_rules and data_rules.get("success"):
+                for r in data_rules.get("data") or []:
+                    if r.get("rule_key") == "daily_active":
+                        today_used = r.get("today_used", 0)
+                        if bool(today_used):
+                            return {
+                                "rule_key": "daily_active",
+                                "total_amount": r.get("amount", 200),
+                                "expire_at": "",
+                                "source": "earn_rules",
+                            }
+    except Exception:
+        pass
+
     return None
 
 
