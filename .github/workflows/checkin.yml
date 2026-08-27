@@ -153,6 +153,12 @@ jobs:
       AGENTROUTER_API_URL: https://ps.air-outer.com
       AGENTROUTER_STATE_FILE: .agentrouter_state.json
       AGENTROUTER_PROXY: socks5://127.0.0.1:1080
+      U1S1_TOKEN: ${{ secrets.U1S1_TOKEN }}
+      U1S1_TOKEN_1: ${{ secrets.U1S1_TOKEN_1 || secrets.U1S1_TOKEN }}
+      U1S1_TOKEN_2: ${{ secrets.U1S1_TOKEN_2 }}
+      U1S1_COOKIE: ${{ secrets.U1S1_COOKIE }}
+      U1S1_COOKIE_1: ${{ secrets.U1S1_COOKIE_1 || secrets.U1S1_COOKIE }}
+      U1S1_COOKIE_2: ${{ secrets.U1S1_COOKIE_2 }}
       WORKBUDDY_COOKIE: ${{ secrets.WORKBUDDY_COOKIE }}
       WORKBUDDY_COOKIE_1: ${{ secrets.WORKBUDDY_COOKIE_1 || secrets.WORKBUDDY_COOKIE }}
       WORKBUDDY_COOKIE_2: ${{ secrets.WORKBUDDY_COOKIE_2 }}

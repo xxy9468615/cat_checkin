@@ -128,6 +128,16 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
+    # --- u1s1.io（AI Token 平台，每日打卡领 200 万 Token，连续第 3 天额外 +100 万 Token）---
+    "u1s1": {
+        "id": "u1s1",
+        "script": "u1s1.py",
+        "name": "u1s1.io 签到",
+        "result": "u1s1.json",
+        "timeout": 300,
+        "account": "",
+        "tags": ["00:50", "matrix", "daily"],
+    },
 
     # --- 多账号站点（单 run 阶段 A 内联并发；旧 QStash 回程接力已退役） ---
     "workbuddy-account-1": {
