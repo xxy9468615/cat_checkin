@@ -26,6 +26,7 @@ docs
 .agentrouter_state.json
 .cloudstudio_state*.json
 .modelscope_state*.json
+.modelscope_*_state*.json
 
 # WSL2 metadata
 *:Zone.Identifier

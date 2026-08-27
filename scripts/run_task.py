@@ -63,7 +63,19 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        timeout = int(os.getenv("TASK_TIMEOUT") or "300")
+        if os.getenv("TASK_TIMEOUT"):
+            timeout = int(os.getenv("TASK_TIMEOUT", "300"))
+        else:
+            try:
+                from task_registry import TASKS
+                script_key = target_path.stem
+                reg_task = TASKS.get(script_key) or next(
+                    (t for t in TASKS.values() if t.get("script") == target_path.name),
+                    None,
+                )
+                timeout = int(reg_task.get("timeout", 300)) if reg_task else 300
+            except Exception:
+                timeout = 300
     except ValueError:
         timeout = 300
         print("⚠️ TASK_TIMEOUT 格式不正确，已回退默认 300 秒")

@@ -4,10 +4,12 @@
 # new Env("ModelScope 国际站 签到")
 """ModelScope 魔搭社区每日签到（国内站 + 国际站分开处理）。
 
-机制：登录奖励（每日 200 魔粒）在用户产生活跃会话后被动发放。
-接口路径已变更：magic_cube → magicubes（2026-08 前后迁移）。
-判断方式：直查交易记录接口，`rule_key == "daily_active"` 且 `gmt_created == 今日`
-即视为已领取，无需余额增长推算或退避轮询。
+机制：
+1. 登录奖励（每日 200 魔粒）在用户产生活跃会话后被动发放。
+2. 每日点击喜欢 20 次任务（单次 +2 魔粒，每日上限 20 次共 40 魔粒）。
+3. 接口路径已变更：magic_cube → magicubes（2026-08 前后迁移）。
+4. 判断方式：直查交易记录接口，`rule_key == "daily_active"` 且 `gmt_created == 今日`
+   即视为已领取，无需余额增长推算或退避轮询。
 
 多认证与长效支持（2026-08 升级）：
 1. SDK 访问令牌（Access Token / API Token）直连：
@@ -16,7 +18,7 @@
 2. Cookie 滑动续期与持久化：
    对于使用 MODELSCOPE_COOKIE 的账号，自动捕获服务端 Set-Cookie 并通过 Upstash Redis
    及本地 state 进行每日滚动续期（解决 source 1 天过期问题）。
-3. 会话触碰：访问 personal overview 与模型/数据集接口，触发「日活」埋点。
+3. 会话触碰与任务执行：访问 personal overview 与模型/数据集接口触发「日活」，并自动执行 MCP Server 点赞任务。
 
 环境变量：
   MODELSCOPE_TOKEN / MODELSCOPE_TOKEN_1, _2...：SDK 访问令牌（国内站，推荐）
@@ -29,12 +31,24 @@ from __future__ import annotations
 
 import hashlib
 import os
+import random
 import sys
 import time
+import urllib.parse
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from common import BJT, Http, env, env_seq, load_kv_state, main_guard, mask_str, save_kv_state
+from common import (
+    BJT,
+    Http,
+    env,
+    env_seq,
+    find,
+    load_kv_state,
+    main_guard,
+    mask_str,
+    save_kv_state,
+)
 
 PREFIX = "MODELSCOPE_"
 
@@ -85,6 +99,9 @@ def _headers(
         headers["X-Modelfun-Token"] = token
     if cookie:
         headers["Cookie"] = cookie
+        raw_csrf = find(r"csrf_token=([^;]+)", cookie, "")
+        if raw_csrf:
+            headers["X-CSRF-TOKEN"] = urllib.parse.unquote(raw_csrf)
     return headers
 
 
@@ -243,27 +260,205 @@ def _get_today_daily_active(
     except Exception:
         pass
 
-    # 诊断输出：如果未匹配到今日签到，打印近期的交易记录和 rules 状态以便排查
-    if cookie and not token:
-        tx_summary = []
-        try:
-            if resp and resp.code == 200:
-                for rec in ((resp.json({}).get("data") or {}).get("records") or [])[:3]:
-                    tx_summary.append(f"{rec.get('rule_key')}:{rec.get('gmt_created')}")
-        except Exception:
-            pass
-        rule_summary = []
-        try:
-            if resp_rules and resp_rules.code == 200:
-                for r in (resp_rules.json({}).get("data") or []):
-                    if r.get("rule_key") in ("daily_active", "daily_login"):
-                        rule_summary.append(f"{r.get('rule_key')}:used={r.get('today_used')}")
-        except Exception:
-            pass
-        if tx_summary or rule_summary:
-            print(f"    ℹ️ [诊断] transactions: {tx_summary or '空'}, rules: {rule_summary or '空'}")
-
     return None
+
+
+DEFAULT_MCP_TARGETS = [
+    {"path": "@modelcontextprotocol", "name": "fetch"},
+    {"path": "itshen", "name": "xsct-bench"},
+    {"path": "@amap", "name": "amap-maps"},
+    {"path": "slcatwujian", "name": "bing-cn-mcp-server"},
+    {"path": "Alipay", "name": "alipay-subscription"},
+    {"path": "TianYanCha", "name": "tyc-mcp"},
+    {"path": "@supabase-community", "name": "supabase-mcp"},
+    {"path": "yorklu", "name": "AI_Go_Hotel_MCP"},
+    {"path": "zephyr", "name": "douyin-mcp-server"},
+    {"path": "Launini", "name": "ChatPPT-MCP"},
+    {"path": "MChina", "name": "mcd_mcp_server"},
+    {"path": "@Joooook", "name": "12306-mcp"},
+    {"path": "@PsychArch", "name": "Jina-AI-MCP-Tools"},
+    {"path": "@ChromeDevTools", "name": "chrome-devtools-mcp"},
+    {"path": "laiyelijingao", "name": "Agentic_Document_Processing_MCP"},
+    {"path": "antvis", "name": "mcp-server-chart"},
+    {"path": "MemTensor", "name": "MemoryOperatingSystem"},
+    {"path": "@open-dingtalk", "name": "dingtalk-mcp"},
+    {"path": "AgentBay", "name": "wuying-agentbay-mcp-server"},
+    {"path": "@UnionPay", "name": "unionpay-mcp-server"},
+    {"path": "@deckflow", "name": "gezhe-mcp-server"},
+    {"path": "@regenrek", "name": "mcp-deepwiki"},
+    {"path": "modelscope", "name": "ModelScope-Image-Generation-MCP"},
+    {"path": "ZhipuAI", "name": "Zhipu-Web-Search"},
+    {"path": "@variflight-ai", "name": "variflight-mcp"},
+    {"path": "@mobvoi", "name": "mobvoi-mcp"},
+    {"path": "@mem0ai", "name": "OpenMemory"},
+    {"path": "@package", "name": "mcp-server-weread"},
+    {"path": "@cantian-ai", "name": "Bazi-MCP"},
+    {"path": "@baidu-maps", "name": "mcp"},
+]
+
+
+def _get_daily_like_status(
+    h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None
+) -> Tuple[int, int, int]:
+    """查询每日点赞/喜欢任务规则与进度。
+
+    返回 (today_used, max_count, amount_per_like)。
+    """
+    hdrs = _headers(host, token=token, cookie=cookie)
+    try:
+        resp = h.request(
+            "GET",
+            f"https://{host}/openapi/v1/magicubes/earn/rules",
+            headers=hdrs,
+            timeout=15,
+        )
+        if resp.code == 200:
+            data = resp.json({})
+            if data and data.get("success"):
+                for r in data.get("data") or []:
+                    rule_key = str(r.get("rule_key") or "").lower()
+                    name = str(r.get("title") or r.get("name") or "").lower()
+                    if (
+                        rule_key == "interaction_like"
+                        or "like" in rule_key
+                        or "vote" in rule_key
+                        or "star" in rule_key
+                        or "favorite" in rule_key
+                        or "点赞" in name
+                        or "喜欢" in name
+                    ):
+                        max_cnt = int(r.get("daily_cap") or r.get("max_count") or 20)
+                        used = int(r.get("today_used") or r.get("today_count") or 0)
+                        amt = int(r.get("amount") or 2)
+                        return used, max_cnt, amt
+    except Exception:
+        pass
+    return 0, 20, 2
+
+
+def _fetch_mcp_like_targets(
+    h: Http,
+    host: str,
+    token: Optional[str] = None,
+    cookie: Optional[str] = None,
+    needed: int = 20,
+) -> List[Dict[str, str]]:
+    """发现可点赞的 MCP Server 目标列表。
+
+    返回 [{"path": "Alipay", "name": "alipay-subscription"}, ...]
+    """
+    targets: List[Dict[str, str]] = []
+    seen = set()
+    hdrs = _headers(host, token=token, cookie=cookie)
+    hdrs["Content-Type"] = "application/json"
+
+    for page in range(1, 3):
+        if len(targets) >= needed:
+            break
+        try:
+            resp = h.request(
+                "PUT",
+                f"https://{host}/api/v1/dolphin/mcpServers",
+                headers=hdrs,
+                json_data={
+                    "PageSize": 30,
+                    "PageNumber": page,
+                    "Query": "",
+                    "Criterion": [],
+                },
+                timeout=10,
+            )
+            if resp.code == 200:
+                data = resp.json({})
+                servers = (
+                    ((data.get("Data") or {}).get("McpServer") or {}).get("McpServers")
+                    or []
+                )
+                if not servers:
+                    break
+                for s in servers:
+                    path = s.get("Path") or s.get("FromSitePath") or s.get("Namespace")
+                    name = s.get("Name")
+                    if path and name:
+                        key = f"{path}/{name}"
+                        if key not in seen:
+                            seen.add(key)
+                            targets.append(
+                                {
+                                    "path": path,
+                                    "name": name,
+                                    "already_star": bool(s.get("AlreadyStar", False)),
+                                }
+                            )
+        except Exception:
+            pass
+
+    # 若动态获取数量不足，补充预设的优质热门 MCP Server
+    for def_t in DEFAULT_MCP_TARGETS:
+        key = f"{def_t['path']}/{def_t['name']}"
+        if key not in seen:
+            seen.add(key)
+            targets.append(
+                {
+                    "path": def_t["path"],
+                    "name": def_t["name"],
+                    "already_star": False,
+                }
+            )
+
+    targets.sort(key=lambda x: x.get("already_star", False))
+    return [{"path": t["path"], "name": t["name"]} for t in targets]
+
+
+def _do_daily_likes(
+    h: Http,
+    host: str,
+    token: Optional[str] = None,
+    cookie: Optional[str] = None,
+    count: int = 20,
+    amount_per_like: int = 2,
+) -> Tuple[int, int]:
+    """执行每日点击喜欢 20 次任务。
+
+    返回 (成功次数, 获得魔粒数)。
+    """
+    if count <= 0:
+        return 0, 0
+
+    targets = _fetch_mcp_like_targets(
+        h, host, token=token, cookie=cookie, needed=count + 10
+    )
+    if not targets:
+        return 0, 0
+
+    success_cnt = 0
+    hdrs = _headers(host, token=token, cookie=cookie)
+    hdrs["Content-Type"] = "application/json"
+
+    for t in targets:
+        if success_cnt >= count:
+            break
+        path = t["path"]
+        name = t["name"]
+        req_hdrs = dict(hdrs)
+        req_hdrs["Referer"] = f"https://{host}/mcp/servers/{path}/{name}"
+        try:
+            resp = h.request(
+                "PUT",
+                f"https://{host}/api/v1/mcpServers/{path}/{name}/stars",
+                headers=req_hdrs,
+                json_data={},
+                timeout=15,
+            )
+            if resp.code == 200:
+                res_data = resp.json({})
+                if res_data.get("Success") or res_data.get("Code") == 200:
+                    success_cnt += 1
+        except Exception:
+            pass
+        time.sleep(random.uniform(0.2, 0.4))
+
+    return success_cnt, success_cnt * amount_per_like
 
 
 def _resolve_cookie(env_cookie: str, idx: int, site: str) -> Tuple[str, str, Optional[str]]:
@@ -571,9 +766,30 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str]:
                 },
             )
 
+    # 每日点击喜欢 20 次任务（单次 +2 魔粒，每日上限 20 次共 40 魔粒）
+    like_msg = ""
+    if user and active_cookie:
+        used_likes, max_likes, amt_per_like = _get_daily_like_status(
+            h, host, token=token, cookie=active_cookie
+        )
+        remaining_likes = max(0, max_likes - used_likes)
+        if remaining_likes > 0:
+            done_likes, earned_magicubes = _do_daily_likes(
+                h,
+                host,
+                token=token,
+                cookie=active_cookie,
+                count=remaining_likes,
+                amount_per_like=amt_per_like,
+            )
+            total_done = used_likes + done_likes
+            like_msg = f"，完成点赞 {total_done}/{max_likes} 次 (+{total_done * amt_per_like} 魔粒)"
+        else:
+            like_msg = f"，点赞已达上限 {used_likes}/{max_likes} 次"
+
     if credited:
         exp_desc = f"，{expire_at} 过期" if expire_at else ""
-        status = f"签到成功，今日已领取 {amount} 魔粒{exp_desc}"
+        status = f"签到成功，今日已领取 {amount} 魔粒{like_msg}{exp_desc}"
     elif token and not cookie:
         # 2026-08-25 实测：Bearer Token 能通过 OpenAPI 鉴权，但 OpenAPI 调用不计入
         # 「日活」，daily_active 奖励永不发放——红卡必须直指根因，不再猜「重置时间」
@@ -584,7 +800,7 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str]:
             f"请配置浏览器 Cookie 环境变量 {cookie_var}（{site} 站）"
         )
     else:
-        status = "交易记录无今日 daily_active（Cookie 可能已失效需手动刷新）"
+        status = f"交易记录无今日 daily_active（Cookie 可能已失效需手动刷新）{like_msg}"
 
     return credited, f"{user_tag} {status}"
 
