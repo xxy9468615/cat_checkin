@@ -27,6 +27,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 import time
@@ -183,22 +184,39 @@ def _get_today_daily_active(
     return None
 
 
-def _resolve_cookie(env_cookie: str, idx: int, site: str) -> Tuple[str, str]:
-    """解析某账号的最终 Cookie：滚动 state（远端权威、每日刷新 source）优先于环境变量。
+def _resolve_cookie(env_cookie: str, idx: int, site: str) -> Tuple[str, str, Optional[str]]:
+    """解析某账号的 Cookie 配置。
 
-    返回 (cookie, cookie来源标签)；state 与 env 皆空时返回 ("", "")。
-    优先级依据：state 里的 Cookie 是上一次 run 合并 Set-Cookie 后的最新滚动版本，
-    比人工粘贴的 env Cookie 更新鲜。
+    返回 (active_cookie, source_tag, fallback_env_cookie)。
+
+    优先级与更新感知策略：
+    1. 计算当前环境变量中的 env_cookie 哈希（env_hash）。
+    2. 若 state 中记录的 env_hash 与当前 env_cookie 不一致，
+       说明用户在 GitHub Secrets / 环境变量中更新了新凭证 → 立即优先使用 env_cookie。
+    3. 若哈希一致且存在 state_cookie，优先使用带滚动 Set-Cookie 的 state_cookie，
+       并将 env_cookie 留作失败回退（fallback_env_cookie）。
+    4. 若无 state 则直接使用 env_cookie。
     """
     state_file = f".modelscope_{site}_state_{idx}.json"
     redis_key = f"cat_checkin:state:modelscope_{site}_{idx}"
-    saved_state = load_kv_state(redis_key, state_file)
-    state_cookie = str((saved_state or {}).get("cookie", "") or "").strip()
+    saved_state = load_kv_state(redis_key, state_file) or {}
+    state_cookie = str(saved_state.get("cookie", "") or "").strip()
+    saved_env_hash = str(saved_state.get("env_hash", "") or "").strip()
+
+    current_env_hash = (
+        hashlib.md5(env_cookie.encode("utf-8")).hexdigest() if env_cookie else ""
+    )
+
+    # 用户手动更新了 Secrets 中的 Cookie（哈希变更），优先使用新配置
+    if env_cookie and saved_env_hash and current_env_hash != saved_env_hash:
+        return env_cookie, "env_updated", None
+
     if state_cookie:
-        return state_cookie, "state"
+        fallback = env_cookie if (env_cookie and env_cookie != state_cookie) else None
+        return state_cookie, "state", fallback
     if env_cookie:
-        return env_cookie, "env"
-    return "", ""
+        return env_cookie, "env", None
+    return "", "", None
 
 
 def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
@@ -252,8 +270,8 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
                     if env_cookie_val:
                         break
 
-        # Cookie 解析：滚动 state（远端权威）优先于 env（详见 _resolve_cookie）
-        cookie_val, _src = _resolve_cookie(env_cookie_val, idx, site)
+        # Cookie 解析：支持 state 滚动、环境变量更新感知与回退
+        cookie_val, _src, fallback_cookie = _resolve_cookie(env_cookie_val, idx, site)
         token_val = token_val.strip()
         if token_val or cookie_val:
             ident = cookie_val or token_val
@@ -265,6 +283,8 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
                         {
                             "token": None,
                             "cookie": cookie_val,
+                            "fallback_cookie": fallback_cookie,
+                            "env_cookie": env_cookie_val,
                             "index": idx,
                             "site": site,
                         }
@@ -274,6 +294,8 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
                         {
                             "token": token_val,
                             "cookie": None,
+                            "fallback_cookie": None,
+                            "env_cookie": None,
                             "index": idx,
                             "site": site,
                         }
@@ -304,7 +326,7 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
                     if env_cookie_val:
                         break
 
-        cookie_val, _src = _resolve_cookie(env_cookie_val, 1, site)
+        cookie_val, _src, fallback_cookie = _resolve_cookie(env_cookie_val, 1, site)
         token_val = token_val.strip()
 
         # 针对单变量 && 或换行切分多账号（Cookie 优先：Token 不触发日活奖励）
@@ -319,6 +341,8 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
                     {
                         "token": None,
                         "cookie": c_item,
+                        "fallback_cookie": None,
+                        "env_cookie": c_item,
                         "index": sub_idx,
                         "site": site,
                     }
@@ -334,6 +358,8 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
                     {
                         "token": t_item,
                         "cookie": None,
+                        "fallback_cookie": None,
+                        "env_cookie": None,
                         "index": sub_idx,
                         "site": site,
                     }
@@ -344,6 +370,8 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
                 {
                     "token": None if cookie_val else token_val,
                     "cookie": cookie_val or None,
+                    "fallback_cookie": fallback_cookie,
+                    "env_cookie": env_cookie_val or None,
                     "index": 1,
                     "site": site,
                 }
@@ -352,10 +380,44 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
     return accounts
 
 
+def _touch_and_check(
+    h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None
+) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Dict[str, Any]], str]:
+    """触碰会话、验证登录态并查询今日 daily_active 交易记录。
+
+    返回 (credited, user_info, transaction_record, error_msg)。
+    """
+    try:
+        user = _touch_user(h, host, token=token, cookie=cookie)
+    except Exception as e:
+        return False, None, None, f"登录态验证失败：{e}"
+
+    try:
+        record = _get_today_daily_active(h, host, token=token, cookie=cookie)
+    except Exception as e:
+        return False, user, None, f"交易记录查询失败：{e}"
+
+    # 若尚未查到今日到账，给予服务端异步发奖队列短暂缓冲（3s / 6s）后复查
+    if record is None and cookie and not token:
+        for wait in (3, 6):
+            time.sleep(wait)
+            try:
+                record = _get_today_daily_active(h, host, token=token, cookie=cookie)
+                if record is not None:
+                    break
+            except Exception:
+                pass
+
+    credited = record is not None
+    return credited, user, record, ""
+
+
 def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str]:
     """执行单个账号的签到逻辑。返回 (成功, 描述)。"""
     token = account.get("token")
     cookie = account.get("cookie")
+    fallback_cookie = account.get("fallback_cookie")
+    env_cookie = account.get("env_cookie") or ""
     idx = account.get("index", 1)
     site = account.get("site", "cn")
 
@@ -366,11 +428,25 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str]:
     )
     h = Http(proxy=proxy)
 
-    # 1. 会话触碰 + 登录态验证 + 账号脱敏（该请求同时是「日活」触发的活跃信号）
-    try:
-        user = _touch_user(h, host, token=token, cookie=cookie)
-    except Exception as e:
-        return False, f"登录态验证失败：{e}"
+    active_cookie = cookie
+    credited, user, record, err = _touch_and_check(
+        h, host, token=token, cookie=active_cookie
+    )
+
+    # 缓存 Cookie 失效或未到账时，自动回退尝试环境变量/Secrets 中的最新 Cookie
+    if not credited and fallback_cookie and fallback_cookie != active_cookie:
+        print(f"  [{idx}] 🔄 缓存 Cookie 登录态失效或未到账，尝试回退使用环境变量最新配置的 Cookie...")
+        h_fallback = Http(proxy=proxy)
+        fb_credited, fb_user, fb_record, fb_err = _touch_and_check(
+            h_fallback, host, token=token, cookie=fallback_cookie
+        )
+        if fb_credited or (fb_user and not user):
+            active_cookie = fallback_cookie
+            credited, user, record, err = fb_credited, fb_user, fb_record, fb_err
+            h = h_fallback
+
+    if not user:
+        return False, err or "登录态验证失败"
 
     name = user.get("nickname") or user.get("username") or ""
     uid = user.get("user_id") or user.get("id")
@@ -383,27 +459,26 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str]:
     parts.append(f"[{auth_tag}]")
     user_tag = " ".join(parts) or "未知用户"
 
-    # 2. 一次查询交易记录，直接判定今日签到是否到账
-    try:
-        record = _get_today_daily_active(h, host, token=token, cookie=cookie)
-    except Exception as e:
-        return False, f"{user_tag} 查询失败：{e}"
-
-    credited = record is not None
     amount = (record or {}).get("total_amount", 200)
     expire_at = (record or {}).get("expire_at") or ""
 
-    # 3. 持久化并滚动更新 Cookie（仅针对纯 Cookie 账号，Token 账号本身长期有效无需滚动）
-    if cookie and not token:
-        updated_cookie = _merge_cookies(cookie, h.jar)
+    # 签到成功且使用 Cookie 时，持久化并滚动更新 Cookie 到 Redis state
+    if credited and active_cookie and not token:
+        updated_cookie = _merge_cookies(active_cookie, h.jar)
         if updated_cookie:
             state_file = f".modelscope_{site}_state_{idx}.json"
             redis_key = f"cat_checkin:state:modelscope_{site}_{idx}"
+            env_hash = (
+                hashlib.md5(env_cookie.encode("utf-8")).hexdigest()
+                if env_cookie
+                else ""
+            )
             save_kv_state(
                 redis_key,
                 state_file,
                 {
                     "cookie": updated_cookie,
+                    "env_hash": env_hash,
                     "updated_at": int(time.time()),
                     "user_tag": user_tag,
                 },
