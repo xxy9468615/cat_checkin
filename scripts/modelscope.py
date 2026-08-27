@@ -186,6 +186,7 @@ def _get_today_daily_active(
     hdrs = _headers(host, token=token, cookie=cookie)
 
     # 判据 1：交易记录直查
+    resp = None
     try:
         resp = h.request(
             "GET",
@@ -210,6 +211,7 @@ def _get_today_daily_active(
         pass
 
     # 判据 2：earn/rules 状态查询（若交易记录存在异步落库延迟，earn/rules 的 today_used 可作即时状态确认）
+    resp_rules = None
     try:
         resp_rules = h.request(
             "GET",
@@ -233,6 +235,26 @@ def _get_today_daily_active(
     except Exception:
         pass
 
+    # 诊断输出：如果未匹配到今日签到，打印近期的交易记录和 rules 状态以便排查
+    if cookie and not token:
+        tx_summary = []
+        try:
+            if resp and resp.code == 200:
+                for rec in ((resp.json({}).get("data") or {}).get("records") or [])[:3]:
+                    tx_summary.append(f"{rec.get('rule_key')}:{rec.get('gmt_created')}")
+        except Exception:
+            pass
+        rule_summary = []
+        try:
+            if resp_rules and resp_rules.code == 200:
+                for r in (resp_rules.json({}).get("data") or []):
+                    if r.get("rule_key") in ("daily_active", "daily_login"):
+                        rule_summary.append(f"{r.get('rule_key')}:used={r.get('today_used')}")
+        except Exception:
+            pass
+        if tx_summary or rule_summary:
+            print(f"    ℹ️ [诊断] transactions: {tx_summary or '空'}, rules: {rule_summary or '空'}")
+
     return None
 
 
@@ -245,9 +267,10 @@ def _resolve_cookie(env_cookie: str, idx: int, site: str) -> Tuple[str, str, Opt
     1. 计算当前环境变量中的 env_cookie 哈希（env_hash）。
     2. 若 state 中记录的 env_hash 与当前 env_cookie 不一致，
        说明用户在 GitHub Secrets / 环境变量中更新了新凭证 → 立即优先使用 env_cookie。
-    3. 若哈希一致且存在 state_cookie，优先使用带滚动 Set-Cookie 的 state_cookie，
+    3. 若无 state_env_hash 但 env_cookie 与 state_cookie 不一致，同样优先使用 env_cookie。
+    4. 若哈希一致且存在 state_cookie，优先使用带滚动 Set-Cookie 的 state_cookie，
        并将 env_cookie 留作失败回退（fallback_env_cookie）。
-    4. 若无 state 则直接使用 env_cookie。
+    5. 若无 state 则直接使用 env_cookie。
     """
     state_file = f".modelscope_{site}_state_{idx}.json"
     redis_key = f"cat_checkin:state:modelscope_{site}_{idx}"
@@ -259,9 +282,12 @@ def _resolve_cookie(env_cookie: str, idx: int, site: str) -> Tuple[str, str, Opt
         hashlib.md5(env_cookie.encode("utf-8")).hexdigest() if env_cookie else ""
     )
 
-    # 用户手动更新了 Secrets 中的 Cookie（哈希变更），优先使用新配置
-    if env_cookie and saved_env_hash and current_env_hash != saved_env_hash:
-        return env_cookie, "env_updated", None
+    # 用户手动更新了 Secrets 中的 Cookie（哈希变更或旧 state 无 hash 但凭证不同），优先使用新配置
+    if env_cookie:
+        if (saved_env_hash and current_env_hash != saved_env_hash) or (
+            not saved_env_hash and state_cookie and env_cookie != state_cookie
+        ):
+            return env_cookie, "env_updated", None
 
     if state_cookie:
         fallback = env_cookie if (env_cookie and env_cookie != state_cookie) else None
