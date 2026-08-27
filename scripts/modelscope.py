@@ -109,6 +109,8 @@ def _touch_user(
             h.request("GET", f"https://{host}/my/overview", headers=web_headers, timeout=15)
             h.request("GET", f"https://{host}/", headers=web_headers, timeout=15)
             h.request("GET", f"https://{host}/home", headers=web_headers, timeout=15)
+            h.request("GET", f"https://{host}/models", headers=web_headers, timeout=15)
+            h.request("GET", f"https://{host}/datasets", headers=web_headers, timeout=15)
             h.request("GET", f"https://{host}/my/tasks", headers=web_headers, timeout=15)
         except Exception:
             pass
@@ -130,19 +132,25 @@ def _touch_user(
         )
         h.request(
             "GET",
-            f"https://{host}/openapi/v1/models?page_number=1&page_size=5",
+            f"https://{host}/openapi/v1/models?page_number=1&page_size=10",
             headers=hdrs,
             timeout=15,
         )
         h.request(
             "GET",
-            f"https://{host}/openapi/v1/datasets?page_number=1&page_size=5",
+            f"https://{host}/openapi/v1/datasets?page_number=1&page_size=10",
             headers=hdrs,
             timeout=15,
         )
         h.request(
             "GET",
-            f"https://{host}/openapi/v1/studios?page_number=1&page_size=5",
+            f"https://{host}/openapi/v1/studios?page_number=1&page_size=10",
+            headers=hdrs,
+            timeout=15,
+        )
+        h.request(
+            "GET",
+            f"https://{host}/openapi/v1/community/posts?page_number=1&page_size=10",
             headers=hdrs,
             timeout=15,
         )
@@ -475,11 +483,12 @@ def _touch_and_check(
     except Exception as e:
         return False, user, None, f"交易记录查询失败：{e}"
 
-    # 若尚未查到今日到账，给予服务端异步发奖队列短暂缓冲（3s / 6s）后复查
+    # 若尚未查到今日到账，给予服务端异步发奖队列短暂缓冲（5s / 10s / 15s）并重触碰
     if record is None and cookie and not token:
-        for wait in (3, 6):
+        for wait in (5, 10, 15):
             time.sleep(wait)
             try:
+                _touch_user(h, host, token=token, cookie=cookie)
                 record = _get_today_daily_active(h, host, token=token, cookie=cookie)
                 if record is not None:
                     break
