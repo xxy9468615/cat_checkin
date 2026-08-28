@@ -205,33 +205,53 @@ def _get_today_daily_active(
 
     双判据保障：
     1. 直查交易记录接口，`rule_key == "daily_active"` 且 `gmt_created` 日期命中今日 BJT。
+       分页扫描（page_size=50，最多 3 页，扫到越过今日即止）：点赞任务每点一次各产生
+       一条流水，20 次点赞会把当日 daily_active 记录挤出第 1 页，只查首页会永久误判。
     2. 若交易记录未落库，查询 earn/rules 的 `daily_active` 规则中的 `today_used > 0`。
     """
     today = datetime.now(BJT).strftime("%Y-%m-%d")
     hdrs = _headers(host, token=token, cookie=cookie)
 
-    # 判据 1：交易记录直查
+    def _created(rec: Dict[str, Any]) -> str:
+        return str(
+            rec.get("gmt_created") or rec.get("gmt_create") or rec.get("created_at") or ""
+        )
+
+    # 判据 1：交易记录直查（分页扫描至越过今日）
+    seen_rule_keys = set()
     resp = None
     try:
-        resp = h.request(
-            "GET",
-            f"https://{host}/openapi/v1/magicubes/transactions?type=EARN&page=1&page_size=10",
-            headers=hdrs,
-            timeout=20,
-        )
-        if resp.code == 200:
+        for page in (1, 2, 3):
+            resp = h.request(
+                "GET",
+                f"https://{host}/openapi/v1/magicubes/transactions"
+                f"?type=EARN&page={page}&page_size=50",
+                headers=hdrs,
+                timeout=20,
+            )
+            if resp.code != 200:
+                break
             data = resp.json({})
-            if data and data.get("success"):
-                for rec in (data.get("data") or {}).get("records") or []:
-                    rule_match = rec.get("rule_key") == "daily_active"
-                    created_str = str(
-                        rec.get("gmt_created")
-                        or rec.get("gmt_create")
-                        or rec.get("created_at")
-                        or ""
-                    )
-                    if rule_match and (created_str.startswith(today) or today in created_str):
-                        return rec
+            if not (data and data.get("success")):
+                break
+            records = (data.get("data") or {}).get("records") or []
+            if not records:
+                break
+            past_today = False
+            for rec in records:
+                rule_key = str(rec.get("rule_key") or "")
+                if rule_key:
+                    seen_rule_keys.add(rule_key)
+                created_str = _created(rec)
+                if rule_key == "daily_active" and (
+                    created_str.startswith(today) or today in created_str
+                ):
+                    return rec
+                # 流水按时间倒序：出现早于今日的记录说明今日记录已全部扫过
+                if created_str[:10] and created_str[:10] < today:
+                    past_today = True
+            if past_today:
+                break
     except Exception:
         pass
 
@@ -257,9 +277,17 @@ def _get_today_daily_active(
                                 "expire_at": "",
                                 "source": "earn_rules",
                             }
+                        # 诊断信息：双判据都未命中时能看到 daily_active 规则的真实字段，
+                        # 便于区分「Cookie 失效」与「接口字段变更」
+                        print(
+                            f"  [diag] daily_active 规则未命中 today_used："
+                            f"{ {k: r.get(k) for k in ('today_used', 'today_count', 'amount', 'daily_cap', 'status') if k in r} }"
+                        )
     except Exception:
         pass
 
+    if seen_rule_keys:
+        print(f"  [diag] 交易记录今日可见 rule_key：{sorted(seen_rule_keys)}")
     return None
 
 
