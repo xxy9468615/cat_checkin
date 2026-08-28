@@ -30,23 +30,31 @@ def _prng(seed: str, length: int) -> str:
     return "".join(out)[:length]
 
 
-def solve_challenge(token: str, challenge: dict) -> list[int]:
-    """对每个子挑战暴力搜索 nonce，使 sha256(salt+nonce) 以 target 开头。"""
-    count = int(challenge["c"])
-    salt_len = int(challenge["s"])
-    difficulty = int(challenge["d"])
-    solutions = []
+def solve_challenge(token: str, challenge: dict | list) -> list[int]:
+    """对每个子挑战暴力搜索 nonce，使 sha256(salt+nonce) 以 target 开头。
+
+    兼容两种挑战结构：单个 {c,s,d} 规格 dict，或规格列表（逐项求解、
+    全局序号连续，salt 种子派生方式与前端 wasm 一致）。
+    """
+    specs = [challenge] if isinstance(challenge, dict) else list(challenge)
+    solutions: list[int] = []
+    idx = 0
     deadline = time.monotonic() + 120
 
-    for i in range(1, count + 1):
-        salt = _prng(f"{token}{i}", salt_len).encode()
-        target = _prng(f"{token}{i}d", difficulty)
-        nonce = 0
-        while not hashlib.sha256(salt + str(nonce).encode()).hexdigest().startswith(target):
-            nonce += 1
-            if nonce % 100000 == 0 and time.monotonic() > deadline:
-                raise RuntimeError(f"PoW 验证码求解超时（第 {i} 个子挑战），放弃求解")
-        solutions.append(nonce)
+    for spec in specs:
+        count = int(spec["c"])
+        salt_len = int(spec["s"])
+        difficulty = int(spec["d"])
+        for _ in range(count):
+            idx += 1
+            salt = _prng(f"{token}{idx}", salt_len).encode()
+            target = _prng(f"{token}{idx}d", difficulty)
+            nonce = 0
+            while not hashlib.sha256(salt + str(nonce).encode()).hexdigest().startswith(target):
+                nonce += 1
+                if nonce % 100000 == 0 and time.monotonic() > deadline:
+                    raise RuntimeError(f"PoW 验证码求解超时（第 {idx} 个子挑战），放弃求解")
+            solutions.append(nonce)
     return solutions
 
 
@@ -66,8 +74,9 @@ def fetch_cap_token(h: Http, site_key: str = CAPCAT_SITE_KEY) -> str:
     token = data.get("token")
     challenge = data.get("challenge")
     ensure(
-        bool(token and isinstance(challenge, dict)),
-        f"获取 CapCat 验证码挑战失败 (HTTP {resp.code}): {resp.text[:200]}",
+        bool(token) and isinstance(challenge, (dict, list)) and bool(challenge),
+        f"获取 CapCat 验证码挑战失败 (HTTP {resp.code}): {resp.text[:200]}"
+        f" [diag] 响应字段: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}",
     )
 
     # 2. 本地求解 PoW
@@ -184,8 +193,12 @@ def run_account(idx: int, total_accounts: int, token: str, h: Http) -> tuple[boo
         bonus_info = f" (达成第 {milestone} 天里程碑额外 +{format_tokens(bonus)})" if bonus else ""
         print(f"🎉 账号 {tag} 打卡成功！今日获得: {reward_text}，{streak_text}{bonus_info}")
     else:
-        err_msg = str(data.get("error") or data.get("message") or data.get("msg") or resp.text[:100])
-        if is_already_signed(err_msg, extra_phrases=("already_claimed", "已打卡", "重复打卡", "请勿重复", "今日已", "已经打卡")):
+        # 错误信息可能是嵌套结构（如 {"error": {"message": "今天已经打过卡了"}}），逐层展开
+        raw_err = data.get("error") or data.get("message") or data.get("msg") or resp.text[:100]
+        if isinstance(raw_err, dict):
+            raw_err = raw_err.get("message") or raw_err.get("msg") or raw_err.get("error") or str(raw_err)
+        err_msg = str(raw_err)
+        if is_already_signed(err_msg, extra_phrases=("already_claimed", "已打卡", "打过卡", "重复打卡", "请勿重复", "今日已", "已经打卡", "已完成打卡")):
             is_ok = True
             print(f"ℹ️ 账号 {tag} 今日已完成打卡")
         else:
