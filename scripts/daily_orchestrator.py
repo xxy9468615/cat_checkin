@@ -86,11 +86,36 @@ def build_task_env(cfg: Dict[str, Any]) -> Dict[str, str]:
     # 结果文件名（同脚本多实例隔离落盘，如 modelscope_ai.json）与邮件卡片标题
     for k, v in (cfg.get("env") or {}).items():
         env[str(k)] = str(v)
+    env["TASK_ID"] = cfg["id"]  # 供脚本回写调度状态（如 last_credit_ts）
     if cfg.get("result"):
         env["TASK_RESULT_NAME"] = cfg["result"]
     if cfg.get("name"):
         env["TASK_TITLE"] = cfg["name"]
     return env
+def _cooldown_due_at(cfg: Dict[str, Any]) -> Optional[float]:
+    """滚动冷却型任务的下次到期时刻（epoch）；无 sched 元数据/无状态 → None（视为已到期）。
+
+    状态来源：脚本自身回写通知状态的 last_credit_ts（如 modelscope 的 daily_active
+    发放时刻）。这就是「按上次签到时间执行」的实现——心跳 cron 只提供轮询频率，
+    是否真正执行由该状态决定。
+    """
+    sched = cfg.get("sched") or {}
+    if sched.get("type") != "rolling":
+        return None
+    period_h = float(sched.get("period_h") or 24)
+    task_id = cfg["id"]
+    prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
+    try:
+        from common import load_kv_state
+        state = load_kv_state(f"{prefix}:state:notify:{task_id}", f".notify_state_{task_id}.json")
+        ts = float(state.get("last_credit_ts") or 0)
+    except Exception:
+        return None
+    if ts <= 0:
+        return None
+    return ts + period_h * 3600
+
+
 def run_task_subprocess(cfg: Dict[str, Any]) -> Tuple[bool, str]:
     cap = cfg["timeout"] + 120
     try:
@@ -171,6 +196,7 @@ class Orchestrator:
                 else:
                     print(f"  -> claim @ {_fmt_bjt(claim_fire)} past cutoff {_fmt_bjt(cutoff)}, deferred to next run")
     def run(self) -> int:
+        due_only = os.getenv("DUE_ONLY", "0").lower() in {"1", "true", "yes"}
         while self.heap or self.futures:
             now = time.time()
             while self.heap and self.heap[0][0] <= now:
@@ -179,6 +205,13 @@ class Orchestrator:
                     print(f"dropping event [{self._label(kind, cfg)}] past hard wall")
                     self.dropped += 1
                     continue
+                # 心跳轮询（DUE_ONLY=1）：滚动冷却任务未到期则秒级跳过，
+                # 是否执行完全由 last_credit_ts 状态决定，与 cron 时刻无关
+                if due_only and cfg:
+                    due_at = _cooldown_due_at(cfg)
+                    if due_at and due_at > now:
+                        print(f"[heartbeat] [{cfg['id']}] 冷却中，跳过（{_fmt_bjt(due_at)} BJT 到期）")
+                        continue
                 self._submit(kind, cfg)
             if not self.heap and not self.futures:
                 break

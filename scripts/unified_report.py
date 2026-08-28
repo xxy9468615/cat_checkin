@@ -290,6 +290,15 @@ def main() -> None:
     print(report)
 
     push_enabled = os.getenv("DAILY_PUSH", "true").lower() not in {"0", "false", "no"}
+    archive_only = os.getenv("ARCHIVE_ONLY", "0").lower() in {"1", "true", "yes"}
+    if push_enabled and archive_only:
+        # 心跳轮询 run（DUE_ONLY 心跳 cron）：仅归档刷新当日汇总 + 输出 failed_matrix，
+        # 不发邮件、不写 marker（每日邮件日报仍由主 run 承担）
+        print("📡 心跳归档模式（ARCHIVE_ONLY）：跳过邮件推送，仅归档当日汇总")
+        archive_daily_summary(collected, today)
+        if fail_count:
+            sys.exit(1)
+        return
     if push_enabled:
         if retry_report:
             title = f"[重跑] {title}"

@@ -791,8 +791,30 @@ def _touch_and_check(
     return credited, user, record, ""
 
 
-def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str]:
-    """执行单个账号的签到逻辑。返回 (成功, 描述)。"""
+def _persist_last_credit_ts(task_id: str, ts: Optional[float]) -> None:
+    """把最近一次 daily_active 发放时刻写入通知状态（心跳 DUE_ONLY 调度的状态来源）。
+
+    只允许变新（历史观测不得覆盖更新的记录）；TASK_ID 缺失（双站兼容模式）时跳过。
+    """
+    if not task_id or not ts:
+        return
+    try:
+        from common import load_kv_state, save_kv_state
+        prefix = (os.getenv("CAT_CHECKIN_REDIS_PREFIX") or "cat_checkin:").rstrip(":")
+        state_file = f".notify_state_{task_id}.json"
+        state = load_kv_state(f"{prefix}:state:notify:{task_id}", state_file)
+        prev = float(state.get("last_credit_ts") or 0)
+        if ts > prev:
+            state["last_credit_ts"] = ts
+            state["updated_at"] = int(time.time())
+            save_kv_state(f"{prefix}:state:notify:{task_id}", state_file, state)
+            print(f"  [sched] last_credit_ts → {datetime.fromtimestamp(ts, timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')} BJT")
+    except Exception as exc:
+        print(f"  ⚠️ last_credit_ts 持久化失败: {exc}")
+
+
+def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[float]]:
+    """执行单个账号的签到逻辑。返回 (成功, 描述, 最近 daily_active 发放时刻或 None)。"""
     token = account.get("token")
     cookie = account.get("cookie")
     fallback_cookie = account.get("fallback_cookie")
@@ -825,8 +847,24 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str]:
             credited, user, record, err = fb_credited, fb_user, fb_record, fb_err
             h = h_fallback
 
+    # 观测最近一次 daily_active 发放时刻（心跳 DUE_ONLY 调度的状态来源）：
+    # 今日流水命中 → 发放时刻即该流水 gmt_created；earn/rules 命中（时刻未知）→
+    # 取当前（偏晚安全，只会延后下次到期不会提前）；冷却中 → 上次发放时刻；
+    # 完全未见 → None（不更新状态）
+    credit_ts: Optional[float] = None
+    if record:
+        src = record.get("source")
+        if src == "transaction":
+            dtv = _parse_created(_created(record))
+            credit_ts = dtv.timestamp() if dtv else time.time()
+        elif src == "cooldown":
+            dtv = _parse_created(str(record.get("last_created") or ""))
+            credit_ts = dtv.timestamp() if dtv else None
+        elif credited:
+            credit_ts = time.time()
+
     if not user:
-        return False, err or "登录态验证失败"
+        return False, err or "登录态验证失败", None
 
     name = user.get("nickname") or user.get("username") or ""
     uid = user.get("user_id") or user.get("id")
@@ -888,7 +926,7 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str]:
     if credited:
         exp_desc = f"，{expire_at} 过期" if expire_at else ""
         status = f"签到成功，今日已领取 {amount} 魔粒{like_msg}{exp_desc}"
-        return True, f"{user_tag} {status}"
+        return True, f"{user_tag} {status}", credit_ts
 
     # 24h 冷却期：今日流水正常（点赞/触碰均已生效），仅奖励未到账，报绿卡避免误报
     # 「Cookie 失效」红卡并触发无意义的自动重跑（冷却期内重跑多少次都不会发奖）
@@ -901,7 +939,7 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str]:
             f"今日 daily_active 未到账：24h 冷却中（上次到账 {record.get('last_created', '?')}），"
             f"Cookie 登录态正常，{eta_desc}{like_msg}"
         )
-        return True, f"{user_tag} {status}"
+        return True, f"{user_tag} {status}", credit_ts
 
     if token and not cookie:
         # 2026-08-25 实测：Bearer Token 能通过 OpenAPI 鉴权，但 OpenAPI 调用不计入
@@ -915,23 +953,26 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str]:
     else:
         status = f"交易记录无今日 daily_active（Cookie 可能已失效需手动刷新）{like_msg}"
 
-    return credited, f"{user_tag} {status}"
+    return credited, f"{user_tag} {status}", credit_ts
 
 
 def _run_site(
     accounts: List[Dict[str, Any]], host: str, site: str, title: str
-) -> Tuple[bool, List[str]]:
-    """运行单个站点的所有账号。返回 (全部成功, 各行输出)。"""
+) -> Tuple[bool, List[str], Optional[float]]:
+    """运行单个站点的所有账号。返回 (全部成功, 各行输出, 最近 daily_active 发放时刻)。"""
     print(f"【{title}】")
     if not accounts:
         print(f"  未提供 {title} 凭证（Token / Cookie），跳过")
-        return True, []
+        return True, [], None
 
     print(f"  {len(accounts)} 个账号 @ {host}")
     results = []
+    latest_ts: Optional[float] = None
     for idx, acc in enumerate(accounts, 1):
         try:
-            ok, msg = _run_one(acc, host)
+            ok, msg, credit_ts = _run_one(acc, host)
+            if credit_ts and (latest_ts is None or credit_ts > latest_ts):
+                latest_ts = credit_ts
             line = f"  [{idx}/{len(accounts)}] {msg}"
             print(line)
             results.append((ok, line))
@@ -943,7 +984,7 @@ def _run_site(
     ok_count = sum(1 for ok, _ in results if ok)
     all_ok = ok_count == len(accounts)
     print(f"  {title} 总结：成功 {ok_count}/{len(accounts)}")
-    return all_ok, [line for _, line in results]
+    return all_ok, [line for _, line in results], latest_ts
 
 
 def _run_single_site(site: str) -> None:
@@ -963,7 +1004,8 @@ def _run_single_site(site: str) -> None:
     title = "ModelScope 国内站 签到" if is_cn else "ModelScope 国际站 签到"
     print(f"共 {len(accounts)} 个账号 @ {host}\n")  # 站点标题由 _run_site 统一打印
 
-    ok, _lines = _run_site(accounts, host, site, title)
+    ok, _lines, latest_ts = _run_site(accounts, host, site, title)
+    _persist_last_credit_ts((os.getenv("TASK_ID") or "").strip(), latest_ts)
     print(f"\n{'国内站' if is_cn else '国际站'}：{'✅ 成功' if ok else '❌ 失败'}")
     if not ok:
         sys.exit(1)
@@ -992,9 +1034,9 @@ def _run_both_sites() -> None:
     )
 
     # 分开运行，互不影响
-    cn_ok, cn_lines = _run_site(cn_accounts, cn_host, "cn", "ModelScope 国内站 签到")
+    cn_ok, cn_lines, _cn_ts = _run_site(cn_accounts, cn_host, "cn", "ModelScope 国内站 签到")
     print()
-    ai_ok, ai_lines = _run_site(ai_accounts, ai_host, "ai", "ModelScope 国际站 签到")
+    ai_ok, ai_lines, _ai_ts = _run_site(ai_accounts, ai_host, "ai", "ModelScope 国际站 签到")
 
     print(f"\n国内站：{'✅ 成功' if cn_ok else '❌ 失败'}")
     print(f"国际站：{'✅ 成功' if ai_ok else '❌ 失败'}")

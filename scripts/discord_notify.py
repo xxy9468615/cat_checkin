@@ -446,8 +446,14 @@ def notify_task_result(
             "{{DESCRIPTION}}": description,
             "{{TIMESTAMP}}": _timestamp_bjt(),
         }
-        tpl = _load_template("discord_failure.json", DEFAULT_FAILURE_TEMPLATE)
-        sent = _post_webhook(_render(tpl, replacements))
+        # 防轰炸：心跳轮询下同日反复失败会重复推卡——当日第 3 次尝试起静默
+        # （状态照常累计，次日 attempts 跨日重置后恢复推送）
+        if attempts > 2:
+            print(f"ℹ️ 任务 {task_id} 当日已推送过失败卡（attempts={attempts}），本次静默")
+            sent = True
+        else:
+            tpl = _load_template("discord_failure.json", DEFAULT_FAILURE_TEMPLATE)
+            sent = _post_webhook(_render(tpl, replacements))
     else:
         # 成功：只更新状态（连签连续性由 last_ok_date 是否为昨天决定），不推频道
         new_state["last_ok_date"] = today

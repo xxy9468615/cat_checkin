@@ -172,6 +172,9 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["09:10", "modelscope", "daily"],
         "env": {"MODELSCOPE_SITE": "cn"},
+        # 滚动冷却型调度：daily_active 领取后 24h 才可再领，由心跳 run 按
+        # last_credit_ts 状态驱动（DUE_ONLY），不依赖固定启动时刻
+        "sched": {"type": "rolling", "period_h": 24},
     },
     "modelscope_ai": {
         "id": "modelscope_ai",
@@ -182,6 +185,7 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["09:10", "modelscope", "modelscope_ai", "daily"],
         "env": {"MODELSCOPE_SITE": "ai"},
+        "sched": {"type": "rolling", "period_h": 24},
     },
 
     # --- 24h 动态冷却站点（Latvi：last_sign_ts+24h 状态驱动，硬墙前 2min 进场） ---

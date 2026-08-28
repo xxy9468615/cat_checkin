@@ -7,6 +7,9 @@ on:
   schedule:
     # 主流水线：北京时间 14:00（UTC 06:00）单 run 全内联（稳态 ~18:1x 结束，硬墙 19:55（ORCH_HARD_DEADLINE））
     - cron: "0 6 * * *"
+    # 心跳轮询：每 4h 一次，仅跑滚动冷却型任务（modelscope 双实例，DUE_ONLY 按
+    # last_credit_ts 状态决定是否执行；未到期秒级跳过）——「按上次签到时间」调度
+    - cron: "0 */4 * * *"
     # 报告兜底：北京时间 20:30（UTC 12:30，晚于硬墙 19:55（ORCH_HARD_DEADLINE）），仅走报告分支
     - cron: "30 12 * * *"
   repository_dispatch:
@@ -26,6 +29,11 @@ on:
         type: string
       retry:
         description: '标记为报告自动重跑（防循环；人工触发保持 false）'
+        required: false
+        default: false
+        type: boolean
+      due_only:
+        description: '心跳模拟：仅滚动冷却任务 + 到期过滤 + 仅归档（不发邮件）'
         required: false
         default: false
         type: boolean
@@ -327,16 +335,22 @@ jobs:
           # 输入经 env 间接传递，避免 ${{ }} 直接内插 shell（引号/命令注入面）
           INPUT_TASKS: ${{ inputs.tasks }}
           EVENT_ACTION: ${{ github.event.action }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: |
           # workflow_dispatch explicit tasks take precedence
           if [ -n "$INPUT_TASKS" ]; then
             echo "tasks=$INPUT_TASKS" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # 心跳轮询：仅滚动冷却型任务（是否执行由 DUE_ONLY + last_credit_ts 决定）
+          if [ "$EVENT_SCHEDULE" = "0 */4 * * *" ]; then
+            echo "tasks=modelscope,modelscope_ai" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           case "$EVENT_ACTION" in
             latvi_next_sign|checkin_latvi) echo "tasks=latvi" >> "$GITHUB_OUTPUT" ;;
             workbuddy_travel_claim)        echo "tasks=workbuddy" >> "$GITHUB_OUTPUT" ;;
-            checkin_modelscope)            echo "tasks=modelscope" >> "$GITHUB_OUTPUT" ;;
+            checkin_modelscope)            echo "tasks=modelscope,modelscope_ai" >> "$GITHUB_OUTPUT" ;;
             checkin_morning)               echo "tasks=matrix,workbuddy" >> "$GITHUB_OUTPUT" ;;
             *) echo "tasks=" >> "$GITHUB_OUTPUT" ;;
           esac
@@ -345,6 +359,9 @@ jobs:
         id: orchestrator
         env:
           ORCH_TASKS: ${{ steps.orch_tasks.outputs.tasks }}
+          # 心跳轮询 run（schedule 或手动 due_only）：滚动冷却任务按 last_credit_ts
+          # 到期过滤，未到期秒级跳过
+          DUE_ONLY: ${{ (github.event.schedule == '0 */4 * * *' || inputs.due_only == true) && '1' || '0' }}
         run: |
           if [ -n "$ORCH_TASKS" ]; then
             python3 scripts/daily_orchestrator.py --tasks "$ORCH_TASKS"
@@ -360,6 +377,8 @@ jobs:
                && contains(fromJSON('["latvi_next_sign","checkin_latvi","checkin_morning","checkin_modelscope","workbuddy_travel_claim"]'), github.event.action))
         env:
           DAILY_PUSH: "true"
+          # 心跳轮询 run：仅归档刷新当日汇总，不发邮件/不写 marker（每日邮件由主 run 承担）
+          ARCHIVE_ONLY: ${{ (github.event.schedule == '0 */4 * * *' || inputs.due_only == true) && '1' || '0' }}
           # 重跑 run 发送「[重跑]」补充邮件（不写当日 marker、不再触发递归重试）
           RETRY_REPORT: ${{ inputs.retry == true && '1' || '0' }}
         run: python3 scripts/unified_report.py
