@@ -494,11 +494,33 @@ def strip_tags(s: Any) -> str:
     s = re.sub(r"<img\b[^>]*\btitle=[\"']([^\"']*)[\"'][^>]*>", r"\1", s, flags=re.I)
     return html.unescape(re.sub(r"<[^>]*>", "", s)).strip()
 
+def _mask_domain(domain: str, mask_char: str = "*") -> str:
+    """邮箱域名脱敏：保留首字符与尾部后缀，其余掩码。
+
+    - aifre.cyou   -> a***.cyou
+    - gmail.com    -> g***.com
+    - mail.foo.co.uk -> m***.co.uk（co/com/net/org/gov/edu/ac + 国家码的二级后缀整段保留）
+    - localhost    -> l***
+    - 极短/异常域  -> ***（掩码兜底，绝不原样返回）
+    """
+    domain = (domain or "").strip().rstrip(".")
+    if not domain:
+        return mask_char * 3
+    labels = domain.split(".")
+    if len(labels) == 1:
+        return f"{domain[0]}{mask_char * 3}" if len(domain) > 1 else mask_char * 3
+    second_level = {"co", "com", "net", "org", "gov", "edu", "ac"}
+    keep_labels = 2 if len(labels) >= 3 and labels[-2].lower() in second_level else 1
+    tail = ".".join(labels[-keep_labels:])
+    return f"{domain[0]}{mask_char * 3}.{tail}"
+
+
 def mask_str(value: Any, keep_start: int | None = None, keep_end: int | None = None, mask_char: str = "*") -> str:
     """智能脱敏字符串（用户名、手机号、邮箱、账号 ID 等）。
 
     脱敏规则：
-    - 邮箱：对 @ 前缀进行脱敏，保留完整域名，如 user123@gmail.com -> u***3@gmail.com
+    - 邮箱：@ 前缀与域名都脱敏，仅保留域名 TLD（co.uk/com.cn 等二级后缀整段保留），
+      如 user123@gmail.com -> u***3@g***.com，abc@aifre.cyou -> a***b@a***.cyou
     - 手机号（11位纯数字）：保留前3后4，如 13812345678 -> 138****5678
     - 自定义 keep_start / keep_end：按指定保留字符数脱敏
     - 默认智能策略（首尾可见、中间掩码，便于本人识别同时防止公开泄露）：
@@ -513,11 +535,11 @@ def mask_str(value: Any, keep_start: int | None = None, keep_end: int | None = N
     if not s:
         return ""
 
-    # 邮箱处理
+    # 邮箱处理：本地部分常规脱敏；域名保留首字符 + TLD，其余掩码
     if "@" in s and not (s.startswith("@") or s.endswith("@")):
         user_part, domain_part = s.split("@", 1)
         masked_user = mask_str(user_part, keep_start=keep_start, keep_end=keep_end, mask_char=mask_char)
-        return f"{masked_user}@{domain_part}"
+        return f"{masked_user}@{_mask_domain(domain_part)}"
 
     # 手机号处理 (11位纯数字)
     if len(s) == 11 and s.isdigit() and keep_start is None and keep_end is None:
