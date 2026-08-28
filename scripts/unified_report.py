@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # new Env("每日统一通知汇总")
-"""统一汇总报告：汇聚当日签到结果，构建 HTML 邮件并经 Resend/SMTP 推送。
+"""统一汇总报告：汇聚当日签到结果，经 Discord Webhook 推送（邮件通道已停用，见下方注释）。
 
 由 checkin.yml 的 unified（内联，orchestrator 结束后）与 report-fallback（20:30 兜底）
 两个 job 触发。优先从 Upstash Redis `cat_checkin:raw:<TODAY>`（HGETALL）汇聚，
@@ -21,7 +21,10 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from common import env_bool, upstash_redis_command, upstash_redis_pipeline  # noqa: E402
-from daily_report import _extract_fields, build_report, send_email, send_resend  # noqa: E402
+from daily_report import _extract_fields, build_report  # noqa: E402
+# 邮件推送已停用（2026-08-28）：send_email / send_resend 调用已注释，函数库保留可随时恢复
+# from daily_report import _extract_fields, build_report, send_email, send_resend  # noqa: E402
+from discord_notify import notify_summary  # noqa: E402
 from task_registry import TASKS, get_expected_results  # noqa: E402
 
 # Latvi 的结果文件名（24h 间隔约束，18:00 运行，报告取昨日结果）
@@ -288,14 +291,19 @@ def main() -> None:
     if push_enabled:
         if retry_report:
             title = f"[重跑] {title}"
-        # Resend 为主通道；仅当主通道失败才回退 SMTP（备选语义，双通道同时配置时不再双发）
-        sent_resend, resend_msg_id = send_resend(title, report, results)
-        sent_smtp = False
-        if not sent_resend:
-            print("⚠️ Resend 主通道失败，回退 SMTP 备选通道")
-            sent_smtp = send_email(title, report, results)
-        if not (sent_smtp or sent_resend):
-            print("❌ 所有邮件通道推送失败：不写发送标记并退出非零，等待 10:30 兜底重试")
+        # === 邮件推送已停用（2026-08-28）：Resend/SMTP 发送逻辑注释保留，取消注释即可恢复 ===
+        # sent_resend, resend_msg_id = send_resend(title, report, results)
+        # sent_smtp = False
+        # if not sent_resend:
+        #     print("⚠️ Resend 主通道失败，回退 SMTP 备选通道")
+        #     sent_smtp = send_email(title, report, results)
+        # if not (sent_smtp or sent_resend):
+        #     print("❌ 所有邮件通道推送失败：不写发送标记并退出非零，等待 20:30 兜底重试")
+        #     sys.exit(1)
+        # === Discord Webhook 推送（替代邮件通道） ===
+        sent_discord = notify_summary(title, report, ok=fail_count == 0)
+        if not sent_discord:
+            print("❌ Discord 推送失败：不写发送标记并退出非零，等待 20:30 兜底重试")
             sys.exit(1)
         if retry_report:
             # 重跑补充邮件：不写当日 sent marker（不挡 20:30 兜底、不冒充主报告），
@@ -304,11 +312,10 @@ def main() -> None:
             archive_daily_summary(collected, today)
             return
         # 邮件已送达或已交接 QStash（至少一个通道）才写当日标记：checkin.yml 兜底去重靠它。
-        # resend_msg_id 可为空（SMTP-only / 直发失败 / QStash publish 失败回退直发但 Resend 未返回 id），
-        # 有值时 10:30 兜底 run 可查询 QStash /v2/logs 确认投递状态。
+        # Discord 推送沿用同一 marker 语义：推送成功即写，20:30 兜底据此去重。
         marker = {"date": today, "sent_at": dt.datetime.now(tz).isoformat()}
-        if resend_msg_id:
-            marker["resend_msg_id"] = resend_msg_id
+        # if resend_msg_id:
+        #     marker["resend_msg_id"] = resend_msg_id  # 邮件通道停用，QStash msg_id 不再产生
         Path(".report_sent").write_text(
             json.dumps(marker, ensure_ascii=False),
             encoding="utf-8",
@@ -334,13 +341,14 @@ def main() -> None:
                 print(f"⚠️ Redis 发送标记写入异常: {e}")
 
         # 输出 resend_msg_id 到 GITHUB_OUTPUT（供 GitHub Actions 后续步骤使用）
-        gh_output = os.getenv("GITHUB_OUTPUT")
-        if gh_output and resend_msg_id:
-            try:
-                with open(gh_output, "a", encoding="utf-8") as fh:
-                    fh.write(f"resend_msg_id={resend_msg_id}\n")
-            except Exception:
-                pass
+        # if resend_msg_id:
+        #     gh_output = os.getenv("GITHUB_OUTPUT")
+        #     if gh_output:
+        #         try:
+        #             with open(gh_output, "a", encoding="utf-8") as fh:
+        #                 fh.write(f"resend_msg_id={resend_msg_id}\n")
+        #         except Exception:
+        #             pass  # 邮件通道停用，不再产生 QStash msg_id
 
         # 报告送达后归档当日汇总（best-effort，失败仅警告）
         archive_daily_summary(collected, today)

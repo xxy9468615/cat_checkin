@@ -196,6 +196,7 @@ jobs:
       LATVI_EMAIL_1: ${{ secrets.LATVI_EMAIL_1 || secrets.LATVI_EMAIL }}
       LATVI_PASSWORD_1: ${{ secrets.LATVI_PASSWORD_1 || secrets.LATVI_PASSWORD }}
       LATVI_STATE_FILE: .latvi_state.json
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
       RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
       RESEND_FROM: ${{ secrets.RESEND_FROM }}
       RESEND_TO: ${{ secrets.RESEND_TO }}
@@ -556,6 +557,7 @@ jobs:
           TZ: Asia/Shanghai
           DAILY_PUSH: "true"
           TASK_OUTPUT_DIR: .task_results
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           RESEND_FROM: ${{ secrets.RESEND_FROM }}
           RESEND_TO: ${{ secrets.RESEND_TO }}

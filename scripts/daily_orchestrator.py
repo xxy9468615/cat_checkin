@@ -12,6 +12,7 @@ ROOT_DIR = BASE_DIR.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 from common import BJT, upstash_redis_command
+from discord_notify import notify_summary, notify_task_progress
 from task_registry import TASKS, resolve_execution_queue
 TRAVEL_EVENT_RE = re.compile(r"TRAVEL_EVENT\s+state=(\w+)\s+arrive_at=(\d+)")
 MAX_CLAIM_ROUNDS, CLAIM_MARGIN_SEC, LATVI_ENTER_EARLY_SEC = 3, 15*60, 120
@@ -83,6 +84,19 @@ def build_task_env(cfg: Dict[str, Any]) -> Dict[str, str]:
         env["LATVI_NO_RELAY"] = "1"
         env.setdefault("LATVI_STATE_FILE", ".latvi_state.json")
     return env
+def _read_elapsed(cfg: Dict[str, Any]) -> Optional[float]:
+    """从 run_task 落盘的结果 JSON 中 best-effort 读取耗时，供 Discord 进度卡片展示。"""
+    result_name = cfg.get("result") or ""
+    if not result_name:
+        return None
+    out_dir = Path(os.getenv("TASK_OUTPUT_DIR", str(ROOT_DIR / ".task_results")))
+    if not out_dir.is_absolute():
+        out_dir = ROOT_DIR / out_dir
+    path = out_dir / result_name
+    try:
+        return float(json.loads(path.read_text(encoding="utf-8")).get("elapsed"))
+    except Exception:
+        return None
 def run_task_subprocess(cfg: Dict[str, Any]) -> Tuple[bool, str]:
     cap = cfg["timeout"] + 120
     try:
@@ -115,6 +129,9 @@ class Orchestrator:
         self.futures: Dict[Future, Tuple[str, Optional[Dict[str, Any]]]] = {}
         self.latvi_fire_at: Optional[float] = None
         self.dropped = 0
+        self.done_seq = 0
+        self.ok_count = 0
+        self.fail_count = 0
     def push(self, fire_at: float, kind: str, cfg: Optional[Dict[str, Any]] = None) -> None:
         heapq.heappush(self.heap, (fire_at, self.seq, kind, cfg))
         self.seq += 1
@@ -136,6 +153,24 @@ class Orchestrator:
         if out:
             print(out)
         print(f"{'='*60}")
+        # Discord 实时进度轮播：每完成一个任务实例推一条卡片（best-effort，绝不阻塞调度）
+        self.done_seq += 1
+        if ok:
+            self.ok_count += 1
+        else:
+            self.fail_count += 1
+        try:
+            notify_task_progress(
+                task_id=tid,
+                name=cfg.get("name") or tid,
+                script=cfg.get("script") or "",
+                ok=ok,
+                output=out or "",
+                elapsed=_read_elapsed(cfg),
+                progress=f"第 {self.done_seq} 个完成 · ✅ {self.ok_count} · ❌ {self.fail_count}",
+            )
+        except Exception as exc:
+            print(f"WARN: Discord 进度推送失败: {exc}", file=sys.stderr)
         matches = TRAVEL_EVENT_RE.findall(out or "")
         if matches:
             state, arrive_raw = matches[-1]
@@ -150,6 +185,27 @@ class Orchestrator:
                     print(f"  -> enqueued claim round {rounds+1} @ {_fmt_bjt(claim_fire)} (cutoff {_fmt_bjt(cutoff)})")
                 else:
                     print(f"  -> claim @ {_fmt_bjt(claim_fire)} past cutoff {_fmt_bjt(cutoff)}, deferred to next run")
+    def _notify_summary(self) -> None:
+        """本轮全部任务结束后的 Discord 总计推送（best-effort，不影响退出码）。"""
+        if not self.results:
+            return
+        failed = sorted(k for k, v in self.results.items() if not v)
+        total = len(self.results)
+        ok_n = total - len(failed)
+        title = (
+            f"📋 签到执行完毕 ({bjt_now().strftime('%Y-%m-%d %H:%M')}) — "
+            f"✅ {ok_n}/{total}" + (f" ❌ {len(failed)}" if failed else "")
+        )
+        lines = [f"✅ 成功 {ok_n} | ❌ 失败 {len(failed)} | 共 {total}", ""]
+        for tid, ok in self.results.items():
+            name = TASKS.get(tid, {}).get("name") or tid
+            lines.append(f"{'✅' if ok else '❌'} {name}")
+        if failed:
+            lines += ["", f"失败站点：{', '.join(failed)}"]
+        try:
+            notify_summary(title, "\n".join(lines), ok=not failed)
+        except Exception as exc:
+            print(f"WARN: Discord 总计推送失败: {exc}", file=sys.stderr)
     def run(self) -> int:
         while self.heap or self.futures:
             now = time.time()
@@ -194,6 +250,7 @@ class Orchestrator:
             print(f"WARNING: no tasks executed — {self.dropped} event(s) dropped past hard wall "
                   f"{os.getenv('ORCH_HARD_DEADLINE', '19:55')} BJT（run 启动过晚）")
             return 1
+        self._notify_summary()
         failed = [k for k, v in self.results.items() if not v]
         for tid, ok in self.results.items():
             print(f"  {'OK' if ok else 'FAIL'} {tid}")

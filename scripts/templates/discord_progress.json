@@ -1,0 +1,17 @@
+{
+  "_comment": "Discord 单任务进度通知模板。占位符: {{STATUS_ICON}} {{STATUS_TEXT}} {{COLOR}} {{TASK_NAME}} {{PROGRESS}} {{ELAPSED}} {{OUTPUT}} {{TIMESTAMP}}。删除本文件或写错时回退代码内置模板。",
+  "username": "cat_checkin",
+  "embeds": [
+    {
+      "title": "{{STATUS_ICON}} {{TASK_NAME}} — {{STATUS_TEXT}}",
+      "color": "{{COLOR}}",
+      "fields": [
+        { "name": "📊 进度", "value": "{{PROGRESS}}", "inline": true },
+        { "name": "⏱️ 耗时", "value": "{{ELAPSED}}", "inline": true },
+        { "name": "📜 输出摘要", "value": "{{OUTPUT}}" }
+      ],
+      "footer": { "text": "cat_checkin 自动推送" },
+      "timestamp": "{{TIMESTAMP}}"
+    }
+  ]
+}

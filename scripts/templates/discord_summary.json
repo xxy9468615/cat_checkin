@@ -1,0 +1,13 @@
+{
+  "_comment": "Discord 汇总总计通知模板。占位符: {{TITLE}} {{REPORT}} {{COLOR}} {{TIMESTAMP}}。删除本文件或写错时回退代码内置模板。",
+  "username": "cat_checkin",
+  "embeds": [
+    {
+      "title": "{{TITLE}}",
+      "description": "{{REPORT}}",
+      "color": "{{COLOR}}",
+      "footer": { "text": "cat_checkin 自动推送" },
+      "timestamp": "{{TIMESTAMP}}"
+    }
+  ]
+}
