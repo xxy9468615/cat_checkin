@@ -35,7 +35,7 @@ import random
 import sys
 import time
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from common import (
@@ -808,7 +808,7 @@ def _persist_last_credit_ts(task_id: str, ts: Optional[float]) -> None:
             state["last_credit_ts"] = ts
             state["updated_at"] = int(time.time())
             save_kv_state(f"{prefix}:state:notify:{task_id}", state_file, state)
-            print(f"  [sched] last_credit_ts → {datetime.fromtimestamp(ts, timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')} BJT")
+            print(f"  [sched] last_credit_ts → {datetime.fromtimestamp(ts, timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')} BJT")
     except Exception as exc:
         print(f"  ⚠️ last_credit_ts 持久化失败: {exc}")
 

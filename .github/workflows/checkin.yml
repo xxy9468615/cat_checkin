@@ -354,6 +354,13 @@ jobs:
             checkin_morning)               echo "tasks=matrix,workbuddy" >> "$GITHUB_OUTPUT" ;;
             *) echo "tasks=" >> "$GITHUB_OUTPUT" ;;
           esac
+          # schedule 事件兜底：显式匹配主 cron 才允许全量时间线；其余未识别的
+          # schedule（如 GitHub 延迟重放/未来新增行）一律降级为心跳任务集，
+          # 防止误触发 2h+ 的全量 run（latvi 7000s 等）
+          if [ -n "$EVENT_SCHEDULE" ] && [ "$EVENT_SCHEDULE" != "0 6 * * *" ]; then
+            echo "⚠️ 未识别的 schedule '$EVENT_SCHEDULE'，降级为心跳任务集"
+            echo "tasks=modelscope,modelscope_ai" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Execute daily orchestrator
         id: orchestrator
