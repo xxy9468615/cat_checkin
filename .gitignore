@@ -27,6 +27,7 @@ docs
 .cloudstudio_state*.json
 .modelscope_state*.json
 .modelscope_*_state*.json
+.notify_state_*.json
 
 # WSL2 metadata
 *:Zone.Identifier

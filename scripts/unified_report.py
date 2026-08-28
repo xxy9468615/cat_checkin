@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # new Env("每日统一通知汇总")
-"""统一汇总报告：汇聚当日签到结果，经 Discord Webhook 推送（邮件通道已停用，见下方注释）。
+"""统一汇总报告：汇聚当日签到结果（统一推送已下线，仅保留汇总/失败矩阵/归档）。
 
 由 checkin.yml 的 unified（内联，orchestrator 结束后）与 report-fallback（20:30 兜底）
 两个 job 触发。优先从 Upstash Redis `cat_checkin:raw:<TODAY>`（HGETALL）汇聚，
 兜底扫描 `.task_results/` 本地 JSON；Latvi 若今日无结果则回退昨日（24h 冷却跨日）。
+
+2026-08-28 起通知改为任务级即时推送（daily_orchestrator → discord_notify 成功/失败卡），
+本脚本不再发送统一报告，仅输出 failed_matrix（自动重跑用）、写发送标记与历史归档。
 """
 from __future__ import annotations
 
@@ -24,7 +27,6 @@ from common import env_bool, upstash_redis_command, upstash_redis_pipeline  # no
 from daily_report import _extract_fields, build_report  # noqa: E402
 # 邮件推送已停用（2026-08-28）：send_email / send_resend 调用已注释，函数库保留可随时恢复
 # from daily_report import _extract_fields, build_report, send_email, send_resend  # noqa: E402
-from discord_notify import notify_summary  # noqa: E402
 from task_registry import TASKS, get_expected_results  # noqa: E402
 
 # Latvi 的结果文件名（24h 间隔约束，18:00 运行，报告取昨日结果）
@@ -289,8 +291,10 @@ def main() -> None:
 
     push_enabled = os.getenv("DAILY_PUSH", "true").lower() not in {"0", "false", "no"}
     if push_enabled:
-        if retry_report:
-            title = f"[重跑] {title}"
+        # === 统一汇总推送已下线（2026-08-28）===
+        # 任务完成时已由 daily_orchestrator 即时推送 Discord 成功/失败卡
+        # （discord_notify.notify_task_progress），此处不再发统一报告，
+        # 仅保留：发送标记（20:30 兜底去重依据）+ 历史归档。
         # === 邮件推送已停用（2026-08-28）：Resend/SMTP 发送逻辑注释保留，取消注释即可恢复 ===
         # sent_resend, resend_msg_id = send_resend(title, report, results)
         # sent_smtp = False
@@ -300,19 +304,14 @@ def main() -> None:
         # if not (sent_smtp or sent_resend):
         #     print("❌ 所有邮件通道推送失败：不写发送标记并退出非零，等待 20:30 兜底重试")
         #     sys.exit(1)
-        # === Discord Webhook 推送（替代邮件通道） ===
-        sent_discord = notify_summary(title, report, ok=fail_count == 0)
-        if not sent_discord:
-            print("❌ Discord 推送失败：不写发送标记并退出非零，等待 20:30 兜底重试")
-            sys.exit(1)
+        print("ℹ️ 统一汇总推送已下线（任务级即时推送已上线），本步骤仅写发送标记与归档")
         if retry_report:
-            # 重跑补充邮件：不写当日 sent marker（不挡 20:30 兜底、不冒充主报告），
+            # 重跑 run：不写当日 sent marker（不挡 20:30 兜底、不冒充主报告），
             # 只把重跑后的最新结果再归档一次（raw hash 已含全量，覆盖为最新状态）
-            print("🔁 重跑补充报告已发送（不写当日发送标记）")
+            print("🔁 重跑 run：仅归档最新结果（不写当日发送标记）")
             archive_daily_summary(collected, today)
             return
-        # 邮件已送达或已交接 QStash（至少一个通道）才写当日标记：checkin.yml 兜底去重靠它。
-        # Discord 推送沿用同一 marker 语义：推送成功即写，20:30 兜底据此去重。
+        # 写当日标记：checkin.yml 兜底去重靠它（语义为「今日汇总已处理」）。
         marker = {"date": today, "sent_at": dt.datetime.now(tz).isoformat()}
         # if resend_msg_id:
         #     marker["resend_msg_id"] = resend_msg_id  # 邮件通道停用，QStash msg_id 不再产生

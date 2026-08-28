@@ -1,0 +1,13 @@
+{
+  "_comment": "Discord 单任务失败卡模板（即时推送）。占位符: {{TASK_NAME}} {{STATUS_TITLE}} {{COLOR}} {{DESCRIPTION}} {{SCRIPT}} {{TIMESTAMP}}；DESCRIPTION 为代码组装的多行正文（原因/账号/连签/资产/上次成功，连续失败次数在标题）。删除本文件或写错时回退代码内置模板。",
+  "username": "cat_checkin",
+  "embeds": [
+    {
+      "title": "🚨 {{TASK_NAME}} · {{STATUS_TITLE}}",
+      "color": "{{COLOR}}",
+      "description": "{{DESCRIPTION}}",
+      "footer": { "text": "cat_checkin · {{SCRIPT}}" },
+      "timestamp": "{{TIMESTAMP}}"
+    }
+  ]
+}

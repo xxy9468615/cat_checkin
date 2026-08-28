@@ -226,6 +226,7 @@ jobs:
             .agentrouter_state.json
             .cloudstudio_state*.json
             .modelscope_*.json
+            .notify_state_*.json
           key: unified-states-${{ github.run_id }}
           restore-keys: |
             unified-states-
@@ -413,6 +414,7 @@ jobs:
             .agentrouter_state.json
             .cloudstudio_state*.json
             .modelscope_*.json
+            .notify_state_*.json
           key: unified-states-${{ github.run_id }}
 
       - name: Cleanup SS proxy
@@ -557,7 +559,6 @@ jobs:
           TZ: Asia/Shanghai
           DAILY_PUSH: "true"
           TASK_OUTPUT_DIR: .task_results
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           RESEND_FROM: ${{ secrets.RESEND_FROM }}
           RESEND_TO: ${{ secrets.RESEND_TO }}
