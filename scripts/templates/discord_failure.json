@@ -1,12 +1,12 @@
 {
-  "_comment": "Discord 单任务失败卡模板（即时推送）。占位符: {{TASK_NAME}} {{STATUS_TITLE}} {{COLOR}} {{DESCRIPTION}} {{SCRIPT}} {{TIMESTAMP}}；DESCRIPTION 为代码组装的多行正文（逐账号失败明细/针对性建议/账号/资产/上次成功，连续失败次数在标题）。删除本文件或写错时回退代码内置模板。",
+  "_comment": "Discord 频道1 失败提醒卡模板（B 标准版，仅失败任务实时推送）。占位符: {{TASK_NAME}} {{TASK_ID}} {{STATUS_TITLE}} {{COLOR}} {{DESCRIPTION}} {{SCRIPT}} {{TIMESTAMP}}；DESCRIPTION 为代码组装的多行正文（失败明细/建议/重跑指引/账号/资产/上次成功）。删除本文件或写错时回退代码内置模板。",
   "username": "cat_checkin",
   "embeds": [
     {
       "title": "🚨 {{TASK_NAME}} · {{STATUS_TITLE}}",
       "color": "{{COLOR}}",
       "description": "{{DESCRIPTION}}",
-      "footer": { "text": "cat_checkin · {{SCRIPT}}" },
+      "footer": { "text": "cat_checkin · {{TASK_ID}} · {{SCRIPT}}" },
       "timestamp": "{{TIMESTAMP}}"
     }
   ]

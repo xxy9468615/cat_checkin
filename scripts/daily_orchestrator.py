@@ -12,7 +12,7 @@ ROOT_DIR = BASE_DIR.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 from common import BJT, upstash_redis_command
-from discord_notify import notify_task_progress
+from discord_notify import notify_task_result, push_daily_report
 from task_registry import TASKS, resolve_execution_queue
 TRAVEL_EVENT_RE = re.compile(r"TRAVEL_EVENT\s+state=(\w+)\s+arrive_at=(\d+)")
 MAX_CLAIM_ROUNDS, CLAIM_MARGIN_SEC, LATVI_ENTER_EARLY_SEC = 3, 15*60, 120
@@ -106,8 +106,9 @@ def run_task_subprocess(cfg: Dict[str, Any]) -> Tuple[bool, str]:
         out = f"[orchestrator kill >{cap}s]\n{(out or '')}"
     return proc.returncode == 0, (out or "").strip()
 class Orchestrator:
-    def __init__(self, hard_deadline: float) -> None:
+    def __init__(self, hard_deadline: float, daily_report: bool = False) -> None:
         self.hard_deadline = hard_deadline
+        self.daily_report = daily_report
         self.heap: List[Tuple[float, int, str, Optional[Dict[str, Any]]]] = []
         self.seq = 0
         self.results: Dict[str, bool] = {}
@@ -137,10 +138,10 @@ class Orchestrator:
         if out:
             print(out)
         print(f"{'='*60}")
-        # Discord 即时推送：任务完成瞬间按成功/失败维度推一条简约卡片
-        # （best-effort，绝不阻塞调度；统一汇总推送已下线）
+        # 频道1 失败提醒：任务失败/超时/异常的瞬间推失败卡；成功只记状态不推送
+        # （best-effort，绝不阻塞调度；每日报表统一由 run() 末尾的日报推送承担）
         try:
-            notify_task_progress(
+            notify_task_result(
                 task_id=tid,
                 name=cfg.get("name") or tid,
                 script=cfg.get("script") or "",
@@ -148,7 +149,7 @@ class Orchestrator:
                 output=out or "",
             )
         except Exception as exc:
-            print(f"WARN: Discord 即时推送失败: {exc}", file=sys.stderr)
+            print(f"WARN: Discord 失败提醒推送失败: {exc}", file=sys.stderr)
         matches = TRAVEL_EVENT_RE.findall(out or "")
         if matches:
             state, arrive_raw = matches[-1]
@@ -207,6 +208,13 @@ class Orchestrator:
             print(f"WARNING: no tasks executed — {self.dropped} event(s) dropped past hard wall "
                   f"{os.getenv('ORCH_HARD_DEADLINE', '19:55')} BJT（run 启动过晚）")
             return 1
+        # 频道2 每日执行情况：一天一条统一日报。仅默认时间线 run（无 --tasks）与
+        # 重跑 run（RETRY_REPORT=1，标题带 [重跑]）推送；局部 dispatch 接力 run 不推。
+        if self.daily_report and self.results:
+            try:
+                push_daily_report(retry=os.getenv("RETRY_REPORT", "0").lower() in {"1", "true", "yes"})
+            except Exception as exc:
+                print(f"WARN: 每日日报推送异常: {exc}", file=sys.stderr)
         failed = [k for k, v in self.results.items() if not v]
         for tid, ok in self.results.items():
             print(f"  {'OK' if ok else 'FAIL'} {tid}")
@@ -270,7 +278,9 @@ def main() -> None:
             hard_deadline = wall_ts
             hard_wall_str = f"{configured_wall} BJT"
 
-    orch = Orchestrator(hard_deadline)
+    # 频道2 日报推送条件：默认时间线 run（主 cron）或重跑 run（RETRY_REPORT=1）
+    is_retry = os.getenv("RETRY_REPORT", "0").lower() in {"1", "true", "yes"}
+    orch = Orchestrator(hard_deadline, daily_report=(not is_explicit) or is_retry)
     if is_explicit:
         build_explicit_timeline(orch, args.tasks)
     else:

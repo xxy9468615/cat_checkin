@@ -1,0 +1,13 @@
+{
+  "_comment": "Discord 频道2 每日执行情况日报模板（C 数据详细版）。占位符: {{TITLE}} {{COLOR}} {{DESCRIPTION}} {{TIMESTAMP}}；DESCRIPTION 由代码组装（统计头 + 等宽伪表格 + 获得/资产变化/连签小结），表格对齐依赖代码内显示宽度计算，改本文件请勿动 description 内的等宽块结构。删除本文件或写错时回退代码内置模板。",
+  "username": "cat_checkin",
+  "embeds": [
+    {
+      "title": "{{TITLE}}",
+      "color": "{{COLOR}}",
+      "description": "{{DESCRIPTION}}",
+      "footer": { "text": "cat_checkin 每日执行情况" },
+      "timestamp": "{{TIMESTAMP}}"
+    }
+  ]
+}

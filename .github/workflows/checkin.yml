@@ -197,6 +197,7 @@ jobs:
       LATVI_PASSWORD_1: ${{ secrets.LATVI_PASSWORD_1 || secrets.LATVI_PASSWORD }}
       LATVI_STATE_FILE: .latvi_state.json
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      DISCORD_REPORT_WEBHOOK_URL: ${{ secrets.DISCORD_REPORT_WEBHOOK_URL }}
       RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
       RESEND_FROM: ${{ secrets.RESEND_FROM }}
       RESEND_TO: ${{ secrets.RESEND_TO }}
@@ -345,6 +346,8 @@ jobs:
         id: orchestrator
         env:
           ORCH_TASKS: ${{ steps.orch_tasks.outputs.tasks }}
+          # 重跑 run（retry=true）结束后补推一条 [重跑] 前缀的每日日报
+          RETRY_REPORT: ${{ inputs.retry == true && '1' || '0' }}
         run: |
           if [ -n "$ORCH_TASKS" ]; then
             python3 scripts/daily_orchestrator.py --tasks "$ORCH_TASKS"
