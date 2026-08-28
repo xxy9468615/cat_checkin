@@ -208,7 +208,8 @@ def _get_today_daily_active(
       - "cooldown"：今日未到账但 24h 冷却未过（上次到账时间见 last_created），
         Cookie 登录态正常，非故障——调用方应视为绿卡
     """
-    today = datetime.now(BJT).strftime("%Y-%m-%d")
+    today = datetime.now(BJT)
+    today_str = today.strftime("%Y-%m-%d")
     hdrs = _headers(host, token=token, cookie=cookie)
 
     def _created(rec: Dict[str, Any]) -> str:
@@ -216,10 +217,35 @@ def _get_today_daily_active(
             rec.get("gmt_created") or rec.get("gmt_create") or rec.get("created_at") or ""
         )
 
+    def _parse_created(s: str) -> Optional[datetime]:
+        """兼容字符串日期与 epoch 秒/毫秒时间戳，返回 BJT datetime 或 None。"""
+        s = s.strip()
+        if not s:
+            return None
+        if s.isdigit():
+            v = int(s)
+            if v > 10**12:  # epoch 毫秒
+                v //= 1000
+            try:
+                return datetime.fromtimestamp(v, BJT)
+            except (ValueError, OverflowError, OSError):
+                return None
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(s, fmt).replace(tzinfo=BJT)
+            except ValueError:
+                continue
+        try:
+            dtv = datetime.fromisoformat(s)
+            return dtv.replace(tzinfo=BJT) if dtv.tzinfo is None else dtv
+        except ValueError:
+            return None
+
     # 判据 1：交易记录直查（分页扫描至越过今日）
     seen_rule_keys = set()
     today_record_cnt = 0
-    last_da_created = ""
+    last_da_dt: Optional[datetime] = None
+    last_da_raw = ""
     resp = None
     try:
         for page in (1, 2, 3):
@@ -242,20 +268,22 @@ def _get_today_daily_active(
             for rec in records:
                 rule_key = str(rec.get("rule_key") or "")
                 created_str = _created(rec)
-                if created_str[:10] == today:
-                    today_record_cnt += 1
+                dt_val = _parse_created(created_str)
+                if dt_val is not None:
+                    if dt_val.date() == today.date():
+                        today_record_cnt += 1
+                    elif dt_val < today:
+                        past_today = True
                 if rule_key:
                     seen_rule_keys.add(rule_key)
                 if rule_key == "daily_active":
-                    if created_str.startswith(today) or today in created_str:
+                    if dt_val is not None and dt_val.date() == today.date():
                         rec["source"] = "transaction"
                         return rec
-                    # 流水按时间倒序：扫描中首个 daily_active 即最近一次到账时间
-                    if not last_da_created:
-                        last_da_created = created_str
-                # 出现早于今日的记录说明今日记录已全部扫过
-                if created_str[:10] and created_str[:10] < today:
-                    past_today = True
+                    # 流水按时间倒序：扫描中首个 daily_active 即最近一次到账
+                    if last_da_dt is None:
+                        last_da_dt = dt_val
+                        last_da_raw = created_str
             if past_today:
                 break
     except Exception:
@@ -293,43 +321,34 @@ def _get_today_daily_active(
         pass
 
     if seen_rule_keys:
-        print(f"  [diag] 交易记录今日可见 rule_key：{sorted(seen_rule_keys)}")
+        print(f"  [diag] 交易记录扫描可见 rule_key：{sorted(seen_rule_keys)}")
 
     # 判据 3：24h 冷却识别——今日流水存在（登录态正常）但 daily_active 上次到账
     # 不足 24h（如昨日 auto-retry 延迟到账），服务端冷却期内不发奖，非 Cookie 失效
-    if last_da_created and today_record_cnt > 0:
-        last_ts = None
-        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-            try:
-                last_ts = datetime.strptime(last_da_created[: len(fmt) + 4], fmt).replace(
-                    tzinfo=BJT
-                )
-                break
-            except ValueError:
-                continue
-        if last_ts is None:
-            try:
-                last_ts = datetime.fromisoformat(last_da_created)
-                if last_ts.tzinfo is None:
-                    last_ts = last_ts.replace(tzinfo=BJT)
-            except ValueError:
-                last_ts = None
-        if last_ts is not None:
-            elapsed_h = (datetime.now(BJT) - last_ts).total_seconds() / 3600
-            if 0 <= elapsed_h < 24:
-                eta_h = 24 - elapsed_h
-                print(
-                    f"  [diag] daily_active 24h 冷却中：上次到账 {last_da_created} "
-                    f"（{elapsed_h:.1f}h 前），预计 {eta_h:.1f}h 后可领"
-                )
-                return {
-                    "rule_key": "daily_active",
-                    "total_amount": 200,
-                    "expire_at": "",
-                    "source": "cooldown",
-                    "last_created": last_da_created,
-                    "eta_hours": round(eta_h, 1),
-                }
+    if last_da_dt is not None and today_record_cnt > 0:
+        elapsed_h = (today - last_da_dt).total_seconds() / 3600
+        if 0 <= elapsed_h < 24:
+            eta_h = 24 - elapsed_h
+            print(
+                f"  [diag] daily_active 24h 冷却中：上次到账 {last_da_raw} "
+                f"（{elapsed_h:.1f}h 前），预计 {eta_h:.1f}h 后可领"
+            )
+            return {
+                "rule_key": "daily_active",
+                "total_amount": 200,
+                "expire_at": "",
+                "source": "cooldown",
+                "last_created": last_da_raw,
+                "eta_hours": round(eta_h, 1),
+            }
+
+    # 诊断信息：双判据都未命中时打印关键原始数据，便于区分「Cookie 失效」、
+    # 「24h 冷却未覆盖」与「接口字段变更」
+    print(
+        f"  [diag] 未命中：今日流水 {today_record_cnt} 条，"
+        f"最近 daily_active 到账 {last_da_raw or '扫描窗口内未见'}，"
+        f"earn/rules today_used=0"
+    )
     return None
 
 
