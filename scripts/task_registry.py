@@ -160,14 +160,28 @@ TASKS: Dict[str, Dict[str, Any]] = {
     },
 
     # --- 特殊窗口站点（09:10 BJT 窗口；单 run 中 max(now,09:10) 零等待） ---
+    # ModelScope CN 站与国际站（AI）拆为两个独立任务实例：分开调度、独立失败卡、
+    # 独立通知状态；MODELSCOPE_SITE 由 orchestrator 按 cfg["env"] 注入。
+    # 显式 tasks=modelscope 仍同时命中两实例（resolve_execution_queue 按脚本名匹配）。
     "modelscope": {
         "id": "modelscope",
         "script": "modelscope.py",
-        "name": "ModelScope 社区签到",
+        "name": "ModelScope 国内站签到",
         "result": "modelscope.json",
         "timeout": 600,
         "account": "",
         "tags": ["09:10", "modelscope", "daily"],
+        "env": {"MODELSCOPE_SITE": "cn"},
+    },
+    "modelscope_ai": {
+        "id": "modelscope_ai",
+        "script": "modelscope.py",
+        "name": "ModelScope 国际站签到",
+        "result": "modelscope_ai.json",
+        "timeout": 600,
+        "account": "",
+        "tags": ["09:10", "modelscope", "modelscope_ai", "daily"],
+        "env": {"MODELSCOPE_SITE": "ai"},
     },
 
     # --- 24h 动态冷却站点（Latvi：last_sign_ts+24h 状态驱动，硬墙前 2min 进场） ---

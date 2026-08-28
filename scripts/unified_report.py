@@ -152,7 +152,9 @@ def collect_all_results(today: str, yesterday: str) -> Tuple[List[Tuple[bool, Pa
         except (TypeError, ValueError):
             elapsed = 0.0
         output = str(data.get("output") or "")
-        out.append((st, path, output, elapsed))
+        # 第 5 元素：结果 JSON 自带任务名（同脚本多实例时与脚本 Env 标题不同，
+        # 如 ModelScope 国内站/国际站），供邮件卡片标题优先使用
+        out.append((st, path, output, elapsed, str(data.get("name") or "")))
 
     return out, collected
 

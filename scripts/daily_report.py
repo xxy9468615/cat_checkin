@@ -77,10 +77,11 @@ def _last_meaningful_line(text: str) -> str:
 
 
 def build_report(results: Iterable[Tuple[Any, Path, str, float]]) -> Tuple[str, str, int]:
-    rows: List[Tuple[str, Path, str, float]] = []
+    rows: List[Tuple[str, Path, str, float, str]] = []
     for item in results:
         st = _normalize_status(item[0])
-        rows.append((st, item[1], item[2], item[3]))
+        # 第 5 元素为结果 JSON 自带的任务名（同脚本多实例时与脚本 Env 标题不同），可空
+        rows.append((st, item[1], item[2], item[3], item[4] if len(item) > 4 else ""))
 
     ok_count = sum(1 for st, *_ in rows if st == "ok")
     fail_count = sum(1 for st, *_ in rows if st == "fail")
@@ -103,8 +104,8 @@ def build_report(results: Iterable[Tuple[Any, Path, str, float]]) -> Tuple[str, 
         stat_line = f"📊 成功 {ok_count} | 失败 {fail_count} | 共 {total_count}"
 
     lines = [summary_header, stat_line, ""]
-    for st, path, output, elapsed in rows:
-        task_title = get_task_title(path)
+    for st, path, output, elapsed, dname in rows:
+        task_title = dname or get_task_title(path)
         if st == "ok":
             status_icon = "✅"
             lines.append(f"{status_icon} {task_title} ({elapsed:.1f}s)")
@@ -276,9 +277,9 @@ def _sanitize_output(text: str) -> str:
     return _html.unescape(text).strip()
 
 
-def _build_task_card(status: Any, path: Path, output: str, elapsed: float) -> str:
+def _build_task_card(status: Any, path: Path, output: str, elapsed: float, dname: str = "") -> str:
     """构造单个任务卡片。"""
-    title = get_task_title(path)
+    title = dname or get_task_title(path)
     st = _normalize_status(status)
     if st == "ok":
         status_color = "#228757"
@@ -348,10 +349,10 @@ def build_email_html(results: List[Tuple[Any, Path, str, float]], stat_line: str
     footer = f"由 cat_checkin 自动生成 · {now}"
 
     # 按 失败 -> 待执行 -> 成功 排序
-    rows: List[Tuple[str, Path, str, float]] = []
+    rows: List[Tuple[str, Path, str, float, str]] = []
     for item in results:
         st = _normalize_status(item[0])
-        rows.append((st, item[1], item[2], item[3]))
+        rows.append((st, item[1], item[2], item[3], item[4] if len(item) > 4 else ""))
 
     failed = [r for r in rows if r[0] == "fail"]
     pending = [r for r in rows if r[0] == "pending"]
@@ -364,16 +365,16 @@ def build_email_html(results: List[Tuple[Any, Path, str, float]], stat_line: str
     cards_html = overview_html
     if failed:
         cards_html += '<div style="margin:12px 0 6px 0;font-size:12px;color:#ce2b39;font-weight:600;">⚠️ 失败任务</div>'
-        for st, path, output, elapsed in failed:
-            cards_html += _build_task_card(st, path, output, elapsed)
+        for st, path, output, elapsed, dname in failed:
+            cards_html += _build_task_card(st, path, output, elapsed, dname)
     if pending:
         cards_html += '<div style="margin:12px 0 6px 0;font-size:12px;color:#64748b;font-weight:600;">⏳ 待执行 / 独立调度任务</div>'
-        for st, path, output, elapsed in pending:
-            cards_html += _build_task_card(st, path, output, elapsed)
+        for st, path, output, elapsed, dname in pending:
+            cards_html += _build_task_card(st, path, output, elapsed, dname)
     if succeeded:
         cards_html += '<div style="margin:12px 0 6px 0;font-size:12px;color:#228757;font-weight:600;">✅ 成功任务</div>'
-        for st, path, output, elapsed in succeeded:
-            cards_html += _build_task_card(st, path, output, elapsed)
+        for st, path, output, elapsed, dname in succeeded:
+            cards_html += _build_task_card(st, path, output, elapsed, dname)
 
     tpl = _template(
         TEMPLATE_DIR / "email_report.html",
@@ -424,7 +425,7 @@ def _streak_days(text: str) -> int:
     return int(m.group(1)) if m else 0
 
 
-def _collect_overview(rows: List[Tuple[str, Path, str, float]], yesterday: str) -> Dict[str, Any]:
+def _collect_overview(rows: List[Tuple[str, Path, str, float, str]], yesterday: str) -> Dict[str, Any]:
     """聚合全局小结：🎁 今日获得(按单位) / 💰 资产变化(vs 昨日归档) / 🔥 连签最高 / ⚠️ 连签将断。
 
     全部 best-effort：昨日归档缺失/Redis 不可用/字段提取不到时对应项为空，不影响邮件。
@@ -445,10 +446,10 @@ def _collect_overview(rows: List[Tuple[str, Path, str, float]], yesterday: str) 
     except Exception:
         y_sites = {}
 
-    for st, path, output, _elapsed in rows:
+    for st, path, output, _elapsed, dname in rows:
         fields = _extract_fields(output or "")
         task_id = path.stem  # u1s1.py → u1s1（与归档 site_key 命名一致）
-        title = get_task_title(path)
+        title = dname or get_task_title(path)
 
         if st == "ok":
             # 今日获得按单位聚合（M/K 简写换算数值；跨单位不求和）
@@ -510,7 +511,7 @@ def _collect_overview(rows: List[Tuple[str, Path, str, float]], yesterday: str) 
     return {"gains": gains, "changes": changes[:4], "max_streak": max_streak, "at_risk": at_risk[:4]}
 
 
-def _build_overview_html(rows: List[Tuple[str, Path, str, float]], yesterday: str) -> str:
+def _build_overview_html(rows: List[Tuple[str, Path, str, float, str]], yesterday: str) -> str:
     """今日概览卡片 HTML（置于逐任务卡片之上）；无任何数据时返回空串。"""
     data = _collect_overview(rows, yesterday)
     gains = data["gains"]

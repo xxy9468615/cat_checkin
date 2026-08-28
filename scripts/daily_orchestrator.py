@@ -79,10 +79,17 @@ def build_task_env(cfg: Dict[str, Any]) -> Dict[str, str]:
         env["WORKBUDDY_COOKIE_1"] = cookie
         env["WORKBUDDY_WAIT_TRAVEL"] = "true"
         env["WORKBUDDY_NO_RELAY"] = "1"
-        env["TASK_RESULT_NAME"] = cfg["result"]
     if cfg["id"] == "latvi":
         env["LATVI_NO_RELAY"] = "1"
         env.setdefault("LATVI_STATE_FILE", ".latvi_state.json")
+    # 通用注入：registry 任务的私有环境变量（如 modelscope 的 MODELSCOPE_SITE）、
+    # 结果文件名（同脚本多实例隔离落盘，如 modelscope_ai.json）与邮件卡片标题
+    for k, v in (cfg.get("env") or {}).items():
+        env[str(k)] = str(v)
+    if cfg.get("result"):
+        env["TASK_RESULT_NAME"] = cfg["result"]
+    if cfg.get("name"):
+        env["TASK_TITLE"] = cfg["name"]
     return env
 def run_task_subprocess(cfg: Dict[str, Any]) -> Tuple[bool, str]:
     cap = cfg["timeout"] + 120
@@ -219,9 +226,9 @@ def build_default_timeline(orch: Orchestrator) -> None:
     stage_a = [t for t in TASKS.values() if "matrix" in t["tags"] or "workbuddy" in t["tags"]]
     for cfg in stage_a:
         orch.push(now, "task", cfg)
-    ms_cfg = TASKS["modelscope"]
     ms_fire = max(now, _hm_today_ts("09:10"))
-    orch.push(ms_fire, "task", ms_cfg)
+    for ms_id in ("modelscope", "modelscope_ai"):
+        orch.push(ms_fire, "task", TASKS[ms_id])
     plan = latvi_plan()
     latvi_cfg = TASKS["latvi"]
     if plan["mode"] == "skip":
@@ -231,7 +238,7 @@ def build_default_timeline(orch: Orchestrator) -> None:
         orch.push(plan["fire_at"], "task", latvi_cfg)
     print("Timeline:")
     print(f"  immediate ({len(stage_a)} tasks, concurrency {os.getenv('BATCH_PARALLEL','4')}): " + ", ".join(t["id"] for t in stage_a))
-    print(f"  modelscope @ {_fmt_bjt(ms_fire)} (gate 09:10)")
+    print(f"  modelscope + modelscope_ai @ {_fmt_bjt(ms_fire)} (gate 09:10)")
     if plan["mode"] == "skip":
         print(f"  latvi: skipped (window {_fmt_bjt(plan['window_open'])} past deadline)")
     else:

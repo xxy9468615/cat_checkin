@@ -88,7 +88,9 @@ def main() -> None:
     if not result_name.endswith(".json"):
         result_name += ".json"
 
-    task_name = get_task_title(target_path)
+    # 任务标题：orchestrator 可经 TASK_TITLE 注入实例化名称（同脚本多实例，
+    # 如 ModelScope 国内站/国际站），缺省回退脚本 # new Env 注释
+    task_name = (os.getenv("TASK_TITLE") or "").strip() or get_task_title(target_path)
     print(f"▶️ 开始执行任务: {task_name} ({target_path.name})")
 
     start_time = time.monotonic()

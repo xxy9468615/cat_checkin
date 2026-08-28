@@ -946,7 +946,32 @@ def _run_site(
     return all_ok, [line for _, line in results]
 
 
-def main():
+def _run_single_site(site: str) -> None:
+    """单站点模式（MODELSCOPE_SITE=cn/ai）：只跑指定站点，站点失败即退出非零。
+
+    供 task_registry 拆分的两个独立任务实例调用（国内站/国际站分开调度、
+    各自独立失败卡与通知状态）。
+    """
+    is_cn = site == "cn"
+    accounts = _load_accounts("cn" if is_cn else "ai")
+    if not accounts:
+        var = f"{PREFIX}TOKEN（或 {PREFIX}TOKEN_1 / {PREFIX}COOKIE_1）" if is_cn \
+            else f"{PREFIX}AI_TOKEN / {PREFIX}AI_COOKIE"
+        raise RuntimeError(f"ModelScope {'国内' if is_cn else '国际'}站缺少环境变量：{var}")
+
+    host = _default_host() if is_cn else _ai_host()
+    title = "ModelScope 国内站 签到" if is_cn else "ModelScope 国际站 签到"
+    print(f"【{title}】")
+    print(f"共 {len(accounts)} 个账号 @ {host}\n")
+
+    ok, _lines = _run_site(accounts, host, site, title)
+    print(f"\n{'国内站' if is_cn else '国际站'}：{'✅ 成功' if ok else '❌ 失败'}")
+    if not ok:
+        sys.exit(1)
+
+
+def _run_both_sites() -> None:
+    """双站顺序执行（兼容青龙/本地手动场景，未设置 MODELSCOPE_SITE 时）。"""
     print("【ModelScope 签到】")
 
     # 国内站
@@ -981,6 +1006,16 @@ def main():
     # 国际站失败时，打印警告但不退出（避免误报影响整体）
     if not ai_ok:
         print("\n⚠️ 国际站签到异常（通常为凭证需手动刷新，不影响国内站）")
+
+
+def main():
+    # MODELSCOPE_SITE=cn/ai：单站点独立任务模式（独立调度/失败卡/通知状态）；
+    # 未设置：双站顺序执行（青龙/本地手动兼容）
+    site = (os.getenv("MODELSCOPE_SITE") or "").strip().lower()
+    if site in ("cn", "ai"):
+        _run_single_site(site)
+    else:
+        _run_both_sites()
 
 
 if __name__ == "__main__":
