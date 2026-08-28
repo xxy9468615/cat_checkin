@@ -961,8 +961,7 @@ def _run_single_site(site: str) -> None:
 
     host = _default_host() if is_cn else _ai_host()
     title = "ModelScope 国内站 签到" if is_cn else "ModelScope 国际站 签到"
-    print(f"【{title}】")
-    print(f"共 {len(accounts)} 个账号 @ {host}\n")
+    print(f"共 {len(accounts)} 个账号 @ {host}\n")  # 站点标题由 _run_site 统一打印
 
     ok, _lines = _run_site(accounts, host, site, title)
     print(f"\n{'国内站' if is_cn else '国际站'}：{'✅ 成功' if ok else '❌ 失败'}")
