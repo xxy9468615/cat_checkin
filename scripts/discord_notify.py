@@ -8,7 +8,7 @@ daily_orchestrator.py 每个任务完成瞬间调用 notify_task_progress，按�
 
 卡片字段（简约版，无耗时 / 无输出摘要）：
   成功卡：账号(脱敏) / 连签进度 / 奖励明细 / 当前资产 / 上次签到成功日期
-  失败卡：失败原因 / 账号(脱敏) / 连签进度 / 当前资产 / 上次签到成功日期(距今N天)
+  失败卡：逐账号失败明细 + 按错误类型的针对性处置建议 + 账号 / 资产 / 上次成功日期
 排版采用 description 正文行（加粗标签 + 值），不用 fields 网格——
 inline 字段在窄屏/多列时挤压错位，正文行渲染更干净。
 
@@ -199,33 +199,84 @@ def _assets_text(fields: Dict[str, str]) -> str:
 
 
 # 强错误特征（HTTP 状态码/异常/失效等）与汇总行特征（失败原因要取真因，不要「执行完毕」汇总）
-_STRONG_ERROR_RE = re.compile(
-    r"(HTTP\s?\d{3}|Traceback|Error|Exception|失效|超时|无法|登录失败|执行异常|退出码)", re.I
-)
-_SUMMARY_LINE_RE = re.compile(r"(执行完毕|总结|共有\s*\d+\s*个|成功\s*\d+\s*/\s*\d+)")
+_FAILURE_LINE_RE = re.compile(r"(❌|失败|失效|错误|Error|Exception|超时|无法|HTTP\s?\d{3})", re.I)
+_SUMMARY_LINE_RE = re.compile(r"(执行完毕|总结|成功\s*\d+\s*/\s*\d+|========|^\s*--- )")
+# 失败行前置噪音（emoji/序号/「账号」标签/「签到失败：」动词短语）剥离，只留可读根因
+_FAIL_LINE_NOISE_RE = re.compile(r"^[❌⚠️✅🚨]*\s*(?:\[\d+\s*/\s*\d+\]\s*)?(?:账号\s*)?(?:(?:签到|打卡)?失败[:：]\s*)?")
+_FAIL_INDEX_RE = re.compile(r"\[(\d+)\s*/\s*\d+\]")
+_FAIL_TEXT_MAX = 160
+
+# 错误类型 → 针对性处置建议（按序首个命中生效；daily_active/幂等打卡优先于泛化的「凭证失效」）
+_ERROR_HINTS = [
+    (r"daily_active|冷却", "日活奖励未到账：24h 滚动冷却中，Cookie 登录态正常，下次运行自动到账，无需处理"),
+    (r"已经打过卡|已打卡|already[_ ]?claimed|重复打卡|请勿重复|今日已打卡",
+     "站点提示今日已打卡：本次为重复执行，无需处理，下轮运行自动恢复绿色"),
+    (r"HTTP\s?40[13]|失效|过期|未登录|session|cookie",
+     "登录凭证疑似失效：请在浏览器重新登录该站点，并更新 GitHub Secrets 中对应的 Cookie/Token"),
+    (r"验证码|captcha|challenge|pow",
+     "验证码求解失败：站点风控可能升级，建议人工登录该站点一次后再观察"),
+    (r"超时|timeout", "执行超时：站点响应缓慢或网络受限，下一轮运行将自动重试"),
+    (r"代理|proxy|socks", "代理通道不可用：请检查 AGENTROUTER_SS_CONFIG 或备用代理配置"),
+]
 
 
-def _one_line_error(output: str) -> str:
-    """失败原因单行摘要：优先含强错误特征的非汇总行，再回退末尾有效行，压平空白后截断。"""
-    lines = [ln.strip() for ln in (output or "").splitlines() if ln.strip()]
-    line = ""
-    for ln in reversed(lines):
-        if _STRONG_ERROR_RE.search(ln) and not _SUMMARY_LINE_RE.search(ln):
-            line = ln
+def _failure_items(output: str, max_items: int = 3) -> List[tuple[str, str]]:
+    """逐账号失败明细：扫描输出中的真实失败行（❌ 行优先，⚠️ 警告行兜底）。
+
+    返回 [(序号 tag 如 '#2' 或 '', 清理后的单行原因)]；汇总行/分隔线不参与，
+    同文去重，最多 max_items 条。
+    """
+    primary: List[str] = []
+    backup: List[str] = []
+    for raw in (output or "").splitlines():
+        line = raw.strip()
+        if not line or _SUMMARY_LINE_RE.search(line):
+            continue
+        if "⚠️" in line:
+            backup.append(line)
+        elif _FAILURE_LINE_RE.search(line):
+            primary.append(line)
+    items: List[tuple[str, str]] = []
+    seen: set[str] = set()
+    for line in primary + backup:
+        m = _FAIL_INDEX_RE.search(line)
+        tag = f"#{m.group(1)}" if m else ""
+        text = _FAIL_LINE_NOISE_RE.sub("", line).strip()
+        if len(text) > _FAIL_TEXT_MAX:
+            text = text[:_FAIL_TEXT_MAX] + "…"
+        if text in seen:
+            continue
+        seen.add(text)
+        items.append((tag, text))
+        if len(items) >= max_items:
             break
-    if not line:
-        try:
-            from daily_report import _last_meaningful_line
-            line = _last_meaningful_line(output or "")
-        except Exception:
-            line = ""
-    if not line:
-        candidates = [ln for ln in reversed(lines) if not _SUMMARY_LINE_RE.search(ln)]
-        line = candidates[0] if candidates else (lines[-1] if lines else "")
-    line = re.sub(r"\s+", " ", line).strip()
-    if not line:
-        return "未知错误（详见 CI 日志）"
-    return line[:REASON_MAX_LEN] + ("…" if len(line) > REASON_MAX_LEN else "")
+    return items
+
+
+def _error_hint(items: List[tuple[str, str]]) -> str:
+    """按失败文本匹配处置建议；混合失败（如冷却 + 凭证失效并存）给最多两条不同建议。"""
+    joined = " ".join(text for _, text in items)
+    hints: List[str] = []
+    for pattern, hint in _ERROR_HINTS:
+        if re.search(pattern, joined, re.I) and hint not in hints:
+            hints.append(hint)
+            if len(hints) >= 2:
+                break
+    return "；".join(hints)
+
+
+def _failed_accounts(output: str) -> str:
+    """从失败明细行提取失败账号（带 [i/n] 序号），与成功账号区分开。"""
+    tags: List[str] = []
+    for tag, text in _failure_items(output, max_items=6):
+        m = _MASKED_TOKEN_RE.search(text)
+        label = f"{tag} {m.group(0).strip('._-')}" if m else tag
+        label = label.strip()
+        if label and label not in tags:
+            tags.append(label)
+    if not tags:
+        return ""
+    return "、".join(tags[:4])
 
 
 # === 按 task_id 的通知状态（上次成功日期 / 连续失败次数） ===
@@ -291,14 +342,28 @@ def _success_description(account: str, streak: str, reward: str, assets: str, la
     return "\n".join(lines)
 
 
-def _failure_description(reason: str, account: str, streak: str, assets: str, last_ok: str) -> str:
-    lines = [
-        f"❗ **原因**　{reason}",
-        f"👤 **账号**　{account}",
-        f"🔥 **连签**　{streak}",
-        f"💰 **资产**　{assets}",
-        f"📅 **上次成功**　{last_ok}",
-    ]
+def _failure_description(
+    items: List[tuple[str, str]],
+    hint: str,
+    failed_acct: str,
+    account: str,
+    assets: str,
+    last_ok: str,
+) -> str:
+    lines: List[str] = []
+    if len(items) == 1:
+        tag, text = items[0]
+        lines.append(f"❗ **原因**　{(tag + ' · ') if tag else ''}{text}")
+    elif items:
+        lines.append("❗ **失败明细**")
+        lines += [f"　{tag} {text}".strip() for tag, text in items]
+    else:
+        lines.append("❗ **原因**　未知错误（进程非零退出但无失败输出，详见 Actions 日志）")
+    if hint:
+        lines.append(f"💡 **建议**　{hint}")
+    lines.append(f"👤 **账号**　{failed_acct or account}")
+    lines.append(f"💰 **资产**　{assets}")
+    lines.append(f"📅 **上次成功**　{last_ok}")
     return "\n".join(lines)
 
 
@@ -367,7 +432,17 @@ def notify_task_progress(
         fail_n = prev_fail_streak + 1
         status_title = f"签到失败（连续第 {fail_n} 次）" if fail_n > 1 else "签到失败"
         last_ok_text = _md_escape(_format_last_ok(prev_ok_date, with_days=True) if prev_ok_date else "无成功记录")
-        description = _failure_description(_md_escape(_one_line_error(output)), account, streak, assets, last_ok_text)
+        items_raw = _failure_items(output)
+        items = [(t, _md_escape(x)) for t, x in items_raw]
+        hint = _error_hint(items_raw)
+        description = _failure_description(
+            items,
+            _md_escape(hint),
+            _md_escape(_failed_accounts(output)),
+            account,
+            assets,
+            last_ok_text,
+        )
         new_state["last_ok_date"] = prev_ok_date
         new_state["fail_streak"] = fail_n
         tpl_file, tpl = "discord_failure.json", DEFAULT_FAILURE_TEMPLATE
@@ -398,9 +473,12 @@ def main() -> None:
         "🎁 打卡赠送额度: 4,000,000 (4.00M) Tokens (有效期至 2026-09-27)\n"
     )
     fail_output = (
-        "账号 x***3@gmail.com\n"
-        "❌ 账号 签到失败: HTTP 401, msg: session expired (Session Cookie 已失效)\n"
-        "🚨 执行完毕，共有 1 个账号签到失败\n"
+        "【ModelScope 签到】\n"
+        "  [1/3] a***1 UID:1***6 [Cookie] 签到成功，今日已领取 200 魔粒\n"
+        "  [2/3] b***2 UID:1***7 [Cookie] 交易记录无今日 daily_active（Cookie 可能已失效需手动刷新）\n"
+        "  [3/3] c***3 UID:1***8 签到失败：HTTP 401, msg: session expired\n"
+        "  国内站总结：成功 1/3\n"
+        "🚨 执行完毕，共有 2 个账号签到失败：\n"
     )
     sent1 = notify_task_progress(
         task_id="selftest", name="自测站点 签到", script="selftest.py",

@@ -311,7 +311,8 @@ def run_account(idx: int, total_accounts: int, token: str, h: Http) -> tuple[boo
             err_detail = f"HTTP {resp.code}, msg: {err_msg}"
             if resp.code in (401, 403):
                 err_detail += " (Session Cookie 已失效)"
-            print(f"❌ 账号 {tag} 打卡失败: {err_detail}")
+            # 失败路径拿不到 /api/me 的邮箱，用脱敏 session 标识账号供通知卡片提取
+            print(f"❌ 账号 {tag}{mask_str(token)} 打卡失败: {err_detail}")
             return False, err_detail
 
     # 3. 获取用户资产与打卡进度信息（/api/me，展示性信息非阻断）
