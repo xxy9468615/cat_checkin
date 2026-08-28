@@ -201,13 +201,12 @@ def _touch_user(
 def _get_today_daily_active(
     h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
-    """查询每日签到（daily_active）奖励交易记录或任务完成状态。返回今日记录 dict 或 None。
+    """查询每日签到（daily_active）奖励交易记录或任务完成状态。
 
-    双判据保障：
-    1. 直查交易记录接口，`rule_key == "daily_active"` 且 `gmt_created` 日期命中今日 BJT。
-       分页扫描（page_size=50，最多 3 页，扫到越过今日即止）：点赞任务每点一次各产生
-       一条流水，20 次点赞会把当日 daily_active 记录挤出第 1 页，只查首页会永久误判。
-    2. 若交易记录未落库，查询 earn/rules 的 `daily_active` 规则中的 `today_used > 0`。
+    返回今日记录 dict 或 None；记录 source 字段区分：
+      - "transaction" / "earn_rules"：今日已真实到账
+      - "cooldown"：今日未到账但 24h 冷却未过（上次到账时间见 last_created），
+        Cookie 登录态正常，非故障——调用方应视为绿卡
     """
     today = datetime.now(BJT).strftime("%Y-%m-%d")
     hdrs = _headers(host, token=token, cookie=cookie)
@@ -219,6 +218,8 @@ def _get_today_daily_active(
 
     # 判据 1：交易记录直查（分页扫描至越过今日）
     seen_rule_keys = set()
+    today_record_cnt = 0
+    last_da_created = ""
     resp = None
     try:
         for page in (1, 2, 3):
@@ -240,14 +241,19 @@ def _get_today_daily_active(
             past_today = False
             for rec in records:
                 rule_key = str(rec.get("rule_key") or "")
+                created_str = _created(rec)
+                if created_str[:10] == today:
+                    today_record_cnt += 1
                 if rule_key:
                     seen_rule_keys.add(rule_key)
-                created_str = _created(rec)
-                if rule_key == "daily_active" and (
-                    created_str.startswith(today) or today in created_str
-                ):
-                    return rec
-                # 流水按时间倒序：出现早于今日的记录说明今日记录已全部扫过
+                if rule_key == "daily_active":
+                    if created_str.startswith(today) or today in created_str:
+                        rec["source"] = "transaction"
+                        return rec
+                    # 流水按时间倒序：扫描中首个 daily_active 即最近一次到账时间
+                    if not last_da_created:
+                        last_da_created = created_str
+                # 出现早于今日的记录说明今日记录已全部扫过
                 if created_str[:10] and created_str[:10] < today:
                     past_today = True
             if past_today:
@@ -288,6 +294,42 @@ def _get_today_daily_active(
 
     if seen_rule_keys:
         print(f"  [diag] 交易记录今日可见 rule_key：{sorted(seen_rule_keys)}")
+
+    # 判据 3：24h 冷却识别——今日流水存在（登录态正常）但 daily_active 上次到账
+    # 不足 24h（如昨日 auto-retry 延迟到账），服务端冷却期内不发奖，非 Cookie 失效
+    if last_da_created and today_record_cnt > 0:
+        last_ts = None
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                last_ts = datetime.strptime(last_da_created[: len(fmt) + 4], fmt).replace(
+                    tzinfo=BJT
+                )
+                break
+            except ValueError:
+                continue
+        if last_ts is None:
+            try:
+                last_ts = datetime.fromisoformat(last_da_created)
+                if last_ts.tzinfo is None:
+                    last_ts = last_ts.replace(tzinfo=BJT)
+            except ValueError:
+                last_ts = None
+        if last_ts is not None:
+            elapsed_h = (datetime.now(BJT) - last_ts).total_seconds() / 3600
+            if 0 <= elapsed_h < 24:
+                eta_h = 24 - elapsed_h
+                print(
+                    f"  [diag] daily_active 24h 冷却中：上次到账 {last_da_created} "
+                    f"（{elapsed_h:.1f}h 前），预计 {eta_h:.1f}h 后可领"
+                )
+                return {
+                    "rule_key": "daily_active",
+                    "total_amount": 200,
+                    "expire_at": "",
+                    "source": "cooldown",
+                    "last_created": last_da_created,
+                    "eta_hours": round(eta_h, 1),
+                }
     return None
 
 
@@ -718,7 +760,7 @@ def _touch_and_check(
             except Exception:
                 pass
 
-    credited = record is not None
+    credited = record is not None and (record or {}).get("source") != "cooldown"
     return credited, user, record, ""
 
 
@@ -744,7 +786,8 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str]:
     )
 
     # 缓存 Cookie 失效或未到账时，自动回退尝试环境变量/Secrets 中的最新 Cookie
-    if not credited and fallback_cookie and fallback_cookie != active_cookie:
+    # （冷却期 cooldown 不回退：今日流水已证明登录态正常，回退无意义）
+    if not credited and record is None and fallback_cookie and fallback_cookie != active_cookie:
         print(f"  [{idx}] 🔄 缓存 Cookie 登录态失效或未到账，尝试回退使用环境变量最新配置的 Cookie...")
         h_fallback = Http(proxy=proxy)
         fb_credited, fb_user, fb_record, fb_err = _touch_and_check(
@@ -772,8 +815,8 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str]:
     amount = (record or {}).get("total_amount", 200)
     expire_at = (record or {}).get("expire_at") or ""
 
-    # 签到成功且使用 Cookie 时，持久化并滚动更新 Cookie 到 Redis state
-    if credited and active_cookie and not token:
+    # 签到成功（或冷却期，登录态同样正常）且使用 Cookie 时，持久化并滚动更新 Cookie
+    if record is not None and active_cookie and not token:
         updated_cookie = _merge_cookies(active_cookie, h.jar)
         if updated_cookie:
             state_file = f".modelscope_{site}_state_{idx}.json"
@@ -818,7 +861,22 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str]:
     if credited:
         exp_desc = f"，{expire_at} 过期" if expire_at else ""
         status = f"签到成功，今日已领取 {amount} 魔粒{like_msg}{exp_desc}"
-    elif token and not cookie:
+        return True, f"{user_tag} {status}"
+
+    # 24h 冷却期：今日流水正常（点赞/触碰均已生效），仅奖励未到账，报绿卡避免误报
+    # 「Cookie 失效」红卡并触发无意义的自动重跑（冷却期内重跑多少次都不会发奖）
+    if (record or {}).get("source") == "cooldown":
+        eta_h = float(record.get("eta_hours") or 0)
+        eta_desc = (
+            f"预计 {int(eta_h)} 小时 {int(round(eta_h % 1 * 60))} 分钟后可领" if eta_h > 0 else "下次运行即可领取"
+        )
+        status = (
+            f"今日 daily_active 未到账：24h 冷却中（上次到账 {record.get('last_created', '?')}），"
+            f"Cookie 登录态正常，{eta_desc}{like_msg}"
+        )
+        return True, f"{user_tag} {status}"
+
+    if token and not cookie:
         # 2026-08-25 实测：Bearer Token 能通过 OpenAPI 鉴权，但 OpenAPI 调用不计入
         # 「日活」，daily_active 奖励永不发放——红卡必须直指根因，不再猜「重置时间」
         cookie_var = f"{PREFIX}COOKIE_{idx}" if site == "cn" else f"{PREFIX}AI_COOKIE_{idx}"
