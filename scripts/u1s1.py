@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 # cron: 0 9 * * *
 # new Env("u1s1.io 签到")
+import base64
 import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
+import zlib
 from common import Http, ensure, env_seq, is_already_signed, main_guard, mask_str
 
 PREFIX = "U1S1_"
 CAPCAT_SITE_KEY = "f8ad0853ed20b00d"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 
 def _fnv1a(seed: str) -> int:
@@ -58,38 +67,135 @@ def solve_challenge(token: str, challenge: dict | list) -> list[int]:
     return solutions
 
 
+def _solve_sha256_pow(token: str, payload: dict) -> int:
+    """sha256-pow 协议：暴力搜索 nonce 使 sha256(salt+nonce) 以 target 开头。"""
+    salt = payload["salt"].encode()
+    target = payload["target"]
+    nonce = 0
+    deadline = time.monotonic() + 120
+    while not hashlib.sha256(salt + str(nonce).encode()).hexdigest().startswith(target):
+        nonce += 1
+        if nonce % 100000 == 0 and time.monotonic() > deadline:
+            raise RuntimeError("sha256-pow 求解超时，放弃求解")
+    return nonce
+
+
+def _solve_rsw(payload: dict) -> str:
+    """RSW 时间锁谜题：y = x^(2^t) mod N（与前端 t 次连续平方等价），返回 hex。"""
+    n = int(payload["N"], 16)
+    x = int(payload["x"], 16)
+    t = int(payload["t"])
+    t0 = time.time()
+    y = pow(x, 1 << t, n)
+    print(f"  🧩 RSW 时间锁求解完成 (t={t}, 耗时 {time.time() - t0:.2f}s)")
+    return format(y, "x")
+
+
+def _run_instr(blob: str) -> dict:
+    """执行 instrumentation 挑战：blob 为 base64(deflate(JS))。
+
+    JS 内的 anti-bot 检查只决定通过/超时；回传的 state 是一段与浏览器无关的
+    确定性算术（位运算 + DOM 算术），用 Node + 迷你 DOM 垫片真实执行。
+    返回 {i, state, ts}（与服务端期望的 postMessage result 结构一致）。
+    需要 Node.js（GitHub Actions runner 自带）。
+    """
+    node = shutil.which("node")
+    ensure(bool(node), "instrumentation 挑战需要 Node.js 但未安装")
+    js = zlib.decompress(base64.b64decode(blob), wbits=-15).decode("utf-8")
+
+    # 提取算术段：最后一个 blocked 早退之后 → 成功 postMessage 之前
+    blocked = js.rfind("'*');return;}")
+    post = js.rfind("parent.postMessage({type: 'cap:instr'")
+    ensure(blocked != -1 and post != -1 and blocked < post, "instrumentation JS 结构与预期不符，无法提取算术段")
+    seg = js[blocked + len("'*');return;}"):post]
+    m = re.search(r"return (\w+);\}\)\(\);", seg)
+    ensure(bool(m), "instrumentation JS 未找到 state 返回语句")
+    seg = seg[: m.start() + len(f"return {m.group(1)};")]
+    m_id = re.search(r'result:\{i:"([0-9a-f]+)"', js)
+    ensure(bool(m_id), "instrumentation JS 未找到内嵌挑战 id")
+
+    harness = "\n".join([
+        'const navigator = {userAgent: ' + json.dumps(UA) + '};',
+        'class Div { constructor(){ this.parentNode=null; this._kids=[]; this._text=""; this.style={}; }',
+        '  appendChild(c){ this._kids.push(c); c.parentNode=this; return c; }',
+        '  removeChild(c){ const i=this._kids.indexOf(c); if(i>=0) this._kids.splice(i,1); return c; }',
+        '  get children(){ return this._kids; }',
+        '  get lastElementChild(){ return this._kids.length ? this._kids[this._kids.length-1] : null; }',
+        '  set innerText(v){ this._text = String(v); }',
+        '  get innerText(){ return this._text; }',
+        '}',
+        'const document = { createElement: () => new Div(), body: new Div() };',
+        '(async () => {',
+        seg,
+        '})().then(s => console.log("STATE:" + JSON.stringify(s)))'
+        '.catch(e => { console.error("ERR:" + e.message); process.exit(1); });',
+    ])
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as f:
+        f.write(harness)
+        path = f.name
+    try:
+        out = subprocess.run([node, path], capture_output=True, text=True, timeout=60)
+    finally:
+        os.unlink(path)
+    ensure(out.returncode == 0 and "STATE:" in out.stdout,
+           f"instrumentation 算术执行失败: {(out.stderr or out.stdout)[:200]}")
+    state = json.loads(out.stdout.split("STATE:", 1)[1])
+    return {"i": m_id.group(1), "state": state, "ts": int(time.time() * 1000)}
+
+
 def fetch_cap_token(h: Http, site_key: str = CAPCAT_SITE_KEY) -> str:
-    """自动完成 CapCat 工作量证明（PoW）验证码求解，换取 cap-token。"""
+    """自动完成 CapCat 人机验证求解，换取 cap-token。
+
+    format 2（challenges 列表）：逐项求解 rsw / instrumentation / sha256-pow，
+    solutions 数组与 challenges 顺序一一对应（与前端 cap.js 行为一致）。
+    format 1（challenge {c,s,d}）：保留原 prng PoW 求解路径。
+    """
     headers = {
         "Origin": "https://u1s1.io",
         "Referer": "https://u1s1.io/",
         "Content-Type": "application/json",
         "Accept": "application/json, text/plain, */*",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "User-Agent": UA,
     }
 
-    # 1. 获取 PoW 挑战
+    # 1. 获取挑战
     resp = h.request("POST", f"https://api.capcat.ai/{site_key}/challenge", headers=headers, json_data={})
     data = resp.json({})
-    token = data.get("token")
-    challenge = data.get("challenge")
     ensure(
-        bool(token) and isinstance(challenge, (dict, list)) and bool(challenge),
+        bool(data.get("token")),
         f"获取 CapCat 验证码挑战失败 (HTTP {resp.code}): {resp.text[:200]}"
         f" [diag] 响应字段: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}",
     )
-
-    # 2. 本地求解 PoW
     t0 = time.time()
-    solutions = solve_challenge(token, challenge)
-    elapsed = time.time() - t0
+
+    # 2a. format 2：challenges 列表，solutions 逐项对应
+    if data.get("format") == 2 and isinstance(data.get("challenges"), list):
+        solutions = []
+        for ch in data["challenges"]:
+            proto = ch.get("protocol")
+            if proto == "rsw":
+                solutions.append({"y": _solve_rsw(ch["payload"])})
+            elif proto == "instrumentation":
+                solutions.append({"instr": _run_instr(ch["payload"]["blob"])})
+            elif proto == "sha256-pow":
+                nonce = _solve_sha256_pow(data["token"], ch["payload"])
+                solutions.append({"nonce": nonce})
+            else:
+                ensure(False, f"CapCat 未知挑战协议: {proto}")
+        redeem_body = {"token": data["token"], "solutions": solutions}
+    else:
+        # 2b. format 1：单 {c,s,d} 规格，salt 由 prng 派生
+        challenge = data.get("challenge")
+        ensure(isinstance(challenge, dict), f"CapCat 挑战结构异常: {resp.text[:200]}")
+        solutions = solve_challenge(data["token"], challenge)
+        redeem_body = {"token": data["token"], "solutions": solutions}
 
     # 3. 提交解答兑换 cap-token
     redeem_resp = h.request(
         "POST",
         f"https://api.capcat.ai/{site_key}/redeem",
         headers=headers,
-        json_data={"token": token, "solutions": solutions},
+        json_data=redeem_body,
     )
     redeem_data = redeem_resp.json({})
     cap_token = redeem_data.get("token")
@@ -97,7 +203,7 @@ def fetch_cap_token(h: Http, site_key: str = CAPCAT_SITE_KEY) -> str:
         bool(redeem_data.get("success") and cap_token),
         f"兑换 CapCat 验证码失败 (HTTP {redeem_resp.code}): {redeem_resp.text[:200]}",
     )
-    print(f"🧩 PoW 验证码求解成功 (耗时 {elapsed:.2f}s)")
+    print(f"🧩 PoW 验证码求解成功 (耗时 {time.time() - t0:.2f}s)")
     return cap_token
 
 
