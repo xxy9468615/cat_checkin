@@ -35,7 +35,7 @@ import random
 import sys
 import time
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from common import (
@@ -323,15 +323,23 @@ def _get_today_daily_active(
     if seen_rule_keys:
         print(f"  [diag] 交易记录扫描可见 rule_key：{sorted(seen_rule_keys)}")
 
-    # 判据 3：24h 冷却识别——今日流水存在（登录态正常）但 daily_active 上次到账
-    # 不足 24h（如昨日 auto-retry 延迟到账），服务端冷却期内不发奖，非 Cookie 失效
+    # 判据 3：24h 冷却识别——今日流水存在（登录态正常）但 daily_active 今日未到账。
+    # gmt_created 可能只有日期没有时刻：带时刻时按时刻精确判断（<24h 才算冷却），
+    # 纯日期时放宽为「上次到账日期为昨天及以上」视为冷却中（无法确定真实时刻，
+    # 宁可绿卡一次；若连续两日仍未见新到账，下次运行会因日期变旧自动回到红卡）
     if last_da_dt is not None and today_record_cnt > 0:
         elapsed_h = (today - last_da_dt).total_seconds() / 3600
-        if 0 <= elapsed_h < 24:
-            eta_h = 24 - elapsed_h
+        raw = (last_da_raw or "").strip()
+        if len(raw) <= 10 or ":" not in raw:  # 纯日期
+            in_cooldown = last_da_dt.date() >= (today - timedelta(days=1)).date()
+        else:  # 带时刻
+            in_cooldown = 0 <= elapsed_h < 24
+        if in_cooldown:
+            eta_h = max(0.0, 24 - elapsed_h) if (len(raw) > 10 and ":" in raw) else 0.0
+            eta_desc = f"{eta_h:.1f}h 后可领" if eta_h > 0 else "下次运行即可领取"
             print(
                 f"  [diag] daily_active 24h 冷却中：上次到账 {last_da_raw} "
-                f"（{elapsed_h:.1f}h 前），预计 {eta_h:.1f}h 后可领"
+                f"（{elapsed_h:.1f}h 前），{eta_desc}"
             )
             return {
                 "rule_key": "daily_active",
