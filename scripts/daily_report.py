@@ -357,7 +357,11 @@ def build_email_html(results: List[Tuple[Any, Path, str, float]], stat_line: str
     pending = [r for r in rows if r[0] == "pending"]
     succeeded = [r for r in rows if r[0] == "ok"]
 
-    cards_html = ""
+    # 今日概览小结（全局统计块，置于所有任务卡片之前）
+    today = datetime.date.today()
+    overview_html = _build_overview_html(rows, (today - datetime.timedelta(days=1)).strftime("%Y-%m-%d"))
+
+    cards_html = overview_html
     if failed:
         cards_html += '<div style="margin:12px 0 6px 0;font-size:12px;color:#ce2b39;font-weight:600;">⚠️ 失败任务</div>'
         for st, path, output, elapsed in failed:
@@ -388,6 +392,161 @@ def build_email_html(results: List[Tuple[Any, Path, str, float]], stat_line: str
 
 def _split_recipients(raw: str) -> List[str]:
     return [x for x in re.split(r"[,;\s]+", raw.strip()) if x]
+
+
+# === 今日概览小结（2026-08-29 邮件日报增强：全局统计块，逐任务卡片之上） ===
+
+_REWARD_UNIT_DENY = {"天", "次", "个"}
+_REWARD_UNIT_MULT = {"K": 1e3, "M": 1e6, "B": 1e9}
+
+
+def _fmt_num(v: float) -> str:
+    if abs(v - round(v)) < 0.01:
+        return f"{int(round(v)):,}"
+    return f"{v:,.1f}"
+
+
+def _parse_asset_pairs(assets: str) -> Dict[str, float]:
+    """"积分 2,430 | 魔粒 240" → {"积分": 2430, "魔粒": 240}（best-effort）。"""
+    pairs: Dict[str, float] = {}
+    for part in (assets or "").split(" | "):
+        m = re.match(r"\s*(\S+)\s+([\d,]+(?:\.\d+)?)\s*$", part.strip())
+        if m:
+            try:
+                pairs[m.group(1)] = float(m.group(2).replace(",", ""))
+            except ValueError:
+                pass
+    return pairs
+
+
+def _streak_days(text: str) -> int:
+    m = re.search(r"(\d+)\s*天", text or "")
+    return int(m.group(1)) if m else 0
+
+
+def _collect_overview(rows: List[Tuple[str, Path, str, float]], yesterday: str) -> Dict[str, Any]:
+    """聚合全局小结：🎁 今日获得(按单位) / 💰 资产变化(vs 昨日归档) / 🔥 连签最高 / ⚠️ 连签将断。
+
+    全部 best-effort：昨日归档缺失/Redis 不可用/字段提取不到时对应项为空，不影响邮件。
+    """
+    gains: Dict[str, float] = {}
+    changes: List[str] = []
+    max_streak = ("", 0)
+    at_risk: List[str] = []
+
+    y_sites: Dict[str, Any] = {}
+    prefix = (os.getenv("CAT_CHECKIN_REDIS_PREFIX") or "cat_checkin:").rstrip(":")
+    try:
+        from common import upstash_redis_command
+        ok, res = upstash_redis_command(["GET", f"{prefix}:daily:{yesterday}"])
+        if ok and isinstance(res, dict) and res.get("result"):
+            archive = _json.loads(res["result"]) if isinstance(res["result"], str) else res["result"]
+            y_sites = archive.get("sites") or {}
+    except Exception:
+        y_sites = {}
+
+    for st, path, output, _elapsed in rows:
+        fields = _extract_fields(output or "")
+        task_id = path.stem  # u1s1.py → u1s1（与归档 site_key 命名一致）
+        title = get_task_title(path)
+
+        if st == "ok":
+            # 今日获得按单位聚合（M/K 简写换算数值；跨单位不求和）
+            for part in (fields.get("reward") or "").split(" | "):
+                part = part.strip()
+                if not part:
+                    continue
+                val, unit = None, ""
+                m = re.search(r"\(([\d.,]+)\s*([KMB]?)\)\s*(\S+)", part)
+                if m:
+                    unit = m.group(3)
+                    try:
+                        val = float(m.group(1).replace(",", "")) * _REWARD_UNIT_MULT.get(m.group(2).upper(), 1.0)
+                    except ValueError:
+                        pass
+                else:
+                    m2 = re.match(r"([\d,]+(?:\.\d+)?)\s*(\S+)\s*$", part)
+                    if m2:
+                        unit = m2.group(2).strip("()（）")
+                        try:
+                            val = float(m2.group(1).replace(",", ""))
+                        except ValueError:
+                            pass
+                if val is not None and unit and unit not in _REWARD_UNIT_DENY:
+                    gains[unit] = gains.get(unit, 0.0) + val
+
+            sd = _streak_days(fields.get("streak") or "")
+            if sd > max_streak[1]:
+                max_streak = (title, sd)
+
+            # 资产变化：与昨日归档同站同标签对比
+            t_pairs = _parse_asset_pairs(fields.get("assets") or "")
+            y_pairs = _parse_asset_pairs(str((y_sites.get(task_id) or {}).get("assets") or ""))
+            diffs = [
+                f"{label}{'+' if tv - y_pairs[label] > 0 else ''}{_fmt_num(tv - y_pairs[label])}"
+                for label, tv in t_pairs.items()
+                if label in y_pairs and abs(tv - y_pairs[label]) >= 0.01
+            ]
+            if diffs:
+                changes.append(f"{title} {' '.join(diffs[:3])}")
+
+        elif st == "fail":
+            # 连签将断：昨天还成功、今天失败的脚本（读通知状态 last_ok_date）。
+            # pending/调度中不算——latvi 等窗口型任务未到点是正常现象，避免误报。
+            # 状态键是 orchestrator 任务 id：经 task_registry 反查（workbuddy.py 有
+            # 多个账号实例 state），查不到再回退脚本 stem。
+            try:
+                from common import load_kv_state
+                from task_registry import TASKS as _REG
+                state_ids = [k for k, t in _REG.items() if t.get("script") == path.name] or [path.stem]
+                for state_id in state_ids:
+                    state = load_kv_state(f"{prefix}:state:notify:{state_id}", f".notify_state_{state_id}.json")
+                    if str(state.get("last_ok_date") or "") == yesterday:
+                        at_risk.append(title)
+                        break
+            except Exception:
+                pass
+
+    return {"gains": gains, "changes": changes[:4], "max_streak": max_streak, "at_risk": at_risk[:4]}
+
+
+def _build_overview_html(rows: List[Tuple[str, Path, str, float]], yesterday: str) -> str:
+    """今日概览卡片 HTML（置于逐任务卡片之上）；无任何数据时返回空串。"""
+    data = _collect_overview(rows, yesterday)
+    gains = data["gains"]
+    changes = data["changes"]
+    max_streak = data["max_streak"]
+    at_risk = data["at_risk"]
+    if not (gains or changes or max_streak[1] or at_risk):
+        return ""
+
+    def badge(bg: str, color: str, text: str) -> str:
+        return (
+            f'<span style="display:inline-block;margin:2px 6px 2px 0;padding:2px 8px;'
+            f'background:{bg};border-radius:10px;font-size:12px;color:{color};">'
+            f'{_html.escape(text)}</span>'
+        )
+
+    chips = ""
+    if gains:
+        def gfmt(v: float) -> str:
+            return f"{v / 1e6:.2f}M" if v >= 1e6 else _fmt_num(v)
+        chips += "".join(badge("#fce8ff", "#ad1457", f"获得 +{gfmt(v)} {unit}") for unit, v in gains.items())
+    if changes:
+        chips += "".join(badge("#eef2ff", "#3730a3", f"变化 {c}") for c in changes)
+    if max_streak[1]:
+        chips += badge("#e6fefa", "#0d9488", f"连签最高 {max_streak[0]} {max_streak[1]} 天")
+    if at_risk:
+        chips += badge("#fff7e6", "#b45309", f"连签将断 {'、'.join(at_risk)}")
+
+    return (
+        '<div style="margin:0 0 16px 0;border:1px solid #e3e6ea;border-left:3px solid #4f46e5;'
+        'background:#fff;border-radius:6px;overflow:hidden;">'
+        '<div style="padding:10px 16px;background:#eef2ff;font-size:13px;font-weight:600;color:#3730a3;">'
+        '📌 今日概览</div>'
+        f'<div style="padding:8px 16px;font-size:12px;line-height:1.9;">{chips}</div>'
+        '</div>'
+    )
 
 
 def send_email(subject: str, report: str, results: List[Tuple[bool, Path, str, float]]) -> bool:

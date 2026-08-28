@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 # new Env("Discord Webhook 通知")
-"""Discord Webhook 通知模块：双频道架构（2026-08-29）。
+"""Discord Webhook 通知模块：频道1 失败即时提醒（2026-08-29 双通道拆分）。
 
-频道1 失败提醒（DISCORD_WEBHOOK_URL，内置兜底）：
-  任务失败/超时/异常的瞬间推一条 B 标准版失败卡（逐账号失败明细 + 针对性处置
-  建议 + 重跑指引）；成功/跳过一律不推，避免正常任务信息干扰。
-频道2 每日执行情况（DISCORD_REPORT_WEBHOOK_URL，未配置回落频道1）：
-  每日主时间线 run 结束后推一条 C 数据详细版日报（等宽代码块伪表格：任务/状态/
-  今日获得/资产/连签 + 获得/资产变化/连签小结）；重跑 run 补一条带 [重跑] 前缀。
+daily_orchestrator.py 每个任务失败/超时/异常的瞬间调用 notify_task_result 推
+失败卡（templates/discord_failure.json）；成功/跳过只更新通知状态、不推送——
+避免正常任务信息干扰。每日任务执行情况日报走邮件通道（unified_report.py +
+daily_report.py HTML 卡片 + 今日概览小结），浏览与归档体验优于 Discord。
 
-两频道同源：任务输出 → daily_report._extract_fields + 本模块提取器；
-状态 → notify state；历史 → Redis 归档（资产变化对比昨日）。
+失败卡字段（B 标准版）：
+  逐账号失败明细 + 按错误类型的针对性处置建议 + 重跑指引（是否建议重跑/
+  当日尝试次数）+ 账号(脱敏) + 当前资产 + 上次签到成功日期。
 
 通知状态按 task_id 记 KV（common.load_kv_state / save_kv_state 双通道）：
   Redis cat_checkin:state:notify:<task_id> + 本地 .notify_state_<task_id>.json
   字段：last_ok_date / fail_streak / ok_streak / attempts / attempt_date。
 
 Environment:
-  DISCORD_WEBHOOK_URL         频道1 失败提醒 Webhook；未设置用内置默认 URL。
-  DISCORD_REPORT_WEBHOOK_URL  频道2 日报 Webhook；未设置回落频道1。
+  DISCORD_WEBHOOK_URL  Discord Webhook 地址；未设置时使用下方内置默认 URL。
 所有推送均为 best-effort：任何异常只打印警告，绝不阻塞/中断主流程。
 """
 from __future__ import annotations
@@ -28,7 +26,6 @@ import json
 import os
 import re
 import sys
-import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -61,12 +58,8 @@ _ACCOUNT_MARKERS = ("用户", "账号", "用户名", "会员", "uid", "email", "
 _CREDENTIAL_LINE_KEYWORDS = ("refresh", "new rt", "rt =", "新 token", "令牌", "authorization", "session=")
 
 
-def webhook_url(channel: str = "fail") -> str:
-    """按频道取 Webhook：fail=失败提醒；report=日报（未配置回落 fail）。"""
-    fail_url = (os.getenv("DISCORD_WEBHOOK_URL") or "").strip() or DEFAULT_WEBHOOK_URL
-    if channel == "report":
-        return (os.getenv("DISCORD_REPORT_WEBHOOK_URL") or "").strip() or fail_url
-    return fail_url
+def webhook_url() -> str:
+    return (os.getenv("DISCORD_WEBHOOK_URL") or "").strip() or DEFAULT_WEBHOOK_URL
 
 
 def _load_template(name: str, fallback: Dict[str, Any]) -> Dict[str, Any]:
@@ -102,23 +95,23 @@ def _coerce_embed_colors(payload: Dict[str, Any]) -> None:
             embed["color"] = int(color)
 
 
-def _post_webhook(payload: Dict[str, Any], channel: str = "fail") -> bool:
-    """POST 到指定频道 Discord Webhook。common.Http 自带 429/5xx 指数退避重试。"""
+def _post_webhook(payload: Dict[str, Any]) -> bool:
+    """POST 到 Discord Webhook。common.Http 自带 429/5xx 指数退避重试。"""
     try:
         _coerce_embed_colors(payload)
         import common as _common
         resp = _common.Http().request(
             "POST",
-            webhook_url(channel),
+            webhook_url(),
             headers={"Content-Type": "application/json"},
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             timeout=15,
         )
         if 200 <= resp.code < 300:
             return True
-        print(f"⚠️ Discord 推送失败[{channel}]: HTTP {resp.code} {(resp.text or '')[:200]}")
+        print(f"⚠️ Discord 推送失败: HTTP {resp.code} {(resp.text or '')[:200]}")
     except Exception as exc:
-        print(f"⚠️ Discord 推送异常[{channel}]: {exc}")
+        print(f"⚠️ Discord 推送异常: {exc}")
     return False
 
 
@@ -128,36 +121,6 @@ def _timestamp_bjt() -> str:
 
 def _bjt_today() -> str:
     return datetime.datetime.now(BJT).strftime("%Y-%m-%d")
-
-
-# === 显示宽度工具（日报等宽伪表格对齐用） ===
-
-def _dw(text: str) -> int:
-    """显示宽度：CJK/全角按 2 列，其余按 1 列。"""
-    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
-
-
-def _dtruncate(text: str, width: int) -> str:
-    """按显示宽度截断，末尾补 …。"""
-    if _dw(text) <= width:
-        return text
-    out, w = "", 0
-    for c in text:
-        cw = 2 if unicodedata.east_asian_width(c) in "WF" else 1
-        if w + cw > width - 1:
-            break
-        out += c
-        w += cw
-    return out + "…"
-
-
-def _pad(text: str, width: int, align: str = "left") -> str:
-    """按显示宽度填充空格；超宽先截断。"""
-    text = _dtruncate(text, width)
-    gap = width - _dw(text)
-    if align == "right":
-        return " " * gap + text
-    return text + " " * gap
 
 
 # === 输出 → 卡片字段提取 ===
@@ -202,32 +165,6 @@ def _extract_accounts(output: str) -> str:
     if len(picked) == 1:
         return picked[0]
     return f"{picked[0]} 等 {len(picked)} 个账号"
-
-
-def _streak_text(fields: Dict[str, str], output: str) -> str:
-    """连签进度：连续 N 天（+ 下一里程碑提示）。"""
-    parts: List[str] = []
-    streak = (fields.get("streak") or "").strip()
-    if streak:
-        parts.append(f"连续 {streak}")
-    m = re.search(r"再连签\s*(\d+)\s*天可额外领\s*(.+?)[)）]\s*$", output or "", re.M)
-    if m:
-        parts.append(f"再签 {m.group(1)} 天可领 {m.group(2).strip()}")
-    return " · ".join(parts) if parts else "—"
-
-
-def _reward_text(fields: Dict[str, str]) -> str:
-    """奖励明细：获得 X · 兑换/赠送 · 剩余 Y 天 · 多账号汇总。"""
-    parts: List[str] = []
-    if fields.get("reward"):
-        parts.append("获得 " + " · ".join(fields["reward"].split(" | ")))
-    if fields.get("exchange"):
-        parts.append(str(fields["exchange"]))
-    if fields.get("remaining"):
-        parts.append(f"剩余 {fields['remaining']}")
-    if fields.get("summary"):
-        parts.append(str(fields["summary"]))
-    return " · ".join(parts) if parts else "—"
 
 
 def _assets_text(fields: Dict[str, str]) -> str:
@@ -510,7 +447,7 @@ def notify_task_result(
             "{{TIMESTAMP}}": _timestamp_bjt(),
         }
         tpl = _load_template("discord_failure.json", DEFAULT_FAILURE_TEMPLATE)
-        sent = _post_webhook(_render(tpl, replacements), channel="fail")
+        sent = _post_webhook(_render(tpl, replacements))
     else:
         # 成功：只更新状态（连签连续性由 last_ok_date 是否为昨天决定），不推频道
         new_state["last_ok_date"] = today
@@ -524,290 +461,8 @@ def notify_task_result(
     return sent
 
 
-# === 频道2：每日执行情况日报（C 数据详细版） ===
-
-# 表格列宽（显示宽度）：emoji 前缀 2 + 任务名/今日获得/资产/连签，列间 1 空格
-_NAME_W, _GAIN_W, _ASSET_W, _STREAK_W = 14, 10, 12, 4
-
-# 资产标签缩短：去掉「账户/当前/可用」等冗余前缀，避免单元格截断
-_ASSET_LABEL_NOISE = ("账户", "当前", "可用", "我的")
-
-
-def _compact_asset(assets_raw: str) -> str:
-    """资产单元格：取第一组「标签 数值」，缩短标签后拼回。"""
-    first = (assets_raw or "").split(" | ")[0].strip()
-    if not first:
-        return "—"
-    for noise in _ASSET_LABEL_NOISE:
-        if first.startswith(noise):
-            first = first[len(noise):].strip()
-            break
-    return first or "—"
-
-
-def _compact_reward(reward: str) -> str:
-    """奖励压缩到单元格宽：优先取括号简写（2,000,000 (2.00M) Tokens → 2.00M Tokens）。"""
-    text = (reward or "").split(" | ")[0].strip()
-    text = re.sub(r"[\d,]+(?:\.\d+)?\s*\(([\d.]+\s*[MK]?)\)", r"\1", text)
-    return text.strip() or "—"
-
-
-def _streak_days(text: str) -> Optional[int]:
-    m = re.search(r"(\d+)\s*天", text or "")
-    return int(m.group(1)) if m else None
-
-
-def _parse_asset_pairs(assets: str) -> Dict[str, float]:
-    """"积分 2,430 | 魔粒 240" → {"积分": 2430, "魔粒": 240}（best-effort）。"""
-    pairs: Dict[str, float] = {}
-    for part in (assets or "").split(" | "):
-        m = re.match(r"\s*(\S+)\s+([\d,]+(?:\.\d+)?)\s*$", part.strip())
-        if m:
-            try:
-                pairs[m.group(1)] = float(m.group(2).replace(",", ""))
-            except ValueError:
-                pass
-    return pairs
-
-
-def _fmt_num(v: float) -> str:
-    if abs(v - round(v)) < 0.01:
-        return f"{int(round(v)):,}"
-    return f"{v:,.1f}"
-
-
-def _aggregate_rewards(rows: List[Dict[str, Any]]) -> str:
-    """今日获得按单位聚合（Tokens/魔粒/积分…，跨单位不求和；M/K 简写换算数值）。"""
-    sums: Dict[str, float] = {}
-    deny = {"天", "次", "个"}
-    mult = {"K": 1e3, "M": 1e6, "B": 1e9}
-    for row in rows:
-        if row["status"] != "ok":
-            continue
-        for part in (row.get("reward_raw") or "").split(" | "):
-            part = part.strip()
-            if not part:
-                continue
-            val = None
-            unit = ""
-            m = re.search(r"\(([\d.,]+)\s*([KMB]?)\)\s*(\S+)", part)  # 2,000,000 (2.00M) Tokens
-            if m:
-                unit = m.group(3)
-                scale = mult.get(m.group(2).upper(), 1.0)
-                try:
-                    val = float(m.group(1).replace(",", "")) * scale
-                except ValueError:
-                    pass
-            else:
-                m2 = re.match(r"([\d,]+(?:\.\d+)?)\s*(\S+)\s*$", part)  # 200 魔粒
-                if m2:
-                    unit = m2.group(2).strip("()（）")
-                    try:
-                        val = float(m2.group(1).replace(",", ""))
-                    except ValueError:
-                        pass
-            if val is None or not unit or unit in deny:
-                continue
-            sums[unit] = sums.get(unit, 0.0) + val
-    if not sums:
-        return "—"
-
-    def fmt(v: float) -> str:
-        if v >= 1e6:
-            return f"{v / 1e6:.2f}M"
-        return _fmt_num(v)
-
-    return " · ".join(f"+{fmt(v)} {unit}" for unit, v in sums.items())
-
-
-def _asset_changes(rows: List[Dict[str, Any]], yesterday: str) -> str:
-    """资产变化：与昨日 Redis 归档（cat_checkin:daily:<yesterday>）按站同单位对比。"""
-    if not rows:
-        return "—"
-    try:
-        from common import upstash_redis_command
-        prefix = (os.getenv("CAT_CHECKIN_REDIS_PREFIX") or "cat_checkin:").rstrip(":")
-        ok, res = upstash_redis_command(["GET", f"{prefix}:daily:{yesterday}"])
-        if not (ok and isinstance(res, dict) and res.get("result")):
-            return "—"
-        archive = json.loads(res["result"]) if isinstance(res["result"], str) else res["result"]
-        y_sites = archive.get("sites") or {}
-    except Exception:
-        return "—"
-
-    changes: List[str] = []
-    for row in rows:
-        y_entry = y_sites.get(row["key"]) or y_sites.get(row.get("task_id") or "")
-        if not y_entry:
-            continue
-        y_pairs = _parse_asset_pairs(str(y_entry.get("assets") or ""))
-        t_pairs = _parse_asset_pairs(row.get("assets_raw") or "")
-        diffs = []
-        for label, tv in t_pairs.items():
-            if label in y_pairs:
-                d = tv - y_pairs[label]
-                if abs(d) >= 0.01:
-                    diffs.append(f"{label}{'+' if d > 0 else ''}{_fmt_num(d)}")
-        if diffs:
-            changes.append(f"{row['name']} {' '.join(diffs)}")
-        if len(changes) >= 4:
-            break
-    return " · ".join(changes) if changes else "—"
-
-
-def _row_from_result(key: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    """任务结果 → 日报行（状态/奖励/资产/连签/失败摘要，全部 best-effort）。"""
-    is_pending = bool(data.get("is_pending")) or data.get("status") == "pending"
-    status = "skip" if is_pending else ("ok" if bool(data.get("ok")) else "fail")
-    output = str(data.get("output") or "")
-    fields = _extract_fields(output)
-    name = str(data.get("name") or key).strip()
-    task_id = key[:-5] if key.endswith(".json") else key
-    # 表格任务名去掉统一「 签到」后缀，省出列宽（如 "ModelScope 签到" → "ModelScope"）
-    table_name = name[:-2] if name.endswith("签到") else name
-    table_name = table_name.strip() or name
-
-    streak = (fields.get("streak") or "").replace(" ", "")
-    streak_days = _streak_days(streak)
-    state = _load_notify_state(task_id)
-    if not streak_days and status == "ok":
-        try:
-            streak_days = int(state.get("ok_streak") or 0) or None
-            streak = f"{streak_days}天" if streak_days else ""
-        except (TypeError, ValueError):
-            pass
-
-    fail_brief = ""
-    if status == "fail":
-        items = _failure_items(output, max_items=1)
-        fail_brief = items[0][1] if items else "执行失败（详见 Actions 日志）"
-
-    return {
-        "key": key,
-        "task_id": task_id,
-        "name": name,
-        "table_name": table_name,
-        "status": status,
-        "reward": _compact_reward(fields.get("reward", "")),
-        "reward_raw": fields.get("reward", ""),
-        "assets": _compact_asset(fields.get("assets", "")),
-        "assets_raw": fields.get("assets", ""),
-        "streak": streak or "—",
-        "streak_days": streak_days,
-        "account": _extract_accounts(output),
-        "fail_brief": fail_brief,
-        "last_ok_date": str(state.get("last_ok_date") or ""),
-    }
-
-
-def _render_daily_report(rows: List[Dict[str, Any]], retry: bool, date: str) -> Dict[str, Any]:
-    """C 数据详细版日报渲染：统计头 + 等宽伪表格 + 小结（纯函数，可离线测试）。"""
-    ok_n = sum(1 for r in rows if r["status"] == "ok")
-    fail_n = sum(1 for r in rows if r["status"] == "fail")
-    skip_n = sum(1 for r in rows if r["status"] == "skip")
-
-    # 伪表格：emoji 置行首（宽度变化不影响后续列对齐），列内按显示宽度填充
-    def cells(icon: str, name: str, gain: str, assets: str, streak: str) -> str:
-        return (
-            f"{icon} " + _pad(name, _NAME_W) + " " + _pad(gain, _GAIN_W, "right")
-            + " " + _pad(assets, _ASSET_W) + " " + _pad(streak, _STREAK_W, "right")
-        )
-
-    lines = [cells("  ", "任务", "今日获得", "资产", "连签")]
-    status_icon = {"ok": "✅", "fail": "❌", "skip": "⏭️"}
-    for row in sorted(rows, key=lambda r: (r["status"] != "fail", r["status"] != "skip", r["name"])):
-        lines.append(cells(status_icon[row["status"]], row.get("table_name") or row["name"], row["reward"], row["assets"], row["streak"]))
-    table = "```\n" + "\n".join(lines) + "\n```"
-
-    weekday = _WEEKDAY_CN[datetime.date.fromisoformat(date).weekday()]
-    summary: List[str] = []
-    gains = _aggregate_rewards(rows)
-    if gains != "—":
-        summary.append(f"🎁 **今日获得**　{gains}")
-    change = _asset_changes(rows, _date_offset(date, -1))
-    if change != "—":
-        summary.append(f"💰 **资产变化**　{change}")
-    streak_rows = [r for r in rows if r["status"] == "ok" and r["streak_days"]]
-    if streak_rows:
-        best = max(streak_rows, key=lambda r: r["streak_days"])
-        summary.append(f"🔥 **连签最高**　{best['name']} {best['streak_days']} 天")
-    at_risk = [
-        r["name"] for r in rows
-        if r["status"] != "ok" and r["last_ok_date"] == _date_offset(date, -1)
-    ]
-    if at_risk:
-        summary.append(f"⚠️ **连签将断**　{'、'.join(at_risk[:4])}（今天未成功）")
-    fail_rows = [r for r in rows if r["status"] == "fail"]
-    if fail_rows:
-        summary.append("❗ **失败详情**")
-        summary += [f"　{_md_escape(r['name'])}　{_md_escape(r['fail_brief'])}" for r in fail_rows[:5]]
-
-    desc_parts = [
-        f"✅ 成功 {ok_n} · ❌ 失败 {fail_n} · ⏭️ 跳过 {skip_n} · 共 {len(rows)}",
-        table,
-    ]
-    desc_parts += summary
-    title = f"📊 每日任务执行情况 · {date} {weekday}" + (" [重跑]" if retry else "")
-    color = COLOR_FAIL if fail_n else (COLOR_PENDING if ok_n == 0 else COLOR_OK)
-
-    return {
-        "username": "cat_checkin",
-        "embeds": [{
-            "title": title,
-            "color": str(color),
-            "description": "\n\n".join(desc_parts)[:4000],
-            "footer": {"text": "cat_checkin 每日执行情况"},
-            "timestamp": _timestamp_bjt(),
-        }],
-    }
-
-
-DEFAULT_DAILY_TEMPLATE = {
-    "username": "cat_checkin",
-    "embeds": [{
-        "title": "{{TITLE}}",
-        "color": "{{COLOR}}",
-        "description": "{{DESCRIPTION}}",
-        "footer": {"text": "cat_checkin 每日执行情况"},
-        "timestamp": "{{TIMESTAMP}}",
-    }],
-}
-
-
-def push_daily_report(retry: bool = False) -> bool:
-    """汇总当日全部任务结果推频道2日报（数据与 unified_report 归档同源）。
-
-    数据：Redis raw + 本地 .task_results + 期望清单 pending 标记（latvi 今日未跑
-    自动回退昨日结果）。任何异常只打印警告，绝不影响调用方退出码。
-    """
-    try:
-        from unified_report import collect_all_results
-        today = _bjt_today()
-        yesterday = _date_offset(today, -1)
-        _results, collected = collect_all_results(today, yesterday)
-        if not collected:
-            print("ℹ️ 日报跳过：今日未收集到任何任务结果")
-            return False
-        rows = [_row_from_result(key, data) for key, data in sorted(collected.items())]
-        payload = _render_daily_report(rows, retry, today)
-        tpl = _load_template("discord_daily_report.json", DEFAULT_DAILY_TEMPLATE)
-        replacements = {
-            "{{TITLE}}": str(payload["embeds"][0]["title"]),
-            "{{COLOR}}": str(payload["embeds"][0]["color"]),
-            "{{DESCRIPTION}}": str(payload["embeds"][0]["description"]),
-            "{{TIMESTAMP}}": _timestamp_bjt(),
-        }
-        sent = _post_webhook(_render(tpl, replacements), channel="report")
-        print(f"📊 每日日报已推送频道2（{'[重跑] ' if retry else ''}{len(rows)} 任务）" if sent
-              else "⚠️ 每日日报推送失败")
-        return sent
-    except Exception as exc:
-        print(f"⚠️ 每日日报生成/推送异常: {exc}")
-        return False
-
-
 def main() -> None:
-    """CLI 自测：python3 discord_notify.py --test 发一条失败卡（频道1）+ 一条日报（频道2）。"""
+    """CLI 自测：python3 discord_notify.py --test 发一条失败卡（多账号混合样例）。"""
     fail_output = (
         "【ModelScope 签到】\n"
         "  [1/3] a***1 UID:1***6 [Cookie] 签到成功，今日已领取 200 魔粒\n"
@@ -816,42 +471,12 @@ def main() -> None:
         "  国内站总结：成功 1/3\n"
         "🚨 执行完毕，共有 2 个账号签到失败：\n"
     )
-    sent1 = notify_task_result(
+    sent = notify_task_result(
         task_id="selftest", name="自测站点 签到", script="selftest.py",
         ok=False, output=fail_output, persist=False,
     )
-    sample_rows = [
-        {"key": "glados.json", "task_id": "glados", "name": "GLaDOS 签到", "status": "ok",
-         "reward": "+25 积分", "reward_raw": "25 积分", "assets": "2,430 积分",
-         "assets_raw": "积分 2,430", "streak": "45天", "streak_days": 45,
-         "account": "a***1", "fail_brief": "", "last_ok_date": _bjt_today()},
-        {"key": "modelscope.json", "task_id": "modelscope", "name": "ModelScope 签到", "status": "ok",
-         "reward": "+240 魔粒", "reward_raw": "240 魔粒", "assets": "1,240 魔粒",
-         "assets_raw": "魔粒 1,240", "streak": "12天", "streak_days": 12,
-         "account": "b***2 等 3 个账号", "fail_brief": "", "last_ok_date": _bjt_today()},
-        {"key": "u1s1.json", "task_id": "u1s1", "name": "u1s1.io 签到", "status": "ok",
-         "reward": "2.00M Tokens", "reward_raw": "2,000,000 (2.00M) Tokens", "assets": "8.00M Tokens",
-         "assets_raw": "Token余额 8,000,000", "streak": "3天", "streak_days": 3,
-         "account": "t***t@gmail.com", "fail_brief": "", "last_ok_date": _bjt_today()},
-        {"key": "tencent_cloudstudio.json", "task_id": "cloudstudio", "name": "Tencent CloudStudio 签到", "status": "fail",
-         "reward": "—", "reward_raw": "", "assets": "—", "assets_raw": "",
-         "streak": "—", "streak_days": None, "account": "—",
-         "fail_brief": "Cookie 已失效，请在浏览器重新登录并更新 CLOUDSTUDIO_cookie", "last_ok_date": _date_offset(_bjt_today(), -1)},
-        {"key": "latvi.json", "task_id": "latvi", "name": "Latvi 签到", "status": "skip",
-         "reward": "—", "reward_raw": "", "assets": "—", "assets_raw": "",
-         "streak": "—", "streak_days": None, "account": "—", "fail_brief": "",
-         "last_ok_date": _date_offset(_bjt_today(), -1)},
-    ]
-    payload = _render_daily_report(sample_rows, retry=False, date=_bjt_today())
-    replacements = {
-        "{{TITLE}}": str(payload["embeds"][0]["title"]),
-        "{{COLOR}}": str(payload["embeds"][0]["color"]),
-        "{{DESCRIPTION}}": str(payload["embeds"][0]["description"]),
-        "{{TIMESTAMP}}": _timestamp_bjt(),
-    }
-    sent2 = _post_webhook(_render(_load_template("discord_daily_report.json", DEFAULT_DAILY_TEMPLATE), replacements), channel="report")
-    print("✅ 测试消息已发送（失败卡 → 频道1，日报 → 频道2）" if (sent1 and sent2) else "❌ 测试消息发送失败")
-    sys.exit(0 if (sent1 and sent2) else 1)
+    print("✅ 测试失败卡已发送" if sent else "❌ 测试消息发送失败")
+    sys.exit(0 if sent else 1)
 
 
 if __name__ == "__main__":
