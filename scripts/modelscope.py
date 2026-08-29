@@ -119,6 +119,7 @@ def _touch_user(
         web_headers = {
             "User-Agent": DEFAULT_UA,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
             "Referer": f"https://{host}/",
             "Cookie": cookie,
         }
@@ -133,6 +134,13 @@ def _touch_user(
         # 「API 正常但 Web 会话已死（日活埋点收不到）」的场景
         print(f"  [diag] web 触碰[{host}]: {' '.join(page_status)}")
         print(f"  [diag] 触碰响应下发 Cookie 字段[{host}]: {sorted({c.name for c in h.jar})}")
+        # 2026-08-29 HAR 抓包确认：前端每次页面加载都会调 /api/v1/users/login/info
+        # （daily_active 规则即「注册并登陆，每日登录即可获取」）——补齐这一登录事件触碰
+        for api_path in ("/api/v1/users/login/info", "/api/v1/users/authorized/check"):
+            try:
+                h.request("GET", f"https://{host}{api_path}", headers=web_headers, timeout=15)
+            except Exception:
+                pass
 
     hdrs = _headers(host, token=token, cookie=cookie)
     try:
