@@ -131,7 +131,8 @@ def _touch_user(
                 page_status.append(f"{path}=ERR")
         # web 触碰状态码：users/me（OpenAPI）与 Web 会话可能不同寿命，用于区分
         # 「API 正常但 Web 会话已死（日活埋点收不到）」的场景
-        print(f"  [diag] web 触碰: {' '.join(page_status)}")
+        print(f"  [diag] web 触碰[{host}]: {' '.join(page_status)}")
+        print(f"  [diag] 触碰响应下发 Cookie 字段[{host}]: {sorted({c.name for c in h.jar})}")
 
     hdrs = _headers(host, token=token, cookie=cookie)
     try:
@@ -280,7 +281,7 @@ def _get_today_daily_active(
                         past_today = True
                 if rule_key:
                     seen_rule_keys.add(rule_key)
-                if len(recent_samples) < 6:
+                if len(recent_samples) < 10:
                     recent_samples.append((rule_key or "?", created_str[:19], rec.get("total_amount")))
                 if rule_key == "daily_active":
                     if dt_val is not None and dt_val.date() == today.date():
@@ -854,6 +855,34 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
             active_cookie = fallback_cookie
             credited, user, record, err = fb_credited, fb_user, fb_record, fb_err
             h = h_fallback
+
+    # 「每日登录」事件可能记录在账号注册站（CN 站）：AI 站账号 daily_active 未到账时，
+    # 用同一 Cookie 触碰 CN 站 Web 页面补登录事件，再在两个站复查 daily_active
+    if site == "ai" and record is None and user and active_cookie:
+        cn_host = "www.modelscope.cn"
+        print(f"  [{idx}] 🧪 daily_active 未到账，尝试 CN 站跨站登录触碰（{cn_host}）...")
+        cn_h = Http(proxy=proxy)
+        cn_ok = True
+        try:
+            _touch_user(cn_h, cn_host, token=token, cookie=active_cookie)
+        except Exception as exc:
+            cn_ok = False
+            print(f"  [{idx}] [diag] CN 站触碰/登录态校验失败：{exc}")
+        if cn_ok:
+            for check_host, check_h in ((cn_host, cn_h), (host, h)):
+                try:
+                    rec = _get_today_daily_active(
+                        check_h, check_host, token=token, cookie=active_cookie
+                    )
+                except Exception:
+                    rec = None
+                if rec is not None:
+                    print(f"  [{idx}] ✅ CN 站触碰后 daily_active 已在 {check_host} 查到今日记录")
+                    record = rec
+                    credited = rec.get("source") != "cooldown"
+                    # CN 站触碰可能换发了新会话 Cookie，合并进活动 Cookie 以便滚动持久化
+                    active_cookie = _merge_cookies(active_cookie, cn_h.jar) or active_cookie
+                    break
 
     # 观测最近一次 daily_active 发放时刻（心跳 DUE_ONLY 调度的状态来源）：
     # 今日流水命中 → 发放时刻即该流水 gmt_created；earn/rules 命中（时刻未知）→
