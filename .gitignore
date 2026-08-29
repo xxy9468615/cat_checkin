@@ -25,6 +25,7 @@ docs
 .ai_router_state.json
 .agentrouter_state.json
 .cloudstudio_state*.json
+.2libra_state*.json
 .modelscope_state*.json
 .modelscope_*_state*.json
 .notify_state_*.json

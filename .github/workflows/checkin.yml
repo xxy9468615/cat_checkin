@@ -233,6 +233,7 @@ jobs:
             .latvi_state.json
             .agentrouter_state.json
             .cloudstudio_state*.json
+            .2libra_state*.json
             .modelscope_*.json
             .notify_state_*.json
           key: unified-states-${{ github.run_id }}
@@ -439,6 +440,7 @@ jobs:
             .latvi_state.json
             .agentrouter_state.json
             .cloudstudio_state*.json
+            .2libra_state*.json
             .modelscope_*.json
             .notify_state_*.json
           key: unified-states-${{ github.run_id }}
