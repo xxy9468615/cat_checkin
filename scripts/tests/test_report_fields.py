@@ -73,6 +73,11 @@ EXPECT = {
         len(r["lines"]) == 2 and "u***@gmail.com" in r["lines"][0] and "里程碑第8天 +500,000 (0.50M)" in r["lines"][0]
         and "赠额度 1,500,000" in r["lines"][0] and ("Tokens", 2000000.0) in r["gains"]
     ),
+    "juejin": lambda r: (
+        len(r["lines"]) == 1 and "+50矿石" in r["lines"][0] and "连签 5 天" in r["lines"][0]
+        and "抽中 66 矿石" in r["lines"][0] and "矿石 12,345" in r["lines"][0]
+        and ("矿石", 50.0) in r["gains"] and r["streak"] == 5
+    ),
     "workbuddy-account-1": lambda r: (
         len(r["lines"]) == 1 and "连登13天" in r["lines"][0].replace(" ", "") and "算力 1176" in r["lines"][0]
         and "徽章3/11" in r["lines"][0].replace(" ", "")

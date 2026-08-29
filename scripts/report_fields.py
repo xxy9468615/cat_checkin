@@ -635,6 +635,75 @@ def ex_u1s1(output: str, res: Dict[str, Any]) -> None:
     _add_summary(res, output)
 
 
+def ex_juejin(output: str, res: Dict[str, Any]) -> None:
+    """掘金社区：👤 用户：【xx】 (UID: xx) + • 签到 / 抽奖 / 沾喜气 / 资产 行。"""
+    cur: Any = None
+    for raw in output.splitlines():
+        ln = raw.strip()
+        m = re.search(r"👤 用户：【(.+?)】(?:\s*\(UID:\s*(\S+)\))?", ln)
+        if m:
+            if cur:
+                cur.flush(res)
+            cur = _Block(m.group(1))
+            continue
+        if "签到失败" in ln:
+            if cur:
+                cur.flush(res)
+                cur = None
+            res["fail_lines"].append(_clean(ln))
+            res["error_lines"].append(ln)
+            continue
+        if cur is None:
+            continue
+        mm = re.search(r"• 签到：【(.+?)】(?:\s*连签天数：【(\d+)】天)?(?:\s*\(累计 (\d+) 天\))?(?:\s*\+(\d+)\s*矿石)?", ln)
+        if mm:
+            status, cont_d, sum_d, gain_ore = mm.group(1), mm.group(2), mm.group(3), mm.group(4)
+            if status == "成功":
+                if gain_ore:
+                    cur.parts.append(f"+{gain_ore}矿石")
+                    res["gains"].append(("矿石", _f(gain_ore)))
+                    res["badges"].append(("reward", f"+{gain_ore} 矿石"))
+                else:
+                    cur.parts.append("签到成功")
+            elif "已签" in status:
+                cur.parts.append("今日已签")
+            if cont_d:
+                cur.parts.append(f"连签 {cont_d} 天")
+                res["streak"] = max(res["streak"], int(cont_d))
+                res["badges"].append(("streak", f"连签 {cont_d} 天"))
+            continue
+        mm = re.search(r"• 免费抽奖：【(.+?)】", ln)
+        if mm:
+            draw_res = mm.group(1)
+            if "抽中" in draw_res:
+                cur.parts.append(draw_res)
+                m_ore = re.search(r"(\d+)\s*矿石", draw_res)
+                if m_ore:
+                    res["gains"].append(("矿石", _f(m_ore.group(1))))
+                    res["badges"].append(("reward", f"抽奖+{m_ore.group(1)} 矿石"))
+            elif "已抽" in draw_res:
+                pass
+            else:
+                cur.parts.append(_clean(draw_res, 20))
+            continue
+        mm = re.search(r"• 沾喜气：【(.+?)】(?:\s*当前累计幸运值：【(\d+)】)?", ln)
+        if mm:
+            dip_res, total_l = mm.group(1), mm.group(2)
+            if "成功" in dip_res or "+" in dip_res:
+                cur.parts.append(dip_res)
+            if total_l:
+                cur.parts.append(f"幸运值 {total_l}")
+            continue
+        mm = re.search(r"• 资产：矿石 【(" + NUM + r")】", ln)
+        if mm:
+            cur.parts.append(f"矿石 {_d(mm.group(1))}")
+            res["assets"].append(("矿石", _f(mm.group(1))))
+            continue
+    if cur:
+        cur.flush(res)
+    _add_summary(res, output)
+
+
 def ex_workbuddy(output: str, res: Dict[str, Any]) -> None:
     """WorkBuddy：用户【xx】（UID: xx）+ • 八项 bullets。"""
     cur: Any = None
@@ -823,6 +892,7 @@ SCRIPT_EXTRACTORS = {
     "ai_router.py": ex_ai_router,
     "agentrouter.py": ex_agentrouter,
     "u1s1.py": ex_u1s1,
+    "juejin.py": ex_juejin,
     "workbuddy.py": ex_workbuddy,
     "modelscope.py": ex_modelscope,
     "latvi.py": ex_latvi,

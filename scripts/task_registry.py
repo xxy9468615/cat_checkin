@@ -138,6 +138,16 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
+    # --- 掘金社区（juejin.cn 签到、免费抽奖、沾喜气、矿石资产）---
+    "juejin": {
+        "id": "juejin",
+        "script": "juejin.py",
+        "name": "掘金社区 签到",
+        "result": "juejin.json",
+        "timeout": 300,
+        "account": "",
+        "tags": ["00:50", "matrix", "daily"],
+    },
 
     # --- 多账号站点（单 run 阶段 A 内联并发；旧 QStash 回程接力已退役） ---
     "workbuddy-account-1": {

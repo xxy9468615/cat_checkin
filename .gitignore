@@ -28,6 +28,7 @@ docs
 .2libra_state*.json
 .modelscope_state*.json
 .modelscope_*_state*.json
+.juejin_state*.json
 .notify_state_*.json
 
 # WSL2 metadata

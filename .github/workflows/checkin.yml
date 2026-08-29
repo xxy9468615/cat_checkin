@@ -167,6 +167,10 @@ jobs:
       U1S1_COOKIE: ${{ secrets.U1S1_COOKIE }}
       U1S1_COOKIE_1: ${{ secrets.U1S1_COOKIE_1 || secrets.U1S1_COOKIE }}
       U1S1_COOKIE_2: ${{ secrets.U1S1_COOKIE_2 }}
+      JUEJIN_cookie: ${{ secrets.JUEJIN_COOKIE_1 || secrets.JUEJIN_COOKIE }}
+      JUEJIN_COOKIE_1: ${{ secrets.JUEJIN_COOKIE_1 || secrets.JUEJIN_COOKIE }}
+      JUEJIN_COOKIE_2: ${{ secrets.JUEJIN_COOKIE_2 }}
+      JUEJIN_COOKIE_3: ${{ secrets.JUEJIN_COOKIE_3 }}
       WORKBUDDY_COOKIE: ${{ secrets.WORKBUDDY_COOKIE }}
       WORKBUDDY_COOKIE_1: ${{ secrets.WORKBUDDY_COOKIE_1 || secrets.WORKBUDDY_COOKIE }}
       WORKBUDDY_COOKIE_2: ${{ secrets.WORKBUDDY_COOKIE_2 }}
@@ -235,6 +239,7 @@ jobs:
             .cloudstudio_state*.json
             .2libra_state*.json
             .modelscope_*.json
+            .juejin_state*.json
             .notify_state_*.json
           key: unified-states-${{ github.run_id }}
           restore-keys: |
@@ -442,6 +447,7 @@ jobs:
             .cloudstudio_state*.json
             .2libra_state*.json
             .modelscope_*.json
+            .juejin_state*.json
             .notify_state_*.json
           key: unified-states-${{ github.run_id }}
 
