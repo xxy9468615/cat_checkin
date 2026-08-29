@@ -7,10 +7,13 @@
 - 认证体系：业务活动与账单端点强制依赖 Cookie 会话（cloudstudio-session）。
   控制台生成的个人访问令牌（API Key / OpenToken）归属于 Open API 开放生态/应用管理体系，
   传入业务接口会被网关判定为工作空间容器专用的 Workspace Token 而报 1044 错误，无法用于活动签到。
-- Keycloak SSO 自动换票与续期链（2026-08-25 升级）：
-  当环境变量传入完整 Cookie（包含 KEYCLOAK_IDENTITY 长期 SSO 票据）时，若 session 过期，
-  脚本将自动请求 /api/public/login 重定向至 Keycloak OIDC 端点无感换取最新 session，
-  并通过 Upstash Redis（cat_checkin:state:cloudstudio_{idx}）与本地 JSON 状态跨 CI 自动滚动续期。
+- Keycloak SSO 滚动续期链（2026-08-29 升级：主动续票 + 全量 Cookie 持久化）：
+  当 Cookie 中包含 KEYCLOAK_IDENTITY / KEYCLOAK_SESSION 长期 SSO 票据（约 1 年有效期）时，
+  脚本每次运行都会先请求 /api/public/login 重定向至 Keycloak OIDC 端点无感换取最新
+  session（30 天期）——短期 session 每天滚动换新，长期票据保持新鲜；签到成功后再把
+  本次链路全部 Set-Cookie（含 KEYCLOAK_*）合并持久化到 Upstash Redis
+  （cat_checkin:state:cloudstudio_{idx}）与本地 JSON 状态，跨 CI 滚动续期。
+  只有裸 cloudstudio-session 的配置无法 SSO 续票，30 天后仍会失效（报错给出精确指引）。
 - X-XSRF-TOKEN 无需人工复制：前端拦截器对每个请求自动计算
   Vq() = djb2 变体哈希（t=5381; t+=(t<<5)+charCode）& 0x7fffffff，
   输入取 cookie skey || cloudstudio-session。本脚本按同算法派生。
@@ -23,14 +26,16 @@
   明细列表沿用 GET /api/billing/resource/package?pageNumber=0&pageSize=10。
 
 支持环境变量：
-  CLOUDSTUDIO_cookie    cloudstudio-session 完整值（或包含它的完整浏览器 Cookie，必填）
+  CLOUDSTUDIO_cookie    完整浏览器 Cookie（必须包含 cloudstudio-session；推荐同时包含
+                        KEYCLOAK_IDENTITY / KEYCLOAK_SESSION 长期票以启用 SSO 滚动续期，必填）
   CLOUDSTUDIO_COOKIE_1  序列多账号
   CLOUDSTUDIO_xsrf      X-XSRF-TOKEN 覆盖值（可选；缺省自动按 Vq() 派生）
 """
 import datetime as dt
+import hashlib
 import re
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from common import Http, env_seq, find, findall, load_kv_state, main_guard, mask_str, save_kv_state
 
@@ -62,10 +67,42 @@ def extract_session(raw_cookie: str) -> str:
     return ""
 
 
-def try_keycloak_sso(raw_cookie: str) -> Tuple[bool, str]:
-    """尝试利用包含 KEYCLOAK_IDENTITY / 会话票据的完整 Cookie 重换 session。"""
+def _merge_cookie_str(base: str, jar: Any) -> str:
+    """合并已有 Cookie 串与 urllib CookieJar 中的最新 Set-Cookie（同名覆盖）。"""
+    cookie_dict: Dict[str, str] = {}
+    if base:
+        for part in base.split(";"):
+            if "=" in part:
+                k, v = part.strip().split("=", 1)
+                if k.strip():
+                    cookie_dict[k.strip()] = v.strip()
+    for c in jar or ():
+        if getattr(c, "name", None) and getattr(c, "value", None):
+            cookie_dict[c.name] = c.value
+    return "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
+
+
+def _set_session_in_cookie(cookie_str: str, session: str) -> str:
+    """强制覆写 cookie 串中的 cloudstudio-session 值（无则追加），保留其余票据。"""
+    parts = [
+        p.strip()
+        for p in (cookie_str or "").split(";")
+        if "=" in p
+        and p.strip().split("=", 1)[0].strip()
+        and p.strip().split("=", 1)[0].strip().lower() != "cloudstudio-session"
+    ]
+    parts.append(f"cloudstudio-session={session}")
+    return "; ".join(parts)
+
+
+def try_keycloak_sso(raw_cookie: str) -> Tuple[bool, str, str]:
+    """尝试利用包含 KEYCLOAK_IDENTITY / KEYCLOAK_SESSION 长期票据的完整 Cookie 静默重换 session。
+
+    返回 (是否成功, 新 session, 合并了本次 SSO 全部 Set-Cookie 的完整 Cookie 串)。
+    合并结果即使换票失败也返回——其中 KEYCLOAK_* 票据的更新对后续重试仍有价值。
+    """
     if not raw_cookie or "=" not in raw_cookie:
-        return False, ""
+        return False, "", raw_cookie or ""
     h = Http(follow_redirects=True)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -74,10 +111,44 @@ def try_keycloak_sso(raw_cookie: str) -> Tuple[bool, str]:
     }
     url = "https://cloudstudio.net/api/public/login?client_id=cloudstudio-apiserver-club"
     r = h.request("GET", url, headers=headers)
+    merged = _merge_cookie_str(raw_cookie, h.jar)
     for c in h.jar:
         if c.name == "cloudstudio-session" and c.value:
-            return True, c.value
-    return False, ""
+            return True, c.value, merged
+    print(
+        f"    [diag] SSO 未取到新 session（HTTP {r.code}，最终 URL: {r.url}）——"
+        "KEYCLOAK 长期票据可能已失效或被要求交互式重新登录"
+    )
+    return False, "", merged
+
+
+def _cookie_issue_hint(raw_cookie: str) -> str:
+    """根据 Secrets 中 Cookie 的形态给出精确的失效原因与修复指引。"""
+    raw = (raw_cookie or "").strip()
+    if not raw:
+        return "CLOUDSTUDIO_cookie 未配置"
+    if "=" not in raw:
+        return (
+            "Secrets 中只有裸 cloudstudio-session 值，无法进行 Keycloak SSO 自动续票"
+            "（30 天后必失效）。请重新登录后复制完整浏览器 Cookie：必须包含 "
+            "KEYCLOAK_IDENTITY、KEYCLOAK_SESSION 与 cloudstudio-session 三项"
+            "（KEYCLOAK_* 路径限定在 /auth/realms/cloudstudio/，需从 Network 面板任一请求"
+            "的 Cookie 请求头整串复制，或在 Application→Cookies 中逐条合并）"
+        )
+    if "KEYCLOAK_IDENTITY" not in raw:
+        return (
+            "完整 Cookie 中缺少 KEYCLOAK_IDENTITY 长期票（1 年期 SSO 票据，路径 "
+            "/auth/realms/cloudstudio/）。document.cookie 读不到路径限定的 Cookie，"
+            "请从 Network 面板任一请求的 Cookie 请求头整串复制，或 "
+            "Application→Cookies→cloudstudio.net 中合并 /auth/realms/cloudstudio "
+            "路径下的 KEYCLOAK_IDENTITY 与 KEYCLOAK_SESSION"
+        )
+    if "cloudstudio-session" not in raw:
+        return "完整 Cookie 中缺少 cloudstudio-session，请重新登录后整串复制"
+    return (
+        "KEYCLOAK 长期票据已无法静默换票（可能已被服务端吊销或要求交互式重新登录）。"
+        "请在浏览器重新登录 CloudStudio 后整串复制最新完整 Cookie 更新 Secrets"
+    )
 
 
 def bj_now_str() -> str:
@@ -242,57 +313,76 @@ def _run_one(raw_cookie: str, xsrf_override: str, idx: int, total: int) -> Tuple
     state_file = f".cloudstudio_state_{idx}.json"
     redis_key = f"cat_checkin:state:cloudstudio_{idx}"
     saved_state = load_kv_state(redis_key, state_file) or {}
-    saved_session = str(saved_state.get("session") or "").strip()
+    saved_cookie = str(saved_state.get("cookie") or "").strip()
+    saved_session = str(saved_state.get("session") or "").strip()  # 兼容旧版仅存 session 的状态
+    saved_env_hash = str(saved_state.get("env_hash") or "").strip()
     raw_session = extract_session(raw_cookie)
+    env_hash = hashlib.md5(raw_cookie.encode("utf-8")).hexdigest() if raw_cookie else ""
 
-    session = saved_session or raw_session
-    if not session:
-        # 无直接 session，尝试从 raw_cookie 进行 Keycloak SSO 换票
-        sso_ok, sso_session = try_keycloak_sso(raw_cookie)
-        if sso_ok:
-            session = sso_session
-            print(f"[{idx}/{total}] 🔑 通过 Keycloak SSO 初始化换取到最新 session: {session[:12]}***")
-            save_kv_state(redis_key, state_file, {"session": session, "updated_at": bj_now_str()})
+    # 起始 Cookie：env 更新感知（用户更新了 Secrets → 新 env 优先）；否则滚动 state 优先
+    if raw_cookie and env_hash and env_hash != saved_env_hash:
+        print(f"[{idx}/{total}] 🆕 检测到环境变量 Cookie 已更新，优先使用最新配置")
+        base_cookie = raw_cookie
+    else:
+        base_cookie = saved_cookie or raw_cookie
+
+    session = extract_session(base_cookie) or raw_session
+    if not session and saved_session:
+        # 旧版状态迁移：只有裸 session（KEYCLOAK 长期票已丢失，保底使用）
+        session = saved_session
+        base_cookie = f"cloudstudio-session={saved_session}"
 
     if not session:
         raise RuntimeError(
-            "CLOUDSTUDIO_cookie 未找到 cloudstudio-session，且无法自动登录。"
-            "请在浏览器重新登录后更新 CLOUDSTUDIO_cookie（格式如 cloudstudio-session=... 或直接粘贴完整 Cookie）"
+            f"CLOUDSTUDIO_cookie 未找到 cloudstudio-session。{_cookie_issue_hint(raw_cookie)}"
         )
+
+    # 主动 Keycloak 续票（滚动续期核心）：每次运行先用长期票据静默换新 session，
+    # 让 30 天期 session 永远保持新鲜；换票失败只打诊断，不影响本次签到（当前 session 仍有效）
+    if "=" in base_cookie:
+        sso_ok, sso_session, merged = try_keycloak_sso(base_cookie)
+        if sso_ok and sso_session:
+            print(f"[{idx}/{total}] 🔑 SSO 主动续票成功，使用新 session: {sso_session[:12]}***")
+            session = sso_session
+            base_cookie = merged
+        elif not session:
+            base_cookie = merged
 
     ok, report, h = _do_checkin_and_query(session, xsrf_override)
     if not ok and report.startswith("AUTH_EXPIRED"):
-        # 若使用的是 saved_session 但失败，先回退尝试 raw_session
+        # 回退 1：环境变量中的 session（用户可能刚更新过）
         if raw_session and raw_session != session:
-            print(f"[{idx}/{total}] 🔄 缓存 session 失效，尝试使用环境变量最新配置的 session...")
+            print(f"[{idx}/{total}] 🔄 session 失效（{report}），回退使用环境变量中的 session...")
             ok, report, h = _do_checkin_and_query(raw_session, xsrf_override)
             if ok:
                 session = raw_session
-                save_kv_state(redis_key, state_file, {"session": session, "updated_at": bj_now_str()})
-
-        # 若仍失败，尝试通过 Keycloak SSO 续期
-        if not ok and report.startswith("AUTH_EXPIRED"):
-            print(f"[{idx}/{total}] 🔄 session 已过期（{report}），正在尝试通过 Keycloak SSO 自动换取新 session...")
-            sso_ok, new_session = try_keycloak_sso(raw_cookie)
-            if sso_ok and new_session != session:
-                session = new_session
-                print(f"[{idx}/{total}] 🔑 SSO 续期成功，获取到新 session: {session[:12]}***，正在重新签到...")
-                save_kv_state(redis_key, state_file, {"session": session, "updated_at": bj_now_str()})
-                ok, report, h = _do_checkin_and_query(session, xsrf_override)
+        # 回退 2：Keycloak SSO 重新换票
+        if not ok and report.startswith("AUTH_EXPIRED") and "=" in (base_cookie or ""):
+            print(f"[{idx}/{total}] 🔄 正在通过 Keycloak SSO 重新换票...")
+            sso_ok, new_session, merged = try_keycloak_sso(base_cookie)
+            if sso_ok and new_session and new_session != session:
+                print(f"[{idx}/{total}] 🔑 SSO 换票成功: {new_session[:12]}***，重新签到...")
+                ok, report, h = _do_checkin_and_query(new_session, xsrf_override)
+                if ok:
+                    session = new_session
+                    base_cookie = merged
 
     if not ok:
-        raise RuntimeError(
-            "Cookie 已失效，请在浏览器重新登录并更新 CLOUDSTUDIO_cookie。"
-            "（提示：在浏览器 Application -> Cookies 或 Network 中复制 cloudstudio-session=... 填入 Secrets）"
-        )
+        raise RuntimeError(f"Cookie 已失效且自动续票失败。{_cookie_issue_hint(raw_cookie)}")
 
-    # 签到成功后，若有新下发的 Set-Cookie 优先更新；否则保存当前成功使用的 session
-    updated_session = session
-    for c in h.jar:
-        if c.name == "cloudstudio-session" and c.value:
-            updated_session = c.value
-            break
-    save_kv_state(redis_key, state_file, {"session": updated_session, "updated_at": bj_now_str()})
+    # 签到成功：合并本次链路全部 Set-Cookie（含 KEYCLOAK_* 长期票与可能滚动的 session）
+    # 持久化——下次运行 SSO 主动续票直接复用长期票据，这是 cookie 长期存活的关键
+    merged_full = _merge_cookie_str(_set_session_in_cookie(base_cookie, session), h.jar)
+    save_kv_state(
+        redis_key,
+        state_file,
+        {
+            "cookie": merged_full,
+            "session": extract_session(merged_full) or session,
+            "env_hash": env_hash,
+            "updated_at": bj_now_str(),
+        },
+    )
 
     prefix_label = f"[{idx}/{total}] " if total > 1 else ""
     return True, f"{prefix_label}{report}"
