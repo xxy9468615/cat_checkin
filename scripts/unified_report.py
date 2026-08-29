@@ -24,6 +24,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from common import env_bool, upstash_redis_command, upstash_redis_pipeline  # noqa: E402
+import report_fields  # noqa: E402  按任务定制的字段解析（归档结构化字段）
 from daily_report import _extract_fields, build_report, send_email, send_resend  # noqa: E402
 from task_registry import TASKS, get_expected_results  # noqa: E402
 
@@ -217,7 +218,17 @@ def archive_daily_summary(collected: Dict[str, dict], today: str) -> None:
     for key, d in sorted(collected.items()):
         site_key = key[:-5] if key.endswith(".json") else key
         output_str = str(d.get("output") or "")
-        extracted = _extract_fields(output_str) if output_str else {}
+        # 按任务定制解析：assets/reward 供概览昨日对比，accounts 为每账号摘要行
+        info = report_fields.extract_for(str(d.get("script") or ""), output_str)
+        extracted = {
+            "assets": report_fields.assets_pairs_text(info),
+            "reward": " | ".join(txt for grp, txt in info["badges"] if grp == "reward"),
+        }
+        if not (extracted["assets"] or extracted["reward"]) and output_str:
+            # 未注册脚本/解析为空时回退全局启发式，保持归档字段不倒退
+            legacy = _extract_fields(output_str)
+            extracted.setdefault("assets", legacy.get("assets", ""))
+            extracted.setdefault("reward", legacy.get("reward", ""))
         is_pending = bool(d.get("is_pending")) or d.get("status") == "pending"
         st = "pending" if is_pending else ("ok" if bool(d.get("ok")) else "fail")
         sites[site_key] = {
@@ -228,6 +239,7 @@ def archive_daily_summary(collected: Dict[str, dict], today: str) -> None:
             "script": d.get("script", ""),
             "assets": extracted.get("assets", ""),
             "reward": extracted.get("reward", ""),
+            "accounts": info["lines"][:8],
         }
     total = len(sites)
     success = sum(1 for s in sites.values() if s["status"] == "ok")

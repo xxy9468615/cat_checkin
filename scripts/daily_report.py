@@ -28,6 +28,8 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 BASE_DIR = Path(__file__).resolve().parent
 
+import report_fields  # noqa: E402  按任务定制的字段解析器（统一报告/Discord 共用）
+
 
 def bool_env(name: str, default: bool) -> bool:
     value = os.getenv(name)
@@ -106,9 +108,13 @@ def build_report(results: Iterable[Tuple[Any, Path, str, float]]) -> Tuple[str, 
     lines = [summary_header, stat_line, ""]
     for st, path, output, elapsed, dname in rows:
         task_title = dname or get_task_title(path)
+        info = report_fields.extract_for(path.name, output or "")
         if st == "ok":
             status_icon = "✅"
             lines.append(f"{status_icon} {task_title} ({elapsed:.1f}s)")
+            # 每账号一行紧凑摘要（report_fields 按脚本定制解析，过程噪音行不进入）
+            for ln in info["lines"][:8]:
+                lines.append(f"  {ln}")
         elif st == "pending":
             status_icon = "⏳"
             lines.append(f"{status_icon} {task_title} (待执行/调度中)")
@@ -119,9 +125,14 @@ def build_report(results: Iterable[Tuple[Any, Path, str, float]]) -> Tuple[str, 
         else:
             status_icon = "❌"
             lines.append(f"{status_icon} {task_title} ({elapsed:.1f}s)")
-            reason = _last_meaningful_line(output)
-            if reason:
-                lines.append(f"  {reason}")
+            body = info["error_lines"] or info["fail_lines"]
+            if body:
+                for ln in body[:6]:
+                    lines.append(f"  {ln}")
+            else:
+                reason = _last_meaningful_line(output)
+                if reason:
+                    lines.append(f"  {reason}")
         lines.append("")
     return summary_header, "\n".join(lines).strip(), fail_count
 
@@ -294,37 +305,44 @@ def _build_task_card(status: Any, path: Path, output: str, elapsed: float, dname
         status_text = "❌ 失败"
         status_bg = "#fce8e9"
 
-    fields = _extract_fields(output)
+    info = report_fields.extract_for(path.name, output or "")
 
-    # 字段徽标
+    # 字段徽标（按任务定制解析器产出：reward/asset/streak/info/summary）
     badges_html = ""
     badge = lambda bg, color, text: (
         f'<span style="display:inline-block;margin:2px 6px 2px 0;padding:2px 8px;'
         f'background:{bg};border-radius:10px;font-size:12px;color:{color};">'
         f'{_html.escape(str(text))}</span>'
     )
-    if fields.get("remaining"):
-        badges_html += badge("#e0f2fe", "#0369a1", f"剩余 {fields['remaining']}")
-    if fields.get("assets"):
-        for part in fields["assets"].split(" | "):
-            badges_html += badge("#eef2ff", "#3730a3", part)
-    if fields.get("streak"):
-        badges_html += badge("#e6fefa", "#0d9488", f"连续 {fields['streak']}")
-    if fields.get("cumulative"):
-        badges_html += badge("#f0fdf4", "#15803d", f"累计 {fields['cumulative']}")
-    if fields.get("reward"):
-        for part in fields["reward"].split(" | "):
-            badges_html += badge("#fce8ff", "#ad1457", f"获得 {part}")
-    if fields.get("exchange"):
-        badges_html += badge("#f3e8ff", "#6b21a8", fields["exchange"])
-    if fields.get("summary"):
-        badges_html += badge("#fff7e6", "#b45309", fields["summary"])
+    _BADGE_COLORS = {
+        "reward": ("#fce8ff", "#ad1457"),
+        "asset": ("#eef2ff", "#3730a3"),
+        "streak": ("#e6fefa", "#0d9488"),
+        "info": ("#fff7e6", "#b45309"),
+        "summary": ("#fff7e6", "#b45309"),
+    }
+    for group, text in info["badges"][:10]:
+        bg, color = _BADGE_COLORS.get(group, ("#f1f5f9", "#475569"))
+        badges_html += badge(bg, color, text)
 
-    # 截断 + 兜底清洗后渲染卡片正文，保留原始换行符
-    body = _sanitize_output(_truncate_output(output, 1200))
-    if not body and st == "pending":
-        body = "任务尚未执行或处于独立调度窗口中"
-    body_html = _html.escape(body).replace("\n", "<br>")
+    # 卡片正文：成功=每账号一行紧凑摘要；失败=仅错误相关行；无结构化结果时回退原文
+    if st == "ok" and info["lines"]:
+        body_html = "".join(
+            f'<div style="padding:1px 0;">┃ {_html.escape(ln)}</div>' for ln in info["lines"][:10]
+        )
+    elif st == "fail" and (info["error_lines"] or info["fail_lines"]):
+        errs = info["error_lines"][:6] or info["fail_lines"][:6]
+        body_html = "".join(
+            f'<div style="padding:1px 0;color:#8c1d24;">✗ {_html.escape(ln)}</div>' for ln in errs
+        )
+        body_html += (
+            '<div style="padding:4px 0 0 0;color:#9aa4b0;font-size:11px;">（完整输出见 GitHub Actions 运行日志）</div>'
+        )
+    else:
+        body = _sanitize_output(_truncate_output(output, 1200))
+        if not body and st == "pending":
+            body = "任务尚未执行或处于独立调度窗口中"
+        body_html = _html.escape(body).replace("\n", "<br>")
 
     elapsed_str = f"{elapsed:.1f}s" if st != "pending" else "调度中"
 
@@ -447,41 +465,21 @@ def _collect_overview(rows: List[Tuple[str, Path, str, float, str]], yesterday: 
         y_sites = {}
 
     for st, path, output, _elapsed, dname in rows:
-        fields = _extract_fields(output or "")
+        info = report_fields.extract_for(path.name, output or "")
         task_id = path.stem  # u1s1.py → u1s1（与归档 site_key 命名一致）
         title = dname or get_task_title(path)
 
         if st == "ok":
-            # 今日获得按单位聚合（M/K 简写换算数值；跨单位不求和）
-            for part in (fields.get("reward") or "").split(" | "):
-                part = part.strip()
-                if not part:
-                    continue
-                val, unit = None, ""
-                m = re.search(r"\(([\d.,]+)\s*([KMB]?)\)\s*(\S+)", part)
-                if m:
-                    unit = m.group(3)
-                    try:
-                        val = float(m.group(1).replace(",", "")) * _REWARD_UNIT_MULT.get(m.group(2).upper(), 1.0)
-                    except ValueError:
-                        pass
-                else:
-                    m2 = re.match(r"([\d,]+(?:\.\d+)?)\s*(\S+)\s*$", part)
-                    if m2:
-                        unit = m2.group(2).strip("()（）")
-                        try:
-                            val = float(m2.group(1).replace(",", ""))
-                        except ValueError:
-                            pass
-                if val is not None and unit and unit not in _REWARD_UNIT_DENY:
+            # 今日获得按单位聚合（report_fields 已数值化，跨单位不求和）
+            for unit, val in info["gains"]:
+                if unit and unit not in _REWARD_UNIT_DENY:
                     gains[unit] = gains.get(unit, 0.0) + val
 
-            sd = _streak_days(fields.get("streak") or "")
-            if sd > max_streak[1]:
-                max_streak = (title, sd)
+            if info["streak"] > max_streak[1]:
+                max_streak = (title, info["streak"])
 
             # 资产变化：与昨日归档同站同标签对比
-            t_pairs = _parse_asset_pairs(fields.get("assets") or "")
+            t_pairs = report_fields.assets_pairs(info)
             y_pairs = _parse_asset_pairs(str((y_sites.get(task_id) or {}).get("assets") or ""))
             diffs = [
                 f"{label}{'+' if tv - y_pairs[label] > 0 else ''}{_fmt_num(tv - y_pairs[label])}"

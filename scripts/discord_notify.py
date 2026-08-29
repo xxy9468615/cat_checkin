@@ -255,9 +255,22 @@ def _retry_advice(items: List[Tuple[str, str]]) -> Tuple[bool, str]:
     return True, "可手动重跑排查"
 
 
-def _failed_accounts(output: str) -> str:
-    """从失败明细行提取失败账号（带 [i/n] 序号），与成功账号区分开。"""
+def _failed_accounts(output: str, info: Optional[Dict[str, Any]] = None) -> str:
+    """从失败明细行提取失败账号（带 [i/n] 序号），与成功账号区分开。
+
+    优先使用 report_fields 按任务定制的 fail_lines（账号名/原因更准），
+    无结构化结果时回退 _failure_items 启发式。
+    """
     tags: List[str] = []
+    if info and info.get("fail_lines"):
+        for ln in info["fail_lines"][:4]:
+            m = _MASKED_TOKEN_RE.search(ln)
+            label = f"{m.group(0).strip('._-')}" if m else _FAIL_LINE_NOISE_RE.sub("", ln).strip()[:18]
+            label = label.strip()
+            if label and label not in tags:
+                tags.append(label)
+        if tags:
+            return "、".join(tags[:4])
     for tag, text in _failure_items(output, max_items=6):
         m = _MASKED_TOKEN_RE.search(text)
         label = f"{tag} {m.group(0).strip('._-')}" if m else tag
@@ -407,8 +420,15 @@ def notify_task_result(
     else:
         attempts = 1
 
-    fields = _extract_fields(output)
-    assets = _assets_text(fields)
+    info: Optional[Dict[str, Any]] = None
+    try:
+        import report_fields
+        # 按任务定制解析（与统一日报同源）：资产覆盖 2libra 金币/agentrouter 额度/
+        # ai_router USD/CloudStudio 机时等全局启发式抓不到的字段
+        info = report_fields.extract_for(script, output or "")
+        assets = report_fields.assets_text(info) or "—"
+    except Exception:
+        assets = _assets_text(_extract_fields(output))
 
     new_state: Dict[str, Any] = {
         "updated_at": _timestamp_bjt(),
@@ -432,7 +452,7 @@ def notify_task_result(
             retryable,
             _md_escape(retry_reason),
             attempts,
-            _md_escape(_failed_accounts(output)),
+            _md_escape(_failed_accounts(output, info)),
             _md_escape(_extract_accounts(output)),
             _md_escape(assets),
             last_ok_text,

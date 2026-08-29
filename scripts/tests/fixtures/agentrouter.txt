@@ -1,0 +1,7 @@
+【AgentRouter 签到】
+共 1 个账号 | API: https://ps.air-outer.com
+☁️ state 已实时同步至 Upstash Redis（cat_checkin:agentrouter:state）
+[1/1] 账号：1***7 | 签到成功 | 💰 余额额度：324,690,566（已用 309,434）
+
+========== 签到总结 ==========
+成功 1/1

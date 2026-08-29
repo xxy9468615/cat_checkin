@@ -1,0 +1,6 @@
+【Tencent CloudStudio 签到】
+[1/1] 🆕 检测到环境变量 Cookie 已更新，优先使用最新配置
+[1/1] 🔑 SSO 主动续票成功，使用新 session: 5440cd86-00a***
+☁️ state 已实时同步至 Upstash Redis（cat_checkin:state:cloudstudio_1）
+用户 * 今日已签到过（本次奖励 2.00 机时）
+暂无可用资源包

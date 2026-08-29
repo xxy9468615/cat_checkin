@@ -1,0 +1,27 @@
+共 3 个账号 @ www.modelscope.ai
+
+【ModelScope 国际站 签到】
+  3 个账号 @ www.modelscope.ai
+  [diag] web 触碰[www.modelscope.ai]: /my/overview=200 /=302 /home=200 /models=200 /datasets=200 /my/tasks=200
+  [diag] 触碰响应下发 Cookie 字段[www.modelscope.ai]: []
+  [1] [diag] cookie 字段(18): ['_c_WBKFRo', '_ga', '_ga_K9CSTSKFC5', '_gcl_au', 'acw_tc', 'cna', 'csrf_session', 'csrf_token', 'h_uid', 'isg', 'm_session_id', 'modelscope-locale', 'modelscope-theme', 'modelscope-themeAppearance', 'ssxmod_itna', 'ssxmod_itna2', 'tfstk', 'xlly_s']
+  [1] [diag] 用户字段: ['avatar_url', 'email', 'username']
+☁️ state 已实时同步至 Upstash Redis（cat_checkin:state:modelscope_ai_1）
+  [1/3] m***e [Cookie] 签到成功，今日已领取 200 魔粒，点赞已达上限 20/20 次，2026-08-30 01:47:28 过期
+  [diag] web 触碰[www.modelscope.ai]: /my/overview=200 /=302 /home=200 /models=200 /datasets=200 /my/tasks=200
+  [diag] 触碰响应下发 Cookie 字段[www.modelscope.ai]: []
+  [2] [diag] cookie 字段(16): ['acw_tc', 'cna', 'modelscope-locale', '_gcl_au', '_ga', 'csrf_session', 'csrf_token', 'auth_sid', 'm_session_id', 'h_uid', 'xlly_s', '_ga_K9CSTSKFC5', 'tfstk', 'isg', 'ssxmod_itna', 'ssxmod_itna2']
+  [2] [diag] 用户字段: ['avatar_url', 'email', 'username']
+☁️ state 已实时同步至 Upstash Redis（cat_checkin:state:modelscope_ai_2）
+  [2/3] j***k [Cookie] 签到成功，今日已领取 200 魔粒，点赞已达上限 20/20 次，2026-08-30 18:49:41 过期
+  [diag] web 触碰[www.modelscope.ai]: /my/overview=200 /=302 /home=200 /models=200 /datasets=200 /my/tasks=200
+  [diag] 触碰响应下发 Cookie 字段[www.modelscope.ai]: []
+  [3] [diag] cookie 字段(16): ['acw_tc', 'modelscope-locale', 'cna', '_gcl_au', '_ga', 'csrf_session', 'csrf_token', 'xlly_s', 'auth_sid', 'm_session_id', 'h_uid', '_ga_K9CSTSKFC5', 'tfstk', 'isg', 'ssxmod_itna', 'ssxmod_itna2']
+  [3] [diag] 用户字段: ['avatar_url', 'email', 'username']
+☁️ state 已实时同步至 Upstash Redis（cat_checkin:state:modelscope_ai_3）
+  [3/3] j***r [Cookie] 签到成功，今日已领取 200 魔粒，点赞已达上限 20/20 次，2026-08-30 04:07:59 过期
+  ModelScope 国际站 签到 总结：成功 3/3
+☁️ state 已实时同步至 Upstash Redis（cat_checkin:state:notify:modelscope_ai）
+  [sched] last_credit_ts → 2026-08-29 00:00:00 BJT
+
+国际站：✅ 成功
