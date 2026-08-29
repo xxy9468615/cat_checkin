@@ -198,6 +198,37 @@ def _touch_user(
     return user
 
 
+def _created(rec: Dict[str, Any]) -> str:
+    return str(
+        rec.get("gmt_created") or rec.get("gmt_create") or rec.get("created_at") or ""
+    )
+
+
+def _parse_created(s: str) -> Optional[datetime]:
+    """兼容字符串日期与 epoch 秒/毫秒时间戳，返回 BJT datetime 或 None。"""
+    s = s.strip()
+    if not s:
+        return None
+    if s.isdigit():
+        v = int(s)
+        if v > 10**12:  # epoch 毫秒
+            v //= 1000
+        try:
+            return datetime.fromtimestamp(v, BJT)
+        except (ValueError, OverflowError, OSError):
+            return None
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=BJT)
+        except ValueError:
+            continue
+    try:
+        dtv = datetime.fromisoformat(s)
+        return dtv.replace(tzinfo=BJT) if dtv.tzinfo is None else dtv
+    except ValueError:
+        return None
+
+
 def _get_today_daily_active(
     h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
@@ -211,35 +242,6 @@ def _get_today_daily_active(
     today = datetime.now(BJT)
     today_str = today.strftime("%Y-%m-%d")
     hdrs = _headers(host, token=token, cookie=cookie)
-
-    def _created(rec: Dict[str, Any]) -> str:
-        return str(
-            rec.get("gmt_created") or rec.get("gmt_create") or rec.get("created_at") or ""
-        )
-
-    def _parse_created(s: str) -> Optional[datetime]:
-        """兼容字符串日期与 epoch 秒/毫秒时间戳，返回 BJT datetime 或 None。"""
-        s = s.strip()
-        if not s:
-            return None
-        if s.isdigit():
-            v = int(s)
-            if v > 10**12:  # epoch 毫秒
-                v //= 1000
-            try:
-                return datetime.fromtimestamp(v, BJT)
-            except (ValueError, OverflowError, OSError):
-                return None
-        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-            try:
-                return datetime.strptime(s, fmt).replace(tzinfo=BJT)
-            except ValueError:
-                continue
-        try:
-            dtv = datetime.fromisoformat(s)
-            return dtv.replace(tzinfo=BJT) if dtv.tzinfo is None else dtv
-        except ValueError:
-            return None
 
     # 判据 1：交易记录直查（分页扫描至越过今日）
     seen_rule_keys = set()
