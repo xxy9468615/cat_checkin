@@ -122,15 +122,16 @@ def _touch_user(
             "Referer": f"https://{host}/",
             "Cookie": cookie,
         }
-        try:
-            h.request("GET", f"https://{host}/my/overview", headers=web_headers, timeout=15)
-            h.request("GET", f"https://{host}/", headers=web_headers, timeout=15)
-            h.request("GET", f"https://{host}/home", headers=web_headers, timeout=15)
-            h.request("GET", f"https://{host}/models", headers=web_headers, timeout=15)
-            h.request("GET", f"https://{host}/datasets", headers=web_headers, timeout=15)
-            h.request("GET", f"https://{host}/my/tasks", headers=web_headers, timeout=15)
-        except Exception:
-            pass
+        page_status = []
+        for path in ("/my/overview", "/", "/home", "/models", "/datasets", "/my/tasks"):
+            try:
+                r = h.request("GET", f"https://{host}{path}", headers=web_headers, timeout=15)
+                page_status.append(f"{path}={r.code}")
+            except Exception:
+                page_status.append(f"{path}=ERR")
+        # web 触碰状态码：users/me（OpenAPI）与 Web 会话可能不同寿命，用于区分
+        # 「API 正常但 Web 会话已死（日活埋点收不到）」的场景
+        print(f"  [diag] web 触碰: {' '.join(page_status)}")
 
     hdrs = _headers(host, token=token, cookie=cookie)
     try:
@@ -248,6 +249,7 @@ def _get_today_daily_active(
     today_record_cnt = 0
     last_da_dt: Optional[datetime] = None
     last_da_raw = ""
+    recent_samples: list = []
     resp = None
     try:
         for page in (1, 2, 3):
@@ -278,6 +280,8 @@ def _get_today_daily_active(
                         past_today = True
                 if rule_key:
                     seen_rule_keys.add(rule_key)
+                if len(recent_samples) < 6:
+                    recent_samples.append((rule_key or "?", created_str[:19], rec.get("total_amount")))
                 if rule_key == "daily_active":
                     if dt_val is not None and dt_val.date() == today.date():
                         rec["source"] = "transaction"
@@ -313,11 +317,11 @@ def _get_today_daily_active(
                                 "expire_at": "",
                                 "source": "earn_rules",
                             }
-                        # 诊断信息：双判据都未命中时能看到 daily_active 规则的真实字段，
-                        # 便于区分「Cookie 失效」与「接口字段变更」
+                        # 诊断信息：双判据都未命中时能看到 daily_active 规则的完整字段，
+                        # 便于区分「Cookie 失效」与「接口字段变更/任务未领取」
                         print(
-                            f"  [diag] daily_active 规则未命中 today_used："
-                            f"{ {k: r.get(k) for k in ('today_used', 'today_count', 'amount', 'daily_cap', 'status') if k in r} }"
+                            f"  [diag] daily_active 规则未命中 today_used，完整字段："
+                            f"{ {k: str(v)[:60] for k, v in r.items()} }"
                         )
     except Exception:
         pass
@@ -359,6 +363,8 @@ def _get_today_daily_active(
         f"最近 daily_active 到账 {last_da_raw or '扫描窗口内未见'}，"
         f"earn/rules today_used=0"
     )
+    if recent_samples:
+        print(f"  [diag] 最近交易记录: {recent_samples}")
     return None
 
 
@@ -879,11 +885,19 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
     parts.append(f"[{auth_tag}]")
     user_tag = " ".join(parts) or "未知用户"
 
+    # 诊断：cookie 字段构成（只打印字段名与数量，不打印值）与用户对象字段，
+    # 用于对比「发奖正常」与「未发奖」账号的 Cookie/账户差异
+    cnames = [p.split("=", 1)[0].strip() for p in (active_cookie or "").split(";") if "=" in p]
+    print(f"  [{idx}] [diag] cookie 字段({len(cnames)}): {cnames}")
+    print(f"  [{idx}] [diag] 用户字段: {sorted(str(k) for k in user.keys())}")
+
     amount = (record or {}).get("total_amount", 200)
     expire_at = (record or {}).get("expire_at") or ""
 
-    # 签到成功（或冷却期，登录态同样正常）且使用 Cookie 时，持久化并滚动更新 Cookie
-    if record is not None and active_cookie and not token:
+    # 登录态健康（签到成功 / 24h 冷却 / daily_active 未到账）且使用 Cookie 时，
+    # 都持久化并滚动更新 Cookie——确保服务端在触碰过程中下发的新 Cookie 得以积累，
+    # 避免「daily_active 未到账的账号永远卡在最初的 env Cookie」而无法自愈
+    if user and active_cookie and not token:
         updated_cookie = _merge_cookies(active_cookie, h.jar)
         if updated_cookie:
             state_file = f".modelscope_{site}_state_{idx}.json"
