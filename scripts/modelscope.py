@@ -953,7 +953,12 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
             f"请配置浏览器 Cookie 环境变量 {cookie_var}（{site} 站）"
         )
     else:
-        status = f"交易记录无今日 daily_active（Cookie 可能已失效需手动刷新）{like_msg}"
+        # 走到这里说明 users/me 登录态验证已通过（Cookie 未失效），但奖励未发放：
+        # 多为该账号当天缺乏被服务端认可的「日活」行为或奖励规则变化
+        status = (
+            f"交易记录无今日 daily_active（登录态正常、Cookie 未失效；"
+            f"请在浏览器实际登录使用该账号触发日活，连续多日未发放再更新 Cookie）{like_msg}"
+        )
 
     return credited, f"{user_tag} {status}", credit_ts
 
