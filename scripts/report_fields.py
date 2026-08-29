@@ -184,15 +184,16 @@ def _keepalive_badge(output: str, res: Dict[str, Any]) -> None:
 
 
 def ex_glados(output: str, res: Dict[str, Any]) -> None:
-    """【GLaDOS 签到兑换】：📧 账号 块。"""
+    """【GLaDOS / Railgun 签到兑换】：📧 账号 块。"""
     cur: Any = None
     for raw in output.splitlines():
         ln = raw.strip()
-        m = re.match(r"📧 账号: (.+)", ln)
+        m = re.match(r"📧 账号:\s*(.+)", ln)
         if m:
             if cur:
                 cur.flush(res)
-            cur = _Block(m.group(1))
+            acc_name = m.group(1).split(" | ")[0].strip()
+            cur = _Block(acc_name)
             continue
         if cur is None:
             continue
@@ -229,6 +230,9 @@ def ex_glados(output: str, res: Dict[str, Any]) -> None:
     if cur:
         cur.flush(res)
     _add_summary(res, output)
+
+
+ex_railgun = ex_glados
 
 
 def ex_bianjie_ai(output: str, res: Dict[str, Any]) -> None:
@@ -881,6 +885,7 @@ def ex_latvi(output: str, res: Dict[str, Any]) -> None:
 SCRIPT_EXTRACTORS = {
     "2libra.py": ex_2libra,
     "glados.py": ex_glados,
+    "railgun.py": ex_railgun,
     "bianjie_ai.py": ex_bianjie_ai,
     "dji.py": ex_dji,
     "monkeycode.py": ex_monkeycode,

@@ -41,6 +41,10 @@ EXPECT = {
         len(r["lines"]) == 2 and "+9积分" in r["lines"][0] and "剩余 40 天" in r["lines"][0]
         and "兑换：" in r["lines"][1] and ("积分", 19.0) in [(u, v) for u, v in r["gains"]] is not None or True
     ),
+    "railgun": lambda r: (
+        len(r["lines"]) == 3 and "今日已签" in r["lines"][0] and "剩余 14 天" in r["lines"][0]
+        and "+1积分" in r["lines"][1] and "+1积分" in r["lines"][2] and "积分 1" in r["lines"][0]
+    ),
     "latvi": lambda r: (
         any("续期 #48216" in ln for ln in r["lines"]) and ("积分", 5.0) in r["gains"] and r["streak"] == 32
     ),

@@ -74,6 +74,16 @@ jobs:
       GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
       GLADOS_AUTO_EXCHANGE: "true"
       GLADOS_DOMAINS: glados.cloud
+      RAILGUN_COOKIES: ${{ secrets.RAILGUN_COOKIES }}
+      RAILGUN_COOKIE_1: ${{ secrets.RAILGUN_COOKIE_1 || secrets.RAILGUN_COOKIES }}
+      RAILGUN_COOKIE_2: ${{ secrets.RAILGUN_COOKIE_2 }}
+      RAILGUN_COOKIE_3: ${{ secrets.RAILGUN_COOKIE_3 }}
+      RAILGUN_ACCOUNTS: ${{ secrets.RAILGUN_ACCOUNTS }}
+      RAILGUN_ACCOUNT_1: ${{ secrets.RAILGUN_ACCOUNT_1 || secrets.RAILGUN_ACCOUNTS }}
+      RAILGUN_ACCOUNT_2: ${{ secrets.RAILGUN_ACCOUNT_2 }}
+      RAILGUN_EXCHANGE_PLAN: ${{ secrets.RAILGUN_EXCHANGE_PLAN }}
+      RAILGUN_AUTO_EXCHANGE: "true"
+      RAILGUN_DOMAINS: railgun.info
       "2LIBRA_COOKIES": ${{ secrets.TWO_LIBRA_COOKIES }}
       "2LIBRA_COOKIE_1": ${{ secrets.TWO_LIBRA_COOKIE_1 || secrets.TWO_LIBRA_COOKIES }}
       "2LIBRA_COOKIE_2": ${{ secrets.TWO_LIBRA_COOKIE_2 }}

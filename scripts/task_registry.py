@@ -28,6 +28,15 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
+    "railgun": {
+        "id": "railgun",
+        "script": "railgun.py",
+        "name": "Railgun 签到兑换",
+        "result": "railgun.json",
+        "timeout": 300,
+        "account": "",
+        "tags": ["00:50", "matrix", "daily"],
+    },
     "2libra": {
         "id": "2libra",
         "script": "2libra.py",
