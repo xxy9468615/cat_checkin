@@ -1156,9 +1156,11 @@ def _get_credit_expiry(h: Http, cred: str, soon_days: int = 7) -> str:
         if not isinstance(a, dict) or int(a.get("CapacityType", 0) or 0) == 4:
             continue
 
-        def _first_num(acc: Dict[str, Any] = a, *keys: str) -> float:
+        def _first_num(*keys: str) -> float:
+            # 闭包直接读当前迭代变量 a（isinstance 守卫保证是 dict，且定义后立即调用）；
+            # 不要用默认参数绑定 a——位置调用会把第一个 key 填进 acc 导致 'str' has no 'get'
             for k in keys:
-                v = acc.get(k)
+                v = a.get(k)
                 if v is None:
                     continue
                 try:
