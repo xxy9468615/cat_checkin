@@ -135,8 +135,16 @@ def _refresh_access_token(h: Http, refresh_token: str) -> Tuple[str, str]:
 
 
 def _redis_refresh_key(idx: int) -> str:
+    """Redis 滚动票键。per-account dispatch（orchestrator 注入 WORKBUDDY_ACCOUNT_IDX）
+    时子进程内账号重编号为 1，键必须映射真实账号号，否则两个账号的独立 dispatch
+    会共用 _1 键互相覆盖、串用对方票据（张冠李戴）。
+    v2：首版 _1 键在修复前已被账号2 的 dispatch 写入过，直接作废改用 v2 命名，
+    免清理；新键带 14 天 TTL，链路长期停摆时自动过期回退 Secret 票。"""
+    real = (os.getenv("WORKBUDDY_ACCOUNT_IDX") or "").strip()
+    if real.isdigit():
+        idx = int(real)
     prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
-    return f"{prefix}:state:workbuddy_refresh_token_{idx}"
+    return f"{prefix}:state:workbuddy_refresh_token_v2_{idx}"
 
 
 def _load_refresh_token_redis(idx: int) -> str:
@@ -157,7 +165,9 @@ def _save_refresh_token_redis(idx: int, new_token: str) -> bool:
     """滚动票写入 Upstash Redis（数据库回写主通道，免 GH_PAT 权限）。"""
     try:
         payload = json.dumps({"refresh_token": new_token, "rotated_at": time.time()}, ensure_ascii=False)
-        ok, _res = upstash_redis_command(["SET", _redis_refresh_key(idx), payload])
+        ok, _res = upstash_redis_command(
+            ["SET", _redis_refresh_key(idx), payload, "EX", str(14 * 86400)]
+        )
         return bool(ok)
     except Exception:  # noqa: BLE001
         return False

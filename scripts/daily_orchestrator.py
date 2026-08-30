@@ -102,6 +102,8 @@ def build_task_env(cfg: Dict[str, Any]) -> Dict[str, str]:
         env["WORKBUDDY_COOKIE_1"] = cookie
         env["WORKBUDDY_REFRESH_TOKEN"] = refresh
         env["WORKBUDDY_REFRESH_TOKEN_1"] = refresh
+        # 子进程内账号重编号为 1，workbuddy.py 的 Redis 滚动票键靠它映射真实账号
+        env["WORKBUDDY_ACCOUNT_IDX"] = n
         env["WORKBUDDY_WAIT_TRAVEL"] = "true"
         env["WORKBUDDY_NO_RELAY"] = "1"
     if cfg["id"] == "latvi":

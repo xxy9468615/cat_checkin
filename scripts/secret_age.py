@@ -166,7 +166,7 @@ def _redis_rotated_at() -> Dict[str, str]:
             m = _re.search(r"_(\d+)$", secret)
             if not m:
                 continue
-            ok, res = upstash_redis_command(["GET", f"{prefix}:state:workbuddy_refresh_token_{m.group(1)}"])
+            ok, res = upstash_redis_command(["GET", f"{prefix}:state:workbuddy_refresh_token_v2_{m.group(1)}"])
             if not (ok and isinstance(res, dict)):
                 continue
             raw = res.get("result")
