@@ -289,6 +289,7 @@ jobs:
       - name: Setup SS proxy for AgentRouter
         env:
           AGENTROUTER_SS_CONFIG: ${{ secrets.AGENTROUTER_SS_CONFIG }}
+          AGENTROUTER_SS_SUB_URL: ${{ secrets.AGENTROUTER_SS_SUB_URL }}
           AGENTROUTER_SS_SHA256: ${{ secrets.AGENTROUTER_SS_SHA256 }}
           AGENTROUTER_BACKUP_PROXIES: ${{ secrets.AGENTROUTER_BACKUP_PROXIES }}
         run: |
@@ -357,74 +358,74 @@ jobs:
             return 1
           }
 
-          # sing-box TUN 模式：以太层透明接管全部流量（无 socks5 中转，原生 SS 隧道）；
-          # TUN 不可用时回退 sslocal socks5 链路
-          setup_singbox() {
-            curl -sL --max-time 60 -o /tmp/singbox.tar.gz \
-              https://github.com/SagerNet/sing-box/releases/download/v1.13.21/sing-box-1.13.21-linux-amd64.tar.gz \
-              || { echo "sing-box download failed"; return 1; }
-            mkdir -p /tmp/singbox
-            tar xf /tmp/singbox.tar.gz -C /tmp/singbox --strip-components=1 \
-              || { echo "sing-box extract failed"; return 1; }
-            test -x /tmp/singbox/sing-box || { echo "sing-box binary missing"; return 1; }
-            test -s /tmp/ss-config.json || { echo "AGENTROUTER_SS_CONFIG empty"; return 1; }
-            python3 - <<'PY' || return 1
-          import json, sys
-          try:
-              cfg = json.load(open("/tmp/ss-config.json", encoding="utf-8"))
-          except Exception as e:
-              print(f"AGENTROUTER_SS_CONFIG not valid JSON: {e}")
-              sys.exit(1)
-          out = {
-              "type": "shadowsocks", "tag": "ss",
-              "server": str(cfg["server"]), "server_port": int(cfg["server_port"]),
-              "method": str(cfg["method"]), "password": str(cfg["password"]),
-          }
-          if cfg.get("plugin"):
-              out["plugin"] = str(cfg["plugin"])
-              out["plugin_opts"] = str(cfg.get("plugin_opts", ""))
-          # 全量接管：业务流量原生走 SS 隧道；仅 DNS(UDP53) 直连——obfs 节点无 UDP
-          # 中继，DNS 进隧道会全灭（runner 连 GitHub/下载全部黑洞，实测教训）
-          sb = {
-              "log": {"level": "warn"},
-              "inbounds": [{
-                  "type": "tun", "tag": "tun-in", "interface_name": "sb0",
-                  "address": ["172.19.0.1/30"], "mtu": 1500,
-                  "auto_route": True, "strict_route": False, "stack": "system",
-              }],
-              "outbounds": [
-                  out,
-                  {"type": "direct", "tag": "direct"},
-              ],
-              "route": {
-                  "rules": [{"port": 53, "outbound": "direct"}],
-                  "final": "ss",
-                  "auto_detect_interface": True,
-              },
-          }
-          json.dump(sb, open("/tmp/sb-config.json", "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-          PY
+          # mihomo（订阅原生格式）TUN 透明接管：proxy-provider 拉 8 节点订阅，
+          # url-test 组健康检查自动切换故障节点；dns-hijack 由 mihomo 自带 DNS 模块处理；
+          # TUN 不可用时回退 sslocal socks5 链路（AGENTROUTER_SS_CONFIG 单节点）
+          setup_mihomo() {
+            test -n "$AGENTROUTER_SS_SUB_URL" || { echo "AGENTROUTER_SS_SUB_URL empty"; return 1; }
+            curl -sL --max-time 60 -o /tmp/mihomo.gz \
+              https://github.com/MetaCubeX/mihomo/releases/download/v1.19.30/mihomo-linux-amd64-v1-go123-v1.19.30.gz \
+              || { echo "mihomo download failed"; return 1; }
+            mkdir -p /tmp/mihomo
+            gunzip -c /tmp/mihomo.gz > /tmp/mihomo/mihomo && chmod +x /tmp/mihomo/mihomo \
+              || { echo "mihomo extract failed"; return 1; }
+            cat > /tmp/mh-config.yaml <<MHEOF
+          mode: rule
+          log-level: warning
+          ipv6: false
+          tun:
+            enable: true
+            device: sb0
+            stack: system
+            mtu: 1500
+            dns-hijack:
+              - any:53
+            auto-route: true
+            auto-detect-interface: true
+          dns:
+            enable: true
+            enhanced-mode: fake-ip
+            fake-ip-range: 198.18.0.1/16
+            default-nameserver: ["8.8.8.8", "1.1.1.1"]
+            nameserver: ["8.8.8.8", "1.1.1.1"]
+          proxy-providers:
+            railgun:
+              type: http
+              url: "$AGENTROUTER_SS_SUB_URL"
+              interval: 86400
+              path: /tmp/mihomo-prov.yaml
+              health-check:
+                enable: true
+                url: "https://www.gstatic.com/generate_204"
+                interval: 300
+          proxy-groups:
+            - name: PROXY
+              type: url-test
+              use: ["railgun"]
+              url: "https://www.gstatic.com/generate_204"
+              interval: 300
+              tolerance: 100
+          rules:
+            - MATCH,PROXY
+          MHEOF
             pip install -q pysocks || { echo "pysocks install failed"; return 1; }
             pip install -q curl-cffi >/dev/null 2>&1 \
               || echo "curl-cffi install failed; nodeseek falls back to urllib fingerprint"
             # TUN/auto_route 需要 root：GH runner 免密 sudo
-            sudo -n /tmp/singbox/sing-box run -c /tmp/sb-config.json &
+            sudo -n /tmp/mihomo/mihomo -d /tmp/mihomo -f /tmp/mh-config.yaml &
             SSPID=$!
             echo "SSPID=$SSPID" >> "$GITHUB_ENV"
-            for i in $(seq 1 20); do
+            for i in $(seq 1 30); do
               if ip link show sb0 >/dev/null 2>&1; then break; fi
               sleep 0.5
             done
-            ip link show sb0 >/dev/null 2>&1 || { echo "sing-box TUN interface missing"; return 1; }
-            # 透明接管：直连测试即可（ipify 走 direct 出去，nodeseek 走 ss 隧道）
-            ok=0
-            for i in 1 2 3; do
-              if curl -sS -m 10 https://api.ipify.org -o /dev/null 2>/dev/null; then ok=1; break; fi
-              sleep 1
-            done
-            if [ "$ok" != "1" ]; then
-              echo "sing-box TUN forwarding failed; tearing down TUN before sslocal fallback"
-              sudo -n pkill -f '[s]ing-box' 2>/dev/null || true
+            ip link show sb0 >/dev/null 2>&1 || { echo "mihomo TUN interface missing"; sudo -n pkill -f '[m]ihomo' 2>/dev/null || true; return 1; }
+            sleep 2
+            # 透明接管：直连 curl 即经 PROXY 组出节点；返回的出口 IP 即当前节点
+            exit_ip=$(curl -sS -m 12 https://api.ipify.org 2>/dev/null || echo "")
+            if [ -z "$exit_ip" ]; then
+              echo "mihomo TUN forwarding failed; tearing down TUN before sslocal fallback"
+              sudo -n pkill -f '[m]ihomo' 2>/dev/null || true
               sleep 1
               return 1
             fi
@@ -432,14 +433,14 @@ jobs:
             echo "NODESEEK_PROXY=" >> "$GITHUB_ENV"
             echo "AGENTROUTER_PROXY=" >> "$GITHUB_ENV"
             ns_code=$(curl -sS -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
-            echo "SS proxy ready via sing-box TUN (pid $SSPID), nodeseek probe HTTP $ns_code"
+            echo "SS proxy ready via mihomo TUN (pid $SSPID), exit IP $exit_ip, nodeseek probe HTTP $ns_code"
             return 0
           }
 
           # sing-box 路径也需要 ss-config.json：提前落盘（setup_ss 内会重复写，幂等）
           printf '%s' "$AGENTROUTER_SS_CONFIG" > /tmp/ss-config.json
 
-          if setup_singbox; then
+          if setup_mihomo; then
             exit 0
           fi
           if setup_ss; then
@@ -585,6 +586,7 @@ jobs:
           kill "${SSPID:-}" 2>/dev/null || true
           sudo -n kill "${SSPID:-}" 2>/dev/null || true
           sudo -n pkill -f '[s]ing-box' 2>/dev/null || true
+          sudo -n pkill -f '[m]ihomo' 2>/dev/null || true
           pkill -f '[s]slocal' 2>/dev/null || true
 
       - name: Upload unified results
