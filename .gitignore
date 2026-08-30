@@ -70,4 +70,5 @@ legacy/
 CLAUDE.md
 ip检测接口.md
 IP_link_test/
-jp/.quark_state*.json
+jp/
+.quark_state*.json
