@@ -404,13 +404,11 @@ jobs:
                 enable: true
                 url: "https://www.gstatic.com/generate_204"
                 interval: 300
+          external-controller: 127.0.0.1:9090
           proxy-groups:
             - name: PROXY
-              type: url-test
+              type: select
               use: ["railgun"]
-              url: "https://www.gstatic.com/generate_204"
-              interval: 300
-              tolerance: 100
           rules:
             - MATCH,PROXY
           MHEOF
@@ -438,8 +436,29 @@ jobs:
             # TUN 模式无需 socks5 端口：清空代理变量，任务流量由 TUN 透明接管
             echo "NODESEEK_PROXY=" >> "$GITHUB_ENV"
             echo "AGENTROUTER_PROXY=" >> "$GITHUB_ENV"
+            # 逐节点探测 nodeseek：url-test 只挑"最快"，但 CF 风控只认"干净"——
+            # 遍历订阅节点切换 PROXY 组，选第一个非 403 的固定下来；全 403 则保留首个可达
+            chosen=""
+            fallback=""
+            nodes=$(curl -sS -m 5 http://127.0.0.1:9090/proxies/PROXY \
+              | python3 -c "import json,sys; print('\n'.join(json.load(sys.stdin).get('all') or []))")
+            for node in $nodes; do
+              curl -sS -m 5 -X PUT http://127.0.0.1:9090/proxies/PROXY \
+                -d "{\"name\": \"$node\"}" >/dev/null 2>&1 || continue
+              code=$(curl -sS -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
+              ip=$(curl -sS -m 8 https://api.ipify.org 2>/dev/null || echo "?")
+              echo "  probe $node -> HTTP $code (exit $ip)"
+              if [ "$code" != "403" ] && [ "$code" != "000" ]; then chosen="$node"; break; fi
+              [ -z "$fallback" ] && fallback="$node"
+            done
+            if [ -n "$chosen" ]; then
+              echo "selected node for nodeseek: $chosen"
+            elif [ -n "$fallback" ]; then
+              curl -sS -m 5 -X PUT http://127.0.0.1:9090/proxies/PROXY -d "{\"name\": \"$fallback\"}" >/dev/null 2>&1 || true
+              echo "no node passed nodeseek probe; pinned first reachable: $fallback"
+            fi
             ns_code=$(curl -sS -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
-            echo "SS proxy ready via mihomo TUN (pid $SSPID), exit IP $exit_ip, nodeseek probe HTTP $ns_code"
+            echo "SS proxy ready via mihomo TUN (pid $SSPID), nodeseek probe HTTP $ns_code"
             return 0
           }
 
