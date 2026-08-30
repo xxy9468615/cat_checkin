@@ -70,6 +70,13 @@ def _parse_cookie_info(cookie_str: str) -> Tuple[str, str, Optional[int]]:
     return username, uid, remaining_days
 
 
+def _proxy_candidates(raw: str) -> List[str]:
+    """NODESEEK_PROXY 多代理解析：逗号/换行分隔，按序 failover。"""
+    if not raw:
+        return []
+    return [x.strip() for x in re.split(r"[,\n]+", raw) if x.strip()]
+
+
 class _CffiResp:
     """与 common.Http.Response 对齐的最小接口（.code/.text/.json(default)）。"""
 
@@ -116,7 +123,6 @@ def _run_account(idx: int, total: int, cookie: str, proxy: str, random_bonus: bo
 
     print(f"[{idx}/{total}] 👤 用户: 【{masked_user}】 (UID: {masked_uid}){expiry_tag}")
 
-    h = Http(follow_redirects=True, proxy=proxy)
     headers = {
         "User-Agent": _UA,
         "Accept": "application/json, text/plain, */*",
@@ -127,7 +133,28 @@ def _run_account(idx: int, total: int, cookie: str, proxy: str, random_bonus: bo
     }
 
     url = f"{DEFAULT_API}/api/attendance?random={'true' if random_bonus else 'false'}"
-    resp = _request_attendance(h, url, headers, proxy)
+
+    # 多代理 failover：NODESEEK_PROXY 支持逗号/换行分隔（住宅代理源不稳定，
+    # 连接失败或被 CF 质询的出口自动跳下一个；空列表=直连）
+    candidates = _proxy_candidates(proxy)
+    resp = None
+    last_err = ""
+    for i, px in enumerate(candidates or [""]):
+        tag = mask_str(px, 6, 3) if px else "直连"
+        try:
+            h = Http(follow_redirects=True, proxy=px)
+            resp = _request_attendance(h, url, headers, px)
+        except Exception as exc:  # noqa: BLE001
+            last_err = f"{tag}: {type(exc).__name__} {str(exc)[:60]}"
+            print(f"[diag] 出口不可用({i + 1}/{len(candidates) or 1}) {tag}: {type(exc).__name__}")
+            continue
+        if resp.code == 403 and "Just a moment" in resp.text and i < len(candidates) - 1:
+            last_err = f"{tag}: CF 403"
+            print(f"[diag] 出口被 CF 质询({i + 1}/{len(candidates)}) {tag}，换下一个")
+            continue
+        break
+    if resp is None:
+        raise RuntimeError(f"NodeSeek 全部出口不可用: {last_err}")
 
     if resp.code == 200:
         data = resp.json({})

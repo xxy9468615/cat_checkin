@@ -433,8 +433,8 @@ jobs:
               sleep 1
               return 1
             fi
-            # TUN 模式无需 socks5 端口：清空代理变量，任务流量由 TUN 透明接管
-            echo "NODESEEK_PROXY=" >> "$GITHUB_ENV"
+            # TUN 模式无需 socks5 端口：AGENTROUTER_PROXY 清空（agentrouter 走 TUN）；
+            # NODESEEK_PROXY 保留（nodeseek 专用住宅代理出口，流量经 TUN 中转不受影响）
             echo "AGENTROUTER_PROXY=" >> "$GITHUB_ENV"
             # 逐节点探测 nodeseek：url-test 只挑"最快"，但 CF 风控只认"干净"——
             # 遍历订阅节点切换 PROXY 组，选第一个非 403 的固定下来；全 403 则保留首个可达
