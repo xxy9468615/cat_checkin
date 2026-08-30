@@ -120,6 +120,7 @@ def _run_account(cookie: str, idx: int, total: int) -> Tuple[bool, str]:
         "Referer": "https://aistudio.baidu.com/overview",
         "X-Requested-With": "XMLHttpRequest",
         "Accept": "application/json, text/plain, */*",
+        "Cookie": cookie.strip(),
     }
     if bd_token:
         api_headers["x-studio-token"] = bd_token
@@ -157,13 +158,17 @@ def _run_account(cookie: str, idx: int, total: int) -> Tuple[bool, str]:
         rec_data: Dict[str, Any] = r_rec.json({})
         if r_rec.code == 200 and rec_data.get("errorCode") == 0:
             rec_res = rec_data.get("result")
-            if isinstance(rec_res, dict) and rec_res.get("received"):
+            if isinstance(rec_res, dict) and rec_res.get("itemName"):
+                card_receive_msg = f"领取成功 ({rec_res.get('itemName')})"
+            elif isinstance(rec_res, dict) and rec_res.get("received"):
                 card_receive_msg = "领取成功"
             elif isinstance(rec_res, (int, float)) and rec_res > 0:
                 card_receive_msg = f"+{_format_compute_card(int(rec_res))}"
             else:
-                card_receive_msg = "已领取"
-        elif is_already_signed(rec_data.get("errorMsg", ""), extra_phrases=("已领取", "已完成", "今日已")):
+                card_receive_msg = "领取成功"
+        elif rec_data.get("errorCode") == 500 and "无效操作" in rec_data.get("errorMsg", ""):
+            card_receive_msg = "今日已领取"
+        elif is_already_signed(rec_data.get("errorMsg", ""), extra_phrases=("已领取", "已完成", "今日已", "无效操作")):
             card_receive_msg = "今日已领取"
     except Exception:
         pass
@@ -180,8 +185,11 @@ def _run_account(cookie: str, idx: int, total: int) -> Tuple[bool, str]:
             total_points = info_res.get("totalPoint")
             streak_days = int(info_res.get("continuousSingCount") or 0)
 
-    # 5. 算力卡总额与资源汇总（POST /studio/resource/user/summary）
+    # 5. 算力卡总额与有效期明细查询（POST /studio/resource/user/summary + /studio/resource/detail/list）
     compute_points: Optional[str] = None
+    card_expire_str: str = ""
+    days_left: Optional[int] = None
+
     try:
         r_res = h.request("POST", "https://aistudio.baidu.com/studio/resource/user/summary", headers=api_headers)
         res_data: Dict[str, Any] = r_res.json({})
@@ -191,6 +199,30 @@ def _run_account(cookie: str, idx: int, total: int) -> Tuple[bool, str]:
                 res_total = sum_res.get("resourceTotal")
                 if res_total is not None and isinstance(res_total, (int, float)):
                     compute_points = _format_compute_card(int(res_total))
+    except Exception:
+        pass
+
+    try:
+        r_detail = h.request(
+            "POST",
+            "https://aistudio.baidu.com/studio/resource/detail/list",
+            headers=api_headers,
+            form={"detailType": 1, "p": 1, "pageSize": 10},
+        )
+        detail_data: Dict[str, Any] = r_detail.json({})
+        if r_detail.code == 200 and detail_data.get("errorCode") == 0:
+            records = (detail_data.get("result") or {}).get("data") or []
+            now_ms = datetime.now(BJT).timestamp() * 1000
+            active_lapses = [
+                item["lapseTime"]
+                for item in records
+                if isinstance(item, dict) and item.get("lapseTime") and item["lapseTime"] > now_ms
+            ]
+            if active_lapses:
+                earliest_ms = min(active_lapses)
+                exp_dt = datetime.fromtimestamp(earliest_ms / 1000, tz=BJT)
+                card_expire_str = exp_dt.strftime("%Y-%m-%d %H:%M")
+                days_left = int((earliest_ms - now_ms) / (1000 * 86400))
     except Exception:
         pass
 
@@ -219,7 +251,13 @@ def _run_account(cookie: str, idx: int, total: int) -> Tuple[bool, str]:
     if total_points is not None:
         asset_parts.append(f"积分 【{total_points}】")
     if compute_points is not None:
-        asset_parts.append(f"算力卡 【{compute_points}】")
+        card_label = f"算力卡 【{compute_points}】"
+        if card_expire_str:
+            if days_left is not None and days_left <= 7:
+                card_label += f" (⚠️ 将于 {days_left} 天后过期: {card_expire_str})"
+            else:
+                card_label += f" (有效期至 {card_expire_str})"
+        asset_parts.append(card_label)
     if token_balance is not None:
         asset_parts.append(f"大模型 Token 【{_format_token_num(token_balance)}】")
 

@@ -805,10 +805,20 @@ def ex_aistudio(output: str, res: Dict[str, Any]) -> None:
             if m_pt:
                 cur.parts.append(f"积分 {_d(m_pt.group(1))}")
                 res["assets"].append(("积分", _f(m_pt.group(1))))
-            m_card = re.search(r"算力卡\s*【([^】]+)】", ln)
+            m_card = re.search(r"算力卡\s*【([^】]+)】(?:\s*\(([^)]+)\))?", ln)
             if m_card:
-                cur.parts.append(f"算力卡 {m_card.group(1)}")
-                c_num = re.search(r"([\d.]+)", m_card.group(1))
+                card_val, card_extra = m_card.group(1), m_card.group(2)
+                if card_extra:
+                    if "⚠️" in card_extra:
+                        cur.parts.append(f"算力卡 {card_val}（{card_extra}）")
+                        res["badges"].append(("warn", "算力卡即将过期"))
+                    else:
+                        m_exp = re.search(r"(\d{4}-\d{2}-\d{2})", card_extra)
+                        exp_date = m_exp.group(1) if m_exp else card_extra
+                        cur.parts.append(f"算力卡 {card_val}（至 {exp_date}）")
+                else:
+                    cur.parts.append(f"算力卡 {card_val}")
+                c_num = re.search(r"([\d.]+)", card_val)
                 if c_num:
                     res["assets"].append(("算力卡", _f(c_num.group(1))))
             m_tk = re.search(r"大模型 Token\s*【([^】]+)】", ln)
