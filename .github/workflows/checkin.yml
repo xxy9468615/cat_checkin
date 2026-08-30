@@ -7,8 +7,10 @@ on:
   schedule:
     # 主流水线：北京时间 14:00（UTC 06:00）单 run 全内联（稳态 ~18:1x 结束，硬墙 19:55（ORCH_HARD_DEADLINE））
     - cron: "0 6 * * *"
-    # 心跳轮询：每 4h 一次，仅跑滚动冷却型任务（modelscope 双实例，DUE_ONLY 按
-    # last_credit_ts 状态决定是否执行；未到期秒级跳过）——「按上次签到时间」调度
+    # 心跳轮询：每 4h 一次，跑滚动冷却型任务（modelscope 双实例，DUE_ONLY 按
+    # last_credit_ts 状态决定是否执行；未到期秒级跳过）+ CloudStudio SSO 保活触碰
+    # （KEYCLOAK 服务端会话是闲置寿命，每日一次续票追不上窗口导致 8/30 整点失效；
+    #  每 4h 触碰一次刷新闲置计时，registry 无 sched 元数据 → DUE_ONLY 恒视为到期）
     - cron: "0 */4 * * *"
     # 报告兜底：北京时间 20:30（UTC 12:30，晚于硬墙 19:55（ORCH_HARD_DEADLINE）），仅走报告分支
     - cron: "30 12 * * *"
@@ -380,9 +382,10 @@ jobs:
             echo "tasks=$INPUT_TASKS" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # 心跳轮询：仅滚动冷却型任务（是否执行由 DUE_ONLY + last_credit_ts 决定）
+          # 心跳轮询：滚动冷却型任务（是否执行由 DUE_ONLY + last_credit_ts 决定）
+          # + tencent_cloudstudio（Keycloak SSO 会话闲置保活，每 4h 触碰续票）
           if [ "$EVENT_SCHEDULE" = "0 */4 * * *" ]; then
-            echo "tasks=modelscope,modelscope_ai" >> "$GITHUB_OUTPUT"
+            echo "tasks=modelscope,modelscope_ai,tencent_cloudstudio" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           case "$EVENT_ACTION" in
@@ -397,7 +400,7 @@ jobs:
           # 防止误触发 2h+ 的全量 run（latvi 7000s 等）
           if [ -n "$EVENT_SCHEDULE" ] && [ "$EVENT_SCHEDULE" != "0 6 * * *" ]; then
             echo "⚠️ 未识别的 schedule '$EVENT_SCHEDULE'，降级为心跳任务集"
-            echo "tasks=modelscope,modelscope_ai" >> "$GITHUB_OUTPUT"
+            echo "tasks=modelscope,modelscope_ai,tencent_cloudstudio" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Execute daily orchestrator
