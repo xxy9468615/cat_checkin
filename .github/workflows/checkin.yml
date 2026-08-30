@@ -333,6 +333,8 @@ jobs:
           json.dump(cfg, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
           PY
             pip install -q pysocks || { echo "pysocks install failed"; return 1; }
+            pip install -q curl-cffi >/dev/null 2>&1 \
+              || echo "curl-cffi install failed; nodeseek falls back to urllib fingerprint"
             /tmp/sslocal -c /tmp/ss-config.json &
             SSPID=$!
             echo "SSPID=$SSPID" >> "$GITHUB_ENV"

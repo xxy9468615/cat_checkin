@@ -70,6 +70,38 @@ def _parse_cookie_info(cookie_str: str) -> Tuple[str, str, Optional[int]]:
     return username, uid, remaining_days
 
 
+class _CffiResp:
+    """与 common.Http.Response 对齐的最小接口（.code/.text/.json(default)）。"""
+
+    def __init__(self, r):
+        self.code = r.status_code
+        self.text = r.text
+
+    def json(self, default=None):
+        try:
+            return json.loads(self.text)
+        except Exception:
+            return default if default is not None else {}
+
+
+def _request_attendance(h, url: str, headers: Dict[str, str], proxy: str):
+    """优先 curl_cffi Chrome TLS 指纹：NodeSeek 的 CF 风控按 IP 信誉+TLS 指纹打分，
+    urllib/requests 的 Python 指纹在数据中心出口上稳定吃 managed challenge（403）。
+    Chrome 指纹不改 UA 语义，仅抹平 JA3 差异；未安装 curl_cffi 时回退原 Http。
+    （实验记录 2026-08-31：干净住宅 IP 上 urllib 也能过 → 指纹只在可疑 IP 上成为
+    压死稻草；TW-X1-1 出口 urllib 连续两轮 403，curl_cffi 是最小代价的对策。）"""
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError:
+        return h.request("POST", url, headers=headers, json_data={})
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    r = cffi_requests.post(
+        url, headers=headers, json={}, proxies=proxies,
+        impersonate="chrome", timeout=60, allow_redirects=False,
+    )
+    return _CffiResp(r)
+
+
 def _run_account(idx: int, total: int, cookie: str, proxy: str, random_bonus: bool) -> None:
     username, uid, remaining_days = _parse_cookie_info(cookie)
     masked_user = mask_str(username, 1, 1) if username else f"账号 #{idx}"
@@ -95,7 +127,7 @@ def _run_account(idx: int, total: int, cookie: str, proxy: str, random_bonus: bo
     }
 
     url = f"{DEFAULT_API}/api/attendance?random={'true' if random_bonus else 'false'}"
-    resp = h.request("POST", url, headers=headers, json_data={})
+    resp = _request_attendance(h, url, headers, proxy)
 
     if resp.code == 200:
         data = resp.json({})
@@ -159,4 +191,5 @@ def main() -> None:
         print(f"\n✅ 全部 {total} 个账号处理完成")
 
 
-main_guard(main)
+if __name__ == "__main__":
+    main_guard(main)
