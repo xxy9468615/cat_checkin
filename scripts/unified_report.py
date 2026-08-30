@@ -24,6 +24,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from common import env_bool, upstash_redis_command, upstash_redis_pipeline  # noqa: E402
+import alert_levels  # noqa: E402  提示/警告分级（归档 level/warns 字段）
 import report_fields  # noqa: E402  按任务定制的字段解析（归档结构化字段）
 from daily_report import _extract_fields, build_report, send_email, send_resend  # noqa: E402
 from task_registry import TASKS, get_expected_results  # noqa: E402
@@ -231,10 +232,16 @@ def archive_daily_summary(collected: Dict[str, dict], today: str) -> None:
             extracted.setdefault("reward", legacy.get("reward", ""))
         is_pending = bool(d.get("is_pending")) or d.get("status") == "pending"
         st = "pending" if is_pending else ("ok" if bool(d.get("ok")) else "fail")
+        # 🟡 黄色预警归档：ok 站点的续期失败/凭据即将过期提示（fail 站点红线已覆盖）
+        cls = alert_levels.classify(
+            str(d.get("script") or ""), st == "ok" and not is_pending, output_str
+        ) if not is_pending else {"level": "ok", "warns": []}
         sites[site_key] = {
             "ok": bool(d.get("ok")),
             "status": st,
             "is_pending": is_pending,
+            "level": cls["level"],
+            "warns": list(cls["warns"])[:4],
             "elapsed": d.get("elapsed", 0),
             "script": d.get("script", ""),
             "assets": extracted.get("assets", ""),
@@ -245,6 +252,7 @@ def archive_daily_summary(collected: Dict[str, dict], today: str) -> None:
     success = sum(1 for s in sites.values() if s["status"] == "ok")
     failed = sum(1 for s in sites.values() if s["status"] == "fail")
     pending = sum(1 for s in sites.values() if s["status"] == "pending")
+    warned = sum(1 for s in sites.values() if s.get("level") == "warn")
     summary = {
         "date": today,
         "updated_at": updated_at,
@@ -252,6 +260,7 @@ def archive_daily_summary(collected: Dict[str, dict], today: str) -> None:
         "success": success,
         "failed": failed,
         "pending": pending,
+        "warned": warned,
         "sites": sites,
     }
     body = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))

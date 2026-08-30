@@ -55,6 +55,8 @@ EXPECT = {
     "modelscope_ai": lambda r: (
         len([ln for ln in r["lines"] if not ln.startswith("资源")]) == 3
         and "+200魔粒" in r["lines"][0] and r["summary"] == "成功 3/3"
+        # 「过期」主体必须是魔粒（奖励有效期），不能写成裸时间让读者误读为 Cookie 过期
+        and "魔粒 2026-08-30 01:47:28 过期" in r["lines"][0]
     ),
     "monkeycode": lambda r: (
         len(r["lines"]) == 2 and "余额 2,086" in r["lines"][0] and "免费额度 10,000,000" in r["lines"][0]

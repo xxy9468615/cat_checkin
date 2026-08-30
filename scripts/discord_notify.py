@@ -3,7 +3,9 @@
 """Discord Webhook 通知模块：频道1 失败即时提醒（2026-08-29 双通道拆分）。
 
 daily_orchestrator.py 每个任务失败/超时/异常的瞬间调用 notify_task_result 推
-失败卡（templates/discord_failure.json）；成功/跳过只更新通知状态、不推送——
+失败卡（templates/discord_failure.json，红色🔴）；任务成功但命中黄色预警
+（无感续期失败 / 凭据即将过期，alert_levels.classify 分级）时推黄色提示卡
+（templates/discord_warn.json，同任务同日仅一次）；纯成功只更新状态、不推送——
 避免正常任务信息干扰。每日任务执行情况日报走邮件通道（unified_report.py +
 daily_report.py HTML 卡片 + 今日概览小结），浏览与归档体验优于 Discord。
 
@@ -13,7 +15,8 @@ daily_report.py HTML 卡片 + 今日概览小结），浏览与归档体验优�
 
 通知状态按 task_id 记 KV（common.load_kv_state / save_kv_state 双通道）：
   Redis cat_checkin:state:notify:<task_id> + 本地 .notify_state_<task_id>.json
-  字段：last_ok_date / fail_streak / ok_streak / attempts / attempt_date。
+  字段：last_ok_date / fail_streak / ok_streak / attempts / attempt_date /
+       warn_date / warn_texts（黄色预警去重与留痕）。
 
 Environment:
   DISCORD_WEBHOOK_URL  Discord Webhook 地址；未设置时使用下方内置默认 URL。
@@ -43,6 +46,7 @@ DEFAULT_WEBHOOK_URL = (
 COLOR_OK = 3066993      # 绿
 COLOR_FAIL = 15158332   # 红
 COLOR_PENDING = 9807270 # 灰
+COLOR_WARN = 0xF59E0B   # 琥珀（黄色预警：成功但带提示）
 
 # Discord embed 限制：description ≤ 4096、总 payload ≤ 6000
 FAIL_TEXT_MAX = 160
@@ -386,6 +390,20 @@ DEFAULT_FAILURE_TEMPLATE = {
 }
 
 
+# === 频道1：黄色提示卡（任务成功但带提示：续期失败 / 凭据即将过期） ===
+
+DEFAULT_WARN_TEMPLATE = {
+    "username": "cat_checkin",
+    "embeds": [{
+        "title": "🟡 {{TASK_NAME}} · {{STATUS_TITLE}}",
+        "color": "{{COLOR}}",
+        "description": "{{DESCRIPTION}}",
+        "footer": {"text": "cat_checkin · {{TASK_ID}} · {{SCRIPT}}"},
+        "timestamp": "{{TIMESTAMP}}",
+    }],
+}
+
+
 def notify_task_result(
     task_id: str,
     name: str,
@@ -394,10 +412,11 @@ def notify_task_result(
     output: str = "",
     persist: bool = True,
 ) -> bool:
-    """记录单任务执行结果并按需推送：成功只更新状态不推送；失败实时推频道1失败卡。
+    """记录单任务执行结果并按需推送：失败实时推红色失败卡；成功带黄色提示时推提示卡
+    （同任务同日仅推一次）；纯成功只更新状态不推送。
 
     persist=False 时不读写通知状态（--test 自测用，避免污染真实 task_id 的记录）。
-    返回值：失败卡是否发送成功（成功任务不推送恒返回 True，方便调用方记日志）。
+    返回值：失败卡/提示卡是否发送成功（纯成功不推送恒返回 True，方便调用方记日志）。
     """
     state = _load_notify_state(task_id) if persist else {}
     prev_ok_date = str(state.get("last_ok_date") or "").strip()
@@ -475,11 +494,41 @@ def notify_task_result(
             tpl = _load_template("discord_failure.json", DEFAULT_FAILURE_TEMPLATE)
             sent = _post_webhook(_render(tpl, replacements))
     else:
-        # 成功：只更新状态（连签连续性由 last_ok_date 是否为昨天决定），不推频道
+        # 成功：只更新状态（连签连续性由 last_ok_date 是否为昨天决定），不推绿卡
         new_state["last_ok_date"] = today
         new_state["fail_streak"] = 0
         new_state["ok_streak"] = prev_ok_streak + 1 if prev_ok_date == _date_offset(today, -1) else 1
         sent = True
+
+        # 🟡 黄色预警：任务成功但带提示（无感续期失败 / 凭据即将过期，alert_levels 分级）。
+        # 防轰炸：心跳轮询一天跑多次，同任务同日只推第一张提示卡，后续静默（状态照记）
+        cls: Dict[str, Any] = {"level": "ok", "warns": []}
+        try:
+            import alert_levels
+            cls = alert_levels.classify(script, True, output or "")
+        except Exception as exc:
+            print(f"⚠️ 分级判定失败（按绿色处理）: {exc}")
+        if cls.get("warns"):
+            new_state["warn_date"] = today
+            new_state["warn_texts"] = list(cls["warns"])[:5]
+            if str(state.get("warn_date") or "") == today:
+                print(f"ℹ️ 任务 {task_id} 今日已推送过提示卡（warn_date={state.get('warn_date')}），本次静默")
+            else:
+                description = "\n".join(
+                    f"⚠️ {_md_escape(w)}" for w in cls["warns"][:4]
+                )
+                description += f"\n💰 **资产**　{assets}"
+                replacements = {
+                    "{{TASK_NAME}}": str(name or task_id),
+                    "{{TASK_ID}}": str(task_id),
+                    "{{SCRIPT}}": str(script or ""),
+                    "{{STATUS_TITLE}}": "签到成功，但有提示",
+                    "{{COLOR}}": str(COLOR_WARN),
+                    "{{DESCRIPTION}}": description,
+                    "{{TIMESTAMP}}": _timestamp_bjt(),
+                }
+                tpl = _load_template("discord_warn.json", DEFAULT_WARN_TEMPLATE)
+                sent = _post_webhook(_render(tpl, replacements))
 
     if persist:
         # 状态反映任务执行事实（与推送是否送达无关），失败也要累计

@@ -29,6 +29,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 BASE_DIR = Path(__file__).resolve().parent
 
 import report_fields  # noqa: E402  按任务定制的字段解析器（统一报告/Discord 共用）
+import alert_levels  # noqa: E402  提示/警告分级引擎（🟡提示级 / 🔴失败级）
 
 
 def bool_env(name: str, default: bool) -> bool:
@@ -91,8 +92,22 @@ def build_report(results: Iterable[Tuple[Any, Path, str, float]]) -> Tuple[str, 
     total_count = len(rows)
     today_str = datetime.date.today().strftime("%Y-%m-%d")
 
+    # 🟡 黄色预警：任务成功但带提示（无感续期失败 / 凭据即将过期）
+    # 按行索引对齐：同脚本多实例（workbuddy 账号1/2 等）输出不同，不能用脚本名做 key
+    warn_by_idx = {
+        idx: alert_levels.classify(path.name, st == "ok", output or "")
+        for idx, (st, path, output, _, _) in enumerate(rows)
+        if st == "ok"
+    }
+    warn_count = sum(1 for c in warn_by_idx.values() if c["level"] == "warn")
+
+    header_tags = ""
     if fail_count > 0:
-        summary_header = f"📢 每日签到汇总 ({today_str}) [❌ {fail_count}项失败]"
+        header_tags += f" [❌ {fail_count}项失败]"
+    if warn_count > 0:
+        header_tags += f" [🟡 {warn_count}项注意]"
+    if header_tags:
+        summary_header = f"📢 每日签到汇总 ({today_str}){header_tags}"
     elif pending_count > 0 and ok_count > 0:
         summary_header = f"📢 每日签到汇总 ({today_str}) [⏳ {pending_count}项待执行]"
     elif pending_count > 0 and ok_count == 0:
@@ -101,20 +116,24 @@ def build_report(results: Iterable[Tuple[Any, Path, str, float]]) -> Tuple[str, 
         summary_header = f"📢 每日签到汇总 ({today_str})"
 
     if pending_count > 0:
-        stat_line = f"📊 成功 {ok_count} | 失败 {fail_count} | 待执行 {pending_count} | 共 {total_count}"
+        stat_line = f"📊 成功 {ok_count} | 失败 {fail_count} | 注意 {warn_count} | 待执行 {pending_count} | 共 {total_count}"
     else:
-        stat_line = f"📊 成功 {ok_count} | 失败 {fail_count} | 共 {total_count}"
+        stat_line = f"📊 成功 {ok_count} | 失败 {fail_count} | 注意 {warn_count} | 共 {total_count}"
 
     lines = [summary_header, stat_line, ""]
-    for st, path, output, elapsed, dname in rows:
+    for idx, (st, path, output, elapsed, dname) in enumerate(rows):
         task_title = dname or get_task_title(path)
         info = report_fields.extract_for(path.name, output or "")
         if st == "ok":
-            status_icon = "✅"
+            cls = warn_by_idx.get(idx) or {"warns": []}
+            warns = cls.get("warns") or []
+            status_icon = "🟡" if warns else "✅"
             lines.append(f"{status_icon} {task_title} ({elapsed:.1f}s)")
             # 每账号一行紧凑摘要（report_fields 按脚本定制解析，过程噪音行不进入）
             for ln in info["lines"][:8]:
                 lines.append(f"  {ln}")
+            for w in warns[:4]:
+                lines.append(f"  ⚠️ {w}")
         elif st == "pending":
             status_icon = "⏳"
             lines.append(f"{status_icon} {task_title} (待执行/调度中)")
@@ -292,7 +311,18 @@ def _build_task_card(status: Any, path: Path, output: str, elapsed: float, dname
     """构造单个任务卡片。"""
     title = dname or get_task_title(path)
     st = _normalize_status(status)
+    # 🟡 黄色预警（任务成功但带提示）：续期失败 / 凭据即将过期
+    warns: List[str] = []
     if st == "ok":
+        try:
+            warns = list(alert_levels.classify(path.name, True, output or "").get("warns") or [])
+        except Exception:
+            warns = []
+    if st == "ok" and warns:
+        status_color = "#b45309"
+        status_text = "🟡 成功（有提示）"
+        status_bg = "#fff7e6"
+    elif st == "ok":
         status_color = "#228757"
         status_text = "✅ 成功"
         status_bg = "#e4f5ec"
@@ -325,10 +355,13 @@ def _build_task_card(status: Any, path: Path, output: str, elapsed: float, dname
         bg, color = _BADGE_COLORS.get(group, ("#f1f5f9", "#475569"))
         badges_html += badge(bg, color, text)
 
-    # 卡片正文：成功=每账号一行紧凑摘要；失败=仅错误相关行；无结构化结果时回退原文
+    # 卡片正文：成功=每账号一行紧凑摘要（有提示时附黄色提示行）；失败=仅错误相关行；无结构化结果时回退原文
     if st == "ok" and info["lines"]:
         body_html = "".join(
             f'<div style="padding:1px 0;">┃ {_html.escape(ln)}</div>' for ln in info["lines"][:10]
+        )
+        body_html += "".join(
+            f'<div style="padding:1px 0;color:#b45309;">⚠️ {_html.escape(w)}</div>' for w in warns[:4]
         )
     elif st == "fail" and (info["error_lines"] or info["fail_lines"]):
         errs = info["error_lines"][:6] or info["fail_lines"][:6]

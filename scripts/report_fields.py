@@ -1087,9 +1087,10 @@ def ex_modelscope(output: str, res: Dict[str, Any]) -> None:
             eta_txt = f"约{em.group(1)}h{em.group(2)}m后领" if em else "下次运行可领"
             parts.append(f"冷却中（上次 {mm.group(1)}，{eta_txt}）")
             res["badges"].append(("info", "24h 冷却中，登录态正常"))
-        mm = re.search(r"，([\d-]+ [\d:]+) 过期$", body)
+        mm = re.search(r"，(?:魔粒 )?([\d-]+ [\d:]+) 过期$", body)
         if mm:
-            parts.append(f"{mm.group(1)} 过期")
+            # 该时间是本次到账魔粒奖励的有效期（非 Cookie 有效期），展示必须带「魔粒」主体
+            parts.append(f"魔粒 {mm.group(1)} 过期")
         if "交易记录无今日 daily_active" in body:
             res["fail_lines"].append(_acc_line(name, [_clean(body)]))
             res["error_lines"].append(body)

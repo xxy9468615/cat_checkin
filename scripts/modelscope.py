@@ -977,7 +977,9 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
             like_msg = f"，点赞已达上限 {used_likes}/{max_likes} 次"
 
     if credited:
-        exp_desc = f"，{expire_at} 过期" if expire_at else ""
+        # 「过期」主体是本次到账的魔粒奖励（流水自带 expire_at，非 Cookie 有效期）——
+        # 必须写明「魔粒」，否则读者会误读成 Cookie/凭据即将过期
+        exp_desc = f"，魔粒 {expire_at} 过期" if expire_at else ""
         status = f"签到成功，今日已领取 {amount} 魔粒{like_msg}{exp_desc}"
         return True, f"{user_tag} {status}", credit_ts
 

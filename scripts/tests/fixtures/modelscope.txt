@@ -7,7 +7,7 @@
   [1] [diag] cookie 字段(16): ['_c_WBKFRo', '_ga', '_ga_K9CSTSKFC5', '_gcl_au', 'cna', 'h_uid', 'isg', 'modelscope-locale', 'modelscope-theme', 'modelscope-themeAppearance', 'm_session_id', 'source', 't', 'xlly_s', 'csrf_token', 'acw_tc']
   [1] [diag] 用户字段: ['avatar_url', 'description', 'email', 'nickname', 'username']
 ☁️ state 已实时同步至 Upstash Redis（cat_checkin:state:modelscope_cn_1）
-  [1/2] 小***灰 [Cookie] 签到成功，今日已领取 200 魔粒，点赞已达上限 20/20 次，2026-08-30 01:55:25 过期
+  [1/2] 小***灰 [Cookie] 签到成功，今日已领取 200 魔粒，点赞已达上限 20/20 次，魔粒 2026-08-30 01:55:25 过期
   [diag] web 触碰[www.modelscope.cn]: /my/overview=200 /=302 /home=200 /models=200 /datasets=200 /my/tasks=200
   [diag] 触碰响应下发 Cookie 字段[www.modelscope.cn]: []
   [diag] daily_active 规则未命中 today_used，完整字段：***'rule_key': 'daily_active', 'title': '注册并登录', 'description': '注册账号后每日登录即可获取', 'category': '每日发放', 'category_key': 'daily', 'scene': 'short_term', 'amount': '200', 'expire_days': '1', 'daily_cap': '1', 'total_cap': '0', 'today_used': '0', 'today_remain': '1', 'total_earned': '0', 'today_earned_amount': '0', 'earned_amount': '0'***
