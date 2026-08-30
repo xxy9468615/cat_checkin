@@ -44,6 +44,11 @@ on:
         required: false
         default: false
         type: boolean
+      no_cffi:
+        description: '诊断：nodeseek 强制 urllib/HTTP1.1（禁用 curl_cffi chrome 指纹）'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -492,6 +497,11 @@ jobs:
           echo "NODESEEK_PROXY=" >> "$GITHUB_ENV"
           echo "AGENTROUTER_PROXY=" >> "$GITHUB_ENV"
           echo "direct 诊断模式：跳过代理，任务用 runner IP 直连"
+      - name: no_cffi mode (nodeseek 强制 urllib)
+        if: inputs.no_cffi == true
+        run: |
+          echo "NODESEEK_NO_CFFI=1" >> "$GITHUB_ENV"
+          echo "no_cffi 诊断模式：nodeseek 强制 urllib/HTTP1.1"
 
       - name: Resolve dispatch compat -> ORCH_TASKS
         id: orch_tasks

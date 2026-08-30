@@ -97,6 +97,10 @@ def _request_attendance(h, url: str, headers: Dict[str, str], proxy: str):
     Chrome 指纹不改 UA 语义，仅抹平 JA3 差异；未安装 curl_cffi 时回退原 Http。
     （实验记录 2026-08-31：干净住宅 IP 上 urllib 也能过 → 指纹只在可疑 IP 上成为
     压死稻草；TW-X1-1 出口 urllib 连续两轮 403，curl_cffi 是最小代价的对策。）"""
+    # NODESEEK_NO_CFFI=1：强制 urllib/HTTP1.1。CF 对 h2 指纹打分很重，
+    # curl_cffi 的 chrome 伪装在部分出口反而不如无 h2 的 urllib（实测 A/B）
+    if os.getenv("NODESEEK_NO_CFFI", "").strip() in ("1", "true", "yes"):
+        return h.request("POST", url, headers=headers, json_data={})
     try:
         from curl_cffi import requests as cffi_requests
     except ImportError:
