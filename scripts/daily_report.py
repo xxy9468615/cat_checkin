@@ -87,7 +87,6 @@ def build_report(results: Iterable[Tuple[Any, Path, str, float]]) -> Tuple[str, 
         rows.append((st, item[1], item[2], item[3], item[4] if len(item) > 4 else ""))
 
     ok_count = sum(1 for st, *_ in rows if st == "ok")
-    fail_count = sum(1 for st, *_ in rows if st == "fail")
     pending_count = sum(1 for st, *_ in rows if st == "pending")
     total_count = len(rows)
     today_str = datetime.date.today().strftime("%Y-%m-%d")
@@ -101,11 +100,22 @@ def build_report(results: Iterable[Tuple[Any, Path, str, float]]) -> Tuple[str, 
     }
     warn_count = sum(1 for c in warn_by_idx.values() if c["level"] == "warn")
 
+    # ⚪ 凭据未配置（非故障）：失败行命中未配置证据 → 按跳过展示，不计入失败数
+    unconf_by_idx = {
+        idx: alert_levels.detect_unconfigured(output or "")
+        for idx, (st, path, output, _, _) in enumerate(rows)
+        if st == "fail"
+    }
+    unconf_count = sum(1 for v in unconf_by_idx.values() if v)
+    fail_count = sum(1 for st, *_ in rows if st == "fail") - unconf_count
+
     header_tags = ""
     if fail_count > 0:
         header_tags += f" [❌ {fail_count}项失败]"
     if warn_count > 0:
         header_tags += f" [🟡 {warn_count}项注意]"
+    if unconf_count > 0:
+        header_tags += f" [⚪ {unconf_count}项未配置]"
     if header_tags:
         summary_header = f"📢 每日签到汇总 ({today_str}){header_tags}"
     elif pending_count > 0 and ok_count > 0:
@@ -115,10 +125,12 @@ def build_report(results: Iterable[Tuple[Any, Path, str, float]]) -> Tuple[str, 
     else:
         summary_header = f"📢 每日签到汇总 ({today_str})"
 
-    if pending_count > 0:
-        stat_line = f"📊 成功 {ok_count} | 失败 {fail_count} | 注意 {warn_count} | 待执行 {pending_count} | 共 {total_count}"
-    else:
-        stat_line = f"📊 成功 {ok_count} | 失败 {fail_count} | 注意 {warn_count} | 共 {total_count}"
+    stat_line = (
+        f"📊 成功 {ok_count} | 失败 {fail_count} | 注意 {warn_count}"
+        + (f" | 未配置 {unconf_count}" if unconf_count else "")
+        + (f" | 待执行 {pending_count}" if pending_count > 0 else "")
+        + f" | 共 {total_count}"
+    )
 
     lines = [summary_header, stat_line, ""]
     for idx, (st, path, output, elapsed, dname) in enumerate(rows):
@@ -142,6 +154,13 @@ def build_report(results: Iterable[Tuple[Any, Path, str, float]]) -> Tuple[str, 
             else:
                 lines.append("  任务尚未执行或处于独立调度窗口中")
         else:
+            unconf = unconf_by_idx.get(idx)
+            if unconf:
+                # ⚪ 凭据未配置（非故障）：按跳过展示，不计失败、不触发自动重跑
+                lines.append(f"⚪ {task_title} (未配置凭据，跳过)")
+                lines.append(f"  {unconf}")
+                lines.append("")
+                continue
             status_icon = "❌"
             lines.append(f"{status_icon} {task_title} ({elapsed:.1f}s)")
             body = info["error_lines"] or info["fail_lines"]
@@ -311,6 +330,8 @@ def _build_task_card(status: Any, path: Path, output: str, elapsed: float, dname
     """构造单个任务卡片。"""
     title = dname or get_task_title(path)
     st = _normalize_status(status)
+    # ⚪ 凭据未配置（非故障）：按跳过展示，不渲染成红色失败
+    unconf = alert_levels.detect_unconfigured(output or "") if st == "fail" else None
     # 🟡 黄色预警（任务成功但带提示）：续期失败 / 凭据即将过期
     warns: List[str] = []
     if st == "ok":
@@ -318,7 +339,11 @@ def _build_task_card(status: Any, path: Path, output: str, elapsed: float, dname
             warns = list(alert_levels.classify(path.name, True, output or "").get("warns") or [])
         except Exception:
             warns = []
-    if st == "ok" and warns:
+    if st == "fail" and unconf:
+        status_color = "#64748b"
+        status_text = "⚪ 未配置凭据（跳过）"
+        status_bg = "#f1f5f9"
+    elif st == "ok" and warns:
         status_color = "#b45309"
         status_text = "🟡 成功（有提示）"
         status_bg = "#fff7e6"
@@ -370,6 +395,12 @@ def _build_task_card(status: Any, path: Path, output: str, elapsed: float, dname
         )
         body_html += (
             '<div style="padding:4px 0 0 0;color:#9aa4b0;font-size:11px;">（完整输出见 GitHub Actions 运行日志）</div>'
+        )
+    elif st == "fail" and unconf:
+        body_html = (
+            f'<div style="padding:1px 0;color:#475569;">ℹ️ {_html.escape(unconf)}</div>'
+            '<div style="padding:4px 0 0 0;color:#9aa4b0;font-size:11px;">'
+            '非故障：在仓库 Secrets 配置对应凭据后，执行 gh workflow run checkin.yml -f tasks=<task_id> 验证</div>'
         )
     else:
         body = _sanitize_output(_truncate_output(output, 1200))

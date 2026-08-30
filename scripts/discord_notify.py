@@ -536,6 +536,62 @@ def notify_task_result(
     return sent
 
 
+def notify_unconfigured(
+    task_id: str,
+    name: str,
+    script: str,
+    output: str = "",
+    persist: bool = True,
+) -> bool:
+    """凭据未配置（⚪ 非故障）：不推红色失败卡、不计 fail_streak、不动 last_ok_date。
+
+    新任务代码先进 main、Secret 还没配时的场景——历史上每次都以红色失败卡 +
+    无意义自动重跑收场。现只推一张黄色「未配置」提示卡（同任务同日仅一次），
+    附证据行与配置指引，提醒尽快配置凭据。
+    """
+    state = _load_notify_state(task_id) if persist else {}
+    today = _bjt_today()
+    # 保留既有状态字段（last_ok_date / fail_streak / ok_streak / attempts），
+    # 只追加未配置标记——未配置既不是故障也不是成功
+    new_state: Dict[str, Any] = dict(state)
+    new_state.update({
+        "updated_at": _timestamp_bjt(),
+        "attempt_date": today,
+        "last_unconf_date": today,
+    })
+
+    try:
+        import alert_levels
+        evidence = alert_levels.detect_unconfigured(output) or "（未捕获到具体证据行）"
+    except Exception:
+        evidence = "（未捕获到具体证据行）"
+
+    sent = True
+    if str(state.get("last_unconf_date") or "") == today:
+        print(f"ℹ️ 任务 {task_id} 今日已推送过「未配置」提示卡（last_unconf_date={state.get('last_unconf_date')}），本次静默")
+    else:
+        description = "\n".join([
+            "ℹ️ **状态**　凭据未配置，本次按跳过处理（非故障，不计失败、不触发重跑）",
+            f"❗ **证据**　{_md_escape(evidence)}",
+            "💡 **处置**　在仓库 Secrets 配置对应凭据后验证：`gh workflow run checkin.yml -f tasks=" + str(task_id) + "`",
+        ])
+        replacements = {
+            "{{TASK_NAME}}": str(name or task_id),
+            "{{TASK_ID}}": str(task_id),
+            "{{SCRIPT}}": str(script or ""),
+            "{{STATUS_TITLE}}": "凭据未配置，已跳过",
+            "{{COLOR}}": str(COLOR_WARN),
+            "{{DESCRIPTION}}": description,
+            "{{TIMESTAMP}}": _timestamp_bjt(),
+        }
+        tpl = _load_template("discord_warn.json", DEFAULT_WARN_TEMPLATE)
+        sent = _post_webhook(_render(tpl, replacements))
+
+    if persist:
+        _save_notify_state(task_id, new_state)
+    return sent
+
+
 def main() -> None:
     """CLI 自测：python3 discord_notify.py --test 发一条失败卡（多账号混合样例）。"""
     fail_output = (

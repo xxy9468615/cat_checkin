@@ -10,11 +10,37 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent  # scripts/
 sys.path.insert(0, str(BASE))
 
-from alert_levels import classify, EXPIRY_WARN_DAYS  # noqa: E402
+from alert_levels import classify, detect_unconfigured, EXPIRY_WARN_DAYS  # noqa: E402
 
 # 每条用例：(说明, script, ok, output, 期望 level, 期望 warns 命中片段或 None)
 CASES = [
-    # --- 🔴 红色：任务失败恒压过一切 ---
+    # --- ⚪ unconfigured：凭据未配置（非故障），按跳过处理 ---
+    ("smzdm 未配置 Secret → unconfigured", "smzdm.py", False,
+     "【什么值得买 签到】\n签到失败： 缺少环境变量：SMZDM_cookie_1 或 SMZDM_cookie",
+     "unconfigured", "SMZDM_cookie_1"),
+    ("alipan 未配置 refresh_token → unconfigured", "alipan.py", False,
+     "【阿里云盘 签到】\n签到失败： 未配置 ALIPAN_REFRESH_TOKEN_1 或 ALIPAN_TOKEN_1 环境变量",
+     "unconfigured", "ALIPAN_REFRESH_TOKEN_1"),
+    ("modelscope 未配置 Cookie → unconfigured", "modelscope.py", False,
+     "签到失败： ModelScope 国际站缺少环境变量：MODELSCOPE_AI_TOKEN / MODELSCOPE_AI_COOKIE",
+     "unconfigured", "缺少环境变量"),
+    ("orchestrator spawn 报 workbuddy 缺 Cookie → unconfigured", "workbuddy.py", False,
+     "failed to spawn: workbuddy 账号 2 缺少 WORKBUDDY_COOKIE_2（secret 未配置或为空），"
+     "拒绝继承其他账号的 cookie", "unconfigured", "WORKBUDDY_COOKIE_2"),
+    ("2libra 未配置 cookie → unconfigured", "2libra.py", False,
+     "签到失败： 未配置 2LIBRA_COOKIES 或 2LIBRA_cookie", "unconfigured", None),
+
+    # --- 🔴 红色：真故障不得被误判为未配置（回归护栏） ---
+    ("sophnet Token 已过期 ≠ 未配置（凭据死了是真故障）", "sophnet.py", False,
+     "🚨 账号 #1 Token 已过期且未配置 refresh_token，无法自动续期！", "fail", None),
+    ("u1s1 手机号 403（Cookie 已失效）≠ 未配置", "u1s1.py", False,
+     "❌ 账号 eyJ***FFI 打卡失败: HTTP 403, msg: 请先绑定并验证手机号 (Session Cookie 已失效)",
+     "fail", None),
+    ("cloudstudio Cookie 死亡 ≠ 未配置", "tencent_cloudstudio.py", False,
+     "签到失败：Cookie 已失效且自动续票失败。KEYCLOAK 长期票据已无法静默换票", "fail", None),
+    ("非致命 state 告警行不触发 unconfigured 判定", "glados.py", False,
+     "☁️ state 同步失败： 未配置 UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN\n"
+     "签到失败：HTTP 500 服务端错误", "fail", None),
     ("失败压过续期失败信号", "tencent_cloudstudio.py", False,
      "[diag] SSO 未取到新 session（HTTP 200）\n签到失败：Cookie 已失效", "fail", None),
     ("普通失败", "juejin.py", False, "❌ 账号 #1 签到失败: HTTP 401", "fail", None),
@@ -101,7 +127,7 @@ def main() -> None:
     except Exception as exc:
         failures.append(f"端到端联动异常: {exc}")
 
-    # 端到端：daily_report.build_report 头部与行级黄色标注
+    # 端到端：daily_report.build_report 头部与行级黄色标注 + ⚪ 未配置不计失败
     try:
         from daily_report import build_report
         import tempfile
@@ -110,24 +136,53 @@ def main() -> None:
             stub = Path(fh.name)
         warn_out = "🔑 Cookie 剩余 1 天\n签到成功"
         ok_out = "签到成功 +5"
+        unconf_out = "签到失败： 缺少环境变量：SMZDM_cookie_1 或 SMZDM_cookie"
+        fail_out = "签到失败：HTTP 500 服务端错误"
         rows = [
             (True, stub, warn_out, 1.0, "GLaDOS 签到"),
             (True, stub, ok_out, 1.0, "GLaDOS 签到2"),
+            (False, stub, unconf_out, 0.1, "SMZDM 签到"),
+            (False, stub, fail_out, 1.0, "坏站点"),
         ]
         header, text, fail_n = build_report(rows)
         stub.unlink()
         good = (
-            fail_n == 0
+            fail_n == 1  # 只有真故障计入失败
             and "[🟡 1项注意]" in header
+            and "[⚪ 1项未配置]" in header
             and "🟡 GLaDOS 签到" in text
             and "⚠️ Cookie 仅剩 1 天" in text
             and "✅ GLaDOS 签到2" in text
+            and "⚪ SMZDM 签到 (未配置凭据，跳过)" in text
+            and "❌ 坏站点" in text
         )
         if not good:
-            failures.append(f"build_report 端到端：header={header!r}")
-        print(f"[{'PASS' if good else 'FAIL'}] 端到端 build_report：头部统计 + 🟡 行 + ⚠️ 提示行")
+            failures.append(f"build_report 端到端：header={header!r} fail_n={fail_n}")
+        print(f"[{'PASS' if good else 'FAIL'}] 端到端 build_report：🟡/⚠️ + ⚪ 不计失败 + ❌ 真故障")
     except Exception as exc:
         failures.append(f"build_report 端到端异常: {exc}")
+
+    # orchestrator 多轮结果合并：True > False > "unconfigured"
+    try:
+        from daily_orchestrator import _merge_result
+        merge_cases = [
+            (None, False, True, "unconfigured"),   # 首轮未配置
+            (None, False, False, False),           # 首轮真失败
+            (None, True, False, True),             # 首轮成功
+            ("unconfigured", True, False, True),   # 先未配置后成功 → 成功
+            ("unconfigured", False, False, False), # 先未配置后真失败 → 失败
+            (True, False, True, True),             # 成功过一次，后续未配置 → 成功
+            (False, False, True, False),           # 失败过一次，后续未配置 → 失败
+        ]
+        good = True
+        for prev, ok, unconf, want in merge_cases:
+            got = _merge_result(prev, ok, unconf)
+            if got != want:
+                good = False
+                failures.append(f"_merge_result({prev!r}, {ok}, {unconf}) = {got!r}，期望 {want!r}")
+        print(f"[{'PASS' if good else 'FAIL'}] orchestrator _merge_result 三态合并（7 用例）")
+    except Exception as exc:
+        failures.append(f"_merge_result 测试异常: {exc}")
 
     print(f"\n{'❌ ' + str(len(failures)) + ' 项失败' if failures else '✅ 全部通过'}")
     for f in failures:

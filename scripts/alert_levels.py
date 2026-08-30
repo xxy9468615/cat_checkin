@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """提示/警告分级引擎（daily_report / discord_notify / unified_report 共用）。
 
-三级模型（优先级 fail > warn > ok）：
-  🔴 fail  任务失败（退出非 0 / 超时 / 异常）——红色预警，走既有失败卡链路
-  🟡 warn  任务成功但需要关注——黄色预警（提示级），两个来源：
-            1) 无感续期任务（auto-renew）续期失败：本次签到仍成功，但滚动续期
-               链路断了，凭据将在当前余量耗尽后失效 → 提示「续期失败请检查」
-            2) 无法续期任务凭据即将过期：Cookie 剩余有效期 <= 1 天
-               → 提前 1 天提示「请尽快更新」
-  🟢 ok    一切正常
+四级模型（优先级 fail > unconfigured > warn > ok）：
+  🔴 fail          任务失败（退出非 0 / 超时 / 异常）——红色预警，走既有失败卡链路
+  ⚪ unconfigured  凭据未配置——非故障！新任务上线时代码常先进 main、Secret 尚未配置，
+                   历史上每次都以红色失败卡 + 无意义 auto-retry 收场（重跑解决不了
+                   没配凭据）。现按「跳过」处理：不推红卡、不计失败、不触发重跑，
+                   只推一张黄色提示卡提醒配置
+  🟡 warn          任务成功但需要关注——黄色预警（提示级），两个来源：
+                     1) 无感续期任务（auto-renew）续期失败：本次签到仍成功，但滚动续期
+                        链路断了，凭据将在当前余量耗尽后失效 → 提示「续期失败请检查」
+                     2) 无法续期任务凭据即将过期：Cookie 剩余有效期 <= 1 天
+                        → 提前 1 天提示「请尽快更新」
+  🟢 ok            一切正常
 
 设计原则：
 - 站点续期语义集中在本模块注册表（script 文件名 → 模式），report_fields 只管
@@ -16,17 +20,19 @@
 - 无感续期任务的「剩余 N 天」不参与过期提示（滚动续期会自动续，报了反而误导读者，
   modelscope 的「魔粒 X 过期」同理，那是奖励有效期不是凭据有效期）；
 - fail 恒压过 warn：失败卡已覆盖一切，黄色提示不重复打扰；
+- 「凭据已过期/已失效」≠「未配置」：前者凭据存在但死了，是真故障（红）；
+  detect_unconfigured 对含「已过期/失效」的行一律不判未配置；
 - 判定纯函数化（无 IO），便于自测与复用。
 
 用法：
-    from alert_levels import classify
+    from alert_levels import classify, detect_unconfigured
     cls = classify("tencent_cloudstudio.py", ok=True, output="...")
-    cls["level"] ∈ {"ok", "warn", "fail"}；cls["warns"] 为提示文本列表
+    cls["level"] ∈ {"ok", "warn", "fail", "unconfigured"}；cls["warns"] 为提示文本列表
 """
 from __future__ import annotations
 
 import re
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 # ---------------------------------------------------------------------------
 # 站点续期语义注册表（key = 脚本文件名，与 report_fields.SCRIPT_EXTRACTORS 同键位）
@@ -82,7 +88,41 @@ _RENEWAL_HINTS: Dict[str, str] = {
 EXPIRY_WARN_DAYS = 1
 _COOKIE_DAYS_RE = re.compile(r"Cookie 剩余 (\d+) 天")
 
-_LEVELS = ("ok", "warn", "fail")
+# ---------------------------------------------------------------------------
+# 凭据未配置检测（⚪，非故障）：新任务代码先进 main、Secret 还没配的场景。
+# 模式刻意收紧：
+#   1) 只认任务自己的失败行（行首是 签到失败/❌/🚨/缺少/未配置/orchestrator error），
+#      避免命中 ⚠️/☁️ 之类的非致命告警行（如 state 同步的「未配置 UPSTASH...」）；
+#   2) 行内含「已过期/失效」一律不判未配置——凭据存在但死了是真故障（红），
+#      如 sophnet「Token 已过期且未配置 refresh_token」、u1s1 的「Cookie 已失效」。
+_UNCONF_LINE_PREFIX = re.compile(r"^\s*(?:签到失败|❌|🚨|缺少|未配置|orchestrator error|failed to spawn)")
+_UNCONF_PATTERNS = (
+    r"缺少环境变量",
+    r"缺少凭据",
+    r"未配置凭据",
+    r"secret 未配置或为空",
+    r"未配置 [A-Za-z0-9_]+",
+    r"未配置.*(凭[证据]|[Cc]ookie|[Tt]oken|环境变量)",
+)
+_UNCONF_EXCLUDE = ("已过期", "失效")
+
+_LEVELS = ("ok", "warn", "fail", "unconfigured")
+
+
+def detect_unconfigured(output: str) -> Optional[str]:
+    """输出中命中「凭据未配置」证据行则返回该行（cleaned），否则 None。
+
+    仅应在任务整体失败（ok=False）时调用；命中即把该次执行按跳过处理。
+    """
+    for raw in (output or "").splitlines():
+        ln = re.sub(r"\s+", " ", raw.strip())
+        if not ln or not _UNCONF_LINE_PREFIX.match(ln):
+            continue
+        if any(x in ln for x in _UNCONF_EXCLUDE):
+            continue
+        if any(re.search(p, ln) for p in _UNCONF_PATTERNS):
+            return ln if len(ln) <= 120 else ln[:119] + "…"
+    return None
 
 
 def _clean(text: str, limit: int = 60) -> str:
@@ -93,9 +133,15 @@ def _clean(text: str, limit: int = 60) -> str:
 def classify(script: str, ok: bool, output: str) -> Dict[str, object]:
     """按脚本名 + 执行结果 + 原始输出判定预警级别。
 
-    返回 {"level": "ok"|"warn"|"fail", "warns": [str, ...]}，warns 已去重。
+    返回 {"level": "ok"|"warn"|"fail"|"unconfigured", "warns": [str, ...]}，warns 已去重。
+    fail 任务的输出若命中「凭据未配置」证据行，降级为 unconfigured（跳过，非故障）。
     """
     script = (script or "").strip()
+    if not ok:
+        unconf = detect_unconfigured(output)
+        if unconf:
+            return {"level": "unconfigured", "warns": [unconf]}
+        return {"level": "fail", "warns": []}
     warns: List[str] = []
     for raw in (output or "").splitlines():
         ln = raw.strip()
@@ -115,12 +161,7 @@ def classify(script: str, ok: bool, output: str) -> Dict[str, object]:
     # 去重保序，上限 5 条防刷屏
     seen: set = set()
     warns = [w for w in warns if not (w in seen or seen.add(w))][:5]
-    if not ok:
-        level = "fail"
-    elif warns:
-        level = "warn"
-    else:
-        level = "ok"
+    level = "warn" if warns else "ok"
     return {"level": level if level in _LEVELS else "ok", "warns": warns}
 
 

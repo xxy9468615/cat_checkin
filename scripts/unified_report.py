@@ -167,16 +167,27 @@ def _emit_failed_sites(collected: Dict[str, dict]) -> List[str]:
     输出两个 step output：
     - failed_sites  全部真实失败脚本名（含独立 workflow 站点，供日志/排查）
     - failed_matrix 其中属于 checkin.yml 矩阵的脚本（自动重跑仅 dispatch 这些）
-    注意：待执行 (pending) 的站点不计入失败，不触发自动重跑。
+    注意：待执行 (pending) 的站点不计入失败，不触发自动重跑；
+    凭据未配置（⚪，非故障）的站点同样不计入失败——重跑解决不了没配凭据。
     """
+    unconf_sites = sorted(
+        {
+            str(d.get("script"))
+            for d in collected.values()
+            if not d.get("ok") and not d.get("is_pending") and d.get("status") != "pending"
+            and alert_levels.detect_unconfigured(str(d.get("output") or ""))
+        } - {""}
+    )
     failed_scripts = sorted(
         {
             str(d.get("script"))
             for d in collected.values()
             if not d.get("ok") and not d.get("is_pending") and d.get("status") != "pending"
         } - {""}
-    )
+    ) - set(unconf_sites)
     failed_matrix = [s for s in CHECKIN_MATRIX_SCRIPTS if s in failed_scripts]
+    if unconf_sites:
+        print(f"⚪ 凭据未配置（按跳过处理，不触发重跑）：{', '.join(unconf_sites)}")
     if failed_scripts:
         print(
             f"🔴 真实失败站点：{', '.join(failed_scripts)}"
@@ -232,6 +243,8 @@ def archive_daily_summary(collected: Dict[str, dict], today: str) -> None:
             extracted.setdefault("reward", legacy.get("reward", ""))
         is_pending = bool(d.get("is_pending")) or d.get("status") == "pending"
         st = "pending" if is_pending else ("ok" if bool(d.get("ok")) else "fail")
+        if st == "fail" and alert_levels.detect_unconfigured(output_str):
+            st = "unconfigured"  # ⚪ 凭据未配置（非故障）：不计失败、不影响成功率
         # 🟡 黄色预警归档：ok 站点的续期失败/凭据即将过期提示（fail 站点红线已覆盖）
         cls = alert_levels.classify(
             str(d.get("script") or ""), st == "ok" and not is_pending, output_str
@@ -252,6 +265,7 @@ def archive_daily_summary(collected: Dict[str, dict], today: str) -> None:
     success = sum(1 for s in sites.values() if s["status"] == "ok")
     failed = sum(1 for s in sites.values() if s["status"] == "fail")
     pending = sum(1 for s in sites.values() if s["status"] == "pending")
+    unconfigured = sum(1 for s in sites.values() if s["status"] == "unconfigured")
     warned = sum(1 for s in sites.values() if s.get("level") == "warn")
     summary = {
         "date": today,
@@ -260,6 +274,7 @@ def archive_daily_summary(collected: Dict[str, dict], today: str) -> None:
         "success": success,
         "failed": failed,
         "pending": pending,
+        "unconfigured": unconfigured,
         "warned": warned,
         "sites": sites,
     }

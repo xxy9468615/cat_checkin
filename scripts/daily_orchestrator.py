@@ -12,10 +12,28 @@ ROOT_DIR = BASE_DIR.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 from common import BJT, upstash_redis_command
-from discord_notify import notify_task_result
+from alert_levels import detect_unconfigured
+from discord_notify import notify_task_result, notify_unconfigured
 from task_registry import TASKS, resolve_execution_queue
 TRAVEL_EVENT_RE = re.compile(r"TRAVEL_EVENT\s+state=(\w+)\s+arrive_at=(\d+)")
 MAX_CLAIM_ROUNDS, CLAIM_MARGIN_SEC, LATVI_ENTER_EARLY_SEC = 3, 15*60, 120
+
+
+def _merge_result(prev: Any, ok: bool, unconf: bool) -> Any:
+    """多轮执行结果合并（True=有成功轮 / False=有真实失败轮 / "unconfigured"=仅有未配置轮）。
+
+    优先级 True > False > "unconfigured"：任一轮成功即成功；真实失败压过未配置
+    （如上午未配凭据、下午配好了但 Cookie 错——最终应报失败让人看到）。
+    """
+    cur: Any = "unconfigured" if unconf else ok
+    if prev is None:
+        return cur
+    if prev is True or cur is True:
+        return True
+    if prev is False or cur is False:
+        return False
+    return "unconfigured"
+
 def bjt_now() -> datetime:
     return datetime.now(BJT)
 def _hm_today_ts(hm: str) -> float:
@@ -142,7 +160,7 @@ class Orchestrator:
         self.hard_deadline = hard_deadline
         self.heap: List[Tuple[float, int, str, Optional[Dict[str, Any]]]] = []
         self.seq = 0
-        self.results: Dict[str, bool] = {}
+        self.results: Dict[str, Any] = {}
         self.claim_rounds: Dict[str, int] = {}
         self.executor = ThreadPoolExecutor(max_workers=int(os.getenv("BATCH_PARALLEL", "4")))
         self.futures: Dict[Future, Tuple[str, Optional[Dict[str, Any]]]] = {}
@@ -162,23 +180,37 @@ class Orchestrator:
         return anchor - margin
     def _on_task_done(self, cfg: Dict[str, Any], ok: bool, out: str) -> None:
         tid = cfg["id"]
+        # ⚪ 凭据未配置（非故障）：新任务 Secret 尚未配置时按跳过处理——
+        # 不推红色失败卡、不触发自动重跑、不计入 run 失败退出码（重跑解决不了没配凭据）
+        unconf = (not ok) and bool(detect_unconfigured(out or ""))
         prev = self.results.get(tid)
-        self.results[tid] = ok if prev is None else (prev and ok)
-        tag = "OK" if ok else "FAIL"
+        self.results[tid] = _merge_result(prev, ok, unconf)
+        tag = "OK" if ok else ("SKIP" if unconf else "FAIL")
         print(f"\n{'='*60}\n[{tag}] [{tid}] done (ok={ok})\n{'-'*60}")
         if out:
             print(out)
         print(f"{'='*60}")
-        # 频道1 失败提醒（Discord）：任务失败/超时/异常的瞬间推失败卡；成功只记状态不推
+        if unconf:
+            print(f"  ⚪ 凭据未配置，按跳过处理（不推失败卡/不触发重跑）")
+        # 频道1 失败提醒（Discord）：任务失败/超时/异常的瞬间推失败卡；成功只记状态不推；
+        # 凭据未配置推黄色提示卡（同任务同日一次）
         # （best-effort，绝不阻塞调度；每日日报走邮件，由 unified_report 统一汇总发送）
         try:
-            notify_task_result(
-                task_id=tid,
-                name=cfg.get("name") or tid,
-                script=cfg.get("script") or "",
-                ok=ok,
-                output=out or "",
-            )
+            if unconf:
+                notify_unconfigured(
+                    task_id=tid,
+                    name=cfg.get("name") or tid,
+                    script=cfg.get("script") or "",
+                    output=out or "",
+                )
+            else:
+                notify_task_result(
+                    task_id=tid,
+                    name=cfg.get("name") or tid,
+                    script=cfg.get("script") or "",
+                    ok=ok,
+                    output=out or "",
+                )
         except Exception as exc:
             print(f"WARN: Discord 失败提醒推送失败: {exc}", file=sys.stderr)
         matches = TRAVEL_EVENT_RE.findall(out or "")
@@ -247,9 +279,14 @@ class Orchestrator:
             print(f"WARNING: no tasks executed — {self.dropped} event(s) dropped past hard wall "
                   f"{os.getenv('ORCH_HARD_DEADLINE', '19:55')} BJT（run 启动过晚）")
             return 1
-        failed = [k for k, v in self.results.items() if not v]
-        for tid, ok in self.results.items():
-            print(f"  {'OK' if ok else 'FAIL'} {tid}")
+        failed = [k for k, v in self.results.items() if v is False]
+        skipped = [k for k, v in self.results.items() if v == "unconfigured"]
+        for tid, res in self.results.items():
+            mark = "OK" if res is True else ("SKIP(未配置)" if res == "unconfigured" else "FAIL")
+            print(f"  {mark} {tid}")
+        if skipped:
+            # ⚪ 未配置凭据的站点：退出码不受影响，也不会进入 failed_matrix 触发重跑
+            print(f"skipped (credentials not configured): {', '.join(skipped)}")
         if failed:
             print(f"failed: {', '.join(failed)}")
             return 1
