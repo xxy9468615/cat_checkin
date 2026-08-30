@@ -123,7 +123,18 @@ def main() -> int:
     check("载荷形态⑥: 顶层 active 优先级低于 data 对象",
           wb._extract_status_payload({"code": 0, "data": {"active": True}, "active": False}).get("active") is True)
 
-    print(f"\n{'ALL GREEN' if not failures else 'FAILED'}: {15 - len(failures)}/15 passed")
+    # === _wait_agent_completion（对话本体监听，2026-08-31 机制纠正）===
+    import time as _time
+    ok_c, ok_r, n = _wb._wait_agent_completion(
+        ['data: {"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}'], _time.time() - 1)
+    check("AI完成监听: stopReason 判完成", ok_c and ok_r and n == 1, f"{ok_c},{ok_r},{n}")
+    c2, r2, _n2 = _wb._wait_agent_completion(
+        ['data: {"sessionUpdate":"agent_message_chunk"}'], _time.time() - 1)
+    check("AI完成监听: 仅消息块判已回复未完成", (c2, r2) == (False, True), f"{c2},{r2}")
+    c3, r3, n3 = _wb._wait_agent_completion([], _time.time() + 0.3)
+    check("AI完成监听: 无事件超时回三否", (c3, r3, n3) == (False, False, 0), f"{c3},{r3},{n3}")
+
+    print(f"\n{'ALL GREEN' if not failures else 'FAILED'}: {18 - len(failures)}/18 passed")
     return 1 if failures else 0
 
 

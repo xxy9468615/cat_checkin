@@ -529,10 +529,10 @@ def _acp_call(h: Http, acp_url: str, conn_id: str, method: str, params: Dict[str
 
 
 def _daily_meter_checkin(h: Http, cred: str) -> Tuple[str, bool]:
-    """算力中心每日签到（确定性主逻辑，直接调用 API，不依赖 AI 对话）。
+    """算力中心每日领取（幂等确认/兜底）：POST /billing/meter/daily-checkin。
 
-    早期版本即采用此方式：POST /billing/meter/daily-checkin 自包含地领取每日算力与连签天数。
-    AI 对话仅作为辅助激活，真正的签到以本调用为准。
+    机制纠正（2026-08-31 用户确认）：签到本体 = 每天与 AI 完成一次对话；本调用
+    不是签到的实现路径，仅作对话完成后的领取确认与兜底（对话已计签到时返回「今日已签到」）。
     返回 (描述文案, 是否签到成功)。
     """
     headers = _base_auth_headers(cred, referer=f"{BASE_URL}/profile/plans-usage")
@@ -552,10 +552,45 @@ def _daily_meter_checkin(h: Http, cred: str) -> Tuple[str, bool]:
     return f"签到返回：{msg or '未知'}", False
 
 
-def _run_conversation_and_wait(h: Http, cred: str, timeout_seconds: int = 240) -> Tuple[str, bool]:
-    """创建对话任务 -> 通过 ACP 发送 prompt -> 等待 AI 完成 -> 轮询签到状态。
+def _wait_agent_completion(sse_events: list, deadline: float) -> Tuple[bool, bool, int]:
+    """监听 ACP SSE 事件流，等待 AI 真实完成本轮对话。
 
-    返回 (描述文字, 是否签到成功)。
+    ACP 里 prompt 的 JSON-RPC 应答（{"id":2,"result":{"stopReason":...}}）经 GET /acp
+    的 SSE 通道推送；agent 回复内容为 session/update 的 agentMessageChunk。
+    返回 (completed, replied, n_events)：
+    - completed: 观测到 stopReason——本轮对话结束（签到达成的直接证据）
+    - replied: 观测到 agent 消息块——AI 至少开始回复（无 completed 时按已回复计）
+    - n_events: 截至监听结束的事件数（0 = SSE 完全没推送，需走状态轮询兜底）
+    """
+    def _scan(chunk: str) -> Tuple[bool, bool]:
+        # 兼容两种命名（ACP 规范 snake_case / 部分实现 camelCase）与 JSON-RPC 方法名
+        completed = "stopReason" in chunk
+        replied = completed or any(
+            k in chunk for k in ("agent_message_chunk", "agentMessageChunk",
+                                 "sessionUpdate", "session/update"))
+        return completed, replied
+
+    chunk = "".join(sse_events)
+    completed, replied = _scan(chunk)
+    n = len(sse_events)
+    while not completed and time.time() < deadline:
+        new = "".join(sse_events[n:])
+        if new:
+            n = len(sse_events)
+            c, r = _scan(new)
+            completed = completed or c
+            replied = replied or r
+        if not completed:
+            time.sleep(2)
+    return completed, replied, n
+
+
+def _run_conversation_and_wait(h: Http, cred: str, timeout_seconds: int = 240) -> Tuple[str, bool]:
+    """创建对话任务 -> ACP 发送 prompt -> 监听 SSE 等 AI 真实完成本轮对话。
+
+    签到本体 = 每天与 AI 完成一次对话（2026-08-31 机制纠正，此前误把对话当辅助通道）；
+    对话完成后查询一次面板状态作诊断（面板 active 可能绑 web 会话，不作为成败判据）。
+    返回 (描述文字, 是否计签到成功)。
     """
     # 1. 创建 conversation
     conv = _create_conversation(h, cred)
@@ -636,88 +671,56 @@ def _run_conversation_and_wait(h: Http, cred: str, timeout_seconds: int = 240) -
         _flush_dbg()
         return f"ACP 调用异常 (状态码 {acp_codes})，签到可能无法完成", False
 
-    # 3) 保持 SSE 连接打开，等待 AI 完成；随后轮询签到状态
+    # 3) 监听 SSE 等 AI 真实完成本轮对话——这就是「签到」本体
     _dbg(f"[workbuddy] 对话任务已创建并发送 prompt (conversation ID: {conv_id})，等待 AI 完成...")
 
-    # 5. 轮询签到状态
     headers = _init_conversations_headers(cred)
     headers["Referer"] = f"{BASE_URL}/app/task/{conv_id}"
 
     start = time.time()
-    last_status = None
-    last_msg = f"对话任务已创建 (ID:{conv_id})，等待签到激活..."
-    first_poll = True
+    completed, replied, n_events = _wait_agent_completion(sse_events, start + timeout_seconds)
+    elapsed = time.time() - start
+    _dbg(f"[workbuddy] 对话监听结束: completed={completed} replied={replied} "
+         f"sse_events={n_events} ({elapsed:.0f}s)")
 
-    while time.time() - start < timeout_seconds:
-        elapsed = time.time() - start
-        _dbg(f"[workbuddy] [{elapsed:.0f}s] 轮询签到状态...")
+    # 对话后查一次面板状态（诊断用：面板可能绑 web 会话，不作为成败判据）
+    status_note = ""
+    try:
+        resp = h.request("POST", f"{BASE_URL}/billing/meter/checkin-status", headers=headers, json_data={})
+        if resp.code == 200:
+            _dbg(f"[workbuddy] checkin-status 原始响应: {resp.text[:400]}")
+            cd = _extract_status_payload(_resp_dict(resp))
+            if cd:
+                status_note = (f"，面板active={cd.get('active')}，已签={cd.get('today_checked_in')}"
+                               f"，连签{cd.get('streak_days', 0)}天")
+    except Exception:
+        pass
+    stop_event.set()
+
+    if completed:
+        return f"AI 对话完成计签到 ({elapsed:.0f}s){status_note}", True
+    if replied:
+        _flush_dbg()
+        return f"AI 对话有回复但未观测到结束信号 ({elapsed:.0f}s)，按对话达成计签到{status_note}", True
+
+    # SSE 全程无事件：结果可能走了 POST 内嵌流（被排空）等未知推送路径，
+    # 回退轮询状态窗口看服务端是否已把今日记为已签
+    _dbg(f"[workbuddy] SSE 无对话事件，回退轮询 checkin-status（60s 窗口）...")
+    last_msg = f"对话未观测到 AI 回复 (conversation ID:{conv_id})"
+    fallback_until = time.time() + 60
+    while time.time() < fallback_until:
         resp = h.request("POST", f"{BASE_URL}/billing/meter/checkin-status", headers=headers, json_data={})
         if resp.code != 200:
-            last_msg = f"查询签到状态失败 (HTTP {resp.code})"
-            _dbg(f"[workbuddy] 查询签到状态失败 (HTTP {resp.code})")
             time.sleep(5)
             continue
-
-        # 首轮打印原始响应：状态恒为零时一眼分辨「服务端真返回零」还是「解析丢字段」
-        if first_poll:
-            first_poll = False
-            _dbg(f"[workbuddy] checkin-status 原始响应: {resp.text[:400]}")
-
-        data = _resp_dict(resp)
-        if data.get("code") not in (0, None):
-            last_msg = f"签到状态异常：{data.get('msg', '未知')}"
-            _dbg(f"[workbuddy] 签到状态异常：{data.get('msg', '未知')}")
-            time.sleep(5)
-            continue
-
-        cd = _extract_status_payload(data)
-        active = cd.get("active", False)
-        today_checked_in = cd.get("today_checked_in", False)
-        streak_days = cd.get("streak_days", 0)
-        daily_credit = cd.get("daily_credit", 0)
-        is_streak_day = cd.get("is_streak_day", False)
-
-        last_status = (active, today_checked_in)
-        last_msg = (
-            f"签到面板 active={active}, today_checked_in={today_checked_in}, "
-            f"streak={streak_days}天"
-        )
-
-        _dbg(f"[workbuddy] [{elapsed:.0f}s] active={active}, today_checked_in={today_checked_in}, streak={streak_days}天, credit={daily_credit}")
-
-        if today_checked_in:
-            if is_streak_day:
-                _dbg(f"[workbuddy] 签到成功 (+{daily_credit} 算力，连签 {streak_days} 天，连续签到日)")
-                return (
-                    f"签到成功 (+{daily_credit} 算力，连签 {streak_days} 天，连续签到日)",
-                    True,
-                )
-            _dbg(f"[workbuddy] 签到成功 (+{daily_credit} 算力，连签 {streak_days} 天)")
-            return f"签到成功 (+{daily_credit} 算力，连签 {streak_days} 天)", True
-
-        if not active:
-            last_msg = f"签到活动尚未激活 (active=False)，等待对话任务完成..."
-        else:
-            last_msg = (
-                f"签到面板已激活，今日尚未签到 (today_checked_in=False)，等待任务完成..."
-            )
-
+        cd = _extract_status_payload(_resp_dict(resp))
+        if cd.get("today_checked_in"):
+            return f"AI 对话未观测到回复但面板确认已签，计签到{status_note}", True
         time.sleep(5)
 
-    # 超时：关闭 ACP SSE 连接
-    stop_event.set()
-    # 辅助通道失败必须吐出调试轨迹（含 checkin-status 原始响应），否则状态恒零时无从排查
+    # 失败必须吐出调试轨迹（SSE 事件数/原始状态响应都在里面），否则无从排查
     _flush_dbg()
-    if last_status:
-        # checked_in 为真时轮询循环内已提前 return，这里只会是「未签」状态
-        active, _checked_in = last_status
-        if active:
-            _dbg(f"[workbuddy] 对话任务已激活但 {timeout_seconds}s 内未完成签到")
-            return f"对话任务已激活但 {timeout_seconds}s 内未完成签到", False
-        _dbg(f"[workbuddy] 对话任务未激活签到面板，{timeout_seconds}s 超时")
-        return f"对话任务未激活签到面板，{timeout_seconds}s 超时", False
-    _dbg(f"[workbuddy] 轮询超时 ({timeout_seconds}s)，无法获知签到状态")
-    return f"轮询超时 ({timeout_seconds}s)，无法获知签到状态", False
+    return f"{last_msg}，{timeout_seconds}s 内未确认签到", False
 
 
 def _get_growth_profile(h: Http, cred: str) -> Dict[str, Any]:
@@ -1250,17 +1253,19 @@ def _run_one(cred: str, idx: int, total: int, wait_travel: bool) -> Tuple[bool, 
     total_tasks = profile.get("total", 0)
     task_progress = f"任务 {completed}/{total_tasks}" if total_tasks else ""
 
-    # 2. 算力中心每日签到（确定性主逻辑：直接调用 API）
-    daily_msg, daily_ok = _daily_meter_checkin(h, cred)
+    # 2. AI 对话签到（本体）：每天与 AI 完成一次对话即计签到——等 AI 真实回复完成
+    conv_msg, conv_ok = _run_conversation_and_wait(h, cred, timeout_seconds=240)
 
-    # 3. AI 对话任务（辅助激活签到面板，尽力而为，不阻塞主流程）
-    # 主 API 签到已成功时缩短轮询：辅助通道价值有限，省时间给兑换/抽奖/放风链路
-    conv_timeout = 45 if daily_ok else 120
-    conv_msg, conv_ok = _run_conversation_and_wait(h, cred, timeout_seconds=conv_timeout)
-    checkin_ok = daily_ok or conv_ok
-    # AI 对话是辅助通道：主 API 签到已成功时不把辅助通道的超时噪音带进摘要
-    #（避免「签到成功｜超时」这种读起来像报错的组合），仅主通道失败时附详情排查
-    checkin_msg = daily_msg if daily_ok else f"{daily_msg}｜AI对话：{conv_msg}"
+    # 3. 算力中心每日领取（幂等确认/兜底）：对话已计签到时它只会返回「今日已签到」；
+    #    对话失败时作为最后兜底，其响应里的连签天数也是兑换活动的输入
+    daily_msg, daily_ok = _daily_meter_checkin(h, cred)
+    checkin_ok = conv_ok or daily_ok
+    if conv_ok:
+        checkin_msg = conv_msg
+    elif daily_ok:
+        checkin_msg = f"对话未完成，改由每日领取兜底：{daily_msg}"
+    else:
+        checkin_msg = f"对话：{conv_msg}｜每日领取：{daily_msg}"
 
     # 3. 活动一：连登兑换与抽奖追踪（取决于签到是否达成）
     redeem_msg, _ = _redeem_rewards(h, cred)
