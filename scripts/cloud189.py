@@ -11,8 +11,10 @@
 3. 三次抽奖（drawPrizeMarketDetails：摇一摇/相册/流动空间）
 4. 个人/家庭容量统计（portal/getUserSpaceInfo.action）
 
-环境变量：
-- CLOUD189_USERNAME_1 / CLOUD189_PASSWORD_1 ...（手机号+密码，全自动）
+环境变量（按账号三选一，密码模式最优）：
+- CLOUD189_USERNAME_1 / CLOUD189_PASSWORD_1 ...（手机号+密码盲登，全自动）
+- CLOUD189_COOKIE_1 ...（网页全套 Cookie，配合 CLOUD189_ACCESSTOKEN_1 最稳）
+- CLOUD189_ACCESSTOKEN_1 ...（localStorage 的 accessToken，需与 Cookie 同会话）
 """
 from __future__ import annotations
 
@@ -96,9 +98,43 @@ def _rsa_encrypt_hex(pub_key: str, text: str) -> str:
     return cipher.to_bytes(k, "big").hex()
 
 
+def _login_by_accesstoken(h: Http, access_token: str) -> str:
+    """accessToken 换 sessionKey（需配合浏览器 Cookie 会话一起使用）。"""
+    suffix = (f"appId={APP_ID}&clientType=TELEPC&version=6.2"
+              f"&channelId=web_cloud.189.cn&rand={int(time.time() * 1000)}")
+    r = h.request(
+        "POST",
+        f"{WEB_URL}/api/portal/getSessionForPC.action?{suffix}"
+        f"&accessToken={quote(access_token, safe='')}",
+        headers={"User-Agent": UA_WEB, "Referer": AUTH_URL},
+    )
+    sess = _resp_dict(r)
+    sk = sess.get("sessionKey", "")
+    if not sk:
+        raise RuntimeError(f"accessToken 会话交换失败（{str(sess)[:80]}）——token 或 Cookie 可能已过期")
+    return str(sk)
+
+
+def _inject_cookie(h: Http, cookie: str) -> None:
+    """把浏览器 Cookie 头注入 jar（域 .189.cn，兼容本地会话校验）。"""
+    from http.cookiejar import Cookie
+
+    for pair in cookie.split(";"):
+        kv = pair.strip()
+        if not kv or "=" not in kv:
+            continue
+        name, val = kv.split("=", 1)
+        h.jar.set_cookie(Cookie(
+            version=0, name=name.strip(), value=val.strip(),
+            port=None, port_specified=False, domain=".189.cn", domain_specified=True,
+            domain_initial_dot=True, path="/", path_specified=True, secure=False,
+            expires=int(time.time()) + 86400 * 90, discard=False, comment=None,
+            comment_url=None, rest={}, rfc2109=False,
+        ))
+
+
 def _login(h: Http, username: str, password: str) -> str:
-    """密码盲登，返回 sessionKey（后续接口的鉴权凭证）。"""
-    # 1. 加密配置（公钥 + 前缀）
+    """密码盲登，返回 sessionKey（后续接口的鉴权凭证）。"""    # 1. 加密配置（公钥 + 前缀）
     r = h.request("POST", f"{AUTH_URL}/api/logbox/config/encryptConf.do",
                   headers={"User-Agent": UA_WEB, "Referer": AUTH_URL})
     enc = _resp_dict(r).get("data") or {}
@@ -165,13 +201,14 @@ def _login(h: Http, username: str, password: str) -> str:
 
 # ---------- 签到 / 抽奖 / 容量 ----------
 
-def _sign(h: Http, session_key: str) -> Tuple[str, bool]:
+def _sign(h: Http, session_key: str = "") -> Tuple[str, bool]:
     """mkt/userSign.action：GET 即签到动作。返回 (文案, 是否达成)。"""
     rand = int(time.time() * 1000)
+    sk = f"&sessionKey={quote(session_key, safe='')}" if session_key else ""
     resp = h.request(
         "GET",
         f"{WEB_URL}/mkt/userSign.action?rand={rand}&clientType=TELEANDROID"
-        f"&version=6.2&model=PCRT00&sessionKey={quote(session_key, safe='')}",
+        f"&version=6.2&model=PCRT00{sk}",
         headers={"User-Agent": UA_MOBILE, "Referer": REFERER_SIGN},
     )
     d = _resp_dict(resp)
@@ -183,10 +220,10 @@ def _sign(h: Http, session_key: str) -> Tuple[str, bool]:
     return f"【成功】+{bonus}M 空间", True
 
 
-def _lotteries(h: Http, session_key: str) -> str:
+def _lotteries(h: Http, session_key: str = "") -> str:
     """三次抽奖：description=奖品，errorCode=次数不足/未中奖。"""
     prizes: List[str] = []
-    sk = f"&sessionKey={quote(session_key, safe='')}"
+    sk = f"&sessionKey={quote(session_key, safe='')}" if session_key else ""
     for task in LOTTERY_TASKS:
         resp = h.request(
             "GET",
@@ -201,7 +238,7 @@ def _lotteries(h: Http, session_key: str) -> str:
     return " · ".join(prizes) if prizes else "无可用次数"
 
 
-def _space(h: Http, session_key: str) -> str:
+def _space(h: Http, session_key: str = "") -> str:
     """个人/家庭容量（portal 接口）。"""
 
     def _gb(v: Any) -> str:
@@ -210,9 +247,10 @@ def _space(h: Http, session_key: str) -> str:
         except (TypeError, ValueError):
             return "?"
 
+    sk = f"?sessionKey={quote(session_key, safe='')}" if session_key else ""
     resp = h.request(
         "GET",
-        f"{WEB_URL}/api/portal/getUserSpaceInfo.action?sessionKey={quote(session_key, safe='')}",
+        f"{WEB_URL}/api/portal/getUserSpaceInfo.action{sk}",
         headers={"User-Agent": UA_WEB, "Referer": f"{WEB_URL}/"},
     )
     d = _resp_dict(resp)
@@ -226,11 +264,25 @@ def _space(h: Http, session_key: str) -> str:
     return " · ".join(parts)
 
 
-def _run_one(idx: int, total: int, username: str, password: str) -> Tuple[bool, str]:
+def _run_one(idx: int, total: int, username: str, password: str,
+             cookie: str = "", access_token: str = "") -> Tuple[bool, str]:
     h = Http(follow_redirects=True)
-    time.sleep(random.uniform(2, 8))
-    sk = _login(h, username, password)
-    print(f"[{idx}/{total}] 👤 用户: 【{mask_str(username)}】")
+    sk = ""
+    if username and password:
+        time.sleep(random.uniform(2, 8))
+        sk = _login(h, username, password)
+        who = mask_str(username)
+    elif cookie:
+        _inject_cookie(h, cookie)
+        if access_token:
+            try:
+                sk = _login_by_accesstoken(h, access_token)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[diag] accessToken 换签失败（{exc}），降级 Cookie 直签")
+        who = f"Cookie:{mask_str(cookie[:24])}"
+    else:
+        raise RuntimeError("缺少凭据")
+    print(f"[{idx}/{total}] 👤 用户: 【{who}】")
 
     lines: List[str] = []
     ok = True
@@ -247,15 +299,23 @@ def _run_one(idx: int, total: int, username: str, password: str) -> Tuple[bool, 
 def main() -> None:
     usernames = env_seq("CLOUD189_", "username", required=False, default=[])
     passwords = env_seq("CLOUD189_", "password", required=False, default=[])
-    total = min(len(usernames), len(passwords))
+    cookies = env_seq("CLOUD189_", "cookie", required=False, default=[])
+    access_tokens = env_seq("CLOUD189_", "accesstoken", required=False, default=[])
+    total = max(min(len(usernames), len(passwords)), len(cookies), len(access_tokens))
     if total == 0:
-        print("签到失败：缺少环境变量 CLOUD189_USERNAME_1 / CLOUD189_PASSWORD_1")
+        print("签到失败：缺少环境变量 CLOUD189_USERNAME/PASSWORD 或 CLOUD189_COOKIE")
         sys.exit(1)
     print(f"【天翼云盘 签到】共 {total} 个账号")
     failed = 0
     for idx in range(1, total + 1):
+        access_token = access_tokens[idx - 1].strip() if idx <= len(access_tokens) else ""
+        username = usernames[idx - 1].strip() if idx <= len(usernames) else ""
+        password = passwords[idx - 1].strip() if idx <= len(passwords) else ""
+        cookie = cookies[idx - 1].strip() if idx <= len(cookies) else ""
+        if not (username and password) and not cookie:
+            continue
         try:
-            ok, _ = _run_one(idx, total, usernames[idx - 1].strip(), passwords[idx - 1].strip())
+            ok, _ = _run_one(idx, total, username, password, cookie, access_token)
         except Exception as exc:  # noqa: BLE001
             ok = False
             print(f"❌ 账号 {idx} 处理失败: {exc}")
