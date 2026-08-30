@@ -106,7 +106,24 @@ def main() -> int:
         _os.environ.pop("WORKBUDDY_ACCOUNT_IDX", None)
         check("统一模式键按运行时 idx", _wb._redis_refresh_key(2).endswith("v2_2"), _wb._redis_refresh_key(2))
 
-    print(f"\n{'ALL GREEN' if not failures else 'FAILED'}: {8 - len(failures)}/8 passed")
+    # === checkin-status 载荷提取（辅助对话通道回归，2026-08-31）===
+    # bfb5805 的 _data_dict 曾把 data 为 JSON 字符串的形态静默抹成 {} → 状态恒全零
+    check("载荷形态①: data 为对象",
+          wb._extract_status_payload({"code": 0, "data": {"active": True, "today_checked_in": False}}).get("active") is True)
+    check("载荷形态②: data 为 JSON 字符串",
+          wb._extract_status_payload({"code": 0, "data": '{"active": true, "today_checked_in": true, "streak_days": 18}'}).get("streak_days") == 18)
+    check("载荷形态②b: data 为非 JSON 字符串不炸",
+          wb._extract_status_payload({"code": 0, "data": "已签到"}) == {})
+    check("载荷形态③: 字段在顶层无 data 包装",
+          wb._extract_status_payload({"active": False, "today_checked_in": False, "daily_credit": 0}).get("daily_credit") == 0)
+    check("载荷形态④: 完全不认识的形状回空 dict",
+          wb._extract_status_payload({"code": 0, "msg": "ok"}) == {})
+    check("载荷形态⑤: 非 dict 输入回空 dict",
+          wb._extract_status_payload("whatever") == {})
+    check("载荷形态⑥: 顶层 active 优先级低于 data 对象",
+          wb._extract_status_payload({"code": 0, "data": {"active": True}, "active": False}).get("active") is True)
+
+    print(f"\n{'ALL GREEN' if not failures else 'FAILED'}: {15 - len(failures)}/15 passed")
     return 1 if failures else 0
 
 

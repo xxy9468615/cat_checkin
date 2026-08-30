@@ -109,6 +109,31 @@ def _data_dict(data: Any, key: str = "data") -> Dict[str, Any]:
     return v if isinstance(v, dict) else {}
 
 
+def _extract_status_payload(data: Any) -> Dict[str, Any]:
+    """从 checkin-status 响应提取状态载荷，兼容三种形态。
+
+    ① data 为对象（常规）；② data 为 JSON 字符串（服务端双重序列化，此前被
+    _data_dict 静默抹成空 dict → 状态恒为全零，疑似辅助通道失效根因）；
+    ③ 无 data 包装、字段直接在顶层。识别不出返回空 dict。
+    """
+    if not isinstance(data, dict):
+        return {}
+    cd = _data_dict(data)
+    if cd:
+        return cd
+    raw = data.get("data")
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    if "active" in data or "today_checked_in" in data:
+        return data
+    return {}
+
+
 def _refresh_access_token(h: Http, refresh_token: str) -> Tuple[str, str]:
     """用 refresh_token 换新凭据，返回 (access_token, 轮换后的新 refresh_token)。
 
@@ -537,6 +562,7 @@ def _run_conversation_and_wait(h: Http, cred: str, timeout_seconds: int = 240) -
     conv_id = conv.get("id")
     if not conv_id:
         _dbg("[workbuddy] 创建对话任务失败，无法激活签到面板")
+        _flush_dbg()
         return "创建对话任务失败，无法激活签到面板", False
 
     _dbg(f"[workbuddy] 对话任务已创建，conversation_id={conv_id}")
@@ -547,6 +573,7 @@ def _run_conversation_and_wait(h: Http, cred: str, timeout_seconds: int = 240) -
     session_id = session_data.get("sessionId", conv_id)
     if not e2b_endpoint:
         _dbg(f"[workbuddy] conversation_id={conv_id} 但无法获取 ACP endpoint，签到面板可能无法激活")
+        _flush_dbg()
         return f"对话已创建 (ID:{conv_id}) 但无法获取 ACP endpoint，签到面板可能无法激活", False
 
     _dbg(f"[workbuddy] ACP endpoint: {e2b_endpoint}，session_id: {session_id}")
@@ -564,6 +591,8 @@ def _run_conversation_and_wait(h: Http, cred: str, timeout_seconds: int = 240) -
     stop_event = threading.Event()
     conn_id, sse_thread, sse_events = _acp_connect(h, acp_url, stop_event, token)
     if not conn_id:
+        _dbg("[workbuddy] ACP 连接建立失败（未返回 acp-connection-id）")
+        _flush_dbg()
         return "ACP 连接建立失败（未返回 acp-connection-id）", False
     _dbg(f"[workbuddy] ACP 连接已建立 acp-connection-id={conn_id}")
 
@@ -604,6 +633,7 @@ def _run_conversation_and_wait(h: Http, cred: str, timeout_seconds: int = 240) -
     if not all(c in (200, 202) for c in acp_codes):
         _dbg(f"[workbuddy] ACP 调用状态码异常: {acp_codes}")
         stop_event.set()
+        _flush_dbg()
         return f"ACP 调用异常 (状态码 {acp_codes})，签到可能无法完成", False
 
     # 3) 保持 SSE 连接打开，等待 AI 完成；随后轮询签到状态
@@ -616,6 +646,7 @@ def _run_conversation_and_wait(h: Http, cred: str, timeout_seconds: int = 240) -
     start = time.time()
     last_status = None
     last_msg = f"对话任务已创建 (ID:{conv_id})，等待签到激活..."
+    first_poll = True
 
     while time.time() - start < timeout_seconds:
         elapsed = time.time() - start
@@ -627,14 +658,19 @@ def _run_conversation_and_wait(h: Http, cred: str, timeout_seconds: int = 240) -
             time.sleep(5)
             continue
 
+        # 首轮打印原始响应：状态恒为零时一眼分辨「服务端真返回零」还是「解析丢字段」
+        if first_poll:
+            first_poll = False
+            _dbg(f"[workbuddy] checkin-status 原始响应: {resp.text[:400]}")
+
         data = _resp_dict(resp)
-        if data.get("code") != 0:
+        if data.get("code") not in (0, None):
             last_msg = f"签到状态异常：{data.get('msg', '未知')}"
             _dbg(f"[workbuddy] 签到状态异常：{data.get('msg', '未知')}")
             time.sleep(5)
             continue
 
-        cd = _data_dict(data)
+        cd = _extract_status_payload(data)
         active = cd.get("active", False)
         today_checked_in = cd.get("today_checked_in", False)
         streak_days = cd.get("streak_days", 0)
@@ -670,6 +706,8 @@ def _run_conversation_and_wait(h: Http, cred: str, timeout_seconds: int = 240) -
 
     # 超时：关闭 ACP SSE 连接
     stop_event.set()
+    # 辅助通道失败必须吐出调试轨迹（含 checkin-status 原始响应），否则状态恒零时无从排查
+    _flush_dbg()
     if last_status:
         # checked_in 为真时轮询循环内已提前 return，这里只会是「未签」状态
         active, _checked_in = last_status
