@@ -157,6 +157,26 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
+    # --- NodeSeek（nodeseek.com 每日随机/固定鸡腿签到，支持代理出口）---
+    "nodeseek": {
+        "id": "nodeseek",
+        "script": "nodeseek.py",
+        "name": "NodeSeek 签到",
+        "result": "nodeseek.json",
+        "timeout": 300,
+        "account": "",
+        "tags": ["00:50", "matrix", "daily"],
+    },
+    # --- 飞桨 AI Studio（aistudio.baidu.com 每日签到、积分与大模型 Token）---
+    "aistudio": {
+        "id": "aistudio",
+        "script": "aistudio.py",
+        "name": "飞桨 AI Studio 签到",
+        "result": "aistudio.json",
+        "timeout": 300,
+        "account": "",
+        "tags": ["00:50", "matrix", "daily"],
+    },
 
     # --- 多账号站点（单 run 阶段 A 内联并发；旧 QStash 回程接力已退役） ---
     "workbuddy-account-1": {

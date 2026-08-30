@@ -82,6 +82,17 @@ EXPECT = {
         and "抽中 66 矿石" in r["lines"][0] and "矿石 12,345" in r["lines"][0]
         and ("矿石", 50.0) in r["gains"] and r["streak"] == 5
     ),
+    "nodeseek": lambda r: (
+        len(r["lines"]) == 1 and "+3鸡腿" in r["lines"][0] and "鸡腿 301" in r["lines"][0]
+        and ("鸡腿", 3.0) in r["gains"] and ("鸡腿", 301.0) in r["assets"]
+    ),
+    "aistudio": lambda r: (
+        len(r["lines"]) == 1 and "+1积分" in r["lines"][0] and "积分 7" in r["lines"][0]
+        and "算力卡 +8.0点" in r["lines"][0] and "算力卡 8.0点" in r["lines"][0]
+        and "2,000,000" in r["lines"][0] and ("积分", 1.0) in r["gains"]
+        and ("算力卡", 8.0) in r["gains"] and ("积分", 7.0) in r["assets"]
+        and ("算力卡", 8.0) in r["assets"] and r["streak"] == 1
+    ),
     "workbuddy-account-1": lambda r: (
         len(r["lines"]) == 1 and "连登13天" in r["lines"][0].replace(" ", "") and "算力 1176" in r["lines"][0]
         and "徽章3/11" in r["lines"][0].replace(" ", "")

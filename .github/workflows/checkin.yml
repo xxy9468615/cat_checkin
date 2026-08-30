@@ -181,6 +181,15 @@ jobs:
       JUEJIN_COOKIE_1: ${{ secrets.JUEJIN_COOKIE_1 || secrets.JUEJIN_COOKIE }}
       JUEJIN_COOKIE_2: ${{ secrets.JUEJIN_COOKIE_2 }}
       JUEJIN_COOKIE_3: ${{ secrets.JUEJIN_COOKIE_3 }}
+      NODESEEK_cookie: ${{ secrets.NODESEEK_COOKIE_1 || secrets.NODESEEK_COOKIE }}
+      NODESEEK_COOKIE_1: ${{ secrets.NODESEEK_COOKIE_1 || secrets.NODESEEK_COOKIE }}
+      NODESEEK_COOKIE_2: ${{ secrets.NODESEEK_COOKIE_2 }}
+      NODESEEK_COOKIE_3: ${{ secrets.NODESEEK_COOKIE_3 }}
+      NODESEEK_PROXY: ${{ secrets.NODESEEK_PROXY || 'socks5://127.0.0.1:1080' }}
+      AISTUDIO_cookie: ${{ secrets.AISTUDIO_COOKIE_1 || secrets.AISTUDIO_COOKIE }}
+      AISTUDIO_COOKIE_1: ${{ secrets.AISTUDIO_COOKIE_1 || secrets.AISTUDIO_COOKIE }}
+      AISTUDIO_COOKIE_2: ${{ secrets.AISTUDIO_COOKIE_2 }}
+      AISTUDIO_COOKIE_3: ${{ secrets.AISTUDIO_COOKIE_3 }}
       WORKBUDDY_COOKIE: ${{ secrets.WORKBUDDY_COOKIE }}
       WORKBUDDY_COOKIE_1: ${{ secrets.WORKBUDDY_COOKIE_1 || secrets.WORKBUDDY_COOKIE }}
       WORKBUDDY_COOKIE_2: ${{ secrets.WORKBUDDY_COOKIE_2 }}

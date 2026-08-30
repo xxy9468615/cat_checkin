@@ -708,6 +708,121 @@ def ex_juejin(output: str, res: Dict[str, Any]) -> None:
     _add_summary(res, output)
 
 
+def ex_nodeseek(output: str, res: Dict[str, Any]) -> None:
+    """NodeSeek：👤 用户: 【xx】 (UID: xx) + • 签到 / 资产 行。"""
+    cur: Any = None
+    for raw in output.splitlines():
+        ln = raw.strip()
+        m = re.search(r"👤 用户:\s*【(.+?)】(?:\s*\(UID:\s*(\S+)\))?", ln)
+        if m:
+            if cur:
+                cur.flush(res)
+            cur = _Block(m.group(1))
+            continue
+        if "签到失败" in ln:
+            if cur:
+                cur.flush(res)
+                cur = None
+            res["fail_lines"].append(_clean(ln))
+            res["error_lines"].append(ln)
+            continue
+        if cur is None:
+            continue
+        mm = re.search(r"• 签到:\s*【(.+?)】(?:\s*获得\s*🍗?\s*\+(\d+)\s*鸡腿)?", ln)
+        if mm:
+            status, gain = mm.group(1), mm.group(2)
+            if status == "成功" or gain:
+                if gain:
+                    cur.parts.append(f"+{gain}鸡腿")
+                    res["gains"].append(("鸡腿", _f(gain)))
+                    res["badges"].append(("reward", f"+{gain} 鸡腿"))
+                else:
+                    cur.parts.append("签到成功")
+            elif "已签" in status:
+                cur.parts.append("今日已签")
+            continue
+        mm = re.search(r"• 资产:\s*鸡腿\s*【(" + NUM + r")】", ln)
+        if mm:
+            cur.parts.append(f"鸡腿 {_d(mm.group(1))}")
+            res["assets"].append(("鸡腿", _f(mm.group(1))))
+            continue
+    if cur:
+        cur.flush(res)
+    _add_summary(res, output)
+
+
+def ex_aistudio(output: str, res: Dict[str, Any]) -> None:
+    """飞桨 AI Studio：👤 用户: 【xx】 (UID: xx) + • 签到 / 算力卡 / 资产 行。"""
+    cur: Any = None
+    for raw in output.splitlines():
+        ln = raw.strip()
+        m = re.search(r"👤 用户:\s*【(.+?)】(?:\s*\(UID:\s*(\S+)\))?", ln)
+        if m:
+            if cur:
+                cur.flush(res)
+            cur = _Block(m.group(1))
+            continue
+        if "签到失败" in ln or "失败：" in ln:
+            if cur:
+                cur.flush(res)
+                cur = None
+            res["fail_lines"].append(_clean(ln))
+            res["error_lines"].append(ln)
+            continue
+        if cur is None:
+            continue
+        mm = re.search(r"• 签到:\s*【(.+?)】(?:\s*连签天数:\s*【(\d+)】天)?(?:\s*\+(\d+)\s*积分)?", ln)
+        if mm:
+            status, streak_d, gain_p = mm.group(1), mm.group(2), mm.group(3)
+            if status == "成功":
+                if gain_p:
+                    cur.parts.append(f"+{gain_p}积分")
+                    res["gains"].append(("积分", _f(gain_p)))
+                    res["badges"].append(("reward", f"+{gain_p} 积分"))
+                else:
+                    cur.parts.append("签到成功")
+            elif "已签" in status:
+                cur.parts.append("今日已签")
+            if streak_d:
+                cur.parts.append(f"连签 {streak_d} 天")
+                res["streak"] = max(res["streak"], int(streak_d))
+                res["badges"].append(("streak", f"连签 {streak_d} 天"))
+            continue
+        mm = re.search(r"• 算力卡:\s*【(.+?)】", ln)
+        if mm:
+            card_stat = mm.group(1)
+            if "+" in card_stat:
+                cur.parts.append(f"算力卡 {card_stat}")
+                c_gain = re.search(r"\+([\d.]+)", card_stat)
+                if c_gain:
+                    res["gains"].append(("算力卡", _f(c_gain.group(1))))
+                    res["badges"].append(("reward", f"+{c_gain.group(1)}点算力"))
+            elif "已" in card_stat or "成功" in card_stat:
+                cur.parts.append(f"算力卡 {card_stat}")
+            continue
+        if ln.startswith("• 资产:"):
+            m_pt = re.search(r"积分\s*【(" + NUM + r")】", ln)
+            if m_pt:
+                cur.parts.append(f"积分 {_d(m_pt.group(1))}")
+                res["assets"].append(("积分", _f(m_pt.group(1))))
+            m_card = re.search(r"算力卡\s*【([^】]+)】", ln)
+            if m_card:
+                cur.parts.append(f"算力卡 {m_card.group(1)}")
+                c_num = re.search(r"([\d.]+)", m_card.group(1))
+                if c_num:
+                    res["assets"].append(("算力卡", _f(c_num.group(1))))
+            m_tk = re.search(r"大模型 Token\s*【([^】]+)】", ln)
+            if m_tk:
+                cur.parts.append(f"Token {m_tk.group(1)}")
+                t_num = re.search(r"([\d,]+)", m_tk.group(1))
+                if t_num:
+                    res["assets"].append(("Tokens", _f(t_num.group(1))))
+            continue
+    if cur:
+        cur.flush(res)
+    _add_summary(res, output)
+
+
 def ex_workbuddy(output: str, res: Dict[str, Any]) -> None:
     """WorkBuddy：用户【xx】（UID: xx）+ • 八项 bullets。"""
     cur: Any = None
@@ -898,6 +1013,8 @@ SCRIPT_EXTRACTORS = {
     "agentrouter.py": ex_agentrouter,
     "u1s1.py": ex_u1s1,
     "juejin.py": ex_juejin,
+    "nodeseek.py": ex_nodeseek,
+    "aistudio.py": ex_aistudio,
     "workbuddy.py": ex_workbuddy,
     "modelscope.py": ex_modelscope,
     "latvi.py": ex_latvi,
