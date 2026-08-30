@@ -357,6 +357,71 @@ jobs:
             return 1
           }
 
+          # 优先 sing-box（内置 obfs 插件实现、shadowsocks 协议域名透传节点侧解析），
+          # 排查 sslocal 链路本身的变量（用户怀疑插件/DNS 因素）；失败自动回退 sslocal
+          setup_singbox() {
+            curl -sL --max-time 60 -o /tmp/singbox.tar.gz \
+              https://github.com/SagerNet/sing-box/releases/download/v1.13.21/sing-box-1.13.21-linux-amd64.tar.gz \
+              || { echo "sing-box download failed"; return 1; }
+            mkdir -p /tmp/singbox
+            tar xf /tmp/singbox.tar.gz -C /tmp/singbox --strip-components=1 \
+              || { echo "sing-box extract failed"; return 1; }
+            test -x /tmp/singbox/sing-box || { echo "sing-box binary missing"; return 1; }
+            test -s /tmp/ss-config.json || { echo "AGENTROUTER_SS_CONFIG empty"; return 1; }
+            python3 - <<'PY' || return 1
+          import json, sys
+          try:
+              cfg = json.load(open("/tmp/ss-config.json", encoding="utf-8"))
+          except Exception as e:
+              print(f"AGENTROUTER_SS_CONFIG not valid JSON: {e}")
+              sys.exit(1)
+          out = {
+              "type": "shadowsocks", "tag": "ss",
+              "server": str(cfg["server"]), "server_port": int(cfg["server_port"]),
+              "method": str(cfg["method"]), "password": str(cfg["password"]),
+          }
+          if cfg.get("plugin"):
+              out["plugin"] = str(cfg["plugin"])
+              out["plugin_opts"] = str(cfg.get("plugin_opts", ""))
+          sb = {
+              "log": {"level": "warn"},
+              "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": 1080}],
+              "outbounds": [out],
+              "route": {"final": "ss"},
+          }
+          json.dump(sb, open("/tmp/sb-config.json", "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+          PY
+            pip install -q pysocks || { echo "pysocks install failed"; return 1; }
+            pip install -q curl-cffi >/dev/null 2>&1 \
+              || echo "curl-cffi install failed; nodeseek falls back to urllib fingerprint"
+            /tmp/singbox/sing-box run -c /tmp/sb-config.json &
+            SSPID=$!
+            echo "SSPID=$SSPID" >> "$GITHUB_ENV"
+            SSPORT=1080
+            echo "Waiting for sing-box proxy on port $SSPORT..."
+            for i in $(seq 1 20); do
+              if ss -tln 2>/dev/null | grep -q ":$SSPORT "; then
+                break
+              fi
+              sleep 0.5
+            done
+            for i in 1 2 3; do
+              if curl -sS -x "socks5://127.0.0.1:$SSPORT" -m 8 -o /dev/null https://api.ipify.org; then
+                echo "SS proxy ready via sing-box (pid $SSPID, port $SSPORT)"
+                return 0
+              fi
+              sleep 1
+            done
+            echo "sing-box proxy failed; falling back to sslocal"
+            return 1
+          }
+
+          # sing-box 路径也需要 ss-config.json：提前落盘（setup_ss 内会重复写，幂等）
+          printf '%s' "$AGENTROUTER_SS_CONFIG" > /tmp/ss-config.json
+
+          if setup_singbox; then
+            exit 0
+          fi
           if setup_ss; then
             exit 0
           fi
