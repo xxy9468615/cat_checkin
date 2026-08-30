@@ -393,7 +393,7 @@ jobs:
               type: http
               url: "$AGENTROUTER_SS_SUB_URL"
               interval: 86400
-              path: /tmp/mihomo-prov.yaml
+              path: /tmp/mihomo/prov.yaml
               health-check:
                 enable: true
                 url: "https://www.gstatic.com/generate_204"
