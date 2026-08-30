@@ -17,6 +17,9 @@ from discord_notify import notify_task_result, notify_unconfigured
 from task_registry import TASKS, resolve_execution_queue
 TRAVEL_EVENT_RE = re.compile(r"TRAVEL_EVENT\s+state=(\w+)\s+arrive_at=(\d+)")
 MAX_CLAIM_ROUNDS, CLAIM_MARGIN_SEC, LATVI_ENTER_EARLY_SEC = 3, 15*60, 120
+# 显式任务模式（手动 dispatch/自动重跑）的回访等待上限：猫还在放风且回程超出该窗口时
+# 不再原地干等（曾出现等 4h 阻塞并发队列），顺延到下一次 run 收奖励
+EXPLICIT_CLAIM_MAX_WAIT_SEC = 30 * 60
 
 
 def _merge_result(prev: Any, ok: bool, unconf: bool) -> Any:
@@ -160,8 +163,9 @@ def run_task_subprocess(cfg: Dict[str, Any]) -> Tuple[bool, str]:
         out = f"[orchestrator kill >{cap}s]\n{(out or '')}"
     return proc.returncode == 0, (out or "").strip()
 class Orchestrator:
-    def __init__(self, hard_deadline: float) -> None:
+    def __init__(self, hard_deadline: float, claim_max_wait: Optional[float] = None) -> None:
         self.hard_deadline = hard_deadline
+        self.claim_max_wait = claim_max_wait
         self.heap: List[Tuple[float, int, str, Optional[Dict[str, Any]]]] = []
         self.seq = 0
         self.results: Dict[str, Any] = {}
@@ -226,9 +230,15 @@ class Orchestrator:
             claim_fire = arrive_at + 60
             if state == "traveling" and rounds < MAX_CLAIM_ROUNDS:
                 if claim_fire <= cutoff:
-                    self.push(claim_fire, "task", cfg)
-                    self.claim_rounds[tid] = rounds + 1
-                    print(f"  -> enqueued claim round {rounds+1} @ {_fmt_bjt(claim_fire)} (cutoff {_fmt_bjt(cutoff)})")
+                    if self.claim_max_wait and claim_fire - time.time() > self.claim_max_wait:
+                        print(
+                            f"  -> claim @ {_fmt_bjt(claim_fire)} beyond "
+                            f"{int(self.claim_max_wait // 60)}min explicit-mode wait cap, deferred to next run"
+                        )
+                    else:
+                        self.push(claim_fire, "task", cfg)
+                        self.claim_rounds[tid] = rounds + 1
+                        print(f"  -> enqueued claim round {rounds+1} @ {_fmt_bjt(claim_fire)} (cutoff {_fmt_bjt(cutoff)})")
                 else:
                     print(f"  -> claim @ {_fmt_bjt(claim_fire)} past cutoff {_fmt_bjt(cutoff)}, deferred to next run")
     def run(self) -> int:
@@ -351,7 +361,7 @@ def main() -> None:
             hard_deadline = wall_ts
             hard_wall_str = f"{configured_wall} BJT"
 
-    orch = Orchestrator(hard_deadline)
+    orch = Orchestrator(hard_deadline, claim_max_wait=EXPLICIT_CLAIM_MAX_WAIT_SEC if is_explicit else None)
     if is_explicit:
         build_explicit_timeline(orch, args.tasks)
     else:

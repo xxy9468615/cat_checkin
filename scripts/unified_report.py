@@ -183,8 +183,8 @@ def _emit_failed_sites(collected: Dict[str, dict]) -> List[str]:
             str(d.get("script"))
             for d in collected.values()
             if not d.get("ok") and not d.get("is_pending") and d.get("status") != "pending"
-        } - {""}
-    ) - set(unconf_sites)
+        } - {""} - set(unconf_sites)
+    )
     failed_matrix = [s for s in CHECKIN_MATRIX_SCRIPTS if s in failed_scripts]
     if unconf_sites:
         print(f"⚪ 凭据未配置（按跳过处理，不触发重跑）：{', '.join(unconf_sites)}")
