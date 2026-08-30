@@ -39,6 +39,11 @@ on:
         required: false
         default: false
         type: boolean
+      direct:
+        description: '诊断：跳过 SS/代理，任务用 runner 自身 IP 直连（nodeseek 排查用）'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -287,6 +292,7 @@ jobs:
             agentrouter-state-
 
       - name: Setup SS proxy for AgentRouter
+        if: inputs.direct != true
         env:
           AGENTROUTER_SS_CONFIG: ${{ secrets.AGENTROUTER_SS_CONFIG }}
           AGENTROUTER_SS_SUB_URL: ${{ secrets.AGENTROUTER_SS_SUB_URL }}
@@ -460,6 +466,13 @@ jobs:
             echo "backup proxy unreachable: ${p##*@}"
           done <<< "$AGENTROUTER_BACKUP_PROXIES"
           echo "no backup proxy available; agentrouter will fail (red card by design)"
+
+      - name: Direct mode (clear proxy env, runner IP 直连)
+        if: inputs.direct == true
+        run: |
+          echo "NODESEEK_PROXY=" >> "$GITHUB_ENV"
+          echo "AGENTROUTER_PROXY=" >> "$GITHUB_ENV"
+          echo "direct 诊断模式：跳过代理，任务用 runner IP 直连"
 
       - name: Resolve dispatch compat -> ORCH_TASKS
         id: orch_tasks
