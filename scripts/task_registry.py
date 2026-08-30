@@ -187,6 +187,16 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
+    # --- 什么值得买（smzdm.com 每日签到、积分金币提取与连签统计）---
+    "smzdm": {
+        "id": "smzdm",
+        "script": "smzdm.py",
+        "name": "什么值得买 签到",
+        "result": "smzdm.json",
+        "timeout": 300,
+        "account": "",
+        "tags": ["00:50", "matrix", "daily"],
+    },
 
     # --- 多账号站点（单 run 阶段 A 内联并发；旧 QStash 回程接力已退役） ---
     "workbuddy-account-1": {

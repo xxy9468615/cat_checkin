@@ -102,6 +102,17 @@ EXPECT = {
         and ("空间", 804.24) in r["assets"]
         and r["streak"] == 1
     ),
+    "smzdm": lambda r: (
+        len(r["lines"]) == 1
+        and "连签 5 天" in r["lines"][0]
+        and "+10 积分" in r["lines"][0]
+        and "积分 1,234" in r["lines"][0]
+        and "金币 90" in r["lines"][0]
+        and ("积分", 10.0) in r["gains"]
+        and ("积分", 1234.0) in r["assets"]
+        and ("金币", 90.0) in r["assets"]
+        and r["streak"] == 5
+    ),
     "workbuddy-account-1": lambda r: (
         len(r["lines"]) == 1 and "连登13天" in r["lines"][0].replace(" ", "") and "算力 1176" in r["lines"][0]
         and "徽章3/11" in r["lines"][0].replace(" ", "")

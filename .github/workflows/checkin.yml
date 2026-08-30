@@ -197,6 +197,10 @@ jobs:
       ALIPAN_TOKEN_1: ${{ secrets.ALIPAN_TOKEN_1 || secrets.ALIPAN_REFRESH_TOKEN_1 || secrets.ALIPAN_TOKEN || secrets.ALIPAN_REFRESH_TOKEN }}
       ALIPAN_TOKEN_2: ${{ secrets.ALIPAN_TOKEN_2 || secrets.ALIPAN_REFRESH_TOKEN_2 }}
       ALIPAN_TOKEN_3: ${{ secrets.ALIPAN_TOKEN_3 || secrets.ALIPAN_REFRESH_TOKEN_3 }}
+      SMZDM_cookie: ${{ secrets.SMZDM_COOKIE_1 || secrets.SMZDM_COOKIE }}
+      SMZDM_COOKIE_1: ${{ secrets.SMZDM_COOKIE_1 || secrets.SMZDM_COOKIE }}
+      SMZDM_COOKIE_2: ${{ secrets.SMZDM_COOKIE_2 }}
+      SMZDM_COOKIE_3: ${{ secrets.SMZDM_COOKIE_3 }}
       WORKBUDDY_COOKIE: ${{ secrets.WORKBUDDY_COOKIE }}
       WORKBUDDY_COOKIE_1: ${{ secrets.WORKBUDDY_COOKIE_1 || secrets.WORKBUDDY_COOKIE }}
       WORKBUDDY_COOKIE_2: ${{ secrets.WORKBUDDY_COOKIE_2 }}
@@ -266,6 +270,8 @@ jobs:
             .2libra_state*.json
             .modelscope_*.json
             .juejin_state*.json
+            .alipan_state*.json
+            .smzdm_state*.json
             .notify_state_*.json
           key: unified-states-${{ github.run_id }}
           restore-keys: |
@@ -474,6 +480,8 @@ jobs:
             .2libra_state*.json
             .modelscope_*.json
             .juejin_state*.json
+            .alipan_state*.json
+            .smzdm_state*.json
             .notify_state_*.json
           key: unified-states-${{ github.run_id }}
 

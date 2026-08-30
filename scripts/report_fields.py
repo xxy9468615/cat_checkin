@@ -893,6 +893,69 @@ def ex_alipan(output: str, res: Dict[str, Any]) -> None:
     _add_summary(res, output)
 
 
+def ex_smzdm(output: str, res: Dict[str, Any]) -> None:
+    """什么值得买：👤 用户: 【xx】 (UID: xx) + • 签到 / 资产 行。"""
+    cur: Any = None
+    for raw in output.splitlines():
+        ln = raw.strip()
+        m = re.search(r"👤 用户:\s*【(.+?)】(?:\s*\(UID:\s*([^)]+)\))?", ln)
+        if m:
+            if cur:
+                cur.flush(res)
+            cur = _Block(m.group(1))
+            continue
+        if "签到失败" in ln or "❌" in ln:
+            if cur:
+                cur.flush(res)
+                cur = None
+            res["fail_lines"].append(_clean(ln))
+            res["error_lines"].append(ln)
+            continue
+        if cur is None:
+            continue
+        mm = re.search(r"• 签到:\s*【(.+?)】(?:\s*连签天数:\s*【(\d+)】天)?(?:\s*\((.+?)\))?(?:\s*\|\s*经验:\s*【([^】]+)】)?", ln)
+        if mm:
+            status, days, gain_str, exp_str = mm.group(1), mm.group(2), mm.group(3), mm.group(4)
+            if days:
+                cur.parts.append(f"连签 {days} 天")
+                res["streak"] = max(res["streak"], int(days))
+                res["badges"].append(("streak", f"连签 {days} 天"))
+            if status == "成功":
+                if gain_str and "+" in gain_str:
+                    cur.parts.append(gain_str)
+                    m_p = re.search(r"\+(\d+)", gain_str)
+                    if m_p:
+                        res["gains"].append(("积分", _f(m_p.group(1))))
+                        res["badges"].append(("reward", f"+{m_p.group(1)} 积分"))
+                else:
+                    cur.parts.append("签到成功")
+            elif "已签" in status:
+                cur.parts.append("今日已签")
+                if gain_str and "+" in gain_str:
+                    m_p = re.search(r"\+(\d+)", gain_str)
+                    if m_p:
+                        res["gains"].append(("积分", _f(m_p.group(1))))
+            if exp_str:
+                cur.parts.append(f"经验 {exp_str}")
+            continue
+        if ln.startswith("• 资产:"):
+            m_pt = re.search(r"积分\s*【(" + NUM + r")】", ln)
+            if m_pt:
+                cur.parts.append(f"积分 {_d(m_pt.group(1))}")
+                res["assets"].append(("积分", _f(m_pt.group(1))))
+            m_gd = re.search(r"金币\s*【(" + NUM + r")】", ln)
+            if m_gd:
+                cur.parts.append(f"金币 {_d(m_gd.group(1))}")
+                res["assets"].append(("金币", _f(m_gd.group(1))))
+            m_rk = re.search(r"等级\s*【([^】]+)】", ln)
+            if m_rk:
+                cur.parts.append(m_rk.group(1))
+            continue
+    if cur:
+        cur.flush(res)
+    _add_summary(res, output)
+
+
 def ex_workbuddy(output: str, res: Dict[str, Any]) -> None:
     """WorkBuddy：用户【xx】（UID: xx）+ • 八项 bullets。"""
     cur: Any = None
@@ -1086,6 +1149,7 @@ SCRIPT_EXTRACTORS = {
     "nodeseek.py": ex_nodeseek,
     "aistudio.py": ex_aistudio,
     "alipan.py": ex_alipan,
+    "smzdm.py": ex_smzdm,
     "workbuddy.py": ex_workbuddy,
     "modelscope.py": ex_modelscope,
     "latvi.py": ex_latvi,
