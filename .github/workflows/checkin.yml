@@ -357,8 +357,8 @@ jobs:
             return 1
           }
 
-          # sing-box TUN 模式：以太层透明接管流量（无 socks5 中转，原生 SS 隧道），
-          # 仅 nodeseek/agentrouter 域名进隧道，其余直连；TUN 不可用时回退 sslocal socks5 链路
+          # sing-box TUN 模式：以太层透明接管全部流量（无 socks5 中转，原生 SS 隧道）；
+          # TUN 不可用时回退 sslocal socks5 链路
           setup_singbox() {
             curl -sL --max-time 60 -o /tmp/singbox.tar.gz \
               https://github.com/SagerNet/sing-box/releases/download/v1.13.21/sing-box-1.13.21-linux-amd64.tar.gz \
@@ -383,6 +383,8 @@ jobs:
           if cfg.get("plugin"):
               out["plugin"] = str(cfg["plugin"])
               out["plugin_opts"] = str(cfg.get("plugin_opts", ""))
+          # 全量接管：业务流量原生走 SS 隧道；仅 DNS(UDP53) 直连——obfs 节点无 UDP
+          # 中继，DNS 进隧道会全灭（runner 连 GitHub/下载全部黑洞，实测教训）
           sb = {
               "log": {"level": "warn"},
               "inbounds": [{
@@ -395,11 +397,8 @@ jobs:
                   {"type": "direct", "tag": "direct"},
               ],
               "route": {
-                  "rules": [
-                      {"action": "sniff"},
-                      {"domain_suffix": ["nodeseek.com", "ps.air-outer.com", "agentrouter.org"], "outbound": "ss"},
-                  ],
-                  "final": "direct",
+                  "rules": [{"port": 53, "outbound": "direct"}],
+                  "final": "ss",
                   "auto_detect_interface": True,
               },
           }
@@ -423,7 +422,12 @@ jobs:
               if curl -sS -m 10 https://api.ipify.org -o /dev/null 2>/dev/null; then ok=1; break; fi
               sleep 1
             done
-            [ "$ok" = "1" ] || { echo "sing-box TUN forwarding failed; falling back to sslocal"; return 1; }
+            if [ "$ok" != "1" ]; then
+              echo "sing-box TUN forwarding failed; tearing down TUN before sslocal fallback"
+              sudo -n pkill -f '[s]ing-box' 2>/dev/null || true
+              sleep 1
+              return 1
+            fi
             # TUN 模式无需 socks5 端口：清空代理变量，任务流量由 TUN 透明接管
             echo "NODESEEK_PROXY=" >> "$GITHUB_ENV"
             echo "AGENTROUTER_PROXY=" >> "$GITHUB_ENV"
