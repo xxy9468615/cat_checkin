@@ -1036,6 +1036,10 @@ def ex_workbuddy(output: str, res: Dict[str, Any]) -> None:
             cur.parts.append(f"算力 {_d(mm.group(1))}")
             res["assets"].append(("算力", _f(mm.group(1))))
             continue
+        mm = re.search(r"• 算力到期：(.+)$", ln)
+        if mm:
+            cur.parts.append(_clean(mm.group(1), 32))
+            continue
         mm = re.search(r"• 资产：能量 (\d+) \| 猫咪配额 (\d+) \| 徽章 (\d+)/(\d+)", ln)
         if mm:
             cur.parts.append(f"能量{mm.group(1)} · 配额{mm.group(2)} · 徽章{mm.group(3)}/{mm.group(4)}")

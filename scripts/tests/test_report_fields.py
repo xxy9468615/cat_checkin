@@ -118,6 +118,7 @@ EXPECT = {
     "workbuddy-account-1": lambda r: (
         len(r["lines"]) == 1 and "连登13天" in r["lines"][0].replace(" ", "") and "算力 1176" in r["lines"][0]
         and "徽章3/11" in r["lines"][0].replace(" ", "")
+        and "3 天后（09-02）到期" in r["lines"][0] and "用掉否则作废" in r["lines"][0]
     ),
     "workbuddy-account-2": lambda r: (
         len(r["lines"]) == 1 and "兑换进阶档(14天)失败" in r["lines"][0].replace(" ", "")

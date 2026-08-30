@@ -44,7 +44,7 @@ import sys
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from common import Http, env, env_bool, env_seq, is_already_signed, main_guard, mask_str, schedule_repo_dispatch
 
@@ -1035,6 +1035,97 @@ def _get_user_resource(h: Http, cred: str) -> Dict[str, Any]:
         return {}
 
 
+def _parse_ts_bjt(v: Any) -> Optional[float]:
+    """时间戳容错解析：秒/毫秒 epoch 数字或 'YYYY-MM-DD HH:MM:SS' 字符串 → epoch 秒。
+
+    移植自 workbuddy-switch credits.rs 的 parse_timestamp_ms（资源包到期字段
+    有秒/毫秒/日期字符串多种形态）。
+    """
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        ts = float(v)
+        return ts / 1000.0 if ts > 1e12 else ts
+    s = str(v).strip()
+    if not s:
+        return None
+    if s.replace(".", "", 1).isdigit():
+        n = float(s)
+        return n / 1000.0 if n > 1e12 else n
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return dt.datetime.strptime(s[:19], fmt).replace(
+                tzinfo=dt.timezone(dt.timedelta(hours=8))
+            ).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _get_credit_expiry(h: Http, cred: str, soon_days: int = 7) -> str:
+    """算力到期监控（移植自 workbuddy-switch credits.rs，EXPIRING_SOON_DAYS=7）。
+
+    列出活跃资源包（剔除「个人体验版」CapacityType==4），7 天内到期的剩余算力
+    提醒「用掉否则作废」；无临期包时返回空串，不进卡片。
+    """
+    headers = _base_auth_headers(cred, referer=f"{BASE_URL}/profile/plans-usage")
+    try:
+        resp = h.request(
+            "POST",
+            f"{BASE_URL}/billing/meter/get-user-resource",
+            headers=headers,
+            json_data={
+                "PageNumber": 1, "PageSize": 200, "ProductCode": "p_tcaca",
+                "Status": [0], "OrderBy": "endTime", "SortBy": "asc",
+            },
+        )
+        if resp.code != 200:
+            return ""
+        data = resp.json({})
+        if data.get("code") != 0:
+            return ""
+        inner = (data.get("data", {}) or {}).get("Response", {}).get("Data", {}) or {}
+    except Exception:  # noqa: BLE001
+        return ""
+
+    now = time.time()
+    soon: List[Tuple[float, float, str]] = []
+    for a in inner.get("Accounts") or []:
+        if not isinstance(a, dict) or int(a.get("CapacityType", 0) or 0) == 4:
+            continue
+
+        def _first_num(acc: Dict[str, Any] = a, *keys: str) -> float:
+            for k in keys:
+                v = acc.get(k)
+                if v is None:
+                    continue
+                try:
+                    return float(str(v).replace(",", ""))
+                except (TypeError, ValueError):
+                    continue
+            return 0.0
+
+        remaining = _first_num(
+            "CycleCapacityRemainPrecise", "CycleCapacityRemain",
+            "CapacityRemainPrecise", "CapacityRemain",
+        )
+        expire_ts = None
+        for k in ("DeductionEndTime", "expiredTime", "CycleEndTime"):
+            expire_ts = _parse_ts_bjt(a.get(k))
+            if expire_ts:
+                break
+        if expire_ts and now < expire_ts <= now + soon_days * 86400 and remaining > 0:
+            soon.append((expire_ts, remaining, str(a.get("PackageName") or "资源包")))
+    if not soon:
+        return ""
+    soon.sort()
+    ts, rem, name = soon[0]
+    days = (ts - now) / 86400
+    date_str = dt.datetime.fromtimestamp(ts, tz=dt.timezone(dt.timedelta(hours=8))).strftime("%m-%d")
+    extra = f"（另有 {len(soon) - 1} 包）" if len(soon) > 1 else ""
+    return f"{rem:g} 算力 {days:.0f} 天后（{date_str}）到期——用掉否则作废{extra}"
+
+
 def _run_one(cred: str, idx: int, total: int, wait_travel: bool) -> Tuple[bool, str]:
     """执行单个账号的完整独立流程。"""
     h = Http()
@@ -1076,6 +1167,8 @@ def _run_one(cred: str, idx: int, total: int, wait_travel: bool) -> Tuple[bool, 
 
     # 6. 积分（算力）余额
     # 直接取服务端在响应里算好的 TotalDosage（已按前端口径剔除「个人体验版」等非周期额度包），即为真实可用余额
+    expiry_msg = _get_credit_expiry(h, cred)
+
     resource = _get_user_resource(h, cred)
     total_dosage = resource.get("TotalDosage")
     if total_dosage is not None:
@@ -1098,6 +1191,9 @@ def _run_one(cred: str, idx: int, total: int, wait_travel: bool) -> Tuple[bool, 
         f"• 抽奖活动：{lottery_msg}",
         f"• 猫咪放风：{travel_msg}",
         f"• {credit_str}",
+        *(  # 无临期包时该行整体省略，保持卡片干净
+            [f"• 算力到期：{expiry_msg}"] if expiry_msg else []
+        ),
         f"• 资产：能量 {energy_bal} | 猫咪配额 {quota_bal} | 徽章 {badge_str}",
     ]
     return checkin_ok, "\n".join(lines)
