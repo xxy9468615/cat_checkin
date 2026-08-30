@@ -220,6 +220,14 @@ jobs:
       QUARK_COOKIE_2: ${{ secrets.QUARK_COOKIE_2 }}
       QUARK_MPARAM_1: ${{ secrets.QUARK_MPARAM_1 }}
       QUARK_MPARAM_2: ${{ secrets.QUARK_MPARAM_2 }}
+      CLOUD189_username: ${{ secrets.CLOUD189_USERNAME_1 }}
+      CLOUD189_USERNAME_1: ${{ secrets.CLOUD189_USERNAME_1 }}
+      CLOUD189_username_2: ${{ secrets.CLOUD189_USERNAME_2 }}
+      CLOUD189_USERNAME_2: ${{ secrets.CLOUD189_USERNAME_2 }}
+      CLOUD189_password: ${{ secrets.CLOUD189_PASSWORD_1 }}
+      CLOUD189_PASSWORD_1: ${{ secrets.CLOUD189_PASSWORD_1 }}
+      CLOUD189_password_2: ${{ secrets.CLOUD189_PASSWORD_2 }}
+      CLOUD189_PASSWORD_2: ${{ secrets.CLOUD189_PASSWORD_2 }}
       WORKBUDDY_COOKIE: ${{ secrets.WORKBUDDY_COOKIE }}
       WORKBUDDY_COOKIE_1: ${{ secrets.WORKBUDDY_COOKIE_1 || secrets.WORKBUDDY_COOKIE }}
       WORKBUDDY_COOKIE_2: ${{ secrets.WORKBUDDY_COOKIE_2 }}

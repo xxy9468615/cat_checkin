@@ -198,6 +198,16 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "tags": ["00:50", "matrix", "daily"],
     },
 
+    # --- 天翼云盘（cloud.189.cn 每日签到、三次抽奖与容量统计，密码盲登）---
+    "cloud189": {
+        "id": "cloud189",
+        "script": "cloud189.py",
+        "name": "天翼云盘 签到",
+        "result": "cloud189.json",
+        "timeout": 300,
+        "account": "",
+        "tags": ["00:50", "matrix", "daily"],
+    },
     # --- 夸克网盘（pan.quark.cn 每日签到、容量资产与 __puus 滑动保活）---
     "quark": {
         "id": "quark",

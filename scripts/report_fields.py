@@ -1134,6 +1134,52 @@ def ex_latvi(output: str, res: Dict[str, Any]) -> None:
     _add_summary(res, output)
 
 
+def ex_cloud189(output: str, res: Dict[str, Any]) -> None:
+    """天翼云盘：👤 用户: 【xx】 + • 签到 / 抽奖 / 空间 行。"""
+    cur: Any = None
+    for raw in output.splitlines():
+        ln = raw.strip()
+        m = re.search(r"👤 用户:\s*【(.+?)】", ln)
+        if m:
+            if cur:
+                cur.flush(res)
+            cur = _Block(m.group(1))
+            continue
+        if "签到失败" in ln or "处理失败" in ln or "登录失败" in ln:
+            if cur:
+                cur.flush(res)
+                cur = None
+            res["fail_lines"].append(_clean(ln))
+            res["error_lines"].append(ln)
+            continue
+        if cur is None:
+            continue
+        mm = re.search(r"• 签到:\s*(.+)", ln)
+        if mm:
+            s = mm.group(1)
+            if "【成功】" in s:
+                cur.parts.append("签到成功")
+                m2 = re.search(r"\+(\d+)M", s)
+                if m2:
+                    cur.parts.append(f"+{m2.group(1)}M 空间")
+            elif "已签到" in s:
+                cur.parts.append("今日已签")
+            else:
+                cur.parts.append(_clean(s))
+            continue
+        mm = re.search(r"• 抽奖:\s*(.+)", ln)
+        if mm:
+            cur.parts.append(f"抽奖 {mm.group(1)}")
+            continue
+        mm = re.search(r"• 空间:\s*(.+)", ln)
+        if mm:
+            cur.parts.append(mm.group(1))
+            continue
+    if cur:
+        cur.flush(res)
+    _add_summary(res, output)
+
+
 def ex_quark(output: str, res: Dict[str, Any]) -> None:
     """夸克网盘：👤 用户: 【xx】 + • 签到 / 空间 / 会员 / [keepalive] 行。"""
     cur: Any = None
@@ -1213,6 +1259,7 @@ SCRIPT_EXTRACTORS = {
     "alipan.py": ex_alipan,
     "smzdm.py": ex_smzdm,
     "quark.py": ex_quark,
+    "cloud189.py": ex_cloud189,
     "workbuddy.py": ex_workbuddy,
     "modelscope.py": ex_modelscope,
     "latvi.py": ex_latvi,

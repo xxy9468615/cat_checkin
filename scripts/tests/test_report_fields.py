@@ -125,6 +125,14 @@ EXPECT = {
         and "VIP（10-23 到期）" in r["lines"][0]
         and "滑动续期✓" in r["lines"][0]
     ),
+    "cloud189": lambda r: (
+        len(r["lines"]) == 1
+        and "签到成功" in r["lines"][0]
+        and "+30M 空间" in r["lines"][0]
+        and "抽奖 天翼云盘50M空间 · 谢谢参与 · 5G流量包" in r["lines"][0]
+        and "个人20.15G/60.00G" in r["lines"][0].replace(" ", "")
+        and "家庭5.20G/30.00G" in r["lines"][0].replace(" ", "")
+    ),
     "workbuddy-account-1": lambda r: (
         len(r["lines"]) == 1 and "连登13天" in r["lines"][0].replace(" ", "") and "算力 1176" in r["lines"][0]
         and "徽章3/11" in r["lines"][0].replace(" ", "")
