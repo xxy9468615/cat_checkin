@@ -1134,6 +1134,63 @@ def ex_latvi(output: str, res: Dict[str, Any]) -> None:
     _add_summary(res, output)
 
 
+def ex_quark(output: str, res: Dict[str, Any]) -> None:
+    """夸克网盘：👤 用户: 【xx】 + • 签到 / 空间 / 会员 / [keepalive] 行。"""
+    cur: Any = None
+    for raw in output.splitlines():
+        ln = raw.strip()
+        m = re.search(r"👤 用户:\s*【(.+?)】", ln)
+        if m:
+            if cur:
+                cur.flush(res)
+            cur = _Block(m.group(1))
+            continue
+        if "签到失败" in ln or "处理失败" in ln or "会话失效" in ln:
+            if cur:
+                cur.flush(res)
+                cur = None
+            res["fail_lines"].append(_clean(ln))
+            res["error_lines"].append(ln)
+            continue
+        if cur is None:
+            continue
+        mm = re.search(r"• 签到:\s*(.+)", ln)
+        if mm:
+            s = mm.group(1)
+            if "【成功】" in s:
+                cur.parts.append("签到成功")
+                m2 = re.search(r"\+([\d.]+\wB)", s)
+                if m2:
+                    cur.parts.append(f"+{m2.group(1)}")
+                m3 = re.search(r"连签 (\d+/\d+ 天)", s)
+                if m3:
+                    cur.parts.append(f"连签 {m3.group(1)}")
+            elif "已签到" in s:
+                m2 = re.search(r"\+([\d.]+\wB)", s)
+                cur.parts.append("今日已签" + (f" +{m2.group(1)}" if m2 else ""))
+            elif "未配置" in s:
+                cur.parts.append("签到未配置(App 三参数缺失)")
+            else:
+                cur.parts.append(_clean(s))
+            continue
+        mm = re.search(r"• 空间:\s*已用\s+(.+?)\s*/\s*总量\s+(.+?)(?:，(.+))?$", ln)
+        if mm:
+            cur.parts.append(f"空间 {mm.group(1)}/{mm.group(2)}")
+            if mm.group(3):
+                cur.parts.append(_clean(mm.group(3)))
+            continue
+        mm = re.search(r"• 会员:\s*(.+)", ln)
+        if mm:
+            cur.parts.append(mm.group(1))
+            continue
+        if "[keepalive]" in ln:
+            cur.parts.append("滑动续期✓")
+            continue
+    if cur:
+        cur.flush(res)
+    _add_summary(res, output)
+
+
 # 注册表：key = 脚本文件名（task_registry 的 script 字段 / 结果 JSON 的 script 字段）
 SCRIPT_EXTRACTORS = {
     "2libra.py": ex_2libra,
@@ -1155,6 +1212,7 @@ SCRIPT_EXTRACTORS = {
     "aistudio.py": ex_aistudio,
     "alipan.py": ex_alipan,
     "smzdm.py": ex_smzdm,
+    "quark.py": ex_quark,
     "workbuddy.py": ex_workbuddy,
     "modelscope.py": ex_modelscope,
     "latvi.py": ex_latvi,

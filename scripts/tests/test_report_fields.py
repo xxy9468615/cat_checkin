@@ -115,6 +115,16 @@ EXPECT = {
         and ("金币", 90.0) in r["assets"]
         and r["streak"] == 5
     ),
+    "quark": lambda r: (
+        len(r["lines"]) == 1
+        and "签到成功" in r["lines"][0]
+        and "+10MB" in r["lines"][0]
+        and "连签 3/7 天" in r["lines"][0]
+        and "空间145.7MB/3TB" in r["lines"][0].replace(" ", "")
+        and "累计签到奖励 130MB" in r["lines"][0]
+        and "VIP（10-23 到期）" in r["lines"][0]
+        and "滑动续期✓" in r["lines"][0]
+    ),
     "workbuddy-account-1": lambda r: (
         len(r["lines"]) == 1 and "连登13天" in r["lines"][0].replace(" ", "") and "算力 1176" in r["lines"][0]
         and "徽章3/11" in r["lines"][0].replace(" ", "")
