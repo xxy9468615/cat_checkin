@@ -30,6 +30,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 import report_fields  # noqa: E402  按任务定制的字段解析器（统一报告/Discord 共用）
 import alert_levels  # noqa: E402  提示/警告分级引擎（🟡提示级 / 🔴失败级）
+import secret_age  # noqa: E402  凭据年龄预警（WorkBuddy 等硬寿命凭据提前一天提示）
 
 
 def bool_env(name: str, default: bool) -> bool:
@@ -109,6 +110,14 @@ def build_report(results: Iterable[Tuple[Any, Path, str, float]]) -> Tuple[str, 
     unconf_count = sum(1 for v in unconf_by_idx.values() if v)
     fail_count = sum(1 for st, *_ in rows if st == "fail") - unconf_count
 
+    # 🟡 凭据年龄预警（硬寿命凭据如 WorkBuddy 7 天上限）：与任务运行结果无关，
+    # 由 secret 的 updated_at 推算，提前一天提醒重登；无 token/失败时为空不影响报告
+    try:
+        cred_warns = secret_age.credential_age_warns()
+    except Exception:
+        cred_warns = []
+    warn_count += len(cred_warns)
+
     header_tags = ""
     if fail_count > 0:
         header_tags += f" [❌ {fail_count}项失败]"
@@ -133,6 +142,11 @@ def build_report(results: Iterable[Tuple[Any, Path, str, float]]) -> Tuple[str, 
     )
 
     lines = [summary_header, stat_line, ""]
+    if cred_warns:
+        lines.append("🟡 凭据寿命提醒（定期重登型凭据）")
+        for e in cred_warns:
+            lines.append(f"  ⚠️ {secret_age.format_warn(e)}")
+        lines.append("")
     for idx, (st, path, output, elapsed, dname) in enumerate(rows):
         task_title = dname or get_task_title(path)
         info = report_fields.extract_for(path.name, output or "")
@@ -580,7 +594,12 @@ def _build_overview_html(rows: List[Tuple[str, Path, str, float, str]], yesterda
     changes = data["changes"]
     max_streak = data["max_streak"]
     at_risk = data["at_risk"]
-    if not (gains or changes or max_streak[1] or at_risk):
+    # 🟡 硬寿命凭据年龄预警（WorkBuddy 等）：独立于任务运行结果，无 token/失败时为空
+    try:
+        cred_warns = secret_age.credential_age_warns()
+    except Exception:
+        cred_warns = []
+    if not (gains or changes or max_streak[1] or at_risk or cred_warns):
         return ""
 
     def badge(bg: str, color: str, text: str) -> str:
@@ -601,6 +620,7 @@ def _build_overview_html(rows: List[Tuple[str, Path, str, float, str]], yesterda
         chips += badge("#e6fefa", "#0d9488", f"连签最高 {max_streak[0]} {max_streak[1]} 天")
     if at_risk:
         chips += badge("#fff7e6", "#b45309", f"连签将断 {'、'.join(at_risk)}")
+    chips += "".join(badge("#fff7e6", "#b45309", secret_age.format_chip(e)) for e in cred_warns)
 
     return (
         '<div style="margin:0 0 16px 0;border:1px solid #e3e6ea;border-left:3px solid #4f46e5;'

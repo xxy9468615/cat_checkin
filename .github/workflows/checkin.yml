@@ -630,6 +630,8 @@ jobs:
           TZ: Asia/Shanghai
           DAILY_PUSH: "true"
           TASK_OUTPUT_DIR: .task_results
+          # 凭据年龄预警（secret_age.py）需要读 Secrets 的 updated_at
+          GH_PAT: ${{ secrets.GH_PAT }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           RESEND_FROM: ${{ secrets.RESEND_FROM }}
           RESEND_TO: ${{ secrets.RESEND_TO }}
