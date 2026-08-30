@@ -177,6 +177,16 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
+    # --- 阿里云盘（alipan.com 每日签到、容量延期/扩容礼包与网盘空间）---
+    "alipan": {
+        "id": "alipan",
+        "script": "alipan.py",
+        "name": "阿里云盘 签到",
+        "result": "alipan.json",
+        "timeout": 300,
+        "account": "",
+        "tags": ["00:50", "matrix", "daily"],
+    },
 
     # --- 多账号站点（单 run 阶段 A 内联并发；旧 QStash 回程接力已退役） ---
     "workbuddy-account-1": {

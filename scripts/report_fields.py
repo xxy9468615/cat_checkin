@@ -833,6 +833,66 @@ def ex_aistudio(output: str, res: Dict[str, Any]) -> None:
     _add_summary(res, output)
 
 
+def ex_alipan(output: str, res: Dict[str, Any]) -> None:
+    """阿里云盘：👤 用户: 【xx】 (177***109) + • 签到 / 奖励 / 空间 行。"""
+    cur: Any = None
+    for raw in output.splitlines():
+        ln = raw.strip()
+        m = re.search(r"👤 用户:\s*【(.+?)】(?:\s*\(([^)]+)\))?", ln)
+        if m:
+            if cur:
+                cur.flush(res)
+            cur = _Block(m.group(1))
+            continue
+        if "签到失败" in ln:
+            if cur:
+                cur.flush(res)
+                cur = None
+            res["fail_lines"].append(_clean(ln))
+            res["error_lines"].append(ln)
+            continue
+        if cur is None:
+            continue
+        mm = re.search(r"• 签到:\s*【(.+?)】(?:\s*本月累计签到:\s*【(\d+)】天)?(?:\s*\((.+?)\))?", ln)
+        if mm:
+            status, days, blessing = mm.group(1), mm.group(2), mm.group(3)
+            if days:
+                cur.parts.append(f"月签 {days} 天")
+                res["streak"] = max(res["streak"], int(days))
+                res["badges"].append(("streak", f"月签 {days} 天"))
+            if status == "成功":
+                cur.parts.append("签到成功")
+            elif "已签" in status:
+                cur.parts.append("今日已签")
+            if blessing:
+                cur.parts.append(blessing)
+            continue
+        mm = re.search(r"• 奖励:\s*【(.+?)】(?:\s*\((.+?)\))?", ln)
+        if mm:
+            rw_name = mm.group(1)
+            if rw_name:
+                cur.parts.append(f"奖励 {rw_name}")
+                res["badges"].append(("reward", rw_name))
+                m_gain_days = re.search(r"(\d+)天", rw_name)
+                m_gain_mb = re.search(r"(\d+)\s*(?:M|MB|G|GB)", rw_name, re.I)
+                if m_gain_days:
+                    res["gains"].append(("天特权", _f(m_gain_days.group(1))))
+                elif m_gain_mb:
+                    res["gains"].append(("容量", _f(m_gain_mb.group(1))))
+            continue
+        mm = re.search(r"• 空间:\s*【([^】]+)】(?:\s*\(使用率\s*([^)]+)\))?", ln)
+        if mm:
+            space_val = mm.group(1)
+            cur.parts.append(f"空间 {space_val}")
+            m_total = re.search(r"/\s*([\d.]+)\s*(GB|TB|MB)", space_val)
+            if m_total:
+                res["assets"].append(("空间", _f(m_total.group(1))))
+            continue
+    if cur:
+        cur.flush(res)
+    _add_summary(res, output)
+
+
 def ex_workbuddy(output: str, res: Dict[str, Any]) -> None:
     """WorkBuddy：用户【xx】（UID: xx）+ • 八项 bullets。"""
     cur: Any = None
@@ -1025,6 +1085,7 @@ SCRIPT_EXTRACTORS = {
     "juejin.py": ex_juejin,
     "nodeseek.py": ex_nodeseek,
     "aistudio.py": ex_aistudio,
+    "alipan.py": ex_alipan,
     "workbuddy.py": ex_workbuddy,
     "modelscope.py": ex_modelscope,
     "latvi.py": ex_latvi,
