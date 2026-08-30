@@ -118,6 +118,49 @@ try:
 finally:
     os.environ.update(_saved)
 
+# --- 数据库回写（Redis rotated_at）优先于 Secret updated_at ---
+from unittest import mock  # noqa: E402
+import common  # noqa: E402
+
+
+def _redis_result(rotated_at_epoch):
+    return (True, {"result": __import__("json").dumps({"refresh_token": "tok", "rotated_at": rotated_at_epoch})})
+
+
+try:
+    fresh_epoch = (NOW - timedelta(days=1)).timestamp()
+    stale_epoch = (NOW - timedelta(days=4)).timestamp()
+    secret_fresh = {"WORKBUDDY_REFRESH_TOKEN_1": iso(NOW - timedelta(days=1)),
+                    "WORKBUDDY_REFRESH_TOKEN_2": iso(NOW - timedelta(days=1))}
+    with mock.patch.object(common, "upstash_redis_command", return_value=_redis_result(fresh_epoch)), \
+         mock.patch.object(secret_age, "fetch_secret_updated_at", return_value=secret_fresh), \
+         mock.patch.dict("os.environ", {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:"}):
+        rotated = secret_age._redis_rotated_at()
+        check("Redis rotated_at 解析为 ISO", set(rotated) == {"WORKBUDDY_REFRESH_TOKEN_1", "WORKBUDDY_REFRESH_TOKEN_2"}
+              and all("T" in v for v in rotated.values()), f"got {rotated}")
+        check("Redis 新鲜时整体无预警", secret_age.credential_age_warns() == [], "应无预警")
+
+    with mock.patch.object(common, "upstash_redis_command", return_value=_redis_result(stale_epoch)), \
+         mock.patch.object(secret_age, "fetch_secret_updated_at", return_value=secret_fresh), \
+         mock.patch.dict("os.environ", {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:"}):
+        warns = secret_age.credential_age_warns()
+        check("Redis 超阈值即预警（即使 Secret 新鲜）", len(warns) >= 1 and all(w["kind"] == "rolling" for w in warns), f"got {warns}")
+
+    with mock.patch.object(common, "upstash_redis_command", return_value=(False, "no key")), \
+         mock.patch.object(secret_age, "fetch_secret_updated_at", return_value=secret_fresh), \
+         mock.patch.dict("os.environ", {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:"}):
+        _warns_fb = secret_age.credential_age_warns()
+        check("Redis 无键时回退 Secret updated_at", _warns_fb == [], f"got {_warns_fb}")
+
+    with mock.patch.object(common, "upstash_redis_command", side_effect=RuntimeError("redis down")), \
+         mock.patch.object(secret_age, "fetch_secret_updated_at", return_value=secret_fresh), \
+         mock.patch.dict("os.environ", {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:"}):
+        _warns_ex = secret_age.credential_age_warns()
+        check("Redis 异常时静默回退 Secret", _warns_ex == [], f"got {_warns_ex}")
+except Exception as exc:
+    failures.append(f"Redis rotated_at 联动异常: {exc}")
+    print(f"[FAIL] Redis rotated_at 联动异常: {exc}")
+
 print(f"\n{'❌ ' + str(len(failures)) + ' 项失败' if failures else '✅ 全部通过'}")
 for f in failures:
     print(f"  - {f}")

@@ -47,7 +47,7 @@ import traceback
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from common import Http, env, env_bool, env_seq, is_already_signed, main_guard, mask_str, schedule_repo_dispatch
+from common import Http, env, env_bool, env_seq, is_already_signed, main_guard, mask_str, schedule_repo_dispatch, upstash_redis_command
 
 PREFIX = "WORKBUDDY_"
 BASE_URL = "https://www.workbuddy.cn"
@@ -134,19 +134,61 @@ def _refresh_access_token(h: Http, refresh_token: str) -> Tuple[str, str]:
     return str(data["accessToken"]), str(data.get("refreshToken") or refresh_token)
 
 
-def _persist_refresh_token(idx: int, new_token: str) -> str:
-    """把轮换后的 refresh_token 回写 GitHub Secret（滚动保活）。
+def _redis_refresh_key(idx: int) -> str:
+    prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
+    return f"{prefix}:state:workbuddy_refresh_token_{idx}"
 
-    通过 gh CLI（GH_PAT/GH_TOKEN 鉴权）。失败不阻塞签到：Keycloak 默认不吊销
-    旧 offline token，旧票在过期前仍可用；但长期不回写会导致滚动断链，由
-    secret_age 的「凭据已 N 天未滚动」黄牌兜底提醒。
+
+def _load_refresh_token_redis(idx: int) -> str:
+    """从 Upstash Redis 读滚动 refresh_token（数据库为准，env secret 可能滞后）。"""
+    try:
+        ok, res = upstash_redis_command(["GET", _redis_refresh_key(idx)])
+        if ok and isinstance(res, dict):
+            raw = res.get("result")
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(data, dict):
+                return str(data.get("refresh_token") or "")
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _save_refresh_token_redis(idx: int, new_token: str) -> bool:
+    """滚动票写入 Upstash Redis（数据库回写主通道，免 GH_PAT 权限）。"""
+    try:
+        payload = json.dumps({"refresh_token": new_token, "rotated_at": time.time()}, ensure_ascii=False)
+        ok, _res = upstash_redis_command(["SET", _redis_refresh_key(idx), payload])
+        return bool(ok)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _persist_refresh_token(idx: int, new_token: str) -> str:
+    """滚动回写 refresh_token：Upstash Redis 为主，GitHub Secret 为辅（best-effort）。
+
+    数据库回写不依赖 GH_PAT 权限（CI 内 gh secret set 曾被 403 拒）；
+    Secret 回写仅当 GH_PAT 具备 Secrets 写权限时生效，失败只进调试日志。
+    Keycloak offline token 默认允许重复使用，回写失败不致命（旧票 90 天内仍可刷），
+    但长期不回写会让滚动链退化为同一张票刷到死，由 secret_age 凭据年龄预警兜底。
     """
-    if new_token == (env(PREFIX, "refresh_token", required=False) or ""):
+    if new_token == _load_refresh_token_redis(idx) and new_token == (env(PREFIX, "refresh_token", required=False) or ""):
         return ""
+    if _save_refresh_token_redis(idx, new_token):
+        note = f"☁️🔑 refresh_token 已滚动回写（Redis {_redis_refresh_key(idx)}"
+        if _persist_refresh_token_secret(idx, new_token):
+            note += " + Secret"
+        return note + "）"
+    if _persist_refresh_token_secret(idx, new_token):
+        return f"🔑 refresh_token 已滚动回写 Secret（Redis 不可用，WORKBUDDY_REFRESH_TOKEN_{idx}）"
+    return "⚠️ refresh_token 滚动回写失败（Redis 与 Secret 均不可用，靠 Keycloak 票据可重复使用维持）"
+
+
+def _persist_refresh_token_secret(idx: int, new_token: str) -> bool:
+    """GitHub Secret 回写（best-effort，需 GH_PAT 有 Secrets 写权限）。"""
     repo = os.getenv("GITHUB_REPO") or os.getenv("GITHUB_REPOSITORY") or ""
     pat = os.getenv("GH_PAT") or os.getenv("GH_TOKEN") or ""
     if not (repo and pat and shutil.which("gh")):
-        return "（未配置 GH_PAT/gh，refresh_token 未滚动回写）"
+        return False
     try:
         run_env = dict(os.environ)
         run_env["GH_TOKEN"] = pat
@@ -154,11 +196,12 @@ def _persist_refresh_token(idx: int, new_token: str) -> str:
             ["gh", "secret", "set", f"WORKBUDDY_REFRESH_TOKEN_{idx}", "--body", new_token, "--repo", repo],
             env=run_env, capture_output=True, text=True, timeout=90,
         )
-        if proc.returncode == 0:
-            return f"🔑 refresh_token 已滚动回写（WORKBUDDY_REFRESH_TOKEN_{idx}）"
-        return f"⚠️ refresh_token 回写失败：{(proc.stderr or '').strip()[:80]}"
+        if proc.returncode != 0:
+            _dbg(f"[workbuddy] Secret 回写失败（不影响 Redis 主通道）：{(proc.stderr or '').strip()[:120]}")
+        return proc.returncode == 0
     except Exception as exc:  # noqa: BLE001
-        return f"⚠️ refresh_token 回写异常：{exc}"
+        _dbg(f"[workbuddy] Secret 回写异常（不影响 Redis 主通道）：{exc}")
+        return False
 
 
 def _parse_cookies(raw: str) -> List[str]:
@@ -1219,24 +1262,31 @@ def _run_one(cred: str, idx: int, total: int, wait_travel: bool) -> Tuple[bool, 
 
 
 def _resolve_credential(h: Http, idx: int, refresh_token: str, cookie: str) -> Tuple[str, List[str]]:
-    """解析单账号凭据：refresh_token 优先（换新+滚动回写），Cookie 兜底。
+    """解析单账号凭据：refresh_token 优先（Redis 滚动票 > env secret，换新+数据库回写），Cookie 兜底。
 
     返回 (cred, notes)。refresh 续期失败但配置了 Cookie 时回退（不中断签到），
     续期错误文案进入 notes（alert_levels 据此判黄色「续期失败请检查」）。
     """
     notes: List[str] = []
+    redis_rt = _load_refresh_token_redis(idx)
+    candidates: List[str] = []
+    if redis_rt and redis_rt != refresh_token:
+        candidates.append(redis_rt)  # 数据库里的票更新（Secret 回写可能被 403 挡住）
     if refresh_token:
+        candidates.append(refresh_token)
+    for cand in candidates:
         try:
-            cred, new_rt = _refresh_access_token(h, refresh_token)
+            cred, new_rt = _refresh_access_token(h, cand)
             persist_note = _persist_refresh_token(idx, new_rt)
             if persist_note:
                 notes.append(persist_note)
             return cred, notes
         except Exception as exc:  # noqa: BLE001
             notes.append(f"⚠️ {exc}")
-            if not cookie:
-                raise
-            notes.append("已回退 Cookie 凭据（7 天硬上限，请尽快重跑 workbuddy_device_login.py）")
+    if candidates:
+        if not cookie:
+            raise RuntimeError(notes[-1].removeprefix("⚠️ ") if notes else "refresh_token 续期失败")
+        notes.append("已回退 Cookie 凭据（7 天硬上限，请尽快重跑 workbuddy_device_login.py）")
     if not cookie:
         raise RuntimeError(
             f"缺少 {PREFIX}REFRESH_TOKEN_{idx}/{PREFIX}COOKIE_{idx}（secret 未配置或为空），"

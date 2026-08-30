@@ -22,7 +22,8 @@ from typing import Any, Dict, List, Optional
 # secret 名 → (展示名, 阈值天数[, kind])；新凭据按实测寿命在此登记
 # kind="hard"（缺省）：硬寿命上限，剩 ≤1 天预警（提前一天提示重登）；
 # kind="rolling"：寿命靠每日刷新滚动延续，age 超阈值 = 滚动链已断（如
-# WorkBuddy refresh_token 每日轮换回写，正常 updated_at 永远是昨天）。
+# WorkBuddy refresh_token 每日轮换，回写主通道是 Upstash Redis（rotated_at
+# 优先于 Secret updated_at——CI 内 Secret 回写可能因 PAT 无 Secrets 写权限冻结）。
 CREDENTIAL_LIFETIMES: Dict[str, Any] = {
     "WORKBUDDY_REFRESH_TOKEN_1": ("WorkBuddy 账号1", 3, "rolling"),
     "WORKBUDDY_REFRESH_TOKEN_2": ("WorkBuddy 账号2", 3, "rolling"),
@@ -142,6 +143,44 @@ def format_chip(entry: Dict[str, Any]) -> str:
     return f"{entry['title']} 凭据剩 {rem_txt}"
 
 
+def _redis_rotated_at() -> Dict[str, str]:
+    """滚动型凭据的数据库回写时间（Upstash Redis rotated_at），优先于 Secret updated_at。
+
+    refresh_token 的滚动回写主通道是 Redis（免 GH_PAT 权限），Secret 侧
+    updated_at 可能因 PAT 无 Secrets 写权限而冻结不更新，不能作为滚动健康度。
+    返回 {secret 名: ISO 时间串}；Redis 未配置 / 键不存在 → 该键缺席。
+    """
+    import json as _json
+    import re as _re
+    import time as _time
+
+    rolling = {s for s, spec in CREDENTIAL_LIFETIMES.items() if len(spec) > 2 and spec[2] == "rolling"}
+    if not rolling:
+        return {}
+    try:
+        from common import upstash_redis_command
+
+        prefix = (os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:") or "cat_checkin:").rstrip(":")
+        out: Dict[str, str] = {}
+        for secret in rolling:
+            m = _re.search(r"_(\d+)$", secret)
+            if not m:
+                continue
+            ok, res = upstash_redis_command(["GET", f"{prefix}:state:workbuddy_refresh_token_{m.group(1)}"])
+            if not (ok and isinstance(res, dict)):
+                continue
+            raw = res.get("result")
+            data = _json.loads(raw) if isinstance(raw, str) else raw
+            ts = (data or {}).get("rotated_at") if isinstance(data, dict) else None
+            if isinstance(ts, (int, float)) and ts > 0:
+                out[secret] = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        return out
+    except Exception:
+        return {}
+
+
 def credential_age_warns() -> List[Dict[str, Any]]:
-    """入口：读 API + 计算；无 token / 失败 → []。"""
-    return compute_warns(fetch_secret_updated_at())
+    """入口：读 API + 计算；无 token / 失败 → []。Redis rotated_at 优先。"""
+    updated = dict(fetch_secret_updated_at())  # 拷贝：overlay 会原地改 dict，别污染调用方
+    updated.update(_redis_rotated_at())  # 数据库回写时间戳为准
+    return compute_warns(updated)
