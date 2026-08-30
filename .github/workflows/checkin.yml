@@ -441,10 +441,15 @@ jobs:
             # TUN 模式无需 socks5 端口：AGENTROUTER_PROXY 清空（agentrouter 走 TUN）；
             # NODESEEK_PROXY 保留（nodeseek 专用住宅代理出口，流量经 TUN 中转不受影响）
             echo "AGENTROUTER_PROXY=" >> "$GITHUB_ENV"
-            # 逐节点探测 nodeseek：url-test 只挑"最快"，但 CF 风控只认"干净"——
-            # 遍历订阅节点切换 PROXY 组，选第一个非 403 的固定下来；全 403 则保留首个可达
+            # 逐节点探测 nodeseek：默认关闭（每次 run 发 10+ 裸请求会加重 CF 风控评分，
+            # 实测教训）；需要时 dispatch 传 probe_nodes=true 或设 NODESEEK_PROBE_NODES=1
             chosen=""
             fallback=""
+            if [ "${NODESEEK_PROBE_NODES:-0}" != "1" ]; then
+              ns_code=$(curl -sS -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
+              echo "SS proxy ready via mihomo TUN (pid $SSPID), nodeseek probe HTTP $ns_code (node probing off)"
+              return 0
+            fi
             nodes=$(curl -sS -m 5 http://127.0.0.1:9090/proxies/PROXY \
               | python3 -c "import json,sys; print('\n'.join(json.load(sys.stdin).get('all') or []))")
             for node in $nodes; do
