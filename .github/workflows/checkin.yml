@@ -197,7 +197,9 @@ jobs:
       NODESEEK_COOKIE_1: ${{ secrets.NODESEEK_COOKIE_1 || secrets.NODESEEK_COOKIE }}
       NODESEEK_COOKIE_2: ${{ secrets.NODESEEK_COOKIE_2 }}
       NODESEEK_COOKIE_3: ${{ secrets.NODESEEK_COOKIE_3 }}
-      NODESEEK_PROXY: ${{ secrets.NODESEEK_PROXY || 'socks5://127.0.0.1:1080' }}
+      # 硬空：CF clearance 绑定出口 IP，nodeseek 必须走工作流固定出口（TUN/SS），
+      # 独立代理 secret 一律不认（换出口=触发质询）
+      NODESEEK_PROXY: ""
       AISTUDIO_cookie: ${{ secrets.AISTUDIO_COOKIE_1 || secrets.AISTUDIO_COOKIE }}
       AISTUDIO_COOKIE_1: ${{ secrets.AISTUDIO_COOKIE_1 || secrets.AISTUDIO_COOKIE }}
       AISTUDIO_COOKIE_2: ${{ secrets.AISTUDIO_COOKIE_2 }}
@@ -369,9 +371,10 @@ jobs:
             return 1
           }
 
-          # mihomo（订阅原生格式）TUN 透明接管：proxy-provider 拉 8 节点订阅，
-          # url-test 组健康检查自动切换故障节点；dns-hijack 由 mihomo 自带 DNS 模块处理；
-          # TUN 不可用时回退 sslocal socks5 链路（AGENTROUTER_SS_CONFIG 单节点）
+          # mihomo（订阅原生格式）TUN 透明接管：proxy-provider 按 filter 只加载
+          # TW-X1-3 单节点——CF clearance 绑定出口 IP，节点漂移/自动切换即触发质询，
+          # 禁止任何 failover；dns-hijack 由 mihomo 自带 DNS 模块处理；
+          # TUN 不可用时回退 sslocal socks5 链路（AGENTROUTER_SS_CONFIG 同为 TW-X1-3）
           setup_mihomo() {
             test -n "$AGENTROUTER_SS_SUB_URL" || { echo "AGENTROUTER_SS_SUB_URL empty"; return 1; }
             curl -sL --max-time 60 -o /tmp/mihomo.gz \
@@ -405,6 +408,8 @@ jobs:
               url: "$AGENTROUTER_SS_SUB_URL"
               interval: 86400
               path: /tmp/mihomo/prov.yaml
+              # 只加载 TW-X1-3（锚定行尾，避免误配其他编号）；订阅里其余节点全部不进组
+              filter: "TW-X1-3$"
               health-check:
                 enable: true
                 url: "https://www.gstatic.com/generate_204"
@@ -438,9 +443,10 @@ jobs:
               sleep 1
               return 1
             fi
-            # TUN 模式无需 socks5 端口：AGENTROUTER_PROXY 清空（agentrouter 走 TUN）；
-            # NODESEEK_PROXY 保留（nodeseek 专用住宅代理出口，流量经 TUN 中转不受影响）
+            # TUN 模式无需 socks5 端口：两个代理变量全部清空，所有流量（含 nodeseek）
+            # 经 TUN 从固定 TW-X1-3 出口走；住宅代理/其他节点一律不用
             echo "AGENTROUTER_PROXY=" >> "$GITHUB_ENV"
+            echo "NODESEEK_PROXY=" >> "$GITHUB_ENV"
             # 逐节点探测 nodeseek：默认关闭（每次 run 发 10+ 裸请求会加重 CF 风控评分，
             # 实测教训）；需要时 dispatch 传 probe_nodes=true 或设 NODESEEK_PROBE_NODES=1
             chosen=""
