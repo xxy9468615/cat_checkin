@@ -215,6 +215,11 @@ jobs:
       SMZDM_COOKIE_1: ${{ secrets.SMZDM_COOKIE_1 || secrets.SMZDM_COOKIE }}
       SMZDM_COOKIE_2: ${{ secrets.SMZDM_COOKIE_2 }}
       SMZDM_COOKIE_3: ${{ secrets.SMZDM_COOKIE_3 }}
+      QUARK_cookie: ${{ secrets.QUARK_COOKIE_1 || secrets.QUARK_COOKIE }}
+      QUARK_COOKIE_1: ${{ secrets.QUARK_COOKIE_1 || secrets.QUARK_COOKIE }}
+      QUARK_COOKIE_2: ${{ secrets.QUARK_COOKIE_2 }}
+      QUARK_MPARAM_1: ${{ secrets.QUARK_MPARAM_1 }}
+      QUARK_MPARAM_2: ${{ secrets.QUARK_MPARAM_2 }}
       WORKBUDDY_COOKIE: ${{ secrets.WORKBUDDY_COOKIE }}
       WORKBUDDY_COOKIE_1: ${{ secrets.WORKBUDDY_COOKIE_1 || secrets.WORKBUDDY_COOKIE }}
       WORKBUDDY_COOKIE_2: ${{ secrets.WORKBUDDY_COOKIE_2 }}
