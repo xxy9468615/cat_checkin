@@ -313,6 +313,38 @@ jobs:
           # 支持 user:pass@host:port 与行内 # 注释；仅在本地 sslocal 不可用时
           # 按序探测，取第一条能通 AgentRouter API 的，经 GITHUB_ENV 覆盖 job 级
           # 默认 AGENTROUTER_PROXY=socks5://127.0.0.1:1080。
+          # 代理出口状态入数据库（Upstash Redis，与任务结果同 raw hash 的 proxy_setup
+          # 字段，14 天 TTL）：GH 日志保留期不可控且偶发拉取失败，排查代理/出口问题
+          # 以 Redis 为准。字段不带 date 键——unified_report 汇聚有 date 门禁不会误收。
+          # best-effort：任何失败静默，绝不影响代理链路本身
+          stash_proxy_state() {
+            [ -n "$UPSTASH_REDIS_REST_URL" ] && [ -n "$UPSTASH_REDIS_REST_TOKEN" ] || return 0
+            python3 - "$1" "$2" "$3" "$4" <<'PY'
+          import datetime, json, os, subprocess, sys
+          mode, node, exit_ip, probe = (sys.argv + ["", "", "", ""])[1:5]
+          prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
+          tz = datetime.timezone(datetime.timedelta(hours=8))
+          now = datetime.datetime.now(tz)
+          dkey = f"{prefix}:raw:{now:%Y-%m-%d}"
+          val = json.dumps({"mode": mode, "node": node, "exit_ip": exit_ip,
+                            "nodeseek_probe": probe, "ts": now.isoformat(timespec="seconds")},
+                           ensure_ascii=False)
+          body = json.dumps([["HSET", dkey, "proxy_setup", val],
+                             ["EXPIRE", dkey, 1209600]])
+          try:
+              r = subprocess.run(
+                  ["curl", "-sS", "-m", "10", "-X", "POST",
+                   os.environ["UPSTASH_REDIS_REST_URL"].rstrip("/") + "/pipeline",
+                   "-H", "Authorization: Bearer " + os.environ["UPSTASH_REDIS_REST_TOKEN"],
+                   "-H", "Content-Type: application/json", "-d", body],
+                  capture_output=True, text=True, timeout=15)
+              reply = (r.stdout or r.stderr or "").strip().replace("\n", " ")
+              print(f"📜 proxy_setup → Redis({dkey}[proxy_setup]): {reply[:120]}")
+          except Exception as exc:
+              print(f"📜 proxy_setup → Redis 失败(忽略): {exc}")
+          PY
+          }
+
           setup_ss() {
             curl -sL --max-time 60 -o /tmp/ss.tar.xz \
               https://github.com/shadowsocks/shadowsocks-rust/releases/download/v1.23.4/shadowsocks-v1.23.4.x86_64-unknown-linux-musl.tar.xz \
@@ -361,8 +393,10 @@ jobs:
               sleep 0.5
             done
             for i in 1 2 3; do
-              if curl -sS -x "socks5://127.0.0.1:$SSPORT" -m 8 -o /dev/null https://api.ipify.org; then
-                echo "SS proxy ready (pid $SSPID, port $SSPORT)"
+              ip=$(curl -sS -x "socks5://127.0.0.1:$SSPORT" -m 8 https://api.ipify.org 2>/dev/null || echo "")
+              if [ -n "$ip" ]; then
+                echo "SS proxy ready (pid $SSPID, port $SSPORT, exit $ip)"
+                stash_proxy_state sslocal "sslocal" "$ip" ""
                 return 0
               fi
               sleep 1
@@ -460,6 +494,7 @@ jobs:
             if [ "${NODESEEK_PROBE_NODES:-0}" != "1" ]; then
               ns_code=$(curl -sS -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
               echo "SS proxy ready via mihomo TUN (pid $SSPID), nodeseek probe HTTP $ns_code (node probing off)"
+              stash_proxy_state mihomo "$cur_node" "$exit_ip" "$ns_code"
               return 0
             fi
             nodes=$(curl -sS -m 5 http://127.0.0.1:9090/proxies/PROXY \
@@ -481,6 +516,7 @@ jobs:
             fi
             ns_code=$(curl -sS -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
             echo "SS proxy ready via mihomo TUN (pid $SSPID), nodeseek probe HTTP $ns_code"
+            stash_proxy_state mihomo "${chosen:-${fallback:-$cur_node}}" "$exit_ip" "$ns_code"
             return 0
           }
 
@@ -502,11 +538,13 @@ jobs:
             if curl -sS -x "$p" -m 12 -o /dev/null https://ps.air-outer.com; then
               echo "AGENTROUTER_PROXY=$p" >> "$GITHUB_ENV"
               echo "backup proxy OK: ${p##*@}"
+              stash_proxy_state backup "${p##*@}" "" ""
               exit 0
             fi
             echo "backup proxy unreachable: ${p##*@}"
           done <<< "$AGENTROUTER_BACKUP_PROXIES"
           echo "no backup proxy available; agentrouter will fail (red card by design)"
+          stash_proxy_state none "" "" ""
 
       - name: Direct mode (clear proxy env, runner IP 直连)
         if: inputs.direct == true
@@ -654,7 +692,7 @@ jobs:
         with:
           name: unified-results
           path: .task_results/
-          retention-days: 1
+          retention-days: 7
           include-hidden-files: true
 
   # ============================================================
