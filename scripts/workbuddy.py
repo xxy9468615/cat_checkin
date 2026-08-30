@@ -43,6 +43,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -89,6 +90,25 @@ def _base_auth_headers(cred: str, referer: str = f"{BASE_URL}/profile/growth-cen
     return headers
 
 
+def _resp_dict(resp: Any) -> Dict[str, Any]:
+    """resp.json() 容错：响应非 JSON 对象（JSON 字符串/数组/null、WAF 拦截页）时回退空 dict。
+
+    CI 实弹（#33319485658）踩坑：端点在代理/风控下可能返回非对象 JSON，
+    裸 .get() 会炸 'str' object has no attribute 'get' 且无堆栈难定位。
+    """
+    try:
+        j = resp.json({})
+    except Exception:
+        return {}
+    return j if isinstance(j, dict) else {}
+
+
+def _data_dict(data: Any, key: str = "data") -> Dict[str, Any]:
+    """data[key] 容错取 dict：值缺失或为字符串/列表等非 dict 类型时回退空 dict。"""
+    v = data.get(key) if isinstance(data, dict) else None
+    return v if isinstance(v, dict) else {}
+
+
 def _refresh_access_token(h: Http, refresh_token: str) -> Tuple[str, str]:
     """用 refresh_token 换新凭据，返回 (access_token, 轮换后的新 refresh_token)。
 
@@ -101,11 +121,10 @@ def _refresh_access_token(h: Http, refresh_token: str) -> Tuple[str, str]:
         headers={**PLUGIN_HEADERS, "X-Refresh-Token": refresh_token, "X-Auth-Refresh-Source": "workbuddy"},
         json_data={},
     )
-    try:
-        j = resp.json({})
-    except Exception:
-        raise RuntimeError(f"refresh_token 换新异常（HTTP {resp.code}）")
-    data = j.get("data") or {}
+    j = _resp_dict(resp)
+    if not j:
+        raise RuntimeError(f"refresh_token 换新异常（HTTP {resp.code}，响应非 JSON 对象）")
+    data = _data_dict(j)
     if j.get("code") != 0 or not data.get("accessToken"):
         msg = str(j.get("msg") or resp.code)
         raise RuntimeError(
@@ -216,10 +235,10 @@ def _get_account_info(h: Http, cred: str) -> Tuple[str, str]:
     if resp.code != 200:
         raise RuntimeError(f"获取账号信息失败：HTTP {resp.code}")
 
-    data = resp.json({})
+    data = _resp_dict(resp)
     if data.get("code") not in (0, None):
         raise RuntimeError(f"获取账号信息失败：接口返回 {data.get('code')} ({data.get('msg', '未知')})")
-    accounts = data.get("data", {}).get("accounts", [])
+    accounts = _data_dict(data).get("accounts", [])
     if accounts and isinstance(accounts, list):
         acc = accounts[0]
         uid = str(acc.get("uid") or acc.get("uin") or "")
@@ -261,10 +280,10 @@ def _create_conversation(h: Http, cred: str) -> Dict[str, Any]:
     )
     if resp.code != 200:
         return {}
-    data = resp.json({})
+    data = _resp_dict(resp)
     if data.get("code") != 0:
         return {}
-    return data.get("data", {})
+    return _data_dict(data)
 
 
 
@@ -280,10 +299,10 @@ def _get_conversation_session(h: Http, cred: str, conversation_id: str) -> Dict[
     resp = h.request("GET", f"{BASE_URL}/console/as/conversations/{conversation_id}/session", headers=headers)
     if resp.code != 200:
         return {}
-    data = resp.json({})
+    data = _resp_dict(resp)
     if data.get("code") != 0:
         return {}
-    return data.get("data", {})
+    return _data_dict(data)
 
 
 def _acp_headers(token: str, *, conn_id: str = "", with_auth: bool = False, is_post: bool = False) -> Dict[str, str]:
@@ -440,11 +459,11 @@ def _daily_meter_checkin(h: Http, cred: str) -> Tuple[str, bool]:
     """
     headers = _base_auth_headers(cred, referer=f"{BASE_URL}/profile/plans-usage")
     resp = h.request("POST", f"{BASE_URL}/billing/meter/daily-checkin", headers=headers, json_data={})
-    data = resp.json({}) if resp.code in (200, 400) else {}
+    data = _resp_dict(resp) if resp.code in (200, 400) else {}
     code = data.get("code")
     msg = data.get("msg", "")
     if resp.code == 200 and code == 0:
-        d = data.get("data", {})
+        d = _data_dict(data)
         credit = d.get("credit", 100)
         streak = d.get("streak_days", 1)
         return f"签到成功(+{credit}算力，连签{streak}天)", True
@@ -555,14 +574,14 @@ def _run_conversation_and_wait(h: Http, cred: str, timeout_seconds: int = 240) -
             time.sleep(5)
             continue
 
-        data = resp.json({})
+        data = _resp_dict(resp)
         if data.get("code") != 0:
             last_msg = f"签到状态异常：{data.get('msg', '未知')}"
             _dbg(f"[workbuddy] 签到状态异常：{data.get('msg', '未知')}")
             time.sleep(5)
             continue
 
-        cd = data.get("data", {})
+        cd = _data_dict(data)
         active = cd.get("active", False)
         today_checked_in = cd.get("today_checked_in", False)
         streak_days = cd.get("streak_days", 0)
@@ -616,8 +635,8 @@ def _get_growth_profile(h: Http, cred: str) -> Dict[str, Any]:
     resp = h.request("GET", f"{BASE_URL}/v2/activity/growth/profile", headers=headers)
     if resp.code != 200:
         return {}
-    data = resp.json({})
-    return data.get("data", {}) if data.get("code") == 0 else {}
+    data = _resp_dict(resp)
+    return _data_dict(data) if data.get("code") == 0 else {}
 
 
 def _redeem_rewards(h: Http, cred: str) -> Tuple[str, int]:
@@ -631,14 +650,14 @@ def _redeem_rewards(h: Http, cred: str) -> Tuple[str, int]:
     if resp.code != 200:
         return "查询连登状态失败", 0
 
-    data = resp.json({})
+    data = _resp_dict(resp)
     if data.get("code") != 0:
         return "连登数据异常", 0
 
-    streak_data = data.get("data", {})
-    streak = streak_data.get("streak", {})
+    streak_data = _data_dict(data)
+    streak = _data_dict(streak_data, "streak")
     month_days = streak.get("month_total_days", 0)
-    redemption_status = streak_data.get("redemption_status", {})
+    redemption_status = _data_dict(streak_data, "redemption_status")
 
     tiers_config = [
         ("7d", "入门档(7天)", 7),
@@ -663,9 +682,9 @@ def _redeem_rewards(h: Http, cred: str) -> Tuple[str, int]:
                 json_data={"tier": tier_code, "client_token": client_token},
             )
             if redeem_resp.code == 200:
-                r_json = redeem_resp.json({})
+                r_json = _resp_dict(redeem_resp)
                 if r_json.get("code") == 0:
-                    r_data = r_json.get("data", {})
+                    r_data = _data_dict(r_json)
                     energy = r_data.get("energy_granted", 0)
                     cards = r_data.get("cards_granted", 0)
                     credit = r_data.get("credit_granted", 0)
@@ -707,11 +726,11 @@ def _draw_lottery(h: Http, cred: str) -> str:
     resp = h.request("GET", f"{BASE_URL}/activity/growth/lottery/chances", headers=headers)
     chances = None
     if resp.code == 200:
-        chances = resp.json({}).get("data", {}).get("balance")
+        chances = _data_dict(_resp_dict(resp)).get("balance")
     if chances is None:
         sum_resp = h.request("GET", f"{BASE_URL}/activity/growth/lottery/summary", headers=headers)
         if sum_resp.code == 200:
-            chances = sum_resp.json({}).get("data", {}).get("chances")
+            chances = _data_dict(_resp_dict(sum_resp)).get("chances")
 
     if chances is None:
         # 查询失败不能伪装成「0 次（无需抽奖）」——当日抽奖机会会被静默浪费
@@ -733,9 +752,9 @@ def _draw_lottery(h: Http, cred: str) -> str:
             json_data={"client_token": client_token},
         )
         if draw_resp.code == 200:
-            d_json = draw_resp.json({})
+            d_json = _resp_dict(draw_resp)
             if d_json.get("code") == 0:
-                p_data = d_json.get("data", {})
+                p_data = _data_dict(d_json)
                 p_name = p_data.get("prize_name") or f"{p_data.get('credit_amount', 0)}积分"
                 prizes.append(p_name)
                 success_draws += 1
@@ -757,14 +776,14 @@ def _claim_travel_reward(h: Http, headers: Dict[str, str], travel_data: Dict[str
     claim_resp = h.request("POST", f"{BASE_URL}/activity/growth/buddy/travel/claim", headers=headers, json_data={})
     if claim_resp.code != 200:
         return False, f"回访领奖失败（HTTP {claim_resp.code}）"
-    cj = claim_resp.json({})
+    cj = _resp_dict(claim_resp)
     if cj.get("code") != 0:
         msg = str(cj.get("msg", ""))
         # 匹配词必须精确：单字符「已」/裸「重复」会命中「今日次数已达上限」等错误 → 假成功、奖励静默丢失
         if is_already_signed(msg, ("已经领取", "重复领取", "已领过")):
             return True, "放风奖励（已领取，无需重复领取）"
         return False, f"回访领奖失败：{msg or cj.get('code')}"
-    c_data = cj.get("data", {}) or {}
+    c_data = _data_dict(cj)
     credit = c_data.get("reward_credit") or 0
     # letter 优先取领取响应，回退到状态里的（arrived 态状态里已带 letter）
     letter = c_data.get("letter") or travel_data.get("letter")
@@ -859,12 +878,12 @@ def _process_travel(h: Http, cred: str, wait_travel: bool = True) -> str:
         if resp.code != 200:
             actions.append(f"查询放风状态失败（HTTP {resp.code}）")
             break
-        data = resp.json({})
+        data = _resp_dict(resp)
         if data.get("code") != 0:
             actions.append(f"查询放风状态异常：{data.get('msg', '未知错误')}")
             break
 
-        travel_data = data.get("data", {})
+        travel_data = _data_dict(data)
         state = travel_data.get("state", "idle")
         daily_limit_reached = travel_data.get("daily_limit_reached", False)
         loc = travel_data.get("location", {}) or {}
@@ -910,8 +929,8 @@ def _process_travel(h: Http, cred: str, wait_travel: bool = True) -> str:
                 headers=headers,
                 json_data={"location_id": 1},
             )
-            if depart_resp.code == 200 and depart_resp.json({}).get("code") == 0:
-                depart_data = depart_resp.json({}).get("data", {})
+            if depart_resp.code == 200 and _resp_dict(depart_resp).get("code") == 0:
+                depart_data = _data_dict(_resp_dict(depart_resp))
                 travel_data = depart_data
                 state = "traveling"
                 loc = depart_data.get("location", {}) or {}
@@ -919,7 +938,7 @@ def _process_travel(h: Http, cred: str, wait_travel: bool = True) -> str:
                 dur = loc.get("duration_hours") or depart_data.get("duration_hours") or "?"
                 actions.append(f"派遣猫咪出发放风（【{loc_name}】，预计时长 {dur}小时）")
             else:
-                err_msg = depart_resp.json({}).get("msg") or f"HTTP {depart_resp.code}"
+                err_msg = _resp_dict(depart_resp).get("msg") or f"HTTP {depart_resp.code}"
                 actions.append(f"派遣出发失败（{err_msg}）")
                 break
 
@@ -937,8 +956,8 @@ def _get_energy(h: Http, cred: str) -> Dict[str, Any]:
     resp = h.request("GET", f"{BASE_URL}/activity/growth/energy", headers=headers)
     if resp.code != 200:
         return {}
-    data = resp.json({})
-    return data.get("data", {}) if data.get("code") == 0 else {}
+    data = _resp_dict(resp)
+    return _data_dict(data) if data.get("code") == 0 else {}
 
 
 def _get_buddy_quota(h: Http, cred: str) -> Dict[str, Any]:
@@ -947,8 +966,8 @@ def _get_buddy_quota(h: Http, cred: str) -> Dict[str, Any]:
     resp = h.request("GET", f"{BASE_URL}/activity/growth/buddy/quota", headers=headers)
     if resp.code != 200:
         return {}
-    data = resp.json({})
-    return data.get("data", {}) if data.get("code") == 0 else {}
+    data = _resp_dict(resp)
+    return _data_dict(data) if data.get("code") == 0 else {}
 
 
 def _get_badges(h: Http, cred: str) -> Tuple[int, int]:
@@ -957,11 +976,11 @@ def _get_badges(h: Http, cred: str) -> Tuple[int, int]:
     resp = h.request("GET", f"{BASE_URL}/v2/activity/growth/badges", headers=headers)
     if resp.code != 200:
         return 0, 0
-    data = resp.json({})
-    badges = data.get("data", {}).get("badges", [])
+    data = _resp_dict(resp)
+    badges = _data_dict(_data_dict(data)).get("badges", [])
     if not isinstance(badges, list):
         return 0, 0
-    earned_count = sum(1 for b in badges if b.get("earned"))
+    earned_count = sum(1 for b in badges if isinstance(b, dict) and b.get("earned"))
     return earned_count, len(badges)
 
 
@@ -1000,7 +1019,7 @@ def _get_user_resource(h: Http, cred: str) -> Dict[str, Any]:
         )
         if resp.code != 200:
             return {}
-        data = resp.json({})
+        data = _resp_dict(resp)
         if data.get("code") != 0:
             return {}
         inner = (data.get("data", {}) or {}).get("Response", {}).get("Data", {}) or {}
@@ -1081,7 +1100,7 @@ def _get_credit_expiry(h: Http, cred: str, soon_days: int = 7) -> str:
         )
         if resp.code != 200:
             return ""
-        data = resp.json({})
+        data = _resp_dict(resp)
         if data.get("code") != 0:
             return ""
         inner = (data.get("data", {}) or {}).get("Response", {}).get("Data", {}) or {}
@@ -1260,6 +1279,7 @@ def main():
             print(msg)
             results.append((ok, msg))
         except Exception as e:
+            _dbg("[workbuddy] " + traceback.format_exc().replace("\n", "\n[workbuddy] "))
             _flush_dbg()
             err_msg = f"[{idx}/{total}] 签到失败：{e}" if total > 1 else f"签到失败：{e}"
             print(err_msg)
