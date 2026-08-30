@@ -19,12 +19,15 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-# secret 名 → (展示名, 硬寿命上限天数)；新凭据按实测寿命在此登记
+# secret 名 → (展示名, 阈值天数[, kind])；新凭据按实测寿命在此登记
+# kind="hard"（缺省）：硬寿命上限，剩 ≤1 天预警（提前一天提示重登）；
+# kind="rolling"：寿命靠每日刷新滚动延续，age 超阈值 = 滚动链已断（如
+# WorkBuddy refresh_token 每日轮换回写，正常 updated_at 永远是昨天）。
 CREDENTIAL_LIFETIMES: Dict[str, Any] = {
-    "WORKBUDDY_COOKIE_1": ("WorkBuddy 账号1", 7),
-    "WORKBUDDY_COOKIE_2": ("WorkBuddy 账号2", 7),
+    "WORKBUDDY_REFRESH_TOKEN_1": ("WorkBuddy 账号1", 3, "rolling"),
+    "WORKBUDDY_REFRESH_TOKEN_2": ("WorkBuddy 账号2", 3, "rolling"),
 }
-WARN_REMAINING_DAYS = 1.0  # 剩余 ≤1 天时提示（与分级制「提前一天提示」一致）
+WARN_REMAINING_DAYS = 1.0  # hard 型：剩余 ≤1 天时提示（与「提前一天提示」分级一致）
 
 
 def _token() -> str:
@@ -73,7 +76,9 @@ def compute_warns(updated: Dict[str, str], now: Optional[datetime] = None) -> Li
     """
     now = now or datetime.now(timezone.utc)
     entries: List[Dict[str, Any]] = []
-    for secret, (title, lifetime) in CREDENTIAL_LIFETIMES.items():
+    for secret, spec in CREDENTIAL_LIFETIMES.items():
+        title, lifetime = spec[0], spec[1]
+        kind = spec[2] if len(spec) > 2 else "hard"
         raw = (updated.get(secret) or "").strip()
         if not raw:
             continue
@@ -83,23 +88,35 @@ def compute_warns(updated: Dict[str, str], now: Optional[datetime] = None) -> Li
                 ts = ts.replace(tzinfo=timezone.utc)
         except ValueError:
             continue
-        remaining = lifetime - (now - ts).total_seconds() / 86400
-        entries.append(
-            {
-                "title": title,
-                "secret": secret,
-                "remaining_days": remaining,
-                "lifetime_days": lifetime,
-                "expired": remaining <= 0,
-            }
-        )
+        age = (now - ts).total_seconds() / 86400
+        remaining = lifetime - age
+        entry = {
+            "title": title,
+            "secret": secret,
+            "remaining_days": remaining,
+            "lifetime_days": lifetime,
+            "kind": kind,
+            "age_days": age,
+            "expired": remaining <= 0,
+        }
+        if kind == "rolling":
+            # 滚动型：age 超阈值即预警（正常情况下 updated_at 每天都在刷新）
+            if age >= lifetime:
+                entries.append(entry)
+        elif entry["expired"] or remaining <= WARN_REMAINING_DAYS:
+            entries.append(entry)
     entries.sort(key=lambda e: e["remaining_days"])
-    return [e for e in entries if e["expired"] or e["remaining_days"] <= WARN_REMAINING_DAYS]
+    return entries
 
 
 def format_warn(entry: Dict[str, Any]) -> str:
     """预警条目 → 日报正文文案。"""
     life = entry["lifetime_days"]
+    if entry.get("kind") == "rolling":
+        return (
+            f"{entry['title']} refresh_token 已 {entry['age_days']:.0f} 天未滚动更新"
+            f"（每日签到应自动轮换回写），滚动续期链可能已断——请检查 workbuddy 任务日志"
+        )
     if entry["expired"]:
         return (
             f"{entry['title']} 凭据已到 {life:g} 天硬上限（大概率已失效）"
@@ -116,6 +133,8 @@ def format_warn(entry: Dict[str, Any]) -> str:
 def format_chip(entry: Dict[str, Any]) -> str:
     """预警条目 → 邮件概览短徽标文案。"""
     life = entry["lifetime_days"]
+    if entry.get("kind") == "rolling":
+        return f"{entry['title']} token {entry['age_days']:.0f}天未滚动"
     if entry["expired"]:
         return f"{entry['title']} 凭据已到期（{life:g}天上限）"
     rem = max(entry["remaining_days"], 0.0)

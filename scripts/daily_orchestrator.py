@@ -83,18 +83,22 @@ def build_task_env(cfg: Dict[str, Any]) -> Dict[str, str]:
     if cfg.get("account"):
         n = str(cfg["account"])
         cookie = os.getenv(f"WORKBUDDY_COOKIE_{n}", "") or (os.getenv("WORKBUDDY_COOKIE", "") if n == "1" else "")
-        if not cookie:
+        refresh = os.getenv(f"WORKBUDDY_REFRESH_TOKEN_{n}", "") or (os.getenv("WORKBUDDY_REFRESH_TOKEN", "") if n == "1" else "")
+        if not cookie and not refresh:
             # 缺失时若静默继承父进程的其他账号 cookie：两个并发子进程踩同一账号、
             # 结果还写进账号 n 的 JSON 名下（张冠李戴且无告警）——必须显式失败
             raise RuntimeError(
-                f"workbuddy 账号 {n} 缺少 WORKBUDDY_COOKIE_{n}（secret 未配置或为空），拒绝继承其他账号的 cookie"
+                f"workbuddy 账号 {n} 缺少 WORKBUDDY_COOKIE_{n}/WORKBUDDY_REFRESH_TOKEN_{n}（secret 未配置或为空），拒绝继承其他账号的凭据"
             )
-        # 隔离当前子进程凭证：清除所有 WORKBUDDY_COOKIE_*，只保留当前账号的单个 COOKIE 与 COOKIE_1
+        # 隔离当前子进程凭证：清除所有 WORKBUDDY_COOKIE_*/REFRESH_TOKEN_*，
+        # 只保留当前账号的单个凭据与 _1 别名（refresh_token 优先，cookie 兜底）
         for k in list(env.keys()):
-            if re.match(r"^(QL_)?WORKBUDDY_COOKIE(_\d+)?$", k, re.I):
+            if re.match(r"^(QL_)?WORKBUDDY_(COOKIE|REFRESH_TOKEN)(_\d+)?$", k, re.I):
                 del env[k]
         env["WORKBUDDY_COOKIE"] = cookie
         env["WORKBUDDY_COOKIE_1"] = cookie
+        env["WORKBUDDY_REFRESH_TOKEN"] = refresh
+        env["WORKBUDDY_REFRESH_TOKEN_1"] = refresh
         env["WORKBUDDY_WAIT_TRAVEL"] = "true"
         env["WORKBUDDY_NO_RELAY"] = "1"
     if cfg["id"] == "latvi":

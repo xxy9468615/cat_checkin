@@ -24,7 +24,10 @@
      放风领取的积分计入对应资源包后此处会同步反映最新余额。
 
 环境变量：
-  - WORKBUDDY_COOKIE / WORKBUDDY_cookie：用户凭证
+  - WORKBUDDY_REFRESH_TOKEN / WORKBUDDY_REFRESH_TOKEN_1/2…：插件 OAuth refresh_token（优先凭据）。
+    每次运行先换新 access_token（60 天）再签到，轮换出的新 refresh_token（90 天）经 gh 回写
+    Secret 滚动保活；换取方式见 scripts/workbuddy_device_login.py
+  - WORKBUDDY_COOKIE / WORKBUDDY_cookie：浏览器会话 Cookie（兜底凭据，7 天硬上限）
   - WORKBUDDY_WAIT_TRAVEL：是否开启放风动态等待并自动回访领奖（默认 true，如设为 false 则仅输出当前倒计时）
   - QSTASH_URL / QSTASH_TOKEN：QStash 延时发布服务凭证（放风时通过延时 Webhook 触发下一轮接力）
   - GH_PAT：GitHub Personal Access Token with Actions: write，用于 repository_dispatch（未配置时脚本静默跳过）
@@ -35,6 +38,8 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -45,6 +50,18 @@ from common import Http, env, env_bool, env_seq, is_already_signed, main_guard, 
 
 PREFIX = "WORKBUDDY_"
 BASE_URL = "https://www.workbuddy.cn"
+# 插件 OAuth（realm=copilot）：refresh_token 换新端点。社区逆向（wb2api /
+# workbuddy-switch）证实：X-Refresh-Token 头换新、响应轮换新 refresh_token；
+# 唯一失效方式是闲置数天被服务端清理（12153 invalid_grant）→ 每次签到即刷新保活。
+PLUGIN_REFRESH_URL = "https://www.codebuddy.cn/v2/plugin/auth/token/refresh"
+PLUGIN_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/plain, */*",
+    "X-Requested-With": "XMLHttpRequest",
+    "Origin": "https://www.codebuddy.cn",
+    "Referer": "https://www.codebuddy.cn/",
+    "User-Agent": "CLI/2.63.2 CodeBuddy/2.63.2",
+}
 
 BASE_HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -54,6 +71,75 @@ BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0",
     "x-client-platform": "web",
 }
+
+
+def _is_access_token(cred: str) -> bool:
+    """凭据是插件 OAuth access_token（JWT）还是浏览器会话 Cookie。"""
+    return cred.startswith("eyJ") and cred.count(".") == 2
+
+
+def _base_auth_headers(cred: str, referer: str = f"{BASE_URL}/profile/growth-center") -> Dict[str, str]:
+    """构造鉴权请求头：token 模式用 Bearer，cookie 模式用 Cookie。"""
+    headers = dict(BASE_HEADERS)
+    headers["Referer"] = referer
+    if _is_access_token(cred):
+        headers["Authorization"] = f"Bearer {cred}"
+    else:
+        headers["Cookie"] = cred
+    return headers
+
+
+def _refresh_access_token(h: Http, refresh_token: str) -> Tuple[str, str]:
+    """用 refresh_token 换新凭据，返回 (access_token, 轮换后的新 refresh_token)。
+
+    实测（2026-08-30）：access_token 60 天、refresh_token 90 天，每次刷新轮换；
+    401/12153 invalid_grant = refresh 会话被清理或失效，需重跑设备码登录。
+    """
+    resp = h.request(
+        "POST",
+        PLUGIN_REFRESH_URL,
+        headers={**PLUGIN_HEADERS, "X-Refresh-Token": refresh_token, "X-Auth-Refresh-Source": "workbuddy"},
+        json_data={},
+    )
+    try:
+        j = resp.json({})
+    except Exception:
+        raise RuntimeError(f"refresh_token 换新异常（HTTP {resp.code}）")
+    data = j.get("data") or {}
+    if j.get("code") != 0 or not data.get("accessToken"):
+        msg = str(j.get("msg") or resp.code)
+        raise RuntimeError(
+            f"refresh_token 续期失败（code={j.get('code')} msg={msg}）。"
+            "refresh 会话可能闲置被清理或已失效，请重新运行 scripts/workbuddy_device_login.py 换取新凭据"
+        )
+    return str(data["accessToken"]), str(data.get("refreshToken") or refresh_token)
+
+
+def _persist_refresh_token(idx: int, new_token: str) -> str:
+    """把轮换后的 refresh_token 回写 GitHub Secret（滚动保活）。
+
+    通过 gh CLI（GH_PAT/GH_TOKEN 鉴权）。失败不阻塞签到：Keycloak 默认不吊销
+    旧 offline token，旧票在过期前仍可用；但长期不回写会导致滚动断链，由
+    secret_age 的「凭据已 N 天未滚动」黄牌兜底提醒。
+    """
+    if new_token == (env(PREFIX, "refresh_token", required=False) or ""):
+        return ""
+    repo = os.getenv("GITHUB_REPO") or os.getenv("GITHUB_REPOSITORY") or ""
+    pat = os.getenv("GH_PAT") or os.getenv("GH_TOKEN") or ""
+    if not (repo and pat and shutil.which("gh")):
+        return "（未配置 GH_PAT/gh，refresh_token 未滚动回写）"
+    try:
+        run_env = dict(os.environ)
+        run_env["GH_TOKEN"] = pat
+        proc = subprocess.run(
+            ["gh", "secret", "set", f"WORKBUDDY_REFRESH_TOKEN_{idx}", "--body", new_token, "--repo", repo],
+            env=run_env, capture_output=True, text=True, timeout=90,
+        )
+        if proc.returncode == 0:
+            return f"🔑 refresh_token 已滚动回写（WORKBUDDY_REFRESH_TOKEN_{idx}）"
+        return f"⚠️ refresh_token 回写失败：{(proc.stderr or '').strip()[:80]}"
+    except Exception as exc:  # noqa: BLE001
+        return f"⚠️ refresh_token 回写异常：{exc}"
 
 
 def _parse_cookies(raw: str) -> List[str]:
@@ -113,21 +199,20 @@ def _safe_session_dump(session_data: Dict[str, Any]) -> str:
     return json.dumps(redacted, ensure_ascii=False)
 
 
-def _get_account_info(h: Http, cookie: str) -> Tuple[str, str]:
+def _get_account_info(h: Http, cred: str) -> Tuple[str, str]:
     """获取用户信息，返回 (uid, nickname)。"""
-    headers = dict(BASE_HEADERS)
-    headers["Cookie"] = cookie
-    # 调试日志脱敏：绝不打印 Cookie 等敏感头
+    headers = _base_auth_headers(cred)
+    # 调试日志脱敏：绝不打印 Cookie/Authorization 等敏感头
     safe_headers = {k: ("<redacted>" if k.lower() in ("cookie", "authorization", "x-api-key") else v)
                     for k, v in headers.items()}
     _dbg(f"[workbuddy] _get_account_info 请求头: {json.dumps(safe_headers, ensure_ascii=False, indent=2)}")
     resp = h.request("GET", f"{BASE_URL}/console/accounts", headers=headers)
     if resp.code in (401, 403):
-        raise RuntimeError(f"Cookie 已失效（HTTP {resp.code}），请重新登录并更新 Cookie")
+        raise RuntimeError(f"鉴权已失效（HTTP {resp.code}），请重新登录更新 Cookie 或重跑 workbuddy_device_login.py")
     if resp.code in (301, 302, 303, 307, 308):
         # 补重定向目标(仅路径,去 query 防泄露 token),便于确认是被导向登录页而非其他异常端点
         loc = (resp.headers.get("Location", "?") or "?").split("?")[0]
-        raise RuntimeError(f"Cookie 已失效（HTTP {resp.code} 重定向至 {loc}），请重新登录并更新 Cookie")
+        raise RuntimeError(f"鉴权已失效（HTTP {resp.code} 重定向至 {loc}），请重新登录更新凭据")
     if resp.code != 200:
         raise RuntimeError(f"获取账号信息失败：HTTP {resp.code}")
 
@@ -143,9 +228,9 @@ def _get_account_info(h: Http, cookie: str) -> Tuple[str, str]:
     return "", "用户"
 
 
-def _init_conversations_headers(cookie: str) -> Dict[str, str]:
+def _init_conversations_headers(cred: str) -> Dict[str, str]:
     """对话任务专用请求头。"""
-    return {
+    headers = {
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
         "Content-Type": "application/json",
@@ -153,17 +238,21 @@ def _init_conversations_headers(cookie: str) -> Dict[str, str]:
         "Referer": "https://www.workbuddy.cn/console/agents",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0",
         "x-client-platform": "web",
-        "Cookie": cookie,
     }
+    if _is_access_token(cred):
+        headers["Authorization"] = f"Bearer {cred}"
+    else:
+        headers["Cookie"] = cred
+    return headers
 
 
-def _create_conversation(h: Http, cookie: str) -> Dict[str, Any]:
+def _create_conversation(h: Http, cred: str) -> Dict[str, Any]:
     """创建 AI 对话任务，返回 conversation 数据。
 
     POST /console/as/conversations/
     Body: {"prompt":"hi","model":"auto","plugins":[{"name":"weixinpay","marketplace":"codebuddy-builtin"}]}
     """
-    headers = _init_conversations_headers(cookie)
+    headers = _init_conversations_headers(cred)
     resp = h.request(
         "POST",
         f"{BASE_URL}/console/as/conversations/",
@@ -182,12 +271,12 @@ def _create_conversation(h: Http, cookie: str) -> Dict[str, Any]:
 
 
 
-def _get_conversation_session(h: Http, cookie: str, conversation_id: str) -> Dict[str, Any]:
+def _get_conversation_session(h: Http, cred: str, conversation_id: str) -> Dict[str, Any]:
     """获取对话的 session 配置（包含 e2bEndpoint 等）。
 
     GET /console/as/conversations/{conversation_id}/session
     """
-    headers = _init_conversations_headers(cookie)
+    headers = _init_conversations_headers(cred)
     resp = h.request("GET", f"{BASE_URL}/console/as/conversations/{conversation_id}/session", headers=headers)
     if resp.code != 200:
         return {}
@@ -342,16 +431,14 @@ def _acp_call(h: Http, acp_url: str, conn_id: str, method: str, params: Dict[str
     return _open()
 
 
-def _daily_meter_checkin(h: Http, cookie: str) -> Tuple[str, bool]:
+def _daily_meter_checkin(h: Http, cred: str) -> Tuple[str, bool]:
     """算力中心每日签到（确定性主逻辑，直接调用 API，不依赖 AI 对话）。
 
     早期版本即采用此方式：POST /billing/meter/daily-checkin 自包含地领取每日算力与连签天数。
     AI 对话仅作为辅助激活，真正的签到以本调用为准。
     返回 (描述文案, 是否签到成功)。
     """
-    headers = dict(BASE_HEADERS)
-    headers["Cookie"] = cookie
-    headers["Referer"] = f"{BASE_URL}/profile/plans-usage"
+    headers = _base_auth_headers(cred, referer=f"{BASE_URL}/profile/plans-usage")
     resp = h.request("POST", f"{BASE_URL}/billing/meter/daily-checkin", headers=headers, json_data={})
     data = resp.json({}) if resp.code in (200, 400) else {}
     code = data.get("code")
@@ -368,13 +455,13 @@ def _daily_meter_checkin(h: Http, cookie: str) -> Tuple[str, bool]:
     return f"签到返回：{msg or '未知'}", False
 
 
-def _run_conversation_and_wait(h: Http, cookie: str, timeout_seconds: int = 240) -> Tuple[str, bool]:
+def _run_conversation_and_wait(h: Http, cred: str, timeout_seconds: int = 240) -> Tuple[str, bool]:
     """创建对话任务 -> 通过 ACP 发送 prompt -> 等待 AI 完成 -> 轮询签到状态。
 
     返回 (描述文字, 是否签到成功)。
     """
     # 1. 创建 conversation
-    conv = _create_conversation(h, cookie)
+    conv = _create_conversation(h, cred)
     conv_id = conv.get("id")
     if not conv_id:
         _dbg("[workbuddy] 创建对话任务失败，无法激活签到面板")
@@ -383,7 +470,7 @@ def _run_conversation_and_wait(h: Http, cookie: str, timeout_seconds: int = 240)
     _dbg(f"[workbuddy] 对话任务已创建，conversation_id={conv_id}")
 
     # 2. 获取 session 信息
-    session_data = _get_conversation_session(h, cookie, conv_id)
+    session_data = _get_conversation_session(h, cred, conv_id)
     e2b_endpoint = session_data.get("e2bEndpoint", "")
     session_id = session_data.get("sessionId", conv_id)
     if not e2b_endpoint:
@@ -451,7 +538,7 @@ def _run_conversation_and_wait(h: Http, cookie: str, timeout_seconds: int = 240)
     _dbg(f"[workbuddy] 对话任务已创建并发送 prompt (conversation ID: {conv_id})，等待 AI 完成...")
 
     # 5. 轮询签到状态
-    headers = _init_conversations_headers(cookie)
+    headers = _init_conversations_headers(cred)
     headers["Referer"] = f"{BASE_URL}/app/task/{conv_id}"
 
     start = time.time()
@@ -523,10 +610,9 @@ def _run_conversation_and_wait(h: Http, cookie: str, timeout_seconds: int = 240)
     return f"轮询超时 ({timeout_seconds}s)，无法获知签到状态", False
 
 
-def _get_growth_profile(h: Http, cookie: str) -> Dict[str, Any]:
+def _get_growth_profile(h: Http, cred: str) -> Dict[str, Any]:
     """获取成长等级与任务进度。"""
-    headers = dict(BASE_HEADERS)
-    headers["Cookie"] = cookie
+    headers = _base_auth_headers(cred)
     resp = h.request("GET", f"{BASE_URL}/v2/activity/growth/profile", headers=headers)
     if resp.code != 200:
         return {}
@@ -534,13 +620,12 @@ def _get_growth_profile(h: Http, cookie: str) -> Dict[str, Any]:
     return data.get("data", {}) if data.get("code") == 0 else {}
 
 
-def _redeem_rewards(h: Http, cookie: str) -> Tuple[str, int]:
+def _redeem_rewards(h: Http, cred: str) -> Tuple[str, int]:
     """活动一：检查连登档位并执行兑换。
 
     返回: (描述文字, 新增抽奖机会数)
     """
-    headers = dict(BASE_HEADERS)
-    headers["Cookie"] = cookie
+    headers = _base_auth_headers(cred)
 
     resp = h.request("GET", f"{BASE_URL}/activity/growth/streak", headers=headers)
     if resp.code != 200:
@@ -614,10 +699,9 @@ def _redeem_rewards(h: Http, cookie: str) -> Tuple[str, int]:
         return f"{streak_desc} (未到兑换档位)", 0
 
 
-def _draw_lottery(h: Http, cookie: str) -> str:
+def _draw_lottery(h: Http, cred: str) -> str:
     """活动一：查询抽奖剩余次数，并自动执行抽奖（次数为 0 时跳过）。"""
-    headers = dict(BASE_HEADERS)
-    headers["Cookie"] = cookie
+    headers = _base_auth_headers(cred)
 
     # 查询剩余抽奖次数（chances/summary 双接口兜底）
     resp = h.request("GET", f"{BASE_URL}/activity/growth/lottery/chances", headers=headers)
@@ -754,15 +838,14 @@ def _handle_traveling(h: Http, headers: Dict[str, str], travel_data: Dict[str, A
     )
 
 
-def _process_travel(h: Http, cookie: str, wait_travel: bool = True) -> str:
+def _process_travel(h: Http, cred: str, wait_travel: bool = True) -> str:
     """活动二：动态跟踪放风并自动回访领取礼物（含猫咪来信）。
 
     同一天内若放风额度未用完（daily_limit_reached=False），领取上一场礼物后会继续派遣下一场，
     形成「领取 → 再出发 →（下个 CI run 领取）」的链路，直到当天放风次数达上限，当天任务即完成。
     不依赖硬编码时长，完全基于接口返回的 (arrive_at - server_now) 动态等待并回访。
     """
-    headers = dict(BASE_HEADERS)
-    headers["Cookie"] = cookie
+    headers = _base_auth_headers(cred)
 
     actions: List[str] = []
     # 同一场次（一次到达）的奖励只领取一次，避免接口在领取后仍未清掉 arrived 态时重复领奖
@@ -848,10 +931,9 @@ def _process_travel(h: Http, cookie: str, wait_travel: bool = True) -> str:
     return " | ".join(actions) if actions else "状态：idle"
 
 
-def _get_energy(h: Http, cookie: str) -> Dict[str, Any]:
+def _get_energy(h: Http, cred: str) -> Dict[str, Any]:
     """获取能量数据。"""
-    headers = dict(BASE_HEADERS)
-    headers["Cookie"] = cookie
+    headers = _base_auth_headers(cred)
     resp = h.request("GET", f"{BASE_URL}/activity/growth/energy", headers=headers)
     if resp.code != 200:
         return {}
@@ -859,10 +941,9 @@ def _get_energy(h: Http, cookie: str) -> Dict[str, Any]:
     return data.get("data", {}) if data.get("code") == 0 else {}
 
 
-def _get_buddy_quota(h: Http, cookie: str) -> Dict[str, Any]:
+def _get_buddy_quota(h: Http, cred: str) -> Dict[str, Any]:
     """获取猫咪开启配额。"""
-    headers = dict(BASE_HEADERS)
-    headers["Cookie"] = cookie
+    headers = _base_auth_headers(cred)
     resp = h.request("GET", f"{BASE_URL}/activity/growth/buddy/quota", headers=headers)
     if resp.code != 200:
         return {}
@@ -870,10 +951,9 @@ def _get_buddy_quota(h: Http, cookie: str) -> Dict[str, Any]:
     return data.get("data", {}) if data.get("code") == 0 else {}
 
 
-def _get_badges(h: Http, cookie: str) -> Tuple[int, int]:
+def _get_badges(h: Http, cred: str) -> Tuple[int, int]:
     """获取徽章数量，返回 (已获得数, 总数)。"""
-    headers = dict(BASE_HEADERS)
-    headers["Cookie"] = cookie
+    headers = _base_auth_headers(cred)
     resp = h.request("GET", f"{BASE_URL}/v2/activity/growth/badges", headers=headers)
     if resp.code != 200:
         return 0, 0
@@ -894,7 +974,7 @@ def _now_beijing_str() -> str:
         return ""
 
 
-def _get_user_resource(h: Http, cookie: str) -> Dict[str, Any]:
+def _get_user_resource(h: Http, cred: str) -> Dict[str, Any]:
     """获取账号算力（积分）余额。
 
     直接用服务端在响应里算好的 `TotalDosage` 作为余额，不做本地累加。
@@ -902,8 +982,7 @@ def _get_user_resource(h: Http, cookie: str) -> Dict[str, Any]:
     因此这里先列出全部资源包、剔除该类型后，再用其 PackageCode 二次查询，
     取服务端返回的 TotalDosage 作为真实可用余额。
     """
-    headers = dict(BASE_HEADERS)
-    headers["Cookie"] = cookie
+    headers = _base_auth_headers(cred)
     base_body = {
         "PageNumber": 1,
         "PageSize": 200,
@@ -956,48 +1035,48 @@ def _get_user_resource(h: Http, cookie: str) -> Dict[str, Any]:
         return {}
 
 
-def _run_one(cookie: str, idx: int, total: int, wait_travel: bool) -> Tuple[bool, str]:
+def _run_one(cred: str, idx: int, total: int, wait_travel: bool) -> Tuple[bool, str]:
     """执行单个账号的完整独立流程。"""
     h = Http()
 
     # 1. 用户信息与成长等级
-    uid, nickname = _get_account_info(h, cookie)
-    profile = _get_growth_profile(h, cookie)
+    uid, nickname = _get_account_info(h, cred)
+    profile = _get_growth_profile(h, cred)
     level_name = profile.get("level_name") or f"LV.{profile.get('level', 1)}"
     completed = profile.get("completed", 0)
     total_tasks = profile.get("total", 0)
     task_progress = f"任务 {completed}/{total_tasks}" if total_tasks else ""
 
     # 2. 算力中心每日签到（确定性主逻辑：直接调用 API）
-    daily_msg, daily_ok = _daily_meter_checkin(h, cookie)
+    daily_msg, daily_ok = _daily_meter_checkin(h, cred)
 
     # 3. AI 对话任务（辅助激活签到面板，尽力而为，不阻塞主流程）
     # 主 API 签到已成功时缩短轮询：辅助通道价值有限，省时间给兑换/抽奖/放风链路
     conv_timeout = 45 if daily_ok else 120
-    conv_msg, conv_ok = _run_conversation_and_wait(h, cookie, timeout_seconds=conv_timeout)
+    conv_msg, conv_ok = _run_conversation_and_wait(h, cred, timeout_seconds=conv_timeout)
     checkin_ok = daily_ok or conv_ok
     # AI 对话是辅助通道：主 API 签到已成功时不把辅助通道的超时噪音带进摘要
     #（避免「签到成功｜超时」这种读起来像报错的组合），仅主通道失败时附详情排查
     checkin_msg = daily_msg if daily_ok else f"{daily_msg}｜AI对话：{conv_msg}"
 
     # 3. 活动一：连登兑换与抽奖追踪（取决于签到是否达成）
-    redeem_msg, _ = _redeem_rewards(h, cookie)
-    lottery_msg = _draw_lottery(h, cookie)
+    redeem_msg, _ = _redeem_rewards(h, cred)
+    lottery_msg = _draw_lottery(h, cred)
 
     # 4. 活动二：动态跟踪放风时间与自动回访领奖
-    travel_msg = _process_travel(h, cookie, wait_travel=wait_travel)
+    travel_msg = _process_travel(h, cred, wait_travel=wait_travel)
 
     # 5. 资产统计
-    energy = _get_energy(h, cookie)
+    energy = _get_energy(h, cred)
     energy_bal = energy.get("balance", 0)
-    quota = _get_buddy_quota(h, cookie)
+    quota = _get_buddy_quota(h, cred)
     quota_bal = quota.get("balance", 0)
-    earned_badges, total_badges = _get_badges(h, cookie)
+    earned_badges, total_badges = _get_badges(h, cred)
     badge_str = f"{earned_badges}/{total_badges}" if total_badges else str(earned_badges)
 
     # 6. 积分（算力）余额
     # 直接取服务端在响应里算好的 TotalDosage（已按前端口径剔除「个人体验版」等非周期额度包），即为真实可用余额
-    resource = _get_user_resource(h, cookie)
+    resource = _get_user_resource(h, cred)
     total_dosage = resource.get("TotalDosage")
     if total_dosage is not None:
         try:
@@ -1024,23 +1103,60 @@ def _run_one(cookie: str, idx: int, total: int, wait_travel: bool) -> Tuple[bool
     return checkin_ok, "\n".join(lines)
 
 
+def _resolve_credential(h: Http, idx: int, refresh_token: str, cookie: str) -> Tuple[str, List[str]]:
+    """解析单账号凭据：refresh_token 优先（换新+滚动回写），Cookie 兜底。
+
+    返回 (cred, notes)。refresh 续期失败但配置了 Cookie 时回退（不中断签到），
+    续期错误文案进入 notes（alert_levels 据此判黄色「续期失败请检查」）。
+    """
+    notes: List[str] = []
+    if refresh_token:
+        try:
+            cred, new_rt = _refresh_access_token(h, refresh_token)
+            persist_note = _persist_refresh_token(idx, new_rt)
+            if persist_note:
+                notes.append(persist_note)
+            return cred, notes
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"⚠️ {exc}")
+            if not cookie:
+                raise
+            notes.append("已回退 Cookie 凭据（7 天硬上限，请尽快重跑 workbuddy_device_login.py）")
+    if not cookie:
+        raise RuntimeError(
+            f"缺少 {PREFIX}REFRESH_TOKEN_{idx}/{PREFIX}COOKIE_{idx}（secret 未配置或为空），"
+            "请运行 scripts/workbuddy_device_login.py 获取 refresh_token 或粘贴浏览器 Cookie"
+        )
+    return cookie, notes
+
+
 def main():
     print("【WorkBuddy 签到与成长中心】")
-    cookies = env_seq(PREFIX, "cookie", required=True)
-    if not cookies:
-        raise RuntimeError(f"未配置有效 Cookie，请检查 {PREFIX}COOKIE_1 或 {PREFIX}COOKIE")
+    cookies = env_seq(PREFIX, "cookie", required=False)
+    refresh_tokens = env_seq(PREFIX, "refresh_token", required=False)
+    if not cookies and not refresh_tokens:
+        raise RuntimeError(
+            f"缺少 {PREFIX}REFRESH_TOKEN_1/{PREFIX}COOKIE_1（secret 未配置或为空），"
+            "请运行 scripts/workbuddy_device_login.py 获取 refresh_token 或粘贴浏览器 Cookie"
+        )
 
     # 默认开启动态放风跟踪与自动回访领奖
     wait_travel = os.getenv("WORKBUDDY_WAIT_TRAVEL", "true").lower() in ("true", "1", "yes")
 
-    total = len(cookies)
+    total = max(len(refresh_tokens), len(cookies))
     if total > 1:
         print(f"共发现 {total} 个账号，开始依次独立执行与动态回访...")
 
     results = []
-    for idx, cookie in enumerate(cookies, 1):
+    for idx in range(1, total + 1):
+        refresh_token = refresh_tokens[idx - 1] if idx <= len(refresh_tokens) else ""
+        cookie = cookies[idx - 1] if idx <= len(cookies) else ""
         try:
-            ok, msg = _run_one(cookie, idx, total, wait_travel=wait_travel)
+            h = Http()
+            cred, notes = _resolve_credential(h, idx, refresh_token, cookie)
+            for note in notes:
+                print(f"[{idx}/{total}] {note}" if total > 1 else note)
+            ok, msg = _run_one(cred, idx, total, wait_travel=wait_travel)
             if ok:
                 _DEBUG_LINES.clear()  # 成功：丢弃过程日志，保持邮件卡片干净
             else:

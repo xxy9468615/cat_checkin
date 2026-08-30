@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""secret_age 自检：硬寿命凭据年龄预警（compute_warns 纯函数 + build_report 联动）。
+"""secret_age 自检：凭据年龄预警（hard/rolling 两型 + build_report 联动）。
 
 用法：python3 scripts/tests/test_secret_age.py
 """
@@ -28,47 +28,48 @@ def iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# --- compute_warns：新鲜凭据不提示 ---
-fresh = secret_age.compute_warns(
-    {"WORKBUDDY_COOKIE_1": iso(NOW - timedelta(days=2)), "WORKBUDDY_COOKIE_2": iso(NOW - timedelta(days=3))},
-    NOW,
+# --- rolling 型（真实注册表：WORKBUDDY_REFRESH_TOKEN_*，阈值 3 天）---
+fresh = secret_age.compute_warns({"WORKBUDDY_REFRESH_TOKEN_1": iso(NOW - timedelta(days=1))}, NOW)
+check("rolling 新鲜(1天)无预警", fresh == [], f"got {fresh}")
+
+stale = secret_age.compute_warns(
+    {"WORKBUDDY_REFRESH_TOKEN_2": iso(NOW - timedelta(days=3, hours=2))}, NOW
 )
-check("新鲜凭据(2/3天)无预警", fresh == [], f"got {fresh}")
+check("rolling 超阈值(3天未滚动)预警", len(stale) == 1 and stale[0]["kind"] == "rolling", f"got {stale}")
+check("rolling 文案含断链提示", stale and "滚动" in secret_age.format_warn(stale[0]) and "workbuddy" in secret_age.format_warn(stale[0]))
+check("rolling 徽标含未滚动天数", stale and "未滚动" in secret_age.format_chip(stale[0]))
 
-# --- 剩 ≤1 天 → 非过期预警 ---
-near = secret_age.compute_warns({"WORKBUDDY_COOKIE_1": iso(NOW - timedelta(days=6, hours=3))}, NOW)
-check("剩 0.9 天产出 1 条预警", len(near) == 1, f"got {near}")
-check("非过期标记", near and near[0]["expired"] is False)
-check("secret 名正确", near and near[0]["secret"] == "WORKBUDDY_COOKIE_1")
-check("预警含账号名与重登指引", near and "WorkBuddy 账号1" in secret_age.format_warn(near[0]) and "重新登录" in secret_age.format_warn(near[0]))
+edge = secret_age.compute_warns({"WORKBUDDY_REFRESH_TOKEN_1": iso(NOW - timedelta(days=2, hours=20))}, NOW)
+check("rolling 阈值内(2.8天)不预警", edge == [], f"got {edge}")
 
-# --- 超过 7 天 → 过期预警 ---
-dead = secret_age.compute_warns({"WORKBUDDY_COOKIE_2": iso(NOW - timedelta(days=7, minutes=1))}, NOW)
-check("超 7 天标记 expired", dead and dead[0]["expired"] is True, f"got {dead}")
-check("过期文案含硬上限", dead and "硬上限" in secret_age.format_warn(dead[0]))
+missing = secret_age.compute_warns({"WORKBUDDY_REFRESH_TOKEN_2": ""}, NOW)
+check("空 updated_at 跳过", missing == [], f"got {missing}")
 
-# --- 剩 1.5 天 → 不提示 ---
-edge_out = secret_age.compute_warns({"WORKBUDDY_COOKIE_1": iso(NOW - timedelta(days=5, hours=12))}, NOW)
-check("剩 1.5 天不提示", edge_out == [], f"got {edge_out}")
+# --- hard 型（合成注册表：剩 ≤1 天 / 过期 / 新鲜）---
+SAVED = dict(secret_age.CREDENTIAL_LIFETIMES)
+try:
+    secret_age.CREDENTIAL_LIFETIMES.clear()
+    secret_age.CREDENTIAL_LIFETIMES.update({
+        "HARD_COOKIE_1": ("合成账号", 7),
+    })
+    near = secret_age.compute_warns({"HARD_COOKIE_1": iso(NOW - timedelta(days=6, hours=3))}, NOW)
+    check("hard 剩 0.9 天预警", len(near) == 1 and near[0]["kind"] == "hard" and near[0]["expired"] is False, f"got {near}")
+    check("hard 预警含账号名与重登指引", near and "合成账号" in secret_age.format_warn(near[0]) and "重新登录" in secret_age.format_warn(near[0]))
+    dead = secret_age.compute_warns({"HARD_COOKIE_1": iso(NOW - timedelta(days=7, minutes=1))}, NOW)
+    check("hard 超 7 天标记 expired", dead and dead[0]["expired"] is True and "硬上限" in secret_age.format_warn(dead[0]))
+    edge_out = secret_age.compute_warns({"HARD_COOKIE_1": iso(NOW - timedelta(days=5, hours=12))}, NOW)
+    check("hard 剩 1.5 天不提示", edge_out == [], f"got {edge_out}")
+    bad = secret_age.compute_warns({"HARD_COOKIE_1": "not-a-date"}, NOW)
+    check("坏时间戳跳过", bad == [], f"got {bad}")
+    mixed = secret_age.compute_warns({"HARD_COOKIE_1": iso(NOW - timedelta(days=7, minutes=1))}, NOW)
+    half = secret_age.format_warn({"title": "合成账号", "secret": "HARD_COOKIE_1", "remaining_days": 0.3, "lifetime_days": 7, "expired": False, "kind": "hard"})
+    check("hard 剩 <0.5 天文案", "不足半天" in half, half)
+finally:
+    secret_age.CREDENTIAL_LIFETIMES.clear()
+    secret_age.CREDENTIAL_LIFETIMES.update(SAVED)
 
-# --- 缺失/坏时间戳/naive 时间 ---
-mixed = secret_age.compute_warns(
-    {"WORKBUDDY_COOKIE_1": "not-a-date", "WORKBUDDY_COOKIE_2": iso(NOW - timedelta(days=6, hours=12))}, NOW
-)
-check("坏时间戳跳过 + naive 视为 UTC", len(mixed) == 1 and mixed[0]["secret"] == "WORKBUDDY_COOKIE_2", f"got {mixed}")
-
-# --- 排序：最紧急在前 ---
-two = secret_age.compute_warns(
-    {"WORKBUDDY_COOKIE_1": iso(NOW - timedelta(days=6, hours=2)), "WORKBUDDY_COOKIE_2": iso(NOW - timedelta(days=7, hours=1))},
-    NOW,
-)
-check("过期排在最前", len(two) == 2 and two[0]["expired"] and not two[1]["expired"], f"got {[e['expired'] for e in two]}")
-
-# --- 文案分支：剩不足半天 ---
-half = secret_age.format_warn({"title": "WorkBuddy 账号2", "secret": "WORKBUDDY_COOKIE_2", "remaining_days": 0.3, "lifetime_days": 7, "expired": False})
-check("剩 <0.5 天文案", "不足半天" in half, half)
-chip = secret_age.format_chip({"title": "WorkBuddy 账号2", "secret": "WORKBUDDY_COOKIE_2", "remaining_days": 0.3, "lifetime_days": 7, "expired": False})
-check("徽标短文案", "≤半天" in chip and "WorkBuddy 账号2" in chip, chip)
+chip_hard = secret_age.format_chip({"title": "合成账号", "secret": "HARD_COOKIE_1", "remaining_days": 0.3, "lifetime_days": 7, "expired": False, "kind": "hard"})
+check("hard 徽标短文案", "≤半天" in chip_hard and "合成账号" in chip_hard, chip_hard)
 
 # --- 端到端：build_report 注入凭据预警（头部 🟡 计数 + 独立提醒块） ---
 try:
@@ -77,14 +78,14 @@ try:
     orig = daily_report.secret_age.credential_age_warns
     try:
         daily_report.secret_age.credential_age_warns = lambda: [
-            {"title": "WorkBuddy 账号1", "secret": "WORKBUDDY_COOKIE_1", "remaining_days": 0.8, "lifetime_days": 7, "expired": False}
+            {"title": "WorkBuddy 账号1", "secret": "WORKBUDDY_REFRESH_TOKEN_1", "remaining_days": -0.1, "lifetime_days": 3, "kind": "rolling", "age_days": 3.1, "expired": False}
         ]
         header, text, fail_n = daily_report.build_report(
             [(True, BASE / "workbuddy.py", "签到成功 +5", 1.0, "WorkBuddy 账号1")]
         )
         check(
             "build_report 端到端：[🟡 1项注意] + 凭据寿命提醒块 + 不计失败",
-            "[🟡 1项注意]" in header and "凭据寿命提醒" in text and "重新登录" in text and fail_n == 0,
+            "[🟡 1项注意]" in header and "凭据寿命提醒" in text and fail_n == 0,
             f"header={header!r}",
         )
         # 预警为空时不渲染提醒块
