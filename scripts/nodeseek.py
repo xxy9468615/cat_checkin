@@ -145,12 +145,23 @@ def _run_account(idx: int, total: int, cookie: str, proxy: str, random_bonus: bo
     last_err = ""
     for i, px in enumerate(candidates or [""]):
         tag = mask_str(px, 6, 3) if px else "直连"
-        try:
-            h = Http(follow_redirects=True, proxy=px)
-            resp = _request_attendance(h, url, headers, px)
-        except Exception as exc:  # noqa: BLE001
-            last_err = f"{tag}: {type(exc).__name__} {str(exc)[:60]}"
-            print(f"[diag] 出口不可用({i + 1}/{len(candidates) or 1}) {tag}: {type(exc).__name__}")
+        # 同出口瞬断重试：TUN/节点抖动常在 TLS 层报错（连接没建成，CF 看不到，
+        # 重试不会被计为探测）；403 是 CF 的完整应答，重试无意义不重试
+        for attempt in range(1, 4):
+            try:
+                h = Http(follow_redirects=True, proxy=px)
+                resp = _request_attendance(h, url, headers, px)
+                break
+            except Exception as exc:  # noqa: BLE001
+                detail = f"{type(exc).__name__}: {str(exc)[:80]}"
+                last_err = f"{tag}: {detail}"
+                if attempt < 3:
+                    print(f"[diag] 出口异常({i + 1}/{len(candidates) or 1}) {tag}: {detail}"
+                          f"，{attempt * 2}s 后重试({attempt}/2)")
+                    time.sleep(attempt * 2)
+                else:
+                    print(f"[diag] 出口不可用({i + 1}/{len(candidates) or 1}) {tag}: {detail}")
+        if resp is None:
             continue
         if resp.code == 403 and "Just a moment" in resp.text and i < len(candidates) - 1:
             last_err = f"{tag}: CF 403"

@@ -391,7 +391,10 @@ jobs:
             enable: true
             device: sb0
             stack: system
-            mtu: 1500
+            # 1280 而非 1500：curl_cffi chrome 指纹的 ClientHello 带 PQ 密钥共享
+            # (~1800B)，mtu 1500 时握手包超段被截断 → SSLError（裸 curl 不触发）；
+            # 降 MTU 让本地协议栈自行分段
+            mtu: 1280
             dns-hijack:
               - any:53
             auto-route: true
@@ -443,6 +446,9 @@ jobs:
               sleep 1
               return 1
             fi
+            cur_node=$(curl -sS -m 5 http://127.0.0.1:9090/proxies/PROXY \
+              | python3 -c "import json,sys; print(json.load(sys.stdin).get('now','?'))" 2>/dev/null || echo "?")
+            echo "mihomo pinned node: $cur_node, exit IP: $exit_ip"
             # TUN 模式无需 socks5 端口：两个代理变量全部清空，所有流量（含 nodeseek）
             # 经 TUN 从固定 TW-X1-3 出口走；住宅代理/其他节点一律不用
             echo "AGENTROUTER_PROXY=" >> "$GITHUB_ENV"
