@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -107,6 +108,17 @@ def _calc_cookie_expiry(cookie_str: str, state: Dict[str, Any]) -> Optional[int]
     return 45
 
 
+def _get_candidate_proxies() -> List[str]:
+    """解析候选代理列表（支持换行或逗号分隔，支持带注释）。"""
+    raw = os.getenv("SMZDM_PROXY") or os.getenv("SMZDM_BACKUP_PROXIES") or os.getenv("PROXY") or ""
+    res: List[str] = []
+    for line in raw.replace(",", "\n").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            res.append(line)
+    return res
+
+
 def _fetch_user_current(h: Http, cookie: str) -> Dict[str, Any]:
     """非阻断获取什么值得买当前登录用户信息。"""
     ts = int(time.time() * 1000)
@@ -147,10 +159,59 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
     if state.get("env_hash") == env_hash and state.get("cookie"):
         cur_cookie = str(state["cookie"]).strip()
 
-    h = Http(follow_redirects=True)
+    candidate_proxies = _get_candidate_proxies()
+    if not candidate_proxies:
+        candidate_proxies = [""]
 
-    # 1. 尝试获取用户信息（非阻断）
-    user_info_resp = _fetch_user_current(h, cur_cookie)
+    h: Optional[Http] = None
+    r_checkin = None
+    res_data: Dict[str, Any] = {}
+    used_proxy = ""
+
+    headers = {
+        "User-Agent": UA,
+        "Referer": "https://zhiyou.smzdm.com/user/",
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Cookie": cur_cookie,
+    }
+
+    # 1. 尝试通过候选出口（代理/直连）发起签到
+    for p in candidate_proxies:
+        cur_h = Http(follow_redirects=True, proxy=p)
+        ts = int(time.time() * 1000)
+        checkin_url = f"https://zhiyou.smzdm.com/user/checkin/jsonp_checkin?_={ts}"
+        r = cur_h.request("GET", checkin_url, headers=headers, timeout=20)
+        if r.code == 200:
+            parsed = _extract_jsonp(r.text)
+            if parsed:
+                h = cur_h
+                r_checkin = r
+                res_data = parsed
+                used_proxy = p
+                break
+        elif len(candidate_proxies) > 1:
+            p_label = p if len(p) < 30 else (p[:27] + "...")
+            print(f"⚠️ 代理 {p_label} 连接异常 (HTTP {r.code})，正在尝试备用出口...")
+
+    if not r_checkin:
+        # 若所有代理出口均失败，尝试直连兜底
+        if candidate_proxies != [""]:
+            print("⚠️ 所有代理均未接通，正在尝试直连兜底...")
+            cur_h = Http(follow_redirects=True, proxy="")
+            ts = int(time.time() * 1000)
+            r = cur_h.request("GET", f"https://zhiyou.smzdm.com/user/checkin/jsonp_checkin?_={ts}", headers=headers, timeout=20)
+            r_checkin = r
+            res_data = _extract_jsonp(r.text)
+            h = cur_h
+        else:
+            raise RuntimeError("网络请求异常：无法获取签到响应")
+
+    if r_checkin.code != 200:
+        raise RuntimeError(f"网络请求异常 HTTP [{r_checkin.code}]: {r_checkin.text[:100]}")
+
+    # 2. 尝试获取用户信息（非阻断）
+    user_info_resp = _fetch_user_current(h, cur_cookie) if h else {}
     user_data = user_info_resp.get("data", {}) if isinstance(user_info_resp, dict) else {}
     nickname = str(user_data.get("nickname") or user_data.get("smzdm_id") or init_uid or "")
     smzdm_id = str(user_data.get("smzdm_id") or init_uid or "")
@@ -166,24 +227,8 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
         else:
             expiry_tag = f" | 🔑 Cookie 剩余 {remaining_days} 天"
 
-    print(f"[{idx}/{total}] 👤 用户: 【{masked_name}】 (UID: {masked_id}){expiry_tag}")
-
-    # 2. 发起签到请求（直接 GET/POST 请求，以服务端响应判定）
-    ts = int(time.time() * 1000)
-    checkin_url = f"https://zhiyou.smzdm.com/user/checkin/jsonp_checkin?_={ts}"
-    headers = {
-        "User-Agent": UA,
-        "Referer": "https://zhiyou.smzdm.com/user/",
-        "Accept": "*/*",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Cookie": cur_cookie,
-    }
-
-    r_checkin = h.request("GET", checkin_url, headers=headers, timeout=30)
-    if r_checkin.code != 200:
-        raise RuntimeError(f"网络请求异常 HTTP [{r_checkin.code}]: {r_checkin.text[:100]}")
-
-    res_data = _extract_jsonp(r_checkin.text)
+    proxy_tag = f" | 🌐 代理出口: {used_proxy}" if used_proxy else ""
+    print(f"[{idx}/{total}] 👤 用户: 【{masked_name}】 (UID: {masked_id}){expiry_tag}{proxy_tag}")
     error_code = res_data.get("error_code")
     error_msg = str(res_data.get("error_msg") or "")
     data = res_data.get("data", {}) if isinstance(res_data.get("data"), dict) else {}

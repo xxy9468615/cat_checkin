@@ -215,6 +215,8 @@ jobs:
       SMZDM_COOKIE_1: ${{ secrets.SMZDM_COOKIE_1 || secrets.SMZDM_COOKIE }}
       SMZDM_COOKIE_2: ${{ secrets.SMZDM_COOKIE_2 }}
       SMZDM_COOKIE_3: ${{ secrets.SMZDM_COOKIE_3 }}
+      SMZDM_PROXY: ${{ secrets.SMZDM_PROXY }}
+      SMZDM_BACKUP_PROXIES: ${{ secrets.SMZDM_BACKUP_PROXIES }}
       QUARK_cookie: ${{ secrets.QUARK_COOKIE_1 || secrets.QUARK_COOKIE }}
       QUARK_COOKIE_1: ${{ secrets.QUARK_COOKIE_1 || secrets.QUARK_COOKIE }}
       QUARK_COOKIE_2: ${{ secrets.QUARK_COOKIE_2 }}
@@ -409,6 +411,8 @@ jobs:
               ip=$(curl -sS -x "socks5://127.0.0.1:$SSPORT" -m 8 https://api.ipify.org 2>/dev/null || echo "")
               if [ -n "$ip" ]; then
                 echo "SS proxy ready (pid $SSPID, port $SSPORT, exit $ip)"
+                echo "AGENTROUTER_PROXY=socks5://127.0.0.1:$SSPORT" >> "$GITHUB_ENV"
+                echo "NODESEEK_PROXY=socks5://127.0.0.1:$SSPORT" >> "$GITHUB_ENV"
                 stash_proxy_state sslocal "sslocal" "$ip" ""
                 return 0
               fi
