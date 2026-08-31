@@ -1,4 +1,9 @@
-# Local secrets / env files
+# ============================================================================
+# cat_checkin .gitignore
+# 规则顺序：secrets/env → 任务运行时状态 → 缓存/系统 → 抓包与本地资料
+# ============================================================================
+
+# ---- 环境变量 & secrets（永不提交）----
 .env
 .env.*
 *.env.local
@@ -6,63 +11,46 @@
 env.local
 .env.backup
 !.env.example
+*.secret
+*.secret.json
+*.key
+*.pem
+*.credentials
+*.password
+*.token
 
-# Local Claude Code state
-.claude/
+# ---- 任务运行时状态（通用规则，新任务无需再逐个登记）----
+# 各任务状态文件统一为 .{task}_state[_idx].json（含 .modelscope_{site}_state_{idx}.json 变体）
+.*_state*.json
+.notify_state_*.json
+.report_sent
+.task_results/
 
-# Runtime/cache files
+# ---- 缓存 / 系统文件 ----
 __pycache__/
 */__pycache__/
 *.pyc
 *.pyo
 *.log
 .DS_Store
-docs
-.task_results/
-.zcode/
-.report_sent
-.latvi_state.json
-.ai_router_state.json
-.agentrouter_state.json
-.cloudstudio_state*.json
-.2libra_state*.json
-.modelscope_state*.json
-.modelscope_*_state*.json
-.juejin_state*.json
-.alipan_state*.json
-.smzdm_state*.json
-.notify_state_*.json
-
-# WSL2 metadata
 *:Zone.Identifier
+.claude/
+.zcode/
 
-# HAR captures
-*.har
-
-# Test fixtures / local backups (never commit)
+# ---- 测试数据 / 本地备份 ----
 test_data/
 *.enc
 *.db
-
-# ============================================================================
-# 本地 ONLY - 永远不提交 (安全占位)
-# ============================================================================
-
-# 环境变量 & secrets
-*.secret
-*.key
-*.pem
-*.credentials
-*.password
-*.token
-*.secret.json
-
-# 备份文件
 *.bak
 *.backup
 *.old
+
+# ---- 抓包与本地资料（永不提交）----
+*.har
 s5.txt
-# 项目存档/旧版
+docs
+
+# ---- 本地文档 / 项目存档 ----
 archive/
 old/
 legacy/
@@ -71,4 +59,3 @@ CLAUDE.md
 ip检测接口.md
 IP_link_test/
 jp/
-.quark_state*.json
