@@ -470,7 +470,11 @@ jobs:
               type: select
               use: ["railgun"]
           rules:
-            - MATCH,PROXY
+            - DOMAIN-SUFFIX,air-outer.com,PROXY
+            - DOMAIN-SUFFIX,agentrouter.org,PROXY
+            - DOMAIN-SUFFIX,nodeseek.com,PROXY
+            - DOMAIN-SUFFIX,ipify.org,PROXY
+            - MATCH,DIRECT
           MHEOF
             pip install -q pysocks || { echo "pysocks install failed"; return 1; }
             pip install -q curl-cffi >/dev/null 2>&1 \

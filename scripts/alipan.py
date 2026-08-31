@@ -83,6 +83,7 @@ def _refresh_access_token(h: Http, refresh_token: str) -> Dict[str, Any]:
         "https://auth.alipan.com/v2/account/token",
         headers={"Content-Type": "application/json", "User-Agent": UA},
         json_data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+        timeout=30,
     )
     data: Dict[str, Any] = r.json({})
     if r.code == 200 and data.get("access_token"):
