@@ -116,19 +116,16 @@ def _run_one(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
 
     # 2. 获取用户信息与会话探测
     r_login = h.request("GET", f"{BASE_URL}/api/v2/users/login-info?device=desktop&t={nowms()}", headers=headers, timeout=30)
-    if r_login.code != 200:
-        raise RuntimeError(f"获取用户信息网络异常 (HTTP {r_login.code}): {r_login.text[:100]}")
-
-    login_text = r_login.text
+    login_text = r_login.text if r_login.code == 200 else ""
     uid = find(r'"id":\s*(\d+)', login_text)
     uuid = find(r'"uuid":\s*"([^"]+)"', login_text, "")
     username = find(r'"name":\s*"([^"]+)"', login_text, "?")
     start = find(r'"credits":\s*(\d+)', login_text, "?")
 
-    # 3. 会话过期处理：若未获取到 uid，尝试利用 SSO 凭据自动换票保活
+    # 3. 会话过期或异常处理：若未获取到 uid，尝试利用 SSO 凭据自动换票保活
     if not uid or not uuid:
         if has_sso:
-            print("🔄 论坛会话已过期，检测到 DJI SSO 长效通行证，正在执行自动换票保活...")
+            print("🔄 论坛会话未就绪或已过期，检测到 DJI SSO 长效通行证，正在执行自动换票保活...")
             ok, new_cookie, new_login = _try_sso_exchange(h, cur_cookie)
             if not ok and cur_cookie != raw_cookie:
                 # 滚动凭证换票失败时，回退到环境变量原始凭据重试
@@ -144,8 +141,12 @@ def _run_one(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
                 username = find(r'"name":\s*"([^"]+)"', login_text, "?")
                 start = find(r'"credits":\s*(\d+)', login_text, "?")
             else:
+                if r_login.code != 200:
+                    raise RuntimeError(f"获取用户信息网络异常 (HTTP {r_login.code}) 且 SSO 换票未通过: {r_login.text[:100]}")
                 raise RuntimeError("Cookie 已失效，且 SSO 换票未通过，请重新登录 bbs.dji.com 更新 DJI_cookie")
         else:
+            if r_login.code != 200:
+                raise RuntimeError(f"获取用户信息网络异常 (HTTP {r_login.code}): {r_login.text[:100]}")
             raise RuntimeError("Cookie 失效（login-info 未返回 uid/uuid，且未提供 _meta_key 长效凭据），请更新 DJI_cookie")
 
     # 4. 执行每日签到

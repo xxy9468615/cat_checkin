@@ -418,10 +418,10 @@ jobs:
             return 1
           }
 
-          # mihomo（订阅原生格式）TUN 透明接管：proxy-provider 按 filter 只加载
-          # TW-X1-3 单节点——CF clearance 绑定出口 IP，节点漂移/自动切换即触发质询，
-          # 禁止任何 failover；dns-hijack 由 mihomo 自带 DNS 模块处理；
-          # TUN 不可用时回退 sslocal socks5 链路（AGENTROUTER_SS_CONFIG 同为 TW-X1-3）
+          # mihomo（订阅原生格式）提供本地 SOCKS5/HTTP 混合代理端口（127.0.0.1:1080）：
+          # proxy-provider 按 filter 只加载 TW-X1-3 单节点——CF clearance 绑定出口 IP，
+          # 仅针对需要固定出口的 agentrouter 与 nodeseek 注入代理环境变量，
+          # 国内常规站点保持直连，杜绝全局 TUN/DNS 劫持导致国内 SLB 跨域重置。
           setup_mihomo() {
             test -n "$AGENTROUTER_SS_SUB_URL" || { echo "AGENTROUTER_SS_SUB_URL empty"; return 1; }
             curl -sL --max-time 60 -o /tmp/mihomo.gz \
@@ -434,24 +434,7 @@ jobs:
           mode: rule
           log-level: warning
           ipv6: false
-          tun:
-            enable: true
-            device: sb0
-            stack: system
-            # 1280 而非 1500：curl_cffi chrome 指纹的 ClientHello 带 PQ 密钥共享
-            # (~1800B)，mtu 1500 时握手包超段被截断 → SSLError（裸 curl 不触发）；
-            # 降 MTU 让本地协议栈自行分段
-            mtu: 1280
-            dns-hijack:
-              - any:53
-            auto-route: true
-            auto-detect-interface: true
-          dns:
-            enable: true
-            enhanced-mode: fake-ip
-            fake-ip-range: 198.18.0.1/16
-            default-nameserver: ["8.8.8.8", "1.1.1.1"]
-            nameserver: ["8.8.8.8", "1.1.1.1"]
+          mixed-port: 1080
           proxy-providers:
             railgun:
               type: http
@@ -470,70 +453,38 @@ jobs:
               type: select
               use: ["railgun"]
           rules:
-            - DOMAIN-SUFFIX,air-outer.com,PROXY
-            - DOMAIN-SUFFIX,agentrouter.org,PROXY
-            - DOMAIN-SUFFIX,nodeseek.com,PROXY
-            - DOMAIN-SUFFIX,ipify.org,PROXY
-            - MATCH,DIRECT
+            - MATCH,PROXY
           MHEOF
             pip install -q pysocks || { echo "pysocks install failed"; return 1; }
             pip install -q curl-cffi >/dev/null 2>&1 \
               || echo "curl-cffi install failed; nodeseek falls back to urllib fingerprint"
-            # TUN/auto_route 需要 root：GH runner 免密 sudo
-            sudo -n /tmp/mihomo/mihomo -d /tmp/mihomo -f /tmp/mh-config.yaml &
+            /tmp/mihomo/mihomo -d /tmp/mihomo -f /tmp/mh-config.yaml >/dev/null 2>&1 &
             SSPID=$!
             echo "SSPID=$SSPID" >> "$GITHUB_ENV"
             for i in $(seq 1 30); do
-              if ip link show sb0 >/dev/null 2>&1; then break; fi
+              if ss -tln 2>/dev/null | grep -q ":1080 "; then break; fi
               sleep 0.5
             done
-            ip link show sb0 >/dev/null 2>&1 || { echo "mihomo TUN interface missing"; sudo -n pkill -f '[m]ihomo' 2>/dev/null || true; return 1; }
-            sleep 2
-            # 透明接管：直连 curl 即经 PROXY 组出节点；返回的出口 IP 即当前节点
-            exit_ip=$(curl -sS -m 12 https://api.ipify.org 2>/dev/null || echo "")
+            if ! ss -tln 2>/dev/null | grep -q ":1080 "; then
+              echo "mihomo mixed-port 1080 failed to start"; kill -9 "$SSPID" 2>/dev/null || true; return 1
+            fi
+            sleep 1
+            exit_ip=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 https://api.ipify.org 2>/dev/null || echo "")
             if [ -z "$exit_ip" ]; then
-              echo "mihomo TUN forwarding failed; tearing down TUN before sslocal fallback"
-              sudo -n pkill -f '[m]ihomo' 2>/dev/null || true
+              echo "mihomo proxy forwarding failed; tearing down before sslocal fallback"
+              kill -9 "$SSPID" 2>/dev/null || true
               sleep 1
               return 1
             fi
             cur_node=$(curl -sS -m 5 http://127.0.0.1:9090/proxies/PROXY \
               | python3 -c "import json,sys; print(json.load(sys.stdin).get('now','?'))" 2>/dev/null || echo "?")
             echo "mihomo pinned node: $cur_node, exit IP: $exit_ip"
-            # TUN 模式无需 socks5 端口：两个代理变量全部清空，所有流量（含 nodeseek）
-            # 经 TUN 从固定 TW-X1-3 出口走；住宅代理/其他节点一律不用
-            echo "AGENTROUTER_PROXY=" >> "$GITHUB_ENV"
-            echo "NODESEEK_PROXY=" >> "$GITHUB_ENV"
-            # 逐节点探测 nodeseek：默认关闭（每次 run 发 10+ 裸请求会加重 CF 风控评分，
-            # 实测教训）；需要时 dispatch 传 probe_nodes=true 或设 NODESEEK_PROBE_NODES=1
-            chosen=""
-            fallback=""
-            if [ "${NODESEEK_PROBE_NODES:-0}" != "1" ]; then
-              ns_code=$(curl -sS -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
-              echo "SS proxy ready via mihomo TUN (pid $SSPID), nodeseek probe HTTP $ns_code (node probing off)"
-              stash_proxy_state mihomo "$cur_node" "$exit_ip" "$ns_code"
-              return 0
-            fi
-            nodes=$(curl -sS -m 5 http://127.0.0.1:9090/proxies/PROXY \
-              | python3 -c "import json,sys; print('\n'.join(json.load(sys.stdin).get('all') or []))")
-            for node in $nodes; do
-              curl -sS -m 5 -X PUT http://127.0.0.1:9090/proxies/PROXY \
-                -d "{\"name\": \"$node\"}" >/dev/null 2>&1 || continue
-              code=$(curl -sS -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
-              ip=$(curl -sS -m 8 https://api.ipify.org 2>/dev/null || echo "?")
-              echo "  probe $node -> HTTP $code (exit $ip)"
-              if [ "$code" != "403" ] && [ "$code" != "000" ]; then chosen="$node"; break; fi
-              [ -z "$fallback" ] && fallback="$node"
-            done
-            if [ -n "$chosen" ]; then
-              echo "selected node for nodeseek: $chosen"
-            elif [ -n "$fallback" ]; then
-              curl -sS -m 5 -X PUT http://127.0.0.1:9090/proxies/PROXY -d "{\"name\": \"$fallback\"}" >/dev/null 2>&1 || true
-              echo "no node passed nodeseek probe; pinned first reachable: $fallback"
-            fi
-            ns_code=$(curl -sS -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
-            echo "SS proxy ready via mihomo TUN (pid $SSPID), nodeseek probe HTTP $ns_code"
-            stash_proxy_state mihomo "${chosen:-${fallback:-$cur_node}}" "$exit_ip" "$ns_code"
+            # 仅向需要代理出口的任务注入环境变量
+            echo "AGENTROUTER_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
+            echo "NODESEEK_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
+            ns_code=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
+            echo "SS proxy ready via mihomo on 127.0.0.1:1080 (pid $SSPID), nodeseek probe HTTP $ns_code"
+            stash_proxy_state mihomo "$cur_node" "$exit_ip" "$ns_code"
             return 0
           }
 
