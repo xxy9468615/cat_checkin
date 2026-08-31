@@ -8,6 +8,7 @@ import json
 import functools
 import os
 import re
+import ssl
 import sys
 import time
 import urllib.error
@@ -126,7 +127,15 @@ class Response:
         except Exception:
             return default
 
-def retry(times: int = 2, backoff: float = 3.0, retry_codes: tuple = (-1, 429, 500, 502, 503, 504)):
+def _create_ssl_context() -> ssl.SSLContext:
+    """构建健壮的 SSLContext，启用兼容性选项降低国内老旧/特定 SLB 握手阻断。"""
+    ctx = ssl.create_default_context()
+    if hasattr(ssl, "OP_LEGACY_SERVER_CONNECT"):
+        ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
+    return ctx
+
+
+def retry(times: int = 3, backoff: float = 3.0, retry_codes: tuple = (-1, 429, 500, 502, 503, 504)):
     """Retry decorator for network calls.
 
     - times: total number of attempts (1 = no retry).
@@ -155,7 +164,11 @@ def retry(times: int = 2, backoff: float = 3.0, retry_codes: tuple = (-1, 429, 5
 class Http:
     def __init__(self, follow_redirects: bool = False, proxy: str = ""):
         self.jar = CookieJar()
-        handlers = [urllib.request.HTTPCookieProcessor(self.jar)]
+        ssl_ctx = _create_ssl_context()
+        handlers = [
+            urllib.request.HTTPCookieProcessor(self.jar),
+            urllib.request.HTTPSHandler(context=ssl_ctx),
+        ]
         if not follow_redirects:
             handlers.insert(0, NoRedirectHandler())
         if proxy:
@@ -196,6 +209,7 @@ class Http:
         headers = dict(headers or {})
         headers.setdefault("User-Agent", DEFAULT_UA)
         headers.setdefault("Accept", "application/json, text/plain, */*")
+        headers.setdefault("Connection", "close")
 
         # Clean non-latin-1 characters in header values to prevent urllib encoding errors
         for k, v in list(headers.items()):
