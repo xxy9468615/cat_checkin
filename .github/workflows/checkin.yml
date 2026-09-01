@@ -219,6 +219,11 @@ jobs:
       SMZDM_COOKIE_3: ${{ secrets.SMZDM_COOKIE_3 }}
       SMZDM_PROXY: ${{ secrets.SMZDM_PROXY }}
       SMZDM_BACKUP_PROXIES: ${{ secrets.SMZDM_BACKUP_PROXIES }}
+      52POJIE_cookie: ${{ secrets.WUAI_COOKIE_1 || secrets.WUAI_COOKIE || secrets.POJIE_COOKIE_1 || secrets.POJIE_COOKIE || secrets['52POJIE_COOKIE_1'] || secrets['52POJIE_COOKIE'] }}
+      52POJIE_COOKIE_1: ${{ secrets.WUAI_COOKIE_1 || secrets.WUAI_COOKIE || secrets.POJIE_COOKIE_1 || secrets.POJIE_COOKIE || secrets['52POJIE_COOKIE_1'] || secrets['52POJIE_COOKIE'] }}
+      52POJIE_COOKIE_2: ${{ secrets.WUAI_COOKIE_2 || secrets.POJIE_COOKIE_2 || secrets['52POJIE_COOKIE_2'] }}
+      52POJIE_COOKIE_3: ${{ secrets.WUAI_COOKIE_3 || secrets.POJIE_COOKIE_3 || secrets['52POJIE_COOKIE_3'] }}
+      52POJIE_PROXY: ${{ secrets['52POJIE_PROXY'] || secrets.WUAI_PROXY || secrets.POJIE_PROXY || secrets.SMZDM_PROXY }}
       QUARK_cookie: ${{ secrets.QUARK_COOKIE_1 || secrets.QUARK_COOKIE }}
       QUARK_COOKIE_1: ${{ secrets.QUARK_COOKIE_1 || secrets.QUARK_COOKIE }}
       QUARK_COOKIE_2: ${{ secrets.QUARK_COOKIE_2 }}
@@ -307,6 +312,7 @@ jobs:
             .juejin_state*.json
             .alipan_state*.json
             .smzdm_state*.json
+            .52pojie_state*.json
             .notify_state_*.json
           key: unified-states-${{ github.run_id }}
           restore-keys: |
@@ -652,6 +658,7 @@ jobs:
             .juejin_state*.json
             .alipan_state*.json
             .smzdm_state*.json
+            .52pojie_state*.json
             .notify_state_*.json
           key: unified-states-${{ github.run_id }}
 

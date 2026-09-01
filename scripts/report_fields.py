@@ -956,6 +956,62 @@ def ex_smzdm(output: str, res: Dict[str, Any]) -> None:
     _add_summary(res, output)
 
 
+def ex_52pojie(output: str, res: Dict[str, Any]) -> None:
+    """吾爱破解：👤 用户: 【xx】 (UID: xx) + • 签到 / 资产 行。"""
+    cur: Any = None
+    for raw in output.splitlines():
+        ln = raw.strip()
+        m = re.search(r"👤 用户:\s*【(.+?)】(?:\s*\(UID:\s*([^)]+)\))?", ln)
+        if m:
+            if cur:
+                cur.flush(res)
+            cur = _Block(m.group(1))
+            continue
+        if "签到失败" in ln or "❌" in ln:
+            if cur:
+                cur.flush(res)
+                cur = None
+            res["fail_lines"].append(_clean(ln))
+            res["error_lines"].append(ln)
+            continue
+        if cur is None:
+            continue
+        mm = re.search(r"• 签到:\s*【(.+?)】(?:\s*\((.+?)\))?", ln)
+        if mm:
+            status, gain_desc = mm.group(1), mm.group(2) or ""
+            if status == "成功":
+                cur.parts.append("签到成功")
+                res["badges"].append(("reward", "+2 吾爱币"))
+                res["gains"].append(("吾爱币", 2.0))
+            elif "已签" in status:
+                cur.parts.append("今日已签")
+            continue
+        if ln.startswith("• 资产:"):
+            m_cb = re.search(r"吾爱币\s*【(" + NUM + r")】", ln)
+            if m_cb:
+                cur.parts.append(f"吾爱币 {_d(m_cb.group(1))}")
+                res["assets"].append(("吾爱币", _f(m_cb.group(1))))
+            m_pt = re.search(r"积分\s*【(" + NUM + r")】", ln)
+            if m_pt:
+                cur.parts.append(f"积分 {_d(m_pt.group(1))}")
+                res["assets"].append(("积分", _f(m_pt.group(1))))
+            m_ct = re.search(r"贡献\s*【(" + NUM + r")】", ln)
+            if m_ct:
+                cur.parts.append(f"贡献 {_d(m_ct.group(1))}")
+                res["assets"].append(("贡献", _f(m_ct.group(1))))
+            m_ht = re.search(r"热心值\s*【(" + NUM + r")】", ln)
+            if m_ht:
+                cur.parts.append(f"热心值 {_d(m_ht.group(1))}")
+                res["assets"].append(("热心值", _f(m_ht.group(1))))
+            m_lv = re.search(r"等级\s*【([^】]+)】", ln)
+            if m_lv:
+                cur.parts.append(m_lv.group(1))
+            continue
+    if cur:
+        cur.flush(res)
+    _add_summary(res, output)
+
+
 def ex_workbuddy(output: str, res: Dict[str, Any]) -> None:
     """WorkBuddy：用户【xx】（UID: xx）+ • 八项 bullets。"""
     cur: Any = None
@@ -1258,6 +1314,7 @@ SCRIPT_EXTRACTORS = {
     "aistudio.py": ex_aistudio,
     "alipan.py": ex_alipan,
     "smzdm.py": ex_smzdm,
+    "52pojie.py": ex_52pojie,
     "quark.py": ex_quark,
     "cloud189.py": ex_cloud189,
     "workbuddy.py": ex_workbuddy,

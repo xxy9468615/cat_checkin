@@ -115,6 +115,19 @@ EXPECT = {
         and ("金币", 90.0) in r["assets"]
         and r["streak"] == 5
     ),
+    "52pojie": lambda r: (
+        len(r["lines"]) == 2
+        and "签到成功" in r["lines"][0]
+        and "吾爱币 128" in r["lines"][0]
+        and "积分 520" in r["lines"][0]
+        and "贡献 10" in r["lines"][0]
+        and "热心值 5" in r["lines"][0]
+        and "今日已签" in r["lines"][1]
+        and "吾爱币 256" in r["lines"][1]
+        and ("吾爱币", 2.0) in r["gains"]
+        and ("吾爱币", 128.0) in r["assets"]
+        and ("吾爱币", 256.0) in r["assets"]
+    ),
     "quark": lambda r: (
         len(r["lines"]) == 1
         and "签到成功" in r["lines"][0]

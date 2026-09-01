@@ -208,6 +208,16 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
+    # --- 吾爱破解（52pojie.cn 每日签到、2 吾爱币、积分与资产，固定 CN 出口代理）---
+    "52pojie": {
+        "id": "52pojie",
+        "script": "52pojie.py",
+        "name": "吾爱破解 签到",
+        "result": "52pojie.json",
+        "timeout": 300,
+        "account": "",
+        "tags": ["00:50", "matrix", "daily"],
+    },
 
     # --- 多账号站点（单 run 阶段 A 内联并发；旧 QStash 回程接力已退役） ---
     "workbuddy-account-1": {
