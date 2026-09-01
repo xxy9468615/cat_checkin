@@ -38,8 +38,45 @@ from common import (
     save_kv_state,
 )
 
+SITE = "https://2libra.com"
+
 PREFIX = "2LIBRA_"
-REFRESH_AHEAD_DAYS = 14  # access_token 剩余有效期低于该天数时自动换新
+REFRESH_AHEAD_DAYS = 14
+
+
+class _CffiResp:
+    """curl_cffi Response adapter."""
+    def __init__(self, r):
+        self.code = r.status_code
+        self.text = r.text
+        self.url = str(r.url)
+        self.headers = r.headers
+
+    def json(self, default=None):
+        try:
+            return json.loads(self.text)
+        except Exception:
+            return default if default is not None else {}
+
+
+def _cffi_request(method, url, *, headers, json_data=None, proxy=""):
+    """Chrome TLS fingerprint via curl_cffi; returns None if unavailable."""
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError:
+        return None
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    r = cffi_requests.request(
+        method, url, headers=headers, json=json_data, proxies=proxies,
+        impersonate="chrome", timeout=30, allow_redirects=True,
+    )
+    resp = _CffiResp(r)
+    resp._raw_cookies = r.cookies
+    return resp
+
+
+def _get_proxy() -> str:
+    return (os.getenv("2LIBRA_PROXY") or os.getenv("PROXY") or "").strip()
 
 
 def _load_cookies() -> list[dict]:
@@ -84,7 +121,7 @@ def _load_cookies() -> list[dict]:
 
 
 def _merge_cookies(base: str, jar) -> str:
-    """合并已有 Cookie 串与 urllib CookieJar 中的最新 Set-Cookie（同名覆盖）。"""
+    """合并已有 Cookie 串与 Set-Cookie jar（同名覆盖）。兼容 urllib CookieJar 与 curl_cffi Cookies。"""
     cookie_dict: dict[str, str] = {}
     if base:
         for part in base.split(";"):
@@ -93,8 +130,12 @@ def _merge_cookies(base: str, jar) -> str:
                 if k.strip():
                     cookie_dict[k.strip()] = v.strip()
     for c in jar or ():
-        if getattr(c, "name", None) and getattr(c, "value", None):
+        if hasattr(c, "name") and hasattr(c, "value"):
             cookie_dict[c.name] = c.value
+        elif isinstance(c, str):
+            v = jar[c] if hasattr(jar, "__getitem__") else ""
+            if v:
+                cookie_dict[c] = str(v)
     return "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
 
 
@@ -141,17 +182,16 @@ def _keepalive_refresh(base: str, redis_key: str, state_file: str, env_hash: str
         print(f"{label} [keepalive] access_token 仅剩 {days:.1f} 天到期，尝试 refresh_token 换新...")
     elif not _cookie_get(base, "refresh_token"):
         return base  # 无 access_token/refresh_token 可保活
-    h = Http()
-    r = h.request(
-        "POST",
-        "https://2libra.com/api/auth/refresh",
-        headers={"Cookie": base, "Referer": "https://2libra.com/", "Origin": "https://2libra.com"},
-        json_data={},
-    )
+    refresh_headers = {"Cookie": base, "Referer": f"{SITE}/", "Origin": SITE}
+    proxy = _get_proxy()
+    h = Http(proxy=proxy)
+    r = _cffi_request("POST", f"{SITE}/api/auth/refresh", headers=refresh_headers, json_data={}, proxy=proxy)
+    if r is None or (r.code == 403 and "Just a moment" in r.text):
+        r = h.request("POST", f"{SITE}/api/auth/refresh", headers=refresh_headers, json_data={})
     if r.code not in (200, 201):
         print(f"{label} [keepalive] ⚠️ token 换新失败（HTTP {r.code}）——当前 access_token 到期前仍可签到，请尽快重新登录更新 Cookie")
         return base
-    merged = _merge_cookies(base, h.jar)
+    merged = _merge_cookies(base, h.jar if h.jar else getattr(r, "_raw_cookies", None))
     # 一次性票据：先持久化再继续签到，持久化失败必须显著告警（链路可能已断）
     try:
         _save_state(redis_key, state_file, merged, env_hash)
@@ -181,14 +221,26 @@ def _run_one(raw_cookie: str, auth: str, idx: int = 1, total: int = 1) -> str:
 
     base = _keepalive_refresh(base, redis_key, state_file, env_hash, f"[{idx}/{total}]")
 
-    headers = {"Cookie": base, "Referer": "https://2libra.com/", "Origin": "https://2libra.com"}
+    headers = {"Cookie": base, "Referer": f"{SITE}/", "Origin": SITE}
     if auth:
         headers["Authorization"] = auth
-    h = Http()
-    sign = h.request("POST", "https://2libra.com/api/sign", headers=headers)
+    proxy = _get_proxy()
+    h = Http(proxy=proxy)
+
+    sign = _cffi_request("POST", f"{SITE}/api/sign", headers=headers, proxy=proxy)
+    if sign is None or (sign.code == 403 and "Just a moment" in sign.text):
+        if sign is not None:
+            print(f"[{idx}/{total}] [diag] curl_cffi 被 CF 质询，回退 urllib")
+        sign = h.request("POST", f"{SITE}/api/sign", headers=headers)
     coins = find(r'(?<="coins":)\d+(?=[,}])', sign.text)
-    info = h.request("GET", "https://2libra.com/api/users/info?fields=info%2Cexp%2Ccoins", headers=headers).text
-    stats = h.request("GET", "https://2libra.com/api/sign/stats", headers=headers).text
+    info_r = _cffi_request("GET", f"{SITE}/api/users/info?fields=info%2Cexp%2Ccoins", headers=headers, proxy=proxy)
+    if info_r is None:
+        info_r = h.request("GET", f"{SITE}/api/users/info?fields=info%2Cexp%2Ccoins", headers=headers)
+    info = info_r.text
+    stats_r = _cffi_request("GET", f"{SITE}/api/sign/stats", headers=headers, proxy=proxy)
+    if stats_r is None:
+        stats_r = h.request("GET", f"{SITE}/api/sign/stats", headers=headers)
+    stats = stats_r.text
     username = find(r'(?<="username":").*?(?=")', info, "?")
     num = find(r'(?<="user_number":").*?(?=")', info, "?")
     cur = find(r'(?<="currentExp":)\d+(?=[,}])', info, "?")
@@ -228,6 +280,9 @@ def main():
         raise RuntimeError(f"未配置 {PREFIX}COOKIES 或 {PREFIX}cookie")
 
     print("【2Libra 签到】")
+    proxy = _get_proxy()
+    if proxy:
+        print(f"代理出口: {mask_str(proxy, 6, 3)}")
     print(f"共 {len(accounts)} 个账号")
     results = []
     for idx, acc in enumerate(accounts, 1):

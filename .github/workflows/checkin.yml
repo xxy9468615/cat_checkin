@@ -100,6 +100,7 @@ jobs:
       "2LIBRA_COOKIE_1": ${{ secrets.TWO_LIBRA_COOKIE_1 || secrets.TWO_LIBRA_COOKIES }}
       "2LIBRA_COOKIE_2": ${{ secrets.TWO_LIBRA_COOKIE_2 }}
       "2LIBRA_COOKIE_3": ${{ secrets.TWO_LIBRA_COOKIE_3 }}
+      "2LIBRA_PROXY": ${{ secrets.TWO_LIBRA_PROXY }}
       BIANJIE_AI_ACCOUNTS: ${{ secrets.BIANJIE_AI_ACCOUNTS }}
       BIANJIE_AI_USERNAME_1: ${{ secrets.BIANJIE_AI_USERNAME_1 || secrets.BIANJIE_AI_USERNAME }}
       BIANJIE_AI_PASSWORD_1: ${{ secrets.BIANJIE_AI_PASSWORD_1 || secrets.BIANJIE_AI_PASSWORD }}
@@ -413,6 +414,7 @@ jobs:
                 echo "SS proxy ready (pid $SSPID, port $SSPORT, exit $ip)"
                 echo "AGENTROUTER_PROXY=socks5://127.0.0.1:$SSPORT" >> "$GITHUB_ENV"
                 echo "NODESEEK_PROXY=socks5://127.0.0.1:$SSPORT" >> "$GITHUB_ENV"
+                echo "2LIBRA_PROXY=socks5://127.0.0.1:$SSPORT" >> "$GITHUB_ENV"
                 stash_proxy_state sslocal "sslocal" "$ip" ""
                 return 0
               fi
@@ -486,6 +488,7 @@ jobs:
             # 仅向需要代理出口的任务注入环境变量
             echo "AGENTROUTER_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             echo "NODESEEK_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
+            echo "2LIBRA_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             ns_code=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
             echo "SS proxy ready via mihomo on 127.0.0.1:1080 (pid $SSPID), nodeseek probe HTTP $ns_code"
             stash_proxy_state mihomo "$cur_node" "$exit_ip" "$ns_code"
