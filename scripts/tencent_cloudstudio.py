@@ -62,7 +62,7 @@ def extract_session(raw_cookie: str) -> str:
     raw = raw_cookie.strip()
     if not raw:
         return ""
-    m = re.search(r"cloudstudio-session=([^;\s]+)", raw, re.IGNORECASE)
+    m = re.search(r"(?:^|;\s*)cloudstudio-session=([^;\s]+)", raw, re.IGNORECASE)
     if m:
         return m.group(1).rstrip(";")
     if raw.startswith("s:") or raw.startswith("s%3A"):
@@ -173,10 +173,11 @@ def bj_date_of_iso(value: str) -> str:
         return ""
 
 
-def _do_checkin_and_query(session: str, xsrf_override: str) -> Tuple[bool, str, Http]:
+def _do_checkin_and_query(session: str, xsrf_override: str, cookie_str: str = "") -> Tuple[bool, str, Http]:
     xsrf = xsrf_override or derive_xsrf(session)
+    cookie_val = _set_session_in_cookie(cookie_str, session) if cookie_str else f"cloudstudio-session={session}"
     headers = {
-        "Cookie": f"cloudstudio-session={session}",
+        "Cookie": cookie_val,
         "X-XSRF-TOKEN": xsrf,
         "X-Requested-With": "XMLHttpRequest",
         "Referer": "https://cloudstudio.net/",
@@ -369,12 +370,12 @@ def _run_one(raw_cookie: str, xsrf_override: str, idx: int, total: int) -> Tuple
         elif not session:
             base_cookie = merged
 
-    ok, report, h = _do_checkin_and_query(session, xsrf_override)
+    ok, report, h = _do_checkin_and_query(session, xsrf_override, base_cookie)
     if not ok and report.startswith("AUTH_EXPIRED"):
         # 回退 1：环境变量中的 session（用户可能刚更新过）
         if raw_session and raw_session != session:
             print(f"[{idx}/{total}] 🔄 session 失效（{report}），回退使用环境变量中的 session...")
-            ok, report, h = _do_checkin_and_query(raw_session, xsrf_override)
+            ok, report, h = _do_checkin_and_query(raw_session, xsrf_override, raw_cookie)
             if ok:
                 session = raw_session
         # 回退 2：Keycloak SSO 重新换票
@@ -383,7 +384,7 @@ def _run_one(raw_cookie: str, xsrf_override: str, idx: int, total: int) -> Tuple
             sso_ok, new_session, merged = try_keycloak_sso(base_cookie)
             if sso_ok and new_session and new_session != session:
                 print(f"[{idx}/{total}] 🔑 SSO 换票成功: {new_session[:12]}***，重新签到...")
-                ok, report, h = _do_checkin_and_query(new_session, xsrf_override)
+                ok, report, h = _do_checkin_and_query(new_session, xsrf_override, merged)
                 if ok:
                     session = new_session
                     base_cookie = merged
