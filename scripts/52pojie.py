@@ -55,6 +55,7 @@ EXPIRED_PHRASES = ("您需要先登录才能继续本操作", "请先登录", "�
 WAF_PHRASES = (
     "安域防护节点",
     "安全防护",
+    "访问验证",
     "Just a moment",
     "cf-browser-verification",
     "SafeLine",
@@ -200,27 +201,34 @@ def _http_request_with_failover(
             last_resp = resp
 
         # 2. 回退到 common.Http (urllib)
-        cur_h = Http(follow_redirects=True, proxy=p)
-        resp = cur_h.request(method, url, headers=headers, timeout=20)
-        if resp.code == 200 and not any(w in resp.text for w in WAF_PHRASES):
-            return resp, p, cur_h
-        last_resp = resp
-        last_h = cur_h
-        if len(candidate_proxies) > 1:
+        try:
+            cur_h = Http(follow_redirects=True, proxy=p)
+            resp = cur_h.request(method, url, headers=headers, timeout=20)
+            if resp.code == 200 and not any(w in resp.text for w in WAF_PHRASES):
+                return resp, p, cur_h
+            last_resp = resp
+            last_h = cur_h
+        except Exception:
+            pass
+
+        if len(candidate_proxies) > 1 and last_resp is not None:
             p_label = p if len(p) < 30 else (p[:27] + "...")
-            print(f"  ⚠️ 代理 {p_label} 响应异常 (HTTP {resp.code})，尝试备用出口...")
+            print(f"  ⚠️ 代理 {p_label} 响应异常 (HTTP {last_resp.code})，尝试备用出口...")
 
     # 若所有代理均未能正常请求且无直连，尝试直连一次
     if "" not in candidate_proxies:
         resp = _cffi_request(method, url, headers, proxy="")
-        if resp is not None and resp.code == 200 and not any(w in resp.text for w in WAF_PHRASES):
+        if resp is not None and resp.code != 403 and not any(w in resp.text for w in WAF_PHRASES):
             return resp, "", None
-        cur_h = Http(follow_redirects=True, proxy="")
-        resp = cur_h.request(method, url, headers=headers, timeout=20)
-        if resp.code == 200:
-            return resp, "", cur_h
-        last_resp = resp
-        last_h = cur_h
+        try:
+            cur_h = Http(follow_redirects=True, proxy="")
+            resp = cur_h.request(method, url, headers=headers, timeout=20)
+            if resp.code == 200 and not any(w in resp.text for w in WAF_PHRASES):
+                return resp, "", cur_h
+            last_resp = resp
+            last_h = cur_h
+        except Exception:
+            pass
 
     return last_resp, used_proxy, last_h
 

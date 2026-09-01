@@ -296,6 +296,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install dependencies
+        run: |
+          pip install --no-cache-dir -r requirements.txt
+
       - name: Set TODAY
         run: echo "TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_ENV"
 

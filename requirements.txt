@@ -1,4 +1,6 @@
-# 签到脚本全部使用 Python 标准库；仅 agentrouter 的 SS 代理出口（AGENTROUTER_PROXY）
-# 需要 pysocks（urllib 原生不支持 socks:// scheme）。CI 在 Setup SS proxy 步骤内联
-# pip install pysocks，此处仅供本地调试参考。
+# 依赖说明：
+# 1. pysocks：用于 urllib / socks5 代理支持
+# 2. curl-cffi：用于 Chrome TLS 指纹模拟，绕过 WAF/安域防护/Cloudflare 挑战（吾爱破解、NodeSeek 等）
 pysocks>=1.7.1
+curl-cffi>=0.7.0
+
