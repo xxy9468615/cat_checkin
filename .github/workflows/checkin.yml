@@ -427,6 +427,7 @@ jobs:
                 echo "NODESEEK_PROXY=socks5://127.0.0.1:$SSPORT" >> "$GITHUB_ENV"
                 echo "2LIBRA_PROXY=socks5://127.0.0.1:$SSPORT" >> "$GITHUB_ENV"
                 echo "CLOUDSTUDIO_PROXY=socks5://127.0.0.1:$SSPORT" >> "$GITHUB_ENV"
+                echo "52POJIE_PROXY=socks5://127.0.0.1:$SSPORT" >> "$GITHUB_ENV"
                 stash_proxy_state sslocal "sslocal" "$ip" ""
                 return 0
               fi
@@ -502,6 +503,7 @@ jobs:
             echo "NODESEEK_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             echo "2LIBRA_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             echo "CLOUDSTUDIO_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
+            echo "52POJIE_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             ns_code=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
             echo "SS proxy ready via mihomo on 127.0.0.1:1080 (pid $SSPID), nodeseek probe HTTP $ns_code"
             stash_proxy_state mihomo "$cur_node" "$exit_ip" "$ns_code"
@@ -539,6 +541,7 @@ jobs:
         run: |
           echo "NODESEEK_PROXY=" >> "$GITHUB_ENV"
           echo "AGENTROUTER_PROXY=" >> "$GITHUB_ENV"
+          echo "52POJIE_PROXY=" >> "$GITHUB_ENV"
           echo "direct 诊断模式：跳过代理，任务用 runner IP 直连"
       - name: no_cffi mode (nodeseek 强制 urllib)
         if: inputs.no_cffi == true
