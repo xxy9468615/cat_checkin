@@ -101,6 +101,34 @@ def _parse_cookie_dict(cookie_str: str) -> Dict[str, str]:
     return res
 
 
+def _collect_resp_cookies(resp: Any) -> List[str]:
+    """安全收集 HTTP 响应中的 Set-Cookie 标头。"""
+    if resp is None:
+        return []
+    res: List[str] = []
+    raw_c = getattr(resp, "_raw_cookies", None)
+    if raw_c is not None:
+        try:
+            for k, v in raw_c.items():
+                res.append(f"{k}={v}")
+        except Exception:
+            pass
+    headers = getattr(resp, "headers", None)
+    if headers:
+        if hasattr(headers, "get_all"):
+            res.extend(headers.get_all("Set-Cookie", []))
+        elif hasattr(headers, "get_list"):
+            res.extend(headers.get_list("set-cookie"))
+            res.extend(headers.get_list("Set-Cookie"))
+        elif isinstance(headers, dict):
+            sc = headers.get("Set-Cookie") or headers.get("set-cookie")
+            if isinstance(sc, list):
+                res.extend(sc)
+            elif isinstance(sc, str):
+                res.append(sc)
+    return res
+
+
 def _merge_cookie_str(base_cookie: str, set_cookies: List[str]) -> str:
     """合并现有 Cookie 字符串与 HTTP 响应下发的 Set-Cookie 列表。"""
     c_dict = _parse_cookie_dict(base_cookie)
@@ -475,7 +503,9 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
 
     used_proxy = used_proxy_draw or used_proxy_apply or used_proxy_credit
     proxy_tag = f" | 🌐 代理出口: {used_proxy}" if used_proxy else ""
-    print(f"[{idx}/{total}] 👤 用户: 【{masked_name}】 (UID: {masked_uid}){expiry_tag}{proxy_tag}")
+    is_qq_bind = (c_dict.get("htVC_2132_connect_is_bind") == "1") or ("connect_is_bind" in raw_cookie)
+    login_tag = " | 🐧 QQ 互联登录" if is_qq_bind else ""
+    print(f"[{idx}/{total}] 👤 用户: 【{masked_name}】 (UID: {masked_uid}){login_tag}{expiry_tag}{proxy_tag}")
 
     # 4. 判定签到状态
     is_success = any(s in draw_text for s in SUCCESS_PHRASES) or any(s in apply_text for s in SUCCESS_PHRASES)
@@ -516,9 +546,11 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
 
     # 6. 滚动保存状态（若有新 Set-Cookie 或首次记录）
     try:
-        resp_set_cookies = getattr(r_draw, "headers", {}).get("Set-Cookie")
-        sc_list = [resp_set_cookies] if isinstance(resp_set_cookies, str) else (resp_set_cookies or [])
-        merged_cookie = _merge_cookie_str(cur_cookie, sc_list) if sc_list else cur_cookie
+        all_sc: List[str] = []
+        all_sc.extend(_collect_resp_cookies(r_credit))
+        all_sc.extend(_collect_resp_cookies(r_apply))
+        all_sc.extend(_collect_resp_cookies(r_draw))
+        merged_cookie = _merge_cookie_str(cur_cookie, all_sc) if all_sc else cur_cookie
 
         save_kv_state(
             redis_key,
@@ -528,6 +560,7 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
                 "env_hash": env_hash,
                 "nickname": nickname,
                 "uid": uid,
+                "is_qq": is_qq_bind,
                 "saved_ts": int(state.get("saved_ts") or time.time()),
                 "updated_at": datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S"),
             },
