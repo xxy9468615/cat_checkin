@@ -49,8 +49,15 @@ DEFAULT_UA = (
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
-SUCCESS_PHRASES = ("恭喜您，任务已成功完成", "恭喜", "奖励已发放")
-IDEMPOTENT_PHRASES = ("抱歉，本期您已申请过此任务", "您已申请过此任务", "不是进行中的任务", "已申请过")
+SUCCESS_PHRASES = ("恭喜您，任务已成功完成", "恭喜您，任务已完成", "任务已完成", "恭喜", "奖励已发放")
+IDEMPOTENT_PHRASES = (
+    "抱歉，本期您已申请过此任务",
+    "您已申请过此任务",
+    "不是进行中的任务",
+    "已申请过",
+    "本期任务已完成",
+    "请下期再来",
+)
 EXPIRED_PHRASES = ("您需要先登录才能继续本操作", "请先登录", "未登录")
 WAF_PHRASES = (
     "安域防护节点",
@@ -233,6 +240,21 @@ def _http_request_with_failover(
     return last_resp, used_proxy, last_h
 
 
+def _clean_msg(text: str) -> str:
+    """清理 HTML/JS 干扰字符。"""
+    if not text:
+        return ""
+    # 移除 script 标签及内容
+    text = re.sub(r"<script[\s\S]*?</script>", "", text, flags=re.IGNORECASE)
+    # 移除 style 标签及内容
+    text = re.sub(r"<style[\s\S]*?</style>", "", text, flags=re.IGNORECASE)
+    # 剥离标签
+    text = strip_tags(text).strip()
+    # 移除多余换行与空格
+    text = re.sub(r"[\r\n]+", " ", text).strip()
+    return text
+
+
 def _extract_task_message(html: str) -> str:
     """提取 Discuz 任务提示消息。"""
     if not html:
@@ -240,23 +262,23 @@ def _extract_task_message(html: str) -> str:
     # CDATA
     m_cdata = re.search(r"<!\[CDATA\[([\s\S]+?)\]\]>", html)
     if m_cdata:
-        return strip_tags(m_cdata.group(1)).strip()
+        return _clean_msg(m_cdata.group(1))
     # messagetext
     m_msg = re.search(r'<div\s+id=["\']messagetext["\'][^>]*>([\s\S]+?)</div>', html)
     if m_msg:
-        return strip_tags(m_msg.group(1)).strip()
+        return _clean_msg(m_msg.group(1))
     # alert_info
     m_alert = re.search(r'<p\s+class=["\']alert_info["\'][^>]*>([\s\S]+?)</p>', html)
     if m_alert:
-        return strip_tags(m_alert.group(1)).strip()
+        return _clean_msg(m_alert.group(1))
     # showDialog
     m_diag = re.search(r'showDialog\s*\(\s*["\']([^"\']+)["\']', html)
     if m_diag:
-        return m_diag.group(1).strip()
+        return _clean_msg(m_diag.group(1))
     # 首个 p 标签文本
     m_p = re.search(r"<p>([^<]+)</p>", html)
     if m_p:
-        return m_p.group(1).strip()
+        return _clean_msg(m_p.group(1))
     return ""
 
 
@@ -403,11 +425,20 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
         else:
             expiry_tag = f" | 🔑 Cookie 剩余 {remaining_days} 天"
 
-    # 2. 任务申请：GET /home.php?mod=task&do=apply&id=2
-    apply_url = f"{BASE_URL}/home.php?mod=task&do=apply&id={TASK_ID}"
-    r_apply, used_proxy_apply, _ = _http_request_with_failover(
-        "GET", apply_url, headers, candidate_proxies
-    )
+    # 2. 任务申请：GET /home.php?do=apply&id=2&mod=task (多重 WAF 绕过模板)
+    apply_url_variants = [
+        f"{BASE_URL}/home.php?do=apply&id={TASK_ID}&mod=task",
+        f"{BASE_URL}/./home.php?mod=task&do=apply&id={TASK_ID}",
+        f"{BASE_URL}/home.php?id={TASK_ID}&do=apply&mod=task",
+        f"{BASE_URL}/home.php?mod=task&do=apply&id={TASK_ID}",
+    ]
+    r_apply = None
+    used_proxy_apply = ""
+    for u in apply_url_variants:
+        r_apply, used_proxy_apply, _ = _http_request_with_failover("GET", u, headers, candidate_proxies)
+        if r_apply is not None and not any(w in getattr(r_apply, "text", "") for w in WAF_PHRASES) and r_apply.code != 403:
+            break
+
     if r_apply is None:
         raise RuntimeError("网络请求异常：无法连接至吾爱破解服务器")
 
@@ -415,15 +446,27 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
     if any(w in apply_text for w in WAF_PHRASES) or r_apply.code == 403:
         raise RuntimeError("触发吾爱破解安域安全防护/WAF 拦截，建议配置 CN 代理出口 (52POJIE_PROXY)")
 
-    # 3. 任务领取：GET /home.php?mod=task&do=draw&id=2
-    draw_url = f"{BASE_URL}/home.php?mod=task&do=draw&id={TASK_ID}"
-    r_draw, used_proxy_draw, h_draw = _http_request_with_failover(
-        "GET", draw_url, headers, candidate_proxies
-    )
+    # 3. 任务领取：GET /home.php?do=draw&id=2&mod=task (多重 WAF 绕过模板)
+    draw_url_variants = [
+        f"{BASE_URL}/home.php?do=draw&id={TASK_ID}&mod=task",
+        f"{BASE_URL}/./home.php?mod=task&do=draw&id={TASK_ID}",
+        f"{BASE_URL}/home.php?id={TASK_ID}&do=draw&mod=task",
+        f"{BASE_URL}/home.php?mod=task&do=draw&id={TASK_ID}",
+    ]
+    r_draw = None
+    used_proxy_draw = ""
+    h_draw = None
+    for u in draw_url_variants:
+        r_draw, used_proxy_draw, h_draw = _http_request_with_failover("GET", u, headers, candidate_proxies)
+        if r_draw is not None and not any(w in getattr(r_draw, "text", "") for w in WAF_PHRASES) and r_draw.code != 403:
+            break
+
     if r_draw is None:
         raise RuntimeError("网络请求异常：任务领取步骤请求失败")
 
     draw_text = r_draw.text if hasattr(r_draw, "text") else ""
+    if any(w in draw_text for w in WAF_PHRASES) or r_draw.code == 403:
+        raise RuntimeError("触发吾爱破解安域安全防护/WAF 拦截，建议配置 CN 代理出口 (52POJIE_PROXY)")
     msg = _extract_task_message(draw_text) or _extract_task_message(apply_text)
 
     # 检查登录态失效
