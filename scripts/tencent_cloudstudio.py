@@ -185,7 +185,8 @@ def _do_checkin_and_query(session: str, xsrf_override: str) -> Tuple[bool, str, 
 
     # === 1. 签到两段式：先查今日记录，再决定是否领取 ===
     today = bj_now_str()[:10]
-    q = h.request("GET", f"{BASE}/billing/activityTask/{ACTIVITY}?lastRecord=true", headers=headers)
+    # 优先新接口（全量任务列表），兼容旧接口（按 ACTIVITY ID 查询）
+    q = h.request("GET", f"{BASE}/billing/activityTask?lastRecord=true", headers=headers)
 
     if q.code in (401, 403) or q.code in (301, 302, 303, 307, 308):
         return False, f"AUTH_EXPIRED_{q.code}", h
@@ -195,8 +196,15 @@ def _do_checkin_and_query(session: str, xsrf_override: str) -> Tuple[bool, str, 
 
     status, record = "", {}
     if q.code == 200:
-        data = qjson.get("data") or {}
-        records = data.get("records") or []
+        data = qjson.get("data")
+        records = []
+        if isinstance(data, list):
+            for task in data:
+                if task.get("taskId") == ACTIVITY:
+                    records = task.get("records") or []
+                    break
+        elif isinstance(data, dict):
+            records = data.get("records") or []
         if records:
             record = records[0]
             status = record.get("status", "")
@@ -225,7 +233,15 @@ def _do_checkin_and_query(session: str, xsrf_override: str) -> Tuple[bool, str, 
         if s.code >= 400 or s.code < 0:
             msg = find(r'"msg":"(.*?)"', s.text, s.text[:120])
             raise RuntimeError(f"签到接口 HTTP {s.code}: {msg}")
-        records = ((sjson.get("data") or {}).get("records")) or []
+        sdata = sjson.get("data")
+        records = []
+        if isinstance(sdata, list):
+            for task in sdata:
+                if task.get("taskId") == ACTIVITY:
+                    records = task.get("records") or []
+                    break
+        elif isinstance(sdata, dict):
+            records = sdata.get("records") or []
         rec = records[0] if records else {}
         reward = float(rec.get("rewardNum", 0) or 0) / 100000000
         fail_msg = rec.get("failMessage") or sjson.get("msg") or ""
