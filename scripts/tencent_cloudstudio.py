@@ -33,6 +33,7 @@
 """
 import datetime as dt
 import hashlib
+import os
 import re
 import sys
 from typing import Any, Dict, List, Optional, Tuple
@@ -42,6 +43,10 @@ from common import Http, env_seq, find, findall, load_kv_state, main_guard, mask
 PREFIX = "CLOUDSTUDIO_"
 BASE = "https://cloudstudio.net/api"
 ACTIVITY = "SIGN_IN_2025Q3"
+
+
+def _get_proxy() -> str:
+    return (os.getenv("CLOUDSTUDIO_PROXY") or "").strip()
 
 
 def derive_xsrf(session: str) -> str:
@@ -103,7 +108,7 @@ def try_keycloak_sso(raw_cookie: str) -> Tuple[bool, str, str]:
     """
     if not raw_cookie or "=" not in raw_cookie:
         return False, "", raw_cookie or ""
-    h = Http(follow_redirects=True)
+    h = Http(follow_redirects=True, proxy=_get_proxy())
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://cloudstudio.net/",
@@ -176,7 +181,7 @@ def _do_checkin_and_query(session: str, xsrf_override: str) -> Tuple[bool, str, 
         "X-Requested-With": "XMLHttpRequest",
         "Referer": "https://cloudstudio.net/",
     }
-    h = Http()
+    h = Http(proxy=_get_proxy())
 
     # === 1. 签到两段式：先查今日记录，再决定是否领取 ===
     today = bj_now_str()[:10]
@@ -390,6 +395,9 @@ def _run_one(raw_cookie: str, xsrf_override: str, idx: int, total: int) -> Tuple
 
 def main():
     print("【Tencent CloudStudio 签到】")
+    proxy = _get_proxy()
+    if proxy:
+        print(f"代理出口: {mask_str(proxy, 6, 3)}")
     cookies = env_seq(PREFIX, "cookie")
     xsrfs = env_seq(PREFIX, "xsrf", required=False)
 

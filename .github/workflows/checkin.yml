@@ -120,6 +120,7 @@ jobs:
       CLOUDSTUDIO_cookie: ${{ secrets.CLOUDSTUDIO_COOKIE_1 || secrets.CLOUDSTUDIO_COOKIE }}
       CLOUDSTUDIO_COOKIE_1: ${{ secrets.CLOUDSTUDIO_COOKIE_1 || secrets.CLOUDSTUDIO_COOKIE }}
       CLOUDSTUDIO_COOKIE_2: ${{ secrets.CLOUDSTUDIO_COOKIE_2 }}
+      CLOUDSTUDIO_PROXY: ${{ secrets.CLOUDSTUDIO_PROXY }}
       CLOUDSTUDIO_xsrf: ${{ secrets.CLOUDSTUDIO_XSRF }}
       NAIXI_username: ${{ secrets.NAIXI_USERNAME_1 || secrets.NAIXI_USERNAME }}
       NAIXI_PASSWORD: ${{ secrets.NAIXI_PASSWORD_1 || secrets.NAIXI_PASSWORD }}
@@ -415,6 +416,7 @@ jobs:
                 echo "AGENTROUTER_PROXY=socks5://127.0.0.1:$SSPORT" >> "$GITHUB_ENV"
                 echo "NODESEEK_PROXY=socks5://127.0.0.1:$SSPORT" >> "$GITHUB_ENV"
                 echo "2LIBRA_PROXY=socks5://127.0.0.1:$SSPORT" >> "$GITHUB_ENV"
+                echo "CLOUDSTUDIO_PROXY=socks5://127.0.0.1:$SSPORT" >> "$GITHUB_ENV"
                 stash_proxy_state sslocal "sslocal" "$ip" ""
                 return 0
               fi
@@ -489,6 +491,7 @@ jobs:
             echo "AGENTROUTER_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             echo "NODESEEK_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             echo "2LIBRA_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
+            echo "CLOUDSTUDIO_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             ns_code=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
             echo "SS proxy ready via mihomo on 127.0.0.1:1080 (pid $SSPID), nodeseek probe HTTP $ns_code"
             stash_proxy_state mihomo "$cur_node" "$exit_ip" "$ns_code"
