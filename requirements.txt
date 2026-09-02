@@ -1,6 +1,8 @@
 # 依赖说明：
 # 1. pysocks：用于 urllib / socks5 代理支持
 # 2. curl-cffi：用于 Chrome TLS 指纹模拟，绕过 WAF/安域防护/Cloudflare 挑战（吾爱破解、NodeSeek 等）
+# 3. pycryptodome：用于移动端协议加密（如什么值得买 DES-ECB SK 计算）
 pysocks>=1.7.1
 curl-cffi>=0.7.0
+pycryptodome>=3.18.0
 
