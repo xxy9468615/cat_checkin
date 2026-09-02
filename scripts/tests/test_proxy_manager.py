@@ -26,9 +26,13 @@ class TestProxyManager(unittest.TestCase):
         self.assertIsNotNone(ep)
         self.assertEqual(ep.name, "自建-香港-01")
         self.assertEqual(ep.url, "socks5://user:pass@1.2.3.4:1080")
-        self.assertEqual(ep.safe_url, "socks5://***:***@1.2.3.4:1080")
+        self.assertIn("1.***.***.4", ep.safe_url)
+        self.assertNotIn("1080", ep.safe_url)
         self.assertTrue(ep.is_self_hosted)
-        self.assertEqual(ep.display_name, "【自建-香港-01】(1.2.3.4:1080)")
+        # display_name 严格仅包含名称，绝不包含 IP 和端口
+        self.assertEqual(ep.display_name, "【自建-香港-01】")
+        self.assertNotIn("1.2.3.4", ep.display_name)
+        self.assertNotIn("1080", ep.display_name)
 
     def test_parse_bracket_prefix(self):
         ep1 = parse_proxy_line("[自建-美西搬瓦工] http://5.6.7.8:8080")
@@ -36,18 +40,31 @@ class TestProxyManager(unittest.TestCase):
         self.assertEqual(ep1.name, "自建-美西搬瓦工")
         self.assertEqual(ep1.url, "http://5.6.7.8:8080")
         self.assertTrue(ep1.is_self_hosted)
+        self.assertEqual(ep1.display_name, "【自建-美西搬瓦工】")
 
         ep2 = parse_proxy_line("【自建-日本住宅】 socks5://9.9.9.9:1080")
         self.assertIsNotNone(ep2)
         self.assertEqual(ep2.name, "自建-日本住宅")
         self.assertEqual(ep2.url, "socks5://9.9.9.9:1080")
+        self.assertEqual(ep2.display_name, "【自建-日本住宅】")
+
+    def test_bare_ip_fallback_masking(self):
+        # 裸 IP 自动降级推断名称：必须深度脱敏，且绝不显示端口
+        ep = parse_proxy_line("112.64.135.45:8080")
+        self.assertIsNotNone(ep)
+        self.assertEqual(ep.display_name, "【代理节点-112.***.***.45】")
+        self.assertNotIn("8080", ep.display_name)
+        self.assertNotIn("64", ep.display_name)
+        self.assertNotIn("135", ep.display_name)
 
     def test_parse_key_value(self):
         ep = parse_proxy_line("自建-香港02 = socks5://admin:pw@8.8.8.8:1080")
         self.assertIsNotNone(ep)
         self.assertEqual(ep.name, "自建-香港02")
         self.assertEqual(ep.url, "socks5://admin:pw@8.8.8.8:1080")
-        self.assertEqual(ep.safe_url, "socks5://***:***@8.8.8.8:1080")
+        self.assertEqual(ep.display_name, "【自建-香港02】")
+        self.assertIn("8.***.***.8", ep.safe_url)
+        self.assertNotIn("1080", ep.safe_url)
 
     def test_parse_multiline_with_comments(self):
         text = """
@@ -61,8 +78,11 @@ class TestProxyManager(unittest.TestCase):
         eps = parse_proxies_text(text)
         self.assertEqual(len(eps), 3)
         self.assertEqual(eps[0].name, "自建-广州家宽出口")
+        self.assertEqual(eps[0].display_name, "【自建-广州家宽出口】")
         self.assertEqual(eps[1].name, "备用-AWS")
+        self.assertEqual(eps[1].display_name, "【备用-AWS】")
         self.assertEqual(eps[2].name, "自建-韩国")
+        self.assertEqual(eps[2].display_name, "【自建-韩国】")
         self.assertEqual(eps[2].url, "socks5://12.0.0.3:1080")
 
     def test_self_hosted_priority_scheduling(self):
@@ -86,7 +106,7 @@ class TestProxyManager(unittest.TestCase):
         ep = ProxyEndpoint(
             name="自建-测试节点",
             url="socks5://1.2.3.4:1080",
-            safe_url="socks5://1.2.3.4:1080",
+            safe_url="socks5://***:***@1.***.***.4:****",
             protocol="socks5",
             host="1.2.3.4",
             port=1080,
@@ -95,7 +115,9 @@ class TestProxyManager(unittest.TestCase):
             is_self_hosted=True,
         )
         alert = format_dead_proxy_alert(ep, "连接超时")
-        self.assertIn("❌ 代理失效 【自建-测试节点】(1.2.3.4:1080)", alert)
+        self.assertIn("❌ 代理失效 【自建-测试节点】", alert)
+        self.assertNotIn("1.2.3.4", alert)
+        self.assertNotIn("1080", alert)
         self.assertIn("SELF_HOSTED_PROXIES", alert)
         self.assertIn("死代理", alert)
 

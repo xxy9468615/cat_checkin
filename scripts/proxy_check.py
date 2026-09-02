@@ -32,6 +32,7 @@ from proxy_manager import (
     ProxyEndpoint,
     format_dead_proxy_alert,
     get_all_proxy_endpoints,
+    mask_host,
     mask_proxy_url,
     parse_proxies_text,
     parse_proxy_line,
@@ -295,16 +296,16 @@ def print_healthcheck_report(alive_list: List[ProxyCheckResult], dead_list: List
             ep = res.endpoint
             tag = " [自建]" if ep.is_self_hosted else ""
             src = f" ({ep.source})" if ep.source else ""
+            masked_ip = mask_host(res.exit_ip) if res.exit_ip else "未知"
             print(f"[{idx}] {res.status_icon} {ep.display_name}{tag}{src}")
-            print(f"    • 连接地址: {ep.safe_url}")
-            print(f"    • 出口 IP: {res.exit_ip} | 延迟: {res.latency_ms}ms")
-            print(f"    • 归属信息: {res.ip_geo} ({res.ip_isp})")
+            print(f"    • 协议类型: {ep.protocol.upper()} | 响应延迟: {res.latency_ms}ms")
+            print(f"    • 出口归属: {res.ip_geo} ({res.ip_isp}) | 出口掩码: {masked_ip}")
             if res.site_status:
                 site_line = " | ".join(f"{k}: {v}" for k, v in res.site_status.items())
                 print(f"    • 站点连通: {site_line}")
             print("-" * 70)
 
-    # 2. 打印死代理清单与替换指引
+    # 2. 打印死代理清单与替换指引（严格安全脱敏，绝不暴露真实 IP/端口）
     if dead_list:
         print("\n" + "=" * 80)
         print("🚨 【死代理 / 不可用节点替换清单（请及时更新）】")
@@ -315,9 +316,8 @@ def print_healthcheck_report(alive_list: List[ProxyCheckResult], dead_list: List
             src_str = ep.source or "环境变量"
             print(f"\n👉 [{idx}] {ep.display_name}{tag}")
             print(f"   • 来源配置: {src_str}")
-            print(f"   • 代理地址: {ep.safe_url}")
+            print(f"   • 协议类型: {ep.protocol.upper()}")
             print(f"   • 失效原因: {res.error_msg or '连接超时/拒绝连接/无网络响应'}")
-            print(f"   • 原始定义: {ep.raw_input}")
             print(f"   💡 替换处置建议: 该节点已彻底失效(死代理)，请登录对应服务商后台排查，")
             print(f"      并在 GitHub Secrets 的 [{src_str}] 中将其替换为有效的新代理节点！")
         print("=" * 80)

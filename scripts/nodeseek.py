@@ -159,7 +159,7 @@ def _run_account(idx: int, total: int, cookie: str, proxy: str, random_bonus: bo
     last_err = ""
     for i, px in enumerate(candidates or [""]):
         ep = parse_proxy_line(px) if px else None
-        tag = ep.display_name if ep else (mask_str(px, 6, 3) if px else "直连")
+        tag = ep.display_name if ep else ("【未知代理】" if px else "直连")
         # 同出口瞬断重试：TUN/节点抖动常在 TLS 层报错（连接没建成，CF 看不到，
         # 重试不会被计为探测）；403 是 CF 的完整应答，重试无意义不重试
         for attempt in range(1, 4):

@@ -234,7 +234,7 @@ def _http_request_with_failover(
 
     for p in candidate_proxies:
         ep = parse_proxy_line(p) if p else None
-        p_label = ep.display_name if ep else (p if len(p) < 30 else (p[:27] + "..."))
+        p_label = ep.display_name if ep else "【未知代理】"
 
         # 1. 尝试 curl_cffi
         resp = _cffi_request(method, url, headers, proxy=p)

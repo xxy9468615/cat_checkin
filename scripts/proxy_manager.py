@@ -24,31 +24,34 @@ class ProxyEndpoint:
 
     name: str  # 统一识别名称，如 "自建-香港-01"
     url: str  # 完整可用代理连接串，如 "socks5://user:pass@1.2.3.4:1080"
-    safe_url: str  # 脱敏后的安全连接串，如 "socks5://***:***@1.2.3.4:1080"
+    safe_url: str  # 脱敏后的安全连接串，如 "socks5://***:***@1.***.***.4:****"
     protocol: str  # "socks5", "http", "https"
     host: str  # "1.2.3.4"
     port: int  # 1080
-    raw_input: str = ""  # 原始输入行，便于提示用户替换哪一行
+    raw_input: str = ""  # 原始输入行
     source: str = ""  # 来源环境变量名
     is_self_hosted: bool = False  # 是否标记为自建代理
 
     @property
     def host_port(self) -> str:
-        """返回 host:port 组合。"""
+        """返回 host:port 组合（仅供内部网络传输，严禁直接打印在日志）。"""
         return f"{self.host}:{self.port}"
 
     @property
     def display_name(self) -> str:
-        """友好的显示名称，例如: 【自建-香港-01】(1.2.3.4:1080)。"""
-        return f"【{self.name}】({self.host_port})"
+        """友好的安全显示名称：严格仅显示节点名称，绝不附带真实 IP 与端口。"""
+        clean = self.name.strip()
+        if (clean.startswith("【") and clean.endswith("】")) or (
+            clean.startswith("[") and clean.endswith("]")
+        ):
+            return clean
+        return f"【{clean}】"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
             "url": self.safe_url,
             "protocol": self.protocol,
-            "host": self.host,
-            "port": self.port,
             "display_name": self.display_name,
             "source": self.source,
             "is_self_hosted": self.is_self_hosted,
@@ -58,28 +61,46 @@ class ProxyEndpoint:
         return self.display_name
 
 
-def mask_proxy_url(url: str) -> str:
-    """对代理 URL 中的用户名密码进行脱敏处理。
+def mask_host(host: str) -> str:
+    """对 IP 地址或域名进行安全脱敏（首尾可见、中间掩码，防止在公开日志中暴露资产）。
 
     示例:
-    socks5://admin:secret123@1.2.3.4:1080 -> socks5://***:***@1.2.3.4:1080
-    http://5.6.7.8:8080 -> http://5.6.7.8:8080
+    112.64.135.45 -> 112.***.***.45
+    hk01.myvps.net -> h***1.myvps.net
+    127.0.0.1 / localhost -> 原样保留
+    """
+    if not host:
+        return "***"
+    if host in ("127.0.0.1", "localhost", "0.0.0.0"):
+        return host
+    parts = host.split(".")
+    if len(parts) == 4 and all(p.isdigit() for p in parts):
+        return f"{parts[0]}.***.***.{parts[3]}"
+    if "." in host:
+        sub, rest = host.split(".", 1)
+        masked_sub = f"{sub[0]}***{sub[-1]}" if len(sub) > 2 else "***"
+        return f"{masked_sub}.{rest}"
+    if len(host) > 4:
+        return f"{host[:2]}***{host[-2:]}"
+    return "***"
+
+
+def mask_proxy_url(url: str) -> str:
+    """对代理 URL 进行严格多层脱敏处理（隐去密码、掩码主机、隐去敏感端口）。
+
+    示例:
+    socks5://admin:secret123@1.2.3.4:1080 -> socks5://***:***@1.***.***.4:****
+    http://5.6.7.8:8080 -> http://5.***.***.8:****
     """
     if not url:
         return ""
     try:
         parsed = urllib.parse.urlsplit(url)
-        if parsed.username or parsed.password:
-            masked_netloc = f"***:***@{parsed.hostname}"
-            if parsed.port:
-                masked_netloc += f":{parsed.port}"
-            return urllib.parse.urlunsplit(
-                (parsed.scheme, masked_netloc, parsed.path, parsed.query, parsed.fragment)
-            )
-        return url
+        scheme = parsed.scheme or "socks5"
+        masked_h = mask_host(parsed.hostname or "")
+        return f"{scheme}://***:***@{masked_h}:****"
     except Exception:
-        # 正则降级
-        return re.sub(r"://([^:@]+):([^@]+)@", r"://***:***@", url)
+        return "proxy://***:***@***:****"
 
 
 def parse_proxy_line(
@@ -184,10 +205,11 @@ def parse_proxy_line(
     if not host:
         return None
 
-    # 5. 自动推断识别名称（若配置中未指明）
+    # 5. 自动推断识别名称（若配置中未指明名称，必须严格对 IP 进行掩码，且坚决不暴露端口）
     if not extracted_name:
         prefix = default_name_prefix or ("自建节点" if is_self_hosted else "代理节点")
-        extracted_name = f"{prefix}-{host}:{port}"
+        masked_h = mask_host(host)
+        extracted_name = f"{prefix}-{masked_h}"
 
     # 判断是否为自建代理（根据名称关键字、配置来源或显式标记）
     self_hosted_mark = (
@@ -426,7 +448,7 @@ def probe_first_working_proxy(
             api_code = "000"
 
         print(
-            f"  ✅ {label}代理存活就绪: {ep.display_name} | 落地 IP: {exit_ip} (API HTTP {api_code})"
+            f"  ✅ {label}代理存活就绪: {ep.display_name} (API HTTP {api_code})"
         )
 
         if github_env and os.path.exists(github_env):
@@ -442,7 +464,7 @@ def probe_first_working_proxy(
                     {
                         "mode": f"{label}代理",
                         "node": ep.name,
-                        "exit_ip": exit_ip,
+                        "exit_ip": mask_host(exit_ip),
                         "probe": api_code,
                     },
                     f,

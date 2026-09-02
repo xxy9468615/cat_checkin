@@ -274,7 +274,7 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
     # 1. 尝试通过候选出口（自建代理优先/备用代理/直连）发起 App 端原生签到
     for p in candidate_proxies:
         ep = parse_proxy_line(p) if p else None
-        p_label = ep.display_name if ep else (p if len(p) < 30 else (p[:27] + "..."))
+        p_label = ep.display_name if ep else "【未知代理】"
         try:
             cur_h = Http(follow_redirects=True, proxy=p)
             code, parsed, raw_text, sc_list = _post_app(
