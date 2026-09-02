@@ -34,10 +34,13 @@ from common import (
     BJT,
     Http,
     env_seq,
+    format_dead_proxy_alert,
+    get_all_proxy_endpoints,
     is_already_signed,
     load_kv_state,
     main_guard,
     mask_str,
+    parse_proxy_line,
     save_kv_state,
 )
 
@@ -146,7 +149,10 @@ def _calc_cookie_expiry(cookie_str: str, state: Dict[str, Any]) -> Optional[int]
 
 
 def _get_candidate_proxies() -> List[str]:
-    """解析候选代理列表（支持换行或逗号分隔，支持带注释）。"""
+    """解析候选代理列表，支持带统一识别名称与自建代理优先调度。"""
+    endpoints = get_all_proxy_endpoints(task_prefix="SMZDM", include_self_hosted=True)
+    if endpoints:
+        return [ep.url for ep in endpoints]
     raw = os.getenv("SMZDM_PROXY") or os.getenv("SMZDM_BACKUP_PROXIES") or os.getenv("PROXY") or ""
     res: List[str] = []
     for line in raw.replace(",", "\n").splitlines():
@@ -265,8 +271,10 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
         "touchstone_event": "",
     }
 
-    # 1. 尝试通过候选出口（代理/直连）发起 App 端原生签到
+    # 1. 尝试通过候选出口（自建代理优先/备用代理/直连）发起 App 端原生签到
     for p in candidate_proxies:
+        ep = parse_proxy_line(p) if p else None
+        p_label = ep.display_name if ep else (p if len(p) < 30 else (p[:27] + "..."))
         try:
             cur_h = Http(follow_redirects=True, proxy=p)
             code, parsed, raw_text, sc_list = _post_app(
@@ -277,14 +285,14 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
                 res_data = parsed
                 raw_resp_text = raw_text
                 collected_set_cookies.extend(sc_list)
-                used_proxy = p
+                used_proxy = p_label
                 break
             elif len(candidate_proxies) > 1:
-                p_label = p if len(p) < 30 else (p[:27] + "...")
                 print(f"⚠️ 代理 {p_label} 响应异常 (HTTP {code})，正在尝试备用出口...")
         except Exception as e:
-            if len(candidate_proxies) > 1:
-                p_label = p if len(p) < 30 else (p[:27] + "...")
+            if ep:
+                print(f"  {format_dead_proxy_alert(ep, str(e))}")
+            elif len(candidate_proxies) > 1:
                 print(f"⚠️ 代理 {p_label} 连接失败 ({e})，正在尝试备用出口...")
 
     # 若所有代理均未接通且未尝试过直连，尝试直连兜底

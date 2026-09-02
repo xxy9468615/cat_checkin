@@ -325,9 +325,10 @@ jobs:
             latvi-state-
             agentrouter-state-
 
-      - name: Setup SS proxy for AgentRouter
+      - name: Setup proxy egress (Self-hosted / SS / Backup)
         if: inputs.direct != true
         env:
+          SELF_HOSTED_PROXIES: ${{ secrets.SELF_HOSTED_PROXIES || secrets.CUSTOM_PROXIES }}
           AGENTROUTER_SS_CONFIG: ${{ secrets.AGENTROUTER_SS_CONFIG }}
           AGENTROUTER_SS_SUB_URL: ${{ secrets.AGENTROUTER_SS_SUB_URL }}
           AGENTROUTER_SS_SHA256: ${{ secrets.AGENTROUTER_SS_SHA256 }}
@@ -508,8 +509,87 @@ jobs:
             return 0
           }
 
+          probe_proxy_list() {
+            local label="$1"
+            local raw_text="$2"
+            [ -n "$raw_text" ] || return 1
+            python3 - "$label" "$raw_text" <<'PY'
+import sys, os, subprocess, json
+sys.path.insert(0, "scripts")
+try:
+    from proxy_manager import parse_proxies_text, format_dead_proxy_alert
+except ImportError:
+    sys.exit(1)
+
+label = sys.argv[1]
+raw_text = sys.argv[2]
+endpoints = parse_proxies_text(raw_text, default_name_prefix=f"{label}节点")
+if not endpoints:
+    sys.exit(1)
+
+print(f"🔍 开始探测 {label} 代理池 (共 {len(endpoints)} 个节点)...")
+github_env = os.getenv("GITHUB_ENV", "")
+
+for ep in endpoints:
+    print(f"  ⏳ 正在探测 {ep.display_name}...")
+    cmd_ip = ["curl", "-sS", "-x", ep.url, "-m", "8", "https://api.ipify.org"]
+    try:
+        r_ip = subprocess.run(cmd_ip, capture_output=True, text=True, timeout=10)
+        exit_ip = r_ip.stdout.strip()
+    except Exception:
+        exit_ip = ""
+
+    if not exit_ip:
+        print(f"  {format_dead_proxy_alert(ep, '公网出口超时或无法连接')}")
+        continue
+
+    cmd_api = ["curl", "-sS", "-x", ep.url, "-m", "10", "-o", "/dev/null", "-w", "%{http_code}", "https://ps.air-outer.com"]
+    try:
+        r_api = subprocess.run(cmd_api, capture_output=True, text=True, timeout=12)
+        api_code = r_api.stdout.strip()
+    except Exception:
+        api_code = "000"
+
+    print(f"  ✅ {label}代理存活就绪: {ep.display_name} | 落地 IP: {exit_ip} (API HTTP {api_code})")
+
+    if github_env and os.path.exists(github_env):
+        with open(github_env, "a", encoding="utf-8") as f:
+            f.write(f"AGENTROUTER_PROXY={ep.url}\n")
+            f.write(f"NODESEEK_PROXY={ep.url}\n")
+            f.write(f"2LIBRA_PROXY={ep.url}\n")
+            f.write(f"CLOUDSTUDIO_PROXY={ep.url}\n")
+
+    with open("/tmp/proxy_active.json", "w", encoding="utf-8") as f:
+        json.dump({"mode": f"{label}代理", "node": ep.name, "exit_ip": exit_ip, "probe": api_code}, f)
+    sys.exit(0)
+
+print(f"❌ {label}代理池全部不可达 (死代理)")
+sys.exit(1)
+PY
+            local ret=$?
+            if [ $ret -eq 0 ] && [ -f /tmp/proxy_active.json ]; then
+              local p_mode p_node p_exit p_probe
+              p_mode=$(python3 -c "import json; print(json.load(open('/tmp/proxy_active.json')).get('mode',''))")
+              p_node=$(python3 -c "import json; print(json.load(open('/tmp/proxy_active.json')).get('node',''))")
+              p_exit=$(python3 -c "import json; print(json.load(open('/tmp/proxy_active.json')).get('exit_ip',''))")
+              p_probe=$(python3 -c "import json; print(json.load(open('/tmp/proxy_active.json')).get('probe',''))")
+              stash_proxy_state "$p_mode" "$p_node" "$p_exit" "$p_probe"
+              return 0
+            fi
+            return 1
+          }
+
           # sing-box 路径也需要 ss-config.json：提前落盘（setup_ss 内会重复写，幂等）
           printf '%s' "$AGENTROUTER_SS_CONFIG" > /tmp/ss-config.json
+
+          # 1. 自建代理优先（配置了自建代理时直接探测，优先于机场订阅）
+          if [ -n "$SELF_HOSTED_PROXIES" ]; then
+            echo "检测到配置了自建代理 (SELF_HOSTED_PROXIES)，优先执行自建代理探测..."
+            if probe_proxy_list "自建" "$SELF_HOSTED_PROXIES"; then
+              exit 0
+            fi
+            echo "⚠️ 自建代理暂不可用，回退至订阅与备用代理模式..."
+          fi
 
           if setup_mihomo; then
             exit 0
@@ -518,20 +598,12 @@ jobs:
             exit 0
           fi
 
-          echo "SS proxy unavailable; trying backup proxies..."
-          while IFS= read -r line; do
-            p="${line%%#*}"
-            p="$(printf '%s' "$p" | tr -d '[:space:]')"
-            [ -n "$p" ] || continue
-            if curl -sS -x "$p" -m 12 -o /dev/null https://ps.air-outer.com; then
-              echo "AGENTROUTER_PROXY=$p" >> "$GITHUB_ENV"
-              echo "backup proxy OK: ${p##*@}"
-              stash_proxy_state backup "${p##*@}" "" ""
-              exit 0
-            fi
-            echo "backup proxy unreachable: ${p##*@}"
-          done <<< "$AGENTROUTER_BACKUP_PROXIES"
-          echo "no backup proxy available; agentrouter will fail (red card by design)"
+          echo "SS/订阅代理不可用，正在探测备用代理池..."
+          if probe_proxy_list "备用" "$AGENTROUTER_BACKUP_PROXIES"; then
+            exit 0
+          fi
+
+          echo "所有代理均不可用 (或全部为死代理)；agentrouter 将按设计触发公平失败"
           stash_proxy_state none "" "" ""
 
       - name: Direct mode (clear proxy env, runner IP 直连)

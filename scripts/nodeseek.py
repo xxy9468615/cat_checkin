@@ -29,7 +29,18 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from common import Http, env, env_bool, env_seq, is_already_signed, main_guard, mask_str
+from common import (
+    Http,
+    env,
+    env_bool,
+    env_seq,
+    format_dead_proxy_alert,
+    get_all_proxy_endpoints,
+    is_already_signed,
+    main_guard,
+    mask_str,
+    parse_proxy_line,
+)
 
 PREFIX = "NODESEEK_"
 DEFAULT_API = "https://www.nodeseek.com"
@@ -71,10 +82,13 @@ def _parse_cookie_info(cookie_str: str) -> Tuple[str, str, Optional[int]]:
 
 
 def _proxy_candidates(raw: str) -> List[str]:
-    """NODESEEK_PROXY 多代理解析：逗号/换行分隔，按序 failover。"""
+    """NODESEEK_PROXY 多代理解析：自建代理优先，支持统一识别名称。"""
+    endpoints = get_all_proxy_endpoints(task_prefix="NODESEEK", include_self_hosted=True)
+    if endpoints:
+        return [ep.url for ep in endpoints]
     if not raw:
         return []
-    return [x.strip() for x in re.split(r"[,\n]+", raw) if x.strip()]
+    return [x.strip() for x in re.split(r"[,\n]+", raw) if x.strip() and not x.strip().startswith("#")]
 
 
 class _CffiResp:
@@ -144,7 +158,8 @@ def _run_account(idx: int, total: int, cookie: str, proxy: str, random_bonus: bo
     resp = None
     last_err = ""
     for i, px in enumerate(candidates or [""]):
-        tag = mask_str(px, 6, 3) if px else "直连"
+        ep = parse_proxy_line(px) if px else None
+        tag = ep.display_name if ep else (mask_str(px, 6, 3) if px else "直连")
         # 同出口瞬断重试：TUN/节点抖动常在 TLS 层报错（连接没建成，CF 看不到，
         # 重试不会被计为探测）；403 是 CF 的完整应答，重试无意义不重试
         for attempt in range(1, 4):
@@ -155,6 +170,8 @@ def _run_account(idx: int, total: int, cookie: str, proxy: str, random_bonus: bo
             except Exception as exc:  # noqa: BLE001
                 detail = f"{type(exc).__name__}: {str(exc)[:80]}"
                 last_err = f"{tag}: {detail}"
+                if ep and attempt == 3:
+                    print(f"  {format_dead_proxy_alert(ep, detail)}")
                 if attempt < 3:
                     print(f"[diag] 出口异常({i + 1}/{len(candidates) or 1}) {tag}: {detail}"
                           f"，{attempt * 2}s 后重试({attempt}/2)")

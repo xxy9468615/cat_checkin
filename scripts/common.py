@@ -16,7 +16,39 @@ import urllib.parse
 import urllib.request
 import zlib
 from http.cookiejar import CookieJar
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Union
+
+try:
+    from proxy_manager import (
+        ProxyEndpoint,
+        format_dead_proxy_alert,
+        get_all_proxy_endpoints,
+        get_candidate_proxy_urls,
+        mask_proxy_url,
+        parse_proxies_text,
+        parse_proxy_line,
+    )
+except ImportError:
+    try:
+        from scripts.proxy_manager import (  # type: ignore
+            ProxyEndpoint,
+            format_dead_proxy_alert,
+            get_all_proxy_endpoints,
+            get_candidate_proxy_urls,
+            mask_proxy_url,
+            parse_proxies_text,
+            parse_proxy_line,
+        )
+    except ImportError:
+        from .proxy_manager import (  # type: ignore
+            ProxyEndpoint,
+            format_dead_proxy_alert,
+            get_all_proxy_endpoints,
+            get_candidate_proxy_urls,
+            mask_proxy_url,
+            parse_proxies_text,
+            parse_proxy_line,
+        )
 
 DEFAULT_UA = (
     os.getenv("UA")
@@ -162,8 +194,9 @@ def retry(times: int = 3, backoff: float = 3.0, retry_codes: tuple = (-1, 429, 5
     return decorator
 
 class Http:
-    def __init__(self, follow_redirects: bool = False, proxy: str = ""):
+    def __init__(self, follow_redirects: bool = False, proxy: Union[str, ProxyEndpoint] = ""):
         self.jar = CookieJar()
+        self.proxy_endpoint: Optional[ProxyEndpoint] = None
         ssl_ctx = _create_ssl_context()
         handlers = [
             urllib.request.HTTPCookieProcessor(self.jar),
@@ -172,35 +205,49 @@ class Http:
         if not follow_redirects:
             handlers.insert(0, NoRedirectHandler())
         if proxy:
-            # 代理出口：仅当调用方显式传入 proxy 时启用，其它脚本不受影响。
-            # - http(s):// 走 urllib 原生 ProxyHandler（HTTPS 经 CONNECT 隧道）
-            # - socks5(h):// 或裸 host:port 走 pysocks 全局 monkey-patch socket
-            #   （urllib 原生不支持 socks scheme），支持 user:pass@host:port userinfo
-            if proxy.lower().startswith(("http://", "https://")):
-                handlers.append(
-                    urllib.request.ProxyHandler({"http": proxy, "https": proxy})
-                )
+            # 代理出口：支持字符串 URL (含 [名称] / #名称 识别标签) 或 ProxyEndpoint 对象
+            proxy_str = ""
+            if isinstance(proxy, ProxyEndpoint):
+                self.proxy_endpoint = proxy
+                proxy_str = proxy.url
             else:
-                try:
-                    import socks
-                    import socket
-                except ImportError:
-                    raise RuntimeError(
-                        "检测到 AGENTROUTER_PROXY(socks5) 但缺少 pysocks 依赖，请 pip install pysocks"
+                raw_p = str(proxy).strip()
+                parsed_ep = parse_proxy_line(raw_p)
+                if parsed_ep:
+                    self.proxy_endpoint = parsed_ep
+                    proxy_str = parsed_ep.url
+                else:
+                    proxy_str = raw_p
+
+            if proxy_str:
+                # - http(s):// 走 urllib 原生 ProxyHandler（HTTPS 经 CONNECT 隧道）
+                # - socks5(h):// 或裸 host:port 走 pysocks 全局 monkey-patch socket
+                #   （urllib 原生不支持 socks scheme），支持 user:pass@host:port userinfo
+                if proxy_str.lower().startswith(("http://", "https://")):
+                    handlers.append(
+                        urllib.request.ProxyHandler({"http": proxy_str, "https": proxy_str})
                     )
-                u = urllib.parse.urlparse(
-                    proxy if "://" in proxy else f"socks5://{proxy}"
-                )
-                # rdns=True：目标域名交由代理端解析（与出口 IP 一致，避免本地 DNS 污染）
-                socks.set_default_proxy(
-                    socks.SOCKS5,
-                    u.hostname or "",
-                    u.port or 1080,
-                    rdns=True,
-                    username=urllib.parse.unquote(u.username) if u.username else None,
-                    password=urllib.parse.unquote(u.password) if u.password else None,
-                )
-                socket.socket = socks.socksocket
+                else:
+                    try:
+                        import socks
+                        import socket
+                    except ImportError:
+                        raise RuntimeError(
+                            "检测到 SOCKS5 代理但缺少 pysocks 依赖，请 pip install pysocks"
+                        )
+                    u = urllib.parse.urlparse(
+                        proxy_str if "://" in proxy_str else f"socks5://{proxy_str}"
+                    )
+                    # rdns=True：目标域名交由代理端解析（与出口 IP 一致，避免本地 DNS 污染）
+                    socks.set_default_proxy(
+                        socks.SOCKS5,
+                        u.hostname or "",
+                        u.port or 1080,
+                        rdns=True,
+                        username=urllib.parse.unquote(u.username) if u.username else None,
+                        password=urllib.parse.unquote(u.password) if u.password else None,
+                    )
+                    socket.socket = socks.socksocket
         self.opener = urllib.request.build_opener(*handlers)
     @retry()
     def request(self, method: str, url: str, *, headers: Optional[Dict[str,str]]=None,

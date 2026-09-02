@@ -32,10 +32,13 @@ from common import (
     Http,
     env_seq,
     find,
+    format_dead_proxy_alert,
+    get_all_proxy_endpoints,
     is_already_signed,
     load_kv_state,
     main_guard,
     mask_str,
+    parse_proxy_line,
     save_kv_state,
     strip_tags,
 )
@@ -173,7 +176,10 @@ def _load_accounts() -> List[str]:
 
 
 def _get_candidate_proxies() -> List[str]:
-    """解析候选代理列表（支持换行或逗号分隔，支持带注释）。"""
+    """解析候选代理列表，支持带统一识别名称与自建代理优先调度。"""
+    endpoints = get_all_proxy_endpoints(task_prefix="52POJIE", include_self_hosted=True)
+    if endpoints:
+        return [ep.url for ep in endpoints]
     raw = (
         os.getenv("52POJIE_PROXY")
         or os.getenv("WUAI_PROXY")
@@ -227,12 +233,15 @@ def _http_request_with_failover(
     last_h = None
 
     for p in candidate_proxies:
+        ep = parse_proxy_line(p) if p else None
+        p_label = ep.display_name if ep else (p if len(p) < 30 else (p[:27] + "..."))
+
         # 1. 尝试 curl_cffi
         resp = _cffi_request(method, url, headers, proxy=p)
         if resp is not None:
             # 检查是否被 WAF 阻断
             if resp.code != 403 and not any(w in resp.text for w in WAF_PHRASES):
-                return resp, p, None
+                return resp, p_label, None
             last_resp = resp
 
         # 2. 回退到 common.Http (urllib)
@@ -240,14 +249,14 @@ def _http_request_with_failover(
             cur_h = Http(follow_redirects=True, proxy=p)
             resp = cur_h.request(method, url, headers=headers, timeout=20)
             if resp.code == 200 and not any(w in resp.text for w in WAF_PHRASES):
-                return resp, p, cur_h
+                return resp, p_label, cur_h
             last_resp = resp
             last_h = cur_h
-        except Exception:
-            pass
+        except Exception as exc:
+            if ep:
+                print(f"  {format_dead_proxy_alert(ep, str(exc))}")
 
         if len(candidate_proxies) > 1 and last_resp is not None:
-            p_label = p if len(p) < 30 else (p[:27] + "...")
             print(f"  ⚠️ 代理 {p_label} 响应异常 (HTTP {last_resp.code})，尝试备用出口...")
 
     # 若所有代理均未能正常请求且无直连，尝试直连一次
