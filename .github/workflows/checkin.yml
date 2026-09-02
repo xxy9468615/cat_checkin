@@ -513,67 +513,15 @@ jobs:
             local label="$1"
             local raw_text="$2"
             [ -n "$raw_text" ] || return 1
-            python3 - "$label" "$raw_text" <<'PY'
-import sys, os, subprocess, json
-sys.path.insert(0, "scripts")
-try:
-    from proxy_manager import parse_proxies_text, format_dead_proxy_alert
-except ImportError:
-    sys.exit(1)
-
-label = sys.argv[1]
-raw_text = sys.argv[2]
-endpoints = parse_proxies_text(raw_text, default_name_prefix=f"{label}节点")
-if not endpoints:
-    sys.exit(1)
-
-print(f"🔍 开始探测 {label} 代理池 (共 {len(endpoints)} 个节点)...")
-github_env = os.getenv("GITHUB_ENV", "")
-
-for ep in endpoints:
-    print(f"  ⏳ 正在探测 {ep.display_name}...")
-    cmd_ip = ["curl", "-sS", "-x", ep.url, "-m", "8", "https://api.ipify.org"]
-    try:
-        r_ip = subprocess.run(cmd_ip, capture_output=True, text=True, timeout=10)
-        exit_ip = r_ip.stdout.strip()
-    except Exception:
-        exit_ip = ""
-
-    if not exit_ip:
-        print(f"  {format_dead_proxy_alert(ep, '公网出口超时或无法连接')}")
-        continue
-
-    cmd_api = ["curl", "-sS", "-x", ep.url, "-m", "10", "-o", "/dev/null", "-w", "%{http_code}", "https://ps.air-outer.com"]
-    try:
-        r_api = subprocess.run(cmd_api, capture_output=True, text=True, timeout=12)
-        api_code = r_api.stdout.strip()
-    except Exception:
-        api_code = "000"
-
-    print(f"  ✅ {label}代理存活就绪: {ep.display_name} | 落地 IP: {exit_ip} (API HTTP {api_code})")
-
-    if github_env and os.path.exists(github_env):
-        with open(github_env, "a", encoding="utf-8") as f:
-            f.write(f"AGENTROUTER_PROXY={ep.url}\n")
-            f.write(f"NODESEEK_PROXY={ep.url}\n")
-            f.write(f"2LIBRA_PROXY={ep.url}\n")
-            f.write(f"CLOUDSTUDIO_PROXY={ep.url}\n")
-
-    with open("/tmp/proxy_active.json", "w", encoding="utf-8") as f:
-        json.dump({"mode": f"{label}代理", "node": ep.name, "exit_ip": exit_ip, "probe": api_code}, f)
-    sys.exit(0)
-
-print(f"❌ {label}代理池全部不可达 (死代理)")
-sys.exit(1)
-PY
-            local ret=$?
-            if [ $ret -eq 0 ] && [ -f /tmp/proxy_active.json ]; then
-              local p_mode p_node p_exit p_probe
-              p_mode=$(python3 -c "import json; print(json.load(open('/tmp/proxy_active.json')).get('mode',''))")
-              p_node=$(python3 -c "import json; print(json.load(open('/tmp/proxy_active.json')).get('node',''))")
-              p_exit=$(python3 -c "import json; print(json.load(open('/tmp/proxy_active.json')).get('exit_ip',''))")
-              p_probe=$(python3 -c "import json; print(json.load(open('/tmp/proxy_active.json')).get('probe',''))")
-              stash_proxy_state "$p_mode" "$p_node" "$p_exit" "$p_probe"
+            if python3 scripts/proxy_manager.py probe "$label" "$raw_text"; then
+              if [ -f /tmp/proxy_active.json ]; then
+                local p_mode p_node p_exit p_probe
+                p_mode=$(python3 -c "import json; print(json.load(open('/tmp/proxy_active.json')).get('mode',''))")
+                p_node=$(python3 -c "import json; print(json.load(open('/tmp/proxy_active.json')).get('node',''))")
+                p_exit=$(python3 -c "import json; print(json.load(open('/tmp/proxy_active.json')).get('exit_ip',''))")
+                p_probe=$(python3 -c "import json; print(json.load(open('/tmp/proxy_active.json')).get('probe',''))")
+                stash_proxy_state "$p_mode" "$p_node" "$p_exit" "$p_probe"
+              fi
               return 0
             fi
             return 1

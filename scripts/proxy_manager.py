@@ -377,3 +377,91 @@ def format_dead_proxy_alert(endpoint: ProxyEndpoint, error_msg: str = "") -> str
         f"❌ 代理失效 {endpoint.display_name}{src_info}{err_desc}\n"
         f"   💡 该代理已不可达(死代理)，请及时在 GitHub Secrets 或环境变量中更新替换！"
     )
+
+
+def probe_first_working_proxy(
+    label: str, raw_text: str, state_file: str = "/tmp/proxy_active.json"
+) -> bool:
+    """在 CI 环境下探测一组候选代理，选取首个连通节点写入 GITHUB_ENV。"""
+    import subprocess
+    import json
+
+    endpoints = parse_proxies_text(raw_text, default_name_prefix=f"{label}节点")
+    if not endpoints:
+        return False
+
+    print(f"🔍 开始探测 {label} 代理池 (共 {len(endpoints)} 个节点)...")
+    github_env = os.getenv("GITHUB_ENV", "")
+
+    for ep in endpoints:
+        print(f"  ⏳ 正在探测 {ep.display_name}...")
+        cmd_ip = ["curl", "-sS", "-x", ep.url, "-m", "8", "https://api.ipify.org"]
+        try:
+            r_ip = subprocess.run(cmd_ip, capture_output=True, text=True, timeout=10)
+            exit_ip = r_ip.stdout.strip()
+        except Exception:
+            exit_ip = ""
+
+        if not exit_ip:
+            print(f"  {format_dead_proxy_alert(ep, '公网出口超时或无法连接')}")
+            continue
+
+        cmd_api = [
+            "curl",
+            "-sS",
+            "-x",
+            ep.url,
+            "-m",
+            "10",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "https://ps.air-outer.com",
+        ]
+        try:
+            r_api = subprocess.run(cmd_api, capture_output=True, text=True, timeout=12)
+            api_code = r_api.stdout.strip()
+        except Exception:
+            api_code = "000"
+
+        print(
+            f"  ✅ {label}代理存活就绪: {ep.display_name} | 落地 IP: {exit_ip} (API HTTP {api_code})"
+        )
+
+        if github_env and os.path.exists(github_env):
+            with open(github_env, "a", encoding="utf-8") as f:
+                f.write(f"AGENTROUTER_PROXY={ep.url}\n")
+                f.write(f"NODESEEK_PROXY={ep.url}\n")
+                f.write(f"2LIBRA_PROXY={ep.url}\n")
+                f.write(f"CLOUDSTUDIO_PROXY={ep.url}\n")
+
+        try:
+            with open(state_file, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "mode": f"{label}代理",
+                        "node": ep.name,
+                        "exit_ip": exit_ip,
+                        "probe": api_code,
+                    },
+                    f,
+                )
+        except Exception:
+            pass
+
+        return True
+
+    print(f"❌ {label}代理池全部不可达 (死代理)")
+    return False
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) >= 4 and sys.argv[1] == "probe":
+        _label = sys.argv[2]
+        _raw = sys.argv[3]
+        _ok = probe_first_working_proxy(_label, _raw)
+        sys.exit(0 if _ok else 1)
+
