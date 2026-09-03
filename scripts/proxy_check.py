@@ -158,15 +158,17 @@ def _probe_via_curl_or_urllib(
 
 
 def _query_ip_geo(ip: str) -> Tuple[str, str]:
-    """查询出口 IP 的地理位置与 ISP 归属（优先 ip-api.com / 备用静态推断）。"""
+    """查询出口 IP 的地理位置与 ISP 归属（优先使用强校验 HTTPS 的地理接口 / 备用静态推断）。"""
     if not ip or ip.startswith(("127.", "10.", "192.168.")):
         return "本地环回/私有网络", "局域网"
     try:
+        from common import _create_ssl_context
+        ssl_ctx = _create_ssl_context()
         req = urllib.request.Request(
-            f"http://ip-api.com/json/{ip}?fields=country,regionName,city,isp,org,as",
+            f"https://ip-api.com/json/{ip}?fields=country,regionName,city,isp,org,as",
             headers={"User-Agent": "curl/7.68.0"},
         )
-        with urllib.request.urlopen(req, timeout=4) as resp:
+        with urllib.request.urlopen(req, context=ssl_ctx, timeout=4) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             country = data.get("country", "")
             city = data.get("city", "")

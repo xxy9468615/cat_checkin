@@ -195,6 +195,8 @@ def parse_proxy_line(
     protocol = (parsed.scheme or "socks5").lower()
     if protocol in ("socks", "socks5h"):
         protocol = "socks5"
+    elif protocol in ("socks4a",):
+        protocol = "socks4"
 
     host = parsed.hostname or ""
     try:
@@ -386,6 +388,30 @@ def get_all_proxy_endpoints(
         )
 
     return candidates
+
+
+def get_task_proxy_endpoints(
+    task_name: str,
+    include_self_hosted: bool = True,
+    include_backups: bool = True,
+) -> List[ProxyEndpoint]:
+    """为全仓库任意签到任务获取合规、全协议正规化且安全隔离的候选代理列表。
+
+    支持全代理协议：HTTP, HTTPS, SOCKS5, SOCKS5h, SOCKS4, SOCKS4a。
+    调度特性：
+    1. 自动正规化任务名（如 "juejin" -> "JUEJIN", "cloud189" -> "CLOUD189", "52pojie" -> "52POJIE"）
+    2. 自建代理优先调度（SELF_HOSTED_PROXIES / CUSTOM_PROXIES）
+    3. 任务专属代理（{TASK}_PROXY, {TASK}_BACKUP_PROXIES）
+    4. 国内站点（如 52POJIE, CLOUD189, SMZDM）智能复用仓库共享 CN 代理出口
+    5. 全局高可用备用代理池安全回退
+    6. 节点敏感 IP、端口与密码统一脱敏
+    """
+    clean_task = re.sub(r"[^a-zA-Z0-9_]", "", task_name).upper()
+    return get_all_proxy_endpoints(
+        task_prefix=clean_task,
+        include_self_hosted=include_self_hosted,
+        include_backups=include_backups,
+    )
 
 
 def get_candidate_proxy_urls(task_prefix: str = "") -> List[str]:

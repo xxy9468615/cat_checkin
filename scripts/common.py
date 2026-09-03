@@ -16,6 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+from pathlib import Path
 from http.cookiejar import CookieJar
 from typing import Any, Dict, Iterable, List, Optional, Union
 
@@ -28,6 +29,7 @@ try:
         format_dead_proxy_alert,
         get_all_proxy_endpoints,
         get_candidate_proxy_urls,
+        get_task_proxy_endpoints,
         mask_proxy_url,
         parse_proxies_text,
         parse_proxy_line,
@@ -39,6 +41,7 @@ except ImportError:
             format_dead_proxy_alert,
             get_all_proxy_endpoints,
             get_candidate_proxy_urls,
+            get_task_proxy_endpoints,
             mask_proxy_url,
             parse_proxies_text,
             parse_proxy_line,
@@ -49,6 +52,7 @@ except ImportError:
             format_dead_proxy_alert,
             get_all_proxy_endpoints,
             get_candidate_proxy_urls,
+            get_task_proxy_endpoints,
             mask_proxy_url,
             parse_proxies_text,
             parse_proxy_line,
@@ -164,8 +168,14 @@ class Response:
             return default
 
 def _create_ssl_context() -> ssl.SSLContext:
-    """构建健壮的 SSLContext，启用兼容性选项降低国内老旧/特定 SLB 握手阻断。"""
+    """构建严格且健壮的 SSLContext，强制实施系统根证书链校验与主机名一致性验证，最低 TLS 1.2。"""
     ctx = ssl.create_default_context()
+    # 显式强制验证模式与主机名匹配，杜绝任何外部上下文或环境篡改风险
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.check_hostname = True
+    # 强制最低 TLS 协议版本为 TLSv1.2，防御针对 TLS 1.0/1.1 的 POODLE/BEAST 等降级攻击
+    if hasattr(ssl, "TLSVersion") and hasattr(ssl.TLSVersion, "TLSv1_2"):
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     if hasattr(ssl, "OP_LEGACY_SERVER_CONNECT"):
         ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
     return ctx
@@ -202,16 +212,41 @@ def retry(times: int = 3, backoff: float = 3.0, retry_codes: tuple = (-1, 429, 5
     return decorator
 
 class Http:
-    def __init__(self, follow_redirects: bool = False, proxy: Union[str, ProxyEndpoint] = ""):
+    def __init__(
+        self,
+        follow_redirects: bool = False,
+        proxy: Union[str, ProxyEndpoint] = "",
+        task_name: str = "",
+    ):
         self.jar = CookieJar()
         self.proxy_endpoint: Optional[ProxyEndpoint] = None
+        self.has_proxy: bool = False
         ssl_ctx = _create_ssl_context()
+        self.ssl_context = ssl_ctx
         handlers = [
             urllib.request.HTTPCookieProcessor(self.jar),
             urllib.request.HTTPSHandler(context=ssl_ctx),
         ]
         if not follow_redirects:
             handlers.insert(0, NoRedirectHandler())
+
+        # 原生任务代理能力自适应：若未显式传 proxy，自动探测任务环境配置
+        if not proxy:
+            inferred_task = task_name
+            if not inferred_task and sys.argv and sys.argv[0]:
+                stem = Path(sys.argv[0]).stem
+                if stem and stem not in ("run_task", "daily_orchestrator", "unittest", "pytest", "daily_report"):
+                    inferred_task = stem
+            if inferred_task:
+                try:
+                    # 动态延迟导入以防循环依赖
+                    from proxy_manager import get_task_proxy_endpoints
+                    candidate_eps = get_task_proxy_endpoints(inferred_task)
+                    if candidate_eps:
+                        proxy = candidate_eps[0]
+                except Exception:
+                    pass
+
         if proxy:
             # 代理出口：支持字符串 URL (含 [名称] / #名称 识别标签) 或 ProxyEndpoint 对象
             proxy_str = ""
@@ -228,8 +263,9 @@ class Http:
                     proxy_str = raw_p
 
             if proxy_str:
-                # - http(s):// 走 urllib 原生 ProxyHandler（HTTPS 经 CONNECT 隧道）
-                # - socks5(h):// 或裸 host:port 优先使用 sockshandler.SocksiPyHandler（安全隔离，不修改全局 socket）
+                self.has_proxy = True
+                # - http(s):// 走 urllib 原生 ProxyHandler（HTTPS 经 CONNECT 隧道，隧道内走端到端 TLS）
+                # - socks5(h)://, socks4(a):// 优先使用 sockshandler.SocksiPyHandler（强制 rdns=True 远程 DNS，隔离全局 socket）
                 #   兜底回退为 pysocks 全局 monkey-patch socket，并在后续/直连时及时还原
                 if proxy_str.lower().startswith(("http://", "https://")):
                     socket.socket = _ORIG_SOCKET
@@ -241,7 +277,7 @@ class Http:
                         import socks
                     except ImportError:
                         raise RuntimeError(
-                            "检测到 SOCKS5 代理但缺少 pysocks 依赖，请 pip install pysocks"
+                            "检测到 SOCKS 代理但缺少 pysocks 依赖，请 pip install pysocks"
                         )
                     u = urllib.parse.urlparse(
                         proxy_str if "://" in proxy_str else f"socks5://{proxy_str}"
@@ -249,9 +285,10 @@ class Http:
                     used_handler = False
                     try:
                         import sockshandler
+                        scheme_lower = u.scheme.lower()
                         ptype = (
                             sockshandler.socks.SOCKS4
-                            if u.scheme.startswith("socks4")
+                            if scheme_lower.startswith("socks4")
                             else sockshandler.socks.SOCKS5
                         )
                         handlers.append(
@@ -259,7 +296,7 @@ class Http:
                                 ptype,
                                 u.hostname or "",
                                 u.port or 1080,
-                                True,  # rdns
+                                True,  # rdns=True: 强制远程 DNS 解析，彻底杜绝本地 DNS 劫持与域名泄露
                                 urllib.parse.unquote(u.username) if u.username else None,
                                 urllib.parse.unquote(u.password) if u.password else None,
                             )
@@ -274,7 +311,7 @@ class Http:
                             socks.SOCKS5,
                             u.hostname or "",
                             u.port or 1080,
-                            rdns=True,
+                            rdns=True,  # 强制远程 DNS
                             username=urllib.parse.unquote(u.username) if u.username else None,
                             password=urllib.parse.unquote(u.password) if u.password else None,
                         )
@@ -284,6 +321,7 @@ class Http:
         else:
             socket.socket = _ORIG_SOCKET
         self.opener = urllib.request.build_opener(*handlers)
+
     @retry()
     def request(self, method: str, url: str, *, headers: Optional[Dict[str,str]]=None,
                 data: Any=None, json_data: Any=None, form: Optional[Dict[str,Any]]=None,
@@ -292,6 +330,11 @@ class Http:
         headers.setdefault("User-Agent", DEFAULT_UA)
         headers.setdefault("Accept", "application/json, text/plain, */*")
         headers.setdefault("Connection", "close")
+
+        # 代理模式安全守门员：当通过任何代理（HTTP / SOCKS）传输时，严禁明文 HTTP 裸奔传输
+        if (getattr(self, "proxy_endpoint", None) or getattr(self, "has_proxy", False)) and url.lower().startswith("http://"):
+            # 自动防御性升级为安全 HTTPS，确保流量强制受 TLS 端到端强校验保护，中间人无法嗅探
+            url = "https://" + url[7:]
 
         # Clean non-latin-1 characters in header values to prevent urllib encoding errors
         for k, v in list(headers.items()):
