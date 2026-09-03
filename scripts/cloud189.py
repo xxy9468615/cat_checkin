@@ -48,6 +48,7 @@ from common import (
 )
 
 WEB_URL = "https://cloud.189.cn"
+API_URL = "https://api.cloud.189.cn"
 AUTH_URL = "https://open.e.189.cn"
 APP_ID = "8025431004"
 ACCOUNT_TYPE = "02"
@@ -256,21 +257,17 @@ def _login(h: Http, username: str, password: str) -> str:
         msg = str(res.get("msg") or r.code)
         raise RuntimeError(f"登录失败（{msg}）——可能触发验证码或密码错误")
 
-    print("    [diag] 登录凭据校验通过，正在加载跳转页种下会话 Cookie (toUrl)...", flush=True)
-    # 4. 先访问 toUrl 种下 web 会话 Cookie（COOKIE_LOGIN_USER 即 cookieUserSession，
-    #    getSessionForPC 依赖它，缺它必报 cookieUserSession invalid）
+    # 4. 换取 sessionKey 并种下 COOKIE_LOGIN_USER 会话票
+    # 注意：必须请求 api.cloud.189.cn 的 GET 接口（Client Open API 凭据消费端点）；
+    # 若请求 cloud.189.cn/api/portal/getSessionForPC.action（Web Portal 端点），
+    # 会因缺少先验 Web Cookie 而报 HTTP 400 cookieUserSession is null or invalid
+    print("    [diag] 正在换取移动端 sessionKey (api.cloud.189.cn/getSessionForPC.action)...", flush=True)
     to_url = res.get("toUrl") or RETURN_URL
-    h.request("GET", to_url, headers={"User-Agent": UA_WEB, "Referer": AUTH_URL}, timeout=10, retries=1)
-
-    # 5. 换 sessionKey（best-effort；失败则 _sign 降级用 Cookie 直签）
-    print("    [diag] 正在换取移动端 sessionKey (getSessionForPC.action)...", flush=True)
-    suffix = (f"appId={APP_ID}&clientType=TELEPC&version=6.2"
-              f"&channelId=web_cloud.189.cn&rand={int(time.time() * 1000)}")
+    suffix = "clientType=TELEMAC&version=1.0.0&channelId=web_cloud.189.cn"
     r = h.request(
-        "POST",
-        f"{WEB_URL}/api/portal/getSessionForPC.action?{suffix}"
-        f"&redirectURL={quote(to_url, safe='')}",
-        headers={"User-Agent": UA_WEB, "Referer": AUTH_URL},
+        "GET",
+        f"{API_URL}/getSessionForPC.action?{suffix}&redirectURL={quote(to_url, safe='')}",
+        headers={"User-Agent": UA_WEB, "Accept": "application/json;charset=UTF-8"},
         timeout=10,
         retries=1,
     )
@@ -279,8 +276,9 @@ def _login(h: Http, username: str, password: str) -> str:
     if sk:
         print("    [diag] 换取 sessionKey 成功", flush=True)
     else:
-        err_hint = str(sess.get('errorMsg') or sess.get('message') or '')
-        print(f"    [diag] getSessionForPC 未返回 sessionKey ({err_hint[:40]})，将尝试使用 Web Cookie 直签", flush=True)
+        err_hint = str(sess.get("res_message") or sess.get("errorMsg") or sess.get("message") or "")
+        print(f"    [diag] getSessionForPC 未返回 sessionKey ({err_hint[:40]})", flush=True)
+        raise RuntimeError(f"会话交换失败（{err_hint or r.text[:80]}）")
     return sk
 
 

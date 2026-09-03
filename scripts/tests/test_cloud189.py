@@ -77,6 +77,12 @@ class TestCloud189(unittest.TestCase):
         h_http = Http(proxy="http://127.0.0.1:8888#测试HTTP")
         self.assertIs(socket.socket, _ORIG_SOCKET)
 
+    def test_api_url_and_endpoints(self):
+        """验证 Open API 鉴权端点与 Web Portal 彻底分离，避免 cookieUserSession 错误。"""
+        self.assertEqual(cloud189.API_URL, "https://api.cloud.189.cn")
+        self.assertEqual(cloud189.WEB_URL, "https://cloud.189.cn")
+        self.assertEqual(cloud189.AUTH_URL, "https://open.e.189.cn")
+
 
 if __name__ == "__main__":
     unittest.main()
