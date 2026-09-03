@@ -11,12 +11,16 @@
 3. 三次抽奖（drawPrizeMarketDetails：摇一摇/相册/流动空间）
 4. 个人/家庭容量统计（portal/getUserSpaceInfo.action）
 
-环境变量（按账号二选一，密码模式最优）：
-- CLOUD189_USERNAME_1 / CLOUD189_PASSWORD_1 ...（手机号+密码盲登，全自动）
+环境变量（按账号二选一，密码模式最优，免抓包、每次运行自动重登）：
+- CLOUD189_USERNAME_1 / CLOUD189_PASSWORD_1 ...（手机号+密码盲登，推荐）
 - CLOUD189_COOKIE_1 ...（网页全套 Cookie，COOKIE_LOGIN_USER 为核心票）
 
-注：网页 localStorage 的 accessToken 与客户端会话体系不通用
-（getSessionForPC 对各 appId 均报 UserInvalidOpenToken），勿再尝试。
+注：
+1. 网页 Cookie（COOKIE_LOGIN_USER）为服务端会话票，约 1 天即失效，
+   无法保活/续期，社区各签到项目（51.ruyo.net / cqpcy / BlueSkyXN 等）
+   均改用「手机号+密码」每次运行重新登录来绕过 Cookie 过期；默认请走密码模式。
+2. 网页 localStorage 的 accessToken 与客户端会话体系不通用
+   （getSessionForPC 对各 appId 均报 UserInvalidOpenToken），勿再尝试。
 """
 from __future__ import annotations
 
@@ -75,8 +79,8 @@ def _asn1_tlv(data: bytes, off: int) -> Tuple[int, bytes, int]:
 def _parse_x509_pubkey(b64_der: str) -> Tuple[int, int]:
     """从 SubjectPublicKeyInfo base64 中解析 (n, e)。"""
     der = base64.b64decode(b64_der)
-    _, body, off = _asn1_tlv(der, 0)          # SEQUENCE
-    _, _, off = _asn1_tlv(body, off)          # SEQUENCE（算法标识）
+    _, body, _ = _asn1_tlv(der, 0)            # 外层 SEQUENCE：body 为内部内容，重新从 0 起算
+    _, _, off = _asn1_tlv(body, 0)            # SEQUENCE（算法标识）
     _, bits, off = _asn1_tlv(body, off)       # BIT STRING（公钥位串）
     if bits and bits[0] == 0:
         bits = bits[1:]
@@ -119,9 +123,11 @@ def _inject_cookie(h: Http, cookie: str) -> None:
 
 
 def _login(h: Http, username: str, password: str) -> str:
-    """密码盲登，返回 sessionKey（后续接口的鉴权凭证）。"""    # 1. 加密配置（公钥 + 前缀）
+    """密码盲登，返回 sessionKey（后续接口的鉴权凭证）。"""
+    # 1. 加密配置（公钥 + 前缀）
     r = h.request("POST", f"{AUTH_URL}/api/logbox/config/encryptConf.do",
-                  headers={"User-Agent": UA_WEB, "Referer": AUTH_URL})
+                  headers={"User-Agent": UA_WEB, "Referer": AUTH_URL},
+                  form={"appId": APP_ID})
     enc = _resp_dict(r).get("data") or {}
     pub_key = enc.get("pubKey", "")
     pre = enc.get("pre") or "{RSA}"
@@ -145,20 +151,25 @@ def _login(h: Http, username: str, password: str) -> str:
     lt = _find(r'lt = "(.+?)"')
     param_id = _find(r'paramId = "(.+?)"')
     req_id = _find(r'reqId = "(.+?)"')
-    # 3. RSA 提交
+    # 3. RSA 提交（字段与 platformlogin.js v20260109 对齐：密码字段名为 epd）
     form = {
+        "apToken": "",
         "appKey": APP_ID,
+        "pageKey": "normal",
         "accountType": ACCOUNT_TYPE,
-        "validateCode": "",
+        "userName": f"{pre}{_rsa_encrypt_hex(pub_key, username)}",
+        "epd": f"{pre}{_rsa_encrypt_hex(pub_key, password)}",
+        "validateCode": "",          # 图形验证码（未触发则留空）
+        "smsValidateCode": "",       # 短信动态码（未触发则留空）
         "captchaToken": captcha_token,
+        "returnUrl": RETURN_URL,
+        "mailSuffix": "",            # 手机号登录无后缀
         "dynamicCheck": "FALSE",
-        "clientType": "1",
+        "clientType": "10020",
         "cb_SaveName": "3",
         "isOauth2": "false",
-        "returnUrl": RETURN_URL,
+        "state": "",
         "paramId": param_id,
-        "userName": f"{pre}{_rsa_encrypt_hex(pub_key, username)}",
-        "password": f"{pre}{_rsa_encrypt_hex(pub_key, password)}",
     }
     r = h.request(
         "POST", f"{AUTH_URL}/api/logbox/oauth2/loginSubmit.do",
@@ -167,21 +178,25 @@ def _login(h: Http, username: str, password: str) -> str:
     )
     res = _resp_dict(r)
     if str(res.get("result")) != "0":
-        raise RuntimeError(f"登录失败（{res.get('msg', r.code)}）——可能触发验证码")
-    # 4. 换 sessionKey
+        raise RuntimeError(f"登录失败（{res.get('msg', r.code)}）——可能触发验证码或密码错误")
+    # 4. 先访问 toUrl 种下 web 会话 Cookie（COOKIE_LOGIN_USER 即 cookieUserSession，
+    #    getSessionForPC 依赖它，缺它必报 cookieUserSession invalid）
+    to_url = res.get("toUrl") or RETURN_URL
+    h.request("GET", to_url, headers={"User-Agent": UA_WEB, "Referer": AUTH_URL})
+    # 5. 换 sessionKey（best-effort；失败则 _sign 降级用 Cookie 直签）
     suffix = (f"appId={APP_ID}&clientType=TELEPC&version=6.2"
               f"&channelId=web_cloud.189.cn&rand={int(time.time() * 1000)}")
     r = h.request(
         "POST",
         f"{WEB_URL}/api/portal/getSessionForPC.action?{suffix}"
-        f"&redirectURL={quote(res.get('toUrl', ''), safe='')}",
+        f"&redirectURL={quote(to_url, safe='')}",
         headers={"User-Agent": UA_WEB, "Referer": AUTH_URL},
     )
     sess = _resp_dict(r)
-    sk = sess.get("sessionKey", "")
+    sk = str(sess.get("sessionKey", ""))
     if not sk:
-        raise RuntimeError(f"会话交换失败（{str(sess)[:80]}）")
-    return str(sk)
+        print("[diag] getSessionForPC 未返回 sessionKey，改用 Cookie 直签")
+    return sk
 
 
 # ---------- 签到 / 抽奖 / 容量 ----------
@@ -198,7 +213,12 @@ def _sign(h: Http, session_key: str = "") -> Tuple[str, bool]:
     )
     d = _resp_dict(resp)
     if resp.code != 200 or "netdiskBonus" not in d:
-        return f"签到失败（HTTP {resp.code} {str(d.get('errorMsg') or d.get('msg') or '')[:40]}）", False
+        raw = str(d.get('errorMsg') or d.get('msg') or '')
+        hint = ""
+        if not session_key and "cookieUserSession" in raw:
+            hint = ("；疑似 Cookie 过期（天翼 Cookie 约 1 天失效，无法续期），"
+                    "请改用密码模式 CLOUD189_USERNAME_1 / CLOUD189_PASSWORD_1")
+        return f"签到失败（HTTP {resp.code} {raw[:40]}）{hint}", False
     bonus = d.get("netdiskBonus", 0)
     if d.get("isSign") in (True, "true", "True"):
         return f"今日已签到（可得 {bonus}M 空间）", True
