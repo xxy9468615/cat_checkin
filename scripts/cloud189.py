@@ -183,6 +183,12 @@ def _login(h: Http, username: str, password: str) -> str:
     #    getSessionForPC 依赖它，缺它必报 cookieUserSession invalid）
     to_url = res.get("toUrl") or RETURN_URL
     h.request("GET", to_url, headers={"User-Agent": UA_WEB, "Referer": AUTH_URL})
+    from urllib.parse import urlparse as _up
+    _by = {}
+    for _ck in h.jar:
+        _by.setdefault(_ck.domain, set()).add(_ck.name)
+    print(f"[diag] toUrl: {_up(to_url).netloc}{_up(to_url).path}")
+    print("[diag] jar: " + ("; ".join(f"{d}:{','.join(sorted(ns))}" for d, ns in sorted(_by.items())) or "(空)"))
     # 5. 换 sessionKey（best-effort；失败则 _sign 降级用 Cookie 直签）
     suffix = (f"appId={APP_ID}&clientType=TELEPC&version=6.2"
               f"&channelId=web_cloud.189.cn&rand={int(time.time() * 1000)}")
@@ -193,9 +199,14 @@ def _login(h: Http, username: str, password: str) -> str:
         headers={"User-Agent": UA_WEB, "Referer": AUTH_URL},
     )
     sess = _resp_dict(r)
+    if "sessionKey" not in sess:
+        print(f"[diag] getSessionForPC 未返回 sessionKey，keys={sorted(sess.keys())}"
+              f" error={sess.get('errorCode') or sess.get('code')}:{str(sess.get('errorMsg') or sess.get('message'))[:60]}")
+    else:
+        print("[diag] getSessionForPC 返回 sessionKey（已保密，不打印值）")
     sk = str(sess.get("sessionKey", ""))
     if not sk:
-        print("[diag] getSessionForPC 未返回 sessionKey，改用 Cookie 直签")
+        print("[diag] getSessionForPC 无 sessionKey，改用 Cookie 直签")
     return sk
 
 
