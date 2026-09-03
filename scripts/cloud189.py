@@ -7,13 +7,16 @@
 1. 账号密码盲登（encryptConf.do 取公钥 → unifyLoginForPC 取登录参数 →
    loginSubmit.do RSA 加密提交 → getSessionForPC 换 sessionKey；
    与 wes-lin/cloud189-sdk 同源，纯标准库实现，免抓包，每次运行重新登录）
-2. 每日签到（mkt/userSign.action + sessionKey，TELEANDROID 客户端头）
-3. 三次抽奖（drawPrizeMarketDetails：摇一摇/相册/流动空间）
-4. 个人/家庭容量统计（portal/getUserSpaceInfo.action）
+2. 复用仓库境内 CN 代理出口（SMZDM_PROXY / 52POJIE_PROXY 等）与多候选容灾轮换，
+   彻底解决境外 CI Runner 直连阻断/超时（>300s）问题。
+3. 每日签到（mkt/userSign.action + sessionKey，TELEANDROID 客户端头）
+4. 三次抽奖（drawPrizeMarketDetails：摇一摇/相册/流动空间）
+5. 个人/家庭容量统计（portal/getUserSpaceInfo.action）
 
 环境变量（按账号二选一，密码模式最优，免抓包、每次运行自动重登）：
 - CLOUD189_USERNAME_1 / CLOUD189_PASSWORD_1 ...（手机号+密码盲登，推荐）
 - CLOUD189_COOKIE_1 ...（网页全套 Cookie，COOKIE_LOGIN_USER 为核心票）
+- CLOUD189_PROXY / CLOUD189_BACKUP_PROXIES（CN 代理出口，默认复用仓库现有 CN 出口）
 
 注：
 1. 网页 Cookie（COOKIE_LOGIN_USER）为服务端会话票，约 1 天即失效，
@@ -25,14 +28,24 @@
 from __future__ import annotations
 
 import base64
+import os
 import random
 import re
 import sys
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
-from common import Http, env_seq, main_guard, mask_str
+from common import (
+    Http,
+    ProxyEndpoint,
+    env_seq,
+    format_dead_proxy_alert,
+    get_all_proxy_endpoints,
+    main_guard,
+    mask_str,
+    parse_proxies_text,
+)
 
 WEB_URL = "https://cloud.189.cn"
 AUTH_URL = "https://open.e.189.cn"
@@ -59,6 +72,25 @@ def _resp_dict(resp: Any) -> Dict[str, Any]:
     except Exception:
         return {}
     return j if isinstance(j, dict) else {}
+
+
+# ---------- 代理候选与调度（复用仓库 CN 代理出口） ----------
+
+def _get_candidate_proxies() -> List[ProxyEndpoint]:
+    """获取天翼云盘可用的 CN 代理出口列表（优先复用仓库 SMZDM / 52POJIE 等境内代理通道）。"""
+    endpoints = get_all_proxy_endpoints(task_prefix="CLOUD189", include_self_hosted=True)
+    if endpoints:
+        return endpoints
+    raw = (
+        os.getenv("CLOUD189_PROXY")
+        or os.getenv("52POJIE_PROXY")
+        or os.getenv("WUAI_PROXY")
+        or os.getenv("SMZDM_PROXY")
+        or os.getenv("SMZDM_BACKUP_PROXIES")
+        or os.getenv("PROXY")
+        or ""
+    )
+    return parse_proxies_text(raw, default_name_prefix="CN代理")
 
 
 # ---------- 登录（RSA 盲登，与 wes-lin/cloud189-sdk 同源，纯标准库） ----------
@@ -124,13 +156,22 @@ def _inject_cookie(h: Http, cookie: str) -> None:
 
 def _login(h: Http, username: str, password: str) -> str:
     """密码盲登，返回 sessionKey（后续接口的鉴权凭证）。"""
+    print("    [diag] 正在获取加密配置 (encryptConf.do)...", flush=True)
     # 1. 加密配置（公钥 + 前缀）
-    r = h.request("POST", f"{AUTH_URL}/api/logbox/config/encryptConf.do",
-                  headers={"User-Agent": UA_WEB, "Referer": AUTH_URL},
-                  form={"appId": APP_ID})
+    r = h.request(
+        "POST",
+        f"{AUTH_URL}/api/logbox/config/encryptConf.do",
+        headers={"User-Agent": UA_WEB, "Referer": AUTH_URL},
+        form={"appId": APP_ID},
+        timeout=15,
+    )
     enc = _resp_dict(r).get("data") or {}
     pub_key = enc.get("pubKey", "")
     pre = enc.get("pre") or "{RSA}"
+    if not pub_key:
+        raise RuntimeError(f"获取公钥失败（HTTP {r.code}）：{r.text[:60]}")
+
+    print("    [diag] 正在获取统一登录表单参数 (unifyLoginForPC.action)...", flush=True)
     # 2. 登录表单参数（该页仍为服务端渲染）
     ts = int(time.time() * 1000)
     r = h.request(
@@ -138,6 +179,7 @@ def _login(h: Http, username: str, password: str) -> str:
         f"{WEB_URL}/api/portal/unifyLoginForPC.action?appId={APP_ID}"
         f"&clientType=10020&returnURL={quote(RETURN_URL, safe='')}&timeStamp={ts}",
         headers={"User-Agent": UA_WEB, "Referer": AUTH_URL},
+        timeout=15,
     )
     page = r.text or ""
 
@@ -151,6 +193,8 @@ def _login(h: Http, username: str, password: str) -> str:
     lt = _find(r'lt = "(.+?)"')
     param_id = _find(r'paramId = "(.+?)"')
     req_id = _find(r'reqId = "(.+?)"')
+
+    print("    [diag] 正在提交 RSA 加密认证 (loginSubmit.do)...", flush=True)
     # 3. RSA 提交（字段与 platformlogin.js v20260109 对齐：密码字段名为 epd）
     form = {
         "apToken": "",
@@ -172,24 +216,25 @@ def _login(h: Http, username: str, password: str) -> str:
         "paramId": param_id,
     }
     r = h.request(
-        "POST", f"{AUTH_URL}/api/logbox/oauth2/loginSubmit.do",
+        "POST",
+        f"{AUTH_URL}/api/logbox/oauth2/loginSubmit.do",
         headers={"User-Agent": UA_WEB, "Referer": AUTH_URL, "lt": lt, "REQID": req_id},
         form=form,
+        timeout=15,
     )
     res = _resp_dict(r)
     if str(res.get("result")) != "0":
-        raise RuntimeError(f"登录失败（{res.get('msg', r.code)}）——可能触发验证码或密码错误")
+        msg = str(res.get("msg") or r.code)
+        raise RuntimeError(f"登录失败（{msg}）——可能触发验证码或密码错误")
+
+    print("    [diag] 登录凭据校验通过，正在加载跳转页种下会话 Cookie (toUrl)...", flush=True)
     # 4. 先访问 toUrl 种下 web 会话 Cookie（COOKIE_LOGIN_USER 即 cookieUserSession，
     #    getSessionForPC 依赖它，缺它必报 cookieUserSession invalid）
     to_url = res.get("toUrl") or RETURN_URL
-    h.request("GET", to_url, headers={"User-Agent": UA_WEB, "Referer": AUTH_URL})
-    from urllib.parse import urlparse as _up
-    _by = {}
-    for _ck in h.jar:
-        _by.setdefault(_ck.domain, set()).add(_ck.name)
-    print(f"[diag] toUrl: {_up(to_url).netloc}{_up(to_url).path}")
-    print("[diag] jar: " + ("; ".join(f"{d}:{','.join(sorted(ns))}" for d, ns in sorted(_by.items())) or "(空)"))
+    h.request("GET", to_url, headers={"User-Agent": UA_WEB, "Referer": AUTH_URL}, timeout=15)
+
     # 5. 换 sessionKey（best-effort；失败则 _sign 降级用 Cookie 直签）
+    print("    [diag] 正在换取移动端 sessionKey (getSessionForPC.action)...", flush=True)
     suffix = (f"appId={APP_ID}&clientType=TELEPC&version=6.2"
               f"&channelId=web_cloud.189.cn&rand={int(time.time() * 1000)}")
     r = h.request(
@@ -197,16 +242,15 @@ def _login(h: Http, username: str, password: str) -> str:
         f"{WEB_URL}/api/portal/getSessionForPC.action?{suffix}"
         f"&redirectURL={quote(to_url, safe='')}",
         headers={"User-Agent": UA_WEB, "Referer": AUTH_URL},
+        timeout=15,
     )
     sess = _resp_dict(r)
-    if "sessionKey" not in sess:
-        print(f"[diag] getSessionForPC 未返回 sessionKey，keys={sorted(sess.keys())}"
-              f" error={sess.get('errorCode') or sess.get('code')}:{str(sess.get('errorMsg') or sess.get('message'))[:60]}")
-    else:
-        print("[diag] getSessionForPC 返回 sessionKey（已保密，不打印值）")
     sk = str(sess.get("sessionKey", ""))
-    if not sk:
-        print("[diag] getSessionForPC 无 sessionKey，改用 Cookie 直签")
+    if sk:
+        print("    [diag] 换取 sessionKey 成功", flush=True)
+    else:
+        err_hint = str(sess.get('errorMsg') or sess.get('message') or '')
+        print(f"    [diag] getSessionForPC 未返回 sessionKey ({err_hint[:40]})，将尝试使用 Web Cookie 直签", flush=True)
     return sk
 
 
@@ -221,6 +265,7 @@ def _sign(h: Http, session_key: str = "") -> Tuple[str, bool]:
         f"{WEB_URL}/mkt/userSign.action?rand={rand}&clientType=TELEANDROID"
         f"&version=6.2&model=PCRT00{sk}",
         headers={"User-Agent": UA_MOBILE, "Referer": REFERER_SIGN},
+        timeout=15,
     )
     d = _resp_dict(resp)
     if resp.code != 200 or "netdiskBonus" not in d:
@@ -246,6 +291,7 @@ def _lotteries(h: Http, session_key: str = "") -> str:
             f"https://m.cloud.189.cn/v2/drawPrizeMarketDetails.action"
             f"?taskId={task}&activityId=ACT_SIGNIN{sk}",
             headers={"User-Agent": UA_MOBILE, "Referer": REFERER_SIGN},
+            timeout=15,
         )
         d = _resp_dict(resp)
         desc = d.get("description")
@@ -265,8 +311,10 @@ def _space(h: Http) -> str:
             return "?"
 
     resp = h.request(
-        "GET", f"{WEB_URL}/api/portal/getUserSizeInfo.action",
+        "GET",
+        f"{WEB_URL}/api/portal/getUserSizeInfo.action",
         headers={"User-Agent": UA_WEB, "Referer": f"{WEB_URL}/"},
+        timeout=15,
     )
     if resp.code != 200:
         return "获取失败"
@@ -288,28 +336,59 @@ def _space(h: Http) -> str:
 
 def _run_one(idx: int, total: int, username: str, password: str,
              cookie: str = "") -> Tuple[bool, str]:
-    h = Http(follow_redirects=True)
+    if idx > 1:
+        time.sleep(random.uniform(2, 5))
+
+    who = mask_str(username) if username else f"Cookie:{mask_str(cookie[:24])}"
+    print(f"[{idx}/{total}] 👤 用户: 【{who}】", flush=True)
+
+    candidates = _get_candidate_proxies()
+    proxy_queue: List[Optional[ProxyEndpoint]] = list(candidates)
+    # 若配置了代理，在列表末尾追加 None (直连) 作为兜底选项
+    if None not in proxy_queue:
+        proxy_queue.append(None)
+
+    last_exc: Optional[Exception] = None
     sk = ""
-    if username and password:
-        time.sleep(random.uniform(2, 8))
-        sk = _login(h, username, password)
-        who = mask_str(username)
-    elif cookie:
-        _inject_cookie(h, cookie)
-        who = f"Cookie:{mask_str(cookie[:24])}"
-    else:
-        raise RuntimeError("缺少凭据")
-    print(f"[{idx}/{total}] 👤 用户: 【{who}】")
+    active_h: Optional[Http] = None
+
+    for candidate in proxy_queue:
+        p_name = candidate.display_name if candidate else "直连出网"
+        print(f"  🌐 正在通过 CN 出口 [{p_name}] 建立连接...", flush=True)
+        h = Http(follow_redirects=True, proxy=candidate.url if candidate else "")
+        try:
+            if username and password:
+                sk = _login(h, username, password)
+            elif cookie:
+                _inject_cookie(h, cookie)
+            active_h = h
+            print(f"  ✅ CN 出口 [{p_name}] 会话建立就绪", flush=True)
+            break
+        except Exception as exc:
+            last_exc = exc
+            err_msg = str(exc)
+            if candidate:
+                print(f"  {format_dead_proxy_alert(candidate, err_msg)}", flush=True)
+            else:
+                print(f"  ⚠️ 直连连接失败: {err_msg}", flush=True)
+            # 业务层明确的凭证错误或验证码拦截，不必继续重试其他代理
+            if "账户名或密码错误" in err_msg or "密码错误" in err_msg or "验证码" in err_msg:
+                raise exc
+
+    if active_h is None:
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("网络连接失败，所有候选 CN 代理及直连均不可用")
 
     lines: List[str] = []
     ok = True
-    sign_line, sign_ok = _sign(h, sk)
+    sign_line, sign_ok = _sign(active_h, sk)
     lines.append(f"• 签到: {sign_line}")
     ok = ok and sign_ok
-    lines.append(f"• 抽奖: {_lotteries(h, sk)}")
-    lines.append(f"• 空间: {_space(h)}")
+    lines.append(f"• 抽奖: {_lotteries(active_h, sk)}")
+    lines.append(f"• 空间: {_space(active_h)}")
     for ln in lines:
-        print(ln)
+        print(f"  {ln}", flush=True)
     return ok, "；".join(lines)
 
 

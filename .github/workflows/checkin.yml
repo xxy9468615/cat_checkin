@@ -237,6 +237,8 @@ jobs:
       CLOUD189_PASSWORD_2: ${{ secrets.CLOUD189_PASSWORD_2 }}
       CLOUD189_cookie: ${{ secrets.CLOUD189_COOKIE_1 }}
       CLOUD189_COOKIE_1: ${{ secrets.CLOUD189_COOKIE_1 }}
+      CLOUD189_PROXY: ${{ secrets.CLOUD189_PROXY || secrets['52POJIE_PROXY'] || secrets.WUAI_PROXY || secrets.POJIE_PROXY || secrets.SMZDM_PROXY }}
+      CLOUD189_BACKUP_PROXIES: ${{ secrets.CLOUD189_BACKUP_PROXIES || secrets.SMZDM_BACKUP_PROXIES }}
       WORKBUDDY_COOKIE: ${{ secrets.WORKBUDDY_COOKIE }}
       WORKBUDDY_COOKIE_1: ${{ secrets.WORKBUDDY_COOKIE_1 || secrets.WORKBUDDY_COOKIE }}
       WORKBUDDY_COOKIE_2: ${{ secrets.WORKBUDDY_COOKIE_2 }}

@@ -46,6 +46,20 @@ class TestCloud189(unittest.TestCase):
         b = cloud189._rsa_encrypt_hex(PUBKEY_1024, "13800138000")
         self.assertNotEqual(a, b)
 
+    def test_cloud189_reuses_cn_proxy(self):
+        """天翼云盘复用仓库已有的 SMZDM / 52POJIE 等 CN 出口代理。"""
+        import os
+        from unittest.mock import patch
+
+        env = {
+            "SMZDM_PROXY": "socks5://user:pass@112.64.135.45:1080#自建-上海联通",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            proxies = cloud189._get_candidate_proxies()
+            self.assertTrue(len(proxies) >= 1)
+            self.assertIn("自建-上海联通", proxies[0].name)
+            self.assertEqual(proxies[0].protocol, "socks5")
+
 
 if __name__ == "__main__":
     unittest.main()

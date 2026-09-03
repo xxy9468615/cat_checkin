@@ -347,9 +347,11 @@ def get_all_proxy_endpoints(
             f"{task_prefix}_PROXIES",
             f"{task_prefix}_BACKUP_PROXIES",
         ]
-        # 特殊兼容映射
-        if task_prefix == "52POJIE":
-            task_specific_keys.extend(["WUAI_PROXY", "POJIE_PROXY"])
+        # 特殊兼容映射（国内服务复用仓库 CN 代理出口：SMZDM / 52POJIE 等）
+        if task_prefix in ("52POJIE", "WUAI", "POJIE"):
+            task_specific_keys.extend(["WUAI_PROXY", "POJIE_PROXY", "SMZDM_PROXY", "SMZDM_BACKUP_PROXIES"])
+        elif task_prefix == "CLOUD189":
+            task_specific_keys.extend(["52POJIE_PROXY", "WUAI_PROXY", "POJIE_PROXY", "SMZDM_PROXY", "SMZDM_BACKUP_PROXIES"])
         _collect(
             task_specific_keys,
             is_self=False,
