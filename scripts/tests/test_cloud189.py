@@ -60,6 +60,23 @@ class TestCloud189(unittest.TestCase):
             self.assertIn("自建-上海联通", proxies[0].name)
             self.assertEqual(proxies[0].protocol, "socks5")
 
+    def test_proxy_isolation_no_socket_pollution(self):
+        """验证 SOCKS 代理不会污染全局 socket，直连和 HTTP 代理依然保持原生隔离。"""
+        import socket
+        from common import Http, _ORIG_SOCKET
+
+        # 实例化 SOCKS 代理 Http
+        h_socks = Http(proxy="socks5://user:pass@127.0.0.1:1080#测试")
+        self.assertIs(socket.socket, _ORIG_SOCKET)
+
+        # 实例化直连 Http
+        h_direct = Http()
+        self.assertIs(socket.socket, _ORIG_SOCKET)
+
+        # 实例化 HTTP 代理 Http
+        h_http = Http(proxy="http://127.0.0.1:8888#测试HTTP")
+        self.assertIs(socket.socket, _ORIG_SOCKET)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -78,19 +78,19 @@ def _resp_dict(resp: Any) -> Dict[str, Any]:
 
 def _get_candidate_proxies() -> List[ProxyEndpoint]:
     """获取天翼云盘可用的 CN 代理出口列表（优先复用仓库 SMZDM / 52POJIE 等境内代理通道）。"""
-    endpoints = get_all_proxy_endpoints(task_prefix="CLOUD189", include_self_hosted=True)
+    # 严格仅拉取 CN 境内代理出口，排除 AGENTROUTER_BACKUP_PROXIES 等境外代理；最多保留前 3 个候选节点
+    endpoints = get_all_proxy_endpoints(task_prefix="CLOUD189", include_self_hosted=True, include_backups=False)
     if endpoints:
-        return endpoints
+        return endpoints[:3]
     raw = (
         os.getenv("CLOUD189_PROXY")
         or os.getenv("52POJIE_PROXY")
         or os.getenv("WUAI_PROXY")
         or os.getenv("SMZDM_PROXY")
         or os.getenv("SMZDM_BACKUP_PROXIES")
-        or os.getenv("PROXY")
         or ""
     )
-    return parse_proxies_text(raw, default_name_prefix="CN代理")
+    return parse_proxies_text(raw, default_name_prefix="CN代理")[:3]
 
 
 # ---------- 登录（RSA 盲登，与 wes-lin/cloud189-sdk 同源，纯标准库） ----------
@@ -163,36 +163,64 @@ def _login(h: Http, username: str, password: str) -> str:
         f"{AUTH_URL}/api/logbox/config/encryptConf.do",
         headers={"User-Agent": UA_WEB, "Referer": AUTH_URL},
         form={"appId": APP_ID},
-        timeout=15,
+        timeout=10,
+        retries=1,
     )
+    if r.code != 200:
+        raise RuntimeError(f"获取公钥失败（HTTP {r.code}）：{r.text[:80]}")
     enc = _resp_dict(r).get("data") or {}
     pub_key = enc.get("pubKey", "")
     pre = enc.get("pre") or "{RSA}"
     if not pub_key:
-        raise RuntimeError(f"获取公钥失败（HTTP {r.code}）：{r.text[:60]}")
+        raise RuntimeError(f"公钥内容为空（HTTP {r.code}）：{r.text[:80]}")
 
     print("    [diag] 正在获取统一登录表单参数 (unifyLoginForPC.action)...", flush=True)
-    # 2. 登录表单参数（该页仍为服务端渲染）
+    # 2. 登录表单参数（该页为服务端渲染，302 跳转至 open.e.189.cn）
     ts = int(time.time() * 1000)
+    ret_encoded = quote(RETURN_URL, safe="")
     r = h.request(
         "GET",
-        f"{WEB_URL}/api/portal/unifyLoginForPC.action?appId={APP_ID}"
-        f"&clientType=10020&returnURL={quote(RETURN_URL, safe='')}&timeStamp={ts}",
-        headers={"User-Agent": UA_WEB, "Referer": AUTH_URL},
-        timeout=15,
+        f"{WEB_URL}/api/portal/unifyLoginForPC.action?appId={APP_ID}&clientType=10020&returnURL={ret_encoded}&timeStamp={ts}",
+        headers={
+            "User-Agent": UA_WEB,
+            "Referer": f"{WEB_URL}/web/login.html",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+        timeout=10,
+        retries=1,
     )
+    if r.code != 200:
+        raise RuntimeError(f"获取登录页失败（HTTP {r.code}）：{r.text[:80]}")
     page = r.text or ""
 
-    def _find(pattern: str) -> str:
-        mm = re.search(pattern, page)
-        if not mm:
-            raise RuntimeError("登录失败：登录页解析缺字段")
-        return mm.group(1)
+    def _find(patterns: List[str], name: str) -> str:
+        for p in patterns:
+            mm = re.search(p, page)
+            if mm:
+                val = mm.group(1).strip()
+                if val:
+                    return val
+        title_m = re.search(r"<title>(.*?)</title>", page, re.IGNORECASE)
+        title = title_m.group(1).strip() if title_m else "无标题"
+        raise RuntimeError(f"登录页缺少字段 [{name}]（页面标题: {title}，长度: {len(page)}，内容片段: {page[:120]!r}）")
 
-    captcha_token = _find(r"captchaToken' value='(.+?)'")
-    lt = _find(r'lt = "(.+?)"')
-    param_id = _find(r'paramId = "(.+?)"')
-    req_id = _find(r'reqId = "(.+?)"')
+    captcha_token = _find([
+        r"captchaToken['\"]\s*value=['\"]([^'\"]+)['\"]",
+        r"value=['\"]([^'\"]+)['\"]\s*name=['\"]captchaToken['\"]",
+        r"id=['\"]captchaToken['\"]\s*value=['\"]([^'\"]+)['\"]",
+    ], "captchaToken")
+    lt = _find([
+        r"\blt\s*=\s*['\"]([^'\"]+)['\"]",
+        r"['\"]lt['\"]\s*:\s*['\"]([^'\"]+)['\"]",
+    ], "lt")
+    param_id = _find([
+        r"\bparamId\s*=\s*['\"]([^'\"]+)['\"]",
+        r"['\"]paramId['\"]\s*:\s*['\"]([^'\"]+)['\"]",
+    ], "paramId")
+    req_id = _find([
+        r"\breqId\s*=\s*['\"]([^'\"]+)['\"]",
+        r"['\"]reqId['\"]\s*:\s*['\"]([^'\"]+)['\"]",
+    ], "reqId")
 
     print("    [diag] 正在提交 RSA 加密认证 (loginSubmit.do)...", flush=True)
     # 3. RSA 提交（字段与 platformlogin.js v20260109 对齐：密码字段名为 epd）
@@ -220,7 +248,8 @@ def _login(h: Http, username: str, password: str) -> str:
         f"{AUTH_URL}/api/logbox/oauth2/loginSubmit.do",
         headers={"User-Agent": UA_WEB, "Referer": AUTH_URL, "lt": lt, "REQID": req_id},
         form=form,
-        timeout=15,
+        timeout=10,
+        retries=1,
     )
     res = _resp_dict(r)
     if str(res.get("result")) != "0":
@@ -231,7 +260,7 @@ def _login(h: Http, username: str, password: str) -> str:
     # 4. 先访问 toUrl 种下 web 会话 Cookie（COOKIE_LOGIN_USER 即 cookieUserSession，
     #    getSessionForPC 依赖它，缺它必报 cookieUserSession invalid）
     to_url = res.get("toUrl") or RETURN_URL
-    h.request("GET", to_url, headers={"User-Agent": UA_WEB, "Referer": AUTH_URL}, timeout=15)
+    h.request("GET", to_url, headers={"User-Agent": UA_WEB, "Referer": AUTH_URL}, timeout=10, retries=1)
 
     # 5. 换 sessionKey（best-effort；失败则 _sign 降级用 Cookie 直签）
     print("    [diag] 正在换取移动端 sessionKey (getSessionForPC.action)...", flush=True)
@@ -242,7 +271,8 @@ def _login(h: Http, username: str, password: str) -> str:
         f"{WEB_URL}/api/portal/getSessionForPC.action?{suffix}"
         f"&redirectURL={quote(to_url, safe='')}",
         headers={"User-Agent": UA_WEB, "Referer": AUTH_URL},
-        timeout=15,
+        timeout=10,
+        retries=1,
     )
     sess = _resp_dict(r)
     sk = str(sess.get("sessionKey", ""))

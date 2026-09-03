@@ -8,6 +8,7 @@ import json
 import functools
 import os
 import re
+import socket
 import ssl
 import sys
 import time
@@ -17,6 +18,9 @@ import urllib.request
 import zlib
 from http.cookiejar import CookieJar
 from typing import Any, Dict, Iterable, List, Optional, Union
+
+# 保存原生未被猴子补丁污染的 socket，用于跨代理/直连切换时彻底隔离与还原
+_ORIG_SOCKET = getattr(socket, "_orig_socket", socket.socket)
 
 try:
     from proxy_manager import (
@@ -176,17 +180,21 @@ def retry(times: int = 3, backoff: float = 3.0, retry_codes: tuple = (-1, 429, 5
 
     Only decorates callables whose return value exposes a `.code` attribute
     (i.e. ql_common.Response). Other return types are returned without retry.
+    调用方可通过传递 retries=1 显式指定单次尝试次数（如候选代理快速探测/故障切换）。
     """
     def decorator(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
+            attempt_times = kwargs.pop("retries", None)
+            if attempt_times is None:
+                attempt_times = times
             last = None
-            for attempt in range(1, max(1, times) + 1):
+            for attempt in range(1, max(1, attempt_times) + 1):
                 last = fn(*args, **kwargs)
                 code = getattr(last, "code", None)
                 if code is None or code not in retry_codes:
                     return last
-                if attempt < max(1, times):
+                if attempt < max(1, attempt_times):
                     # 指数退避：backoff, 2*backoff, 4*backoff...（上限 60s，防长退避横跨兜底核查点）
                     time.sleep(min(backoff * (2 ** (attempt - 1)), 60.0))
             return last
@@ -221,16 +229,16 @@ class Http:
 
             if proxy_str:
                 # - http(s):// 走 urllib 原生 ProxyHandler（HTTPS 经 CONNECT 隧道）
-                # - socks5(h):// 或裸 host:port 走 pysocks 全局 monkey-patch socket
-                #   （urllib 原生不支持 socks scheme），支持 user:pass@host:port userinfo
+                # - socks5(h):// 或裸 host:port 优先使用 sockshandler.SocksiPyHandler（安全隔离，不修改全局 socket）
+                #   兜底回退为 pysocks 全局 monkey-patch socket，并在后续/直连时及时还原
                 if proxy_str.lower().startswith(("http://", "https://")):
+                    socket.socket = _ORIG_SOCKET
                     handlers.append(
                         urllib.request.ProxyHandler({"http": proxy_str, "https": proxy_str})
                     )
                 else:
                     try:
                         import socks
-                        import socket
                     except ImportError:
                         raise RuntimeError(
                             "检测到 SOCKS5 代理但缺少 pysocks 依赖，请 pip install pysocks"
@@ -238,16 +246,43 @@ class Http:
                     u = urllib.parse.urlparse(
                         proxy_str if "://" in proxy_str else f"socks5://{proxy_str}"
                     )
-                    # rdns=True：目标域名交由代理端解析（与出口 IP 一致，避免本地 DNS 污染）
-                    socks.set_default_proxy(
-                        socks.SOCKS5,
-                        u.hostname or "",
-                        u.port or 1080,
-                        rdns=True,
-                        username=urllib.parse.unquote(u.username) if u.username else None,
-                        password=urllib.parse.unquote(u.password) if u.password else None,
-                    )
-                    socket.socket = socks.socksocket
+                    used_handler = False
+                    try:
+                        import sockshandler
+                        ptype = (
+                            sockshandler.socks.SOCKS4
+                            if u.scheme.startswith("socks4")
+                            else sockshandler.socks.SOCKS5
+                        )
+                        handlers.append(
+                            sockshandler.SocksiPyHandler(
+                                ptype,
+                                u.hostname or "",
+                                u.port or 1080,
+                                True,  # rdns
+                                urllib.parse.unquote(u.username) if u.username else None,
+                                urllib.parse.unquote(u.password) if u.password else None,
+                            )
+                        )
+                        socket.socket = _ORIG_SOCKET
+                        used_handler = True
+                    except Exception:
+                        pass
+
+                    if not used_handler:
+                        socks.set_default_proxy(
+                            socks.SOCKS5,
+                            u.hostname or "",
+                            u.port or 1080,
+                            rdns=True,
+                            username=urllib.parse.unquote(u.username) if u.username else None,
+                            password=urllib.parse.unquote(u.password) if u.password else None,
+                        )
+                        socket.socket = socks.socksocket
+            else:
+                socket.socket = _ORIG_SOCKET
+        else:
+            socket.socket = _ORIG_SOCKET
         self.opener = urllib.request.build_opener(*handlers)
     @retry()
     def request(self, method: str, url: str, *, headers: Optional[Dict[str,str]]=None,
