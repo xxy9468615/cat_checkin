@@ -147,17 +147,29 @@ def _browser_cookies(h: Http, sess) -> None:
 
 
 def _fingerprint_session(h: Http):
-    """基于 Http 实例构建 curl_cffi 指纹会话，并透传同一代理出口（socks5/http）。"""
+    """基于 Http 实例构建 curl_cffi 指纹会话，并透传同一代理出口（socks5/http）。
+
+    代理解析顺序：h.proxy_endpoint → env AGENTROUTER_PROXY → 本机 socks5://127.0.0.1:1080。
+    任何一项都没拿到时**显式抛错**，绝不静默直连：curl_cffi 不带 proxies 直连 GitHub
+    数据中心 IP 出发，会被阿里 WAF 掐断（SSL_ERROR_SYSCALL），表现为难以排查的偶发失败。
+    """
     from curl_cffi import requests as cr
     sess_kwargs = {"impersonate": _FINGERPRINT, "timeout": 15}
     ep = getattr(h, "proxy_endpoint", None)
     proxy_url = getattr(ep, "url", "") if ep else ""
+    if not proxy_url:
+        # 底座未解析出 endpoint（未显式传且代理管理器无候选时）——回退 env
+        proxy_url = os.getenv(f"{PREFIX}PROXY", "").strip()
     if proxy_url:
         sess_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
     elif getattr(h, "has_proxy", False):
         # 无 endpoint 但标记有代理（sockshandler 全局 patch 类）——回退本机代理
         sess_kwargs["proxies"] = {"http": "socks5://127.0.0.1:1080",
                                   "https": "socks5://127.0.0.1:1080"}
+    else:
+        raise RuntimeError(
+            "agentrouter 指纹链路未拿到任何代理出口（AGENTROUTER_PROXY 未配置且无候选代理）。"
+            "为避免 curl_cffi 直连数据中心 IP 被阿里 WAF 掐断（SSL_ERROR_SYSCALL），拒绝直连。")
     return cr.Session(**sess_kwargs)
 
 
