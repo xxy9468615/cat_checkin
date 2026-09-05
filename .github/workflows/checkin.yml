@@ -409,13 +409,39 @@ jobs:
               kept.append({"type": "mixed", "tag": "in_mixed",
                            "listen": "127.0.0.1", "listen_port": 1080})
           cfg["inbounds"] = kept
-          # 注入显式 DNS：公共 DoH + 传统解析，避免系统 resolver 在 CI 的 NXDOMAIN 抖动
+          # 注入显式 DNS：公共 UDP DNS + sniff，避免系统 resolver 在 CI 的 NXDOMAIN 抖动
+          # 注意 sing-box ≥1.12 已弃用/1.14 移除 legacy DNS server 格式（{"tag","address"}），
+          # 必须显式带 type。这里对已有 servers 做迁移，统一补全为新格式。
           dns = cfg.get("dns") or {}
-          if not dns.get("servers"):
-              dns["servers"] = [
-                  {"tag": "google", "address": "8.8.8.8"},
-                  {"tag": "cloudflare", "address": "1.1.1.1"},
+          servers = dns.get("servers")
+          if not servers:
+              servers = []
+          migrated = []
+          for idx, s in enumerate(servers):
+              if isinstance(s, str):
+                  migrated.append({"type": "udp", "tag": f"dns{idx}",
+                                   "server": s})
+                  continue
+              d = dict(s)
+              if "address" in d and "type" not in d:
+                  addr = d.pop("address")
+                  if isinstance(addr, str) and addr.startswith(("https://", "tls://")):
+                      d["server"] = addr.split("://", 1)[1]
+                      d["server_port"] = 443
+                      d["type"] = "https" if addr.startswith("https://") else "tls"
+                  else:
+                      d["server"] = addr
+                      d["type"] = "udp"
+              elif "type" not in d:
+                  d["type"] = "udp"
+              d.setdefault("tag", f"dns{idx}")
+              migrated.append(d)
+          if not migrated:
+              migrated = [
+                  {"type": "udp", "tag": "google", "server": "8.8.8.8"},
+                  {"type": "udp", "tag": "cloudflare", "server": "1.1.1.1"},
               ]
+          dns["servers"] = migrated
           dns.setdefault("strategy", "ipv4_only")
           if not dns.get("sniff"):
               dns["sniff"] = True
