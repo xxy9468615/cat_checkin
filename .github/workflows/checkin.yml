@@ -331,6 +331,7 @@ jobs:
         if: inputs.direct != true
         env:
           SELF_HOSTED_PROXIES: ${{ secrets.SELF_HOSTED_PROXIES || secrets.CUSTOM_PROXIES }}
+          AGENTROUTER_SINGBOX_CONFIG: ${{ secrets.AGENTROUTER_SINGBOX_CONFIG }}
           AGENTROUTER_SS_CONFIG: ${{ secrets.AGENTROUTER_SS_CONFIG }}
           AGENTROUTER_SS_SUB_URL: ${{ secrets.AGENTROUTER_SS_SUB_URL }}
           AGENTROUTER_SS_SHA256: ${{ secrets.AGENTROUTER_SS_SHA256 }}
@@ -439,6 +440,89 @@ jobs:
             return 1
           }
 
+          # sing-box：优先使用用户提供的原生 JSON 配置（AGENTROUTER_SINGBOX_CONFIG，
+          # 由用户直接提供，不走订阅拉取/转换）。仅做轻量归一化：把本机监听强制锚定到
+          # 127.0.0.1:1080（多 inbound 只保留第一个代理型 inbound，避免端口冲突/外泄），
+          # 其余 outbounds/routes/dns 全按原样交付给 sing-box。启动后探测出口 IP，
+          # 与 mihomo/sslocal 一致注入代理环境变量并存 proxy_setup 状态。
+          setup_singbox() {
+            test -n "$AGENTROUTER_SINGBOX_CONFIG" || { echo "AGENTROUTER_SINGBOX_CONFIG empty"; return 1; }
+            curl -sL --max-time 60 -o /tmp/singbox.tar.gz \
+              https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64-musl.tar.gz \
+              || { echo "sing-box download failed"; return 1; }
+            mkdir -p /tmp/singbox
+            tar xzf /tmp/singbox.tar.gz -C /tmp/singbox --strip-components=1 \
+              || { echo "sing-box extract failed"; return 1; }
+            test -x /tmp/singbox/sing-box || { echo "sing-box binary missing"; return 1; }
+            printf '%s' "$AGENTROUTER_SINGBOX_CONFIG" > /tmp/singbox-config.json
+            test -s /tmp/singbox-config.json || { echo "AGENTROUTER_SINGBOX_CONFIG empty"; return 1; }
+            python3 - <<'PY' || return 1
+          import json, sys
+          p = "/tmp/singbox-config.json"
+          try:
+              cfg = json.load(open(p, encoding="utf-8"))
+          except Exception as e:
+              print(f"AGENTROUTER_SINGBOX_CONFIG not valid JSON: {e}")
+              sys.exit(1)
+          inbounds = cfg.get("inbounds") or []
+          picked = None
+          kept = []
+          for ib in inbounds:
+              if ib.get("type") in ("mixed", "socks", "http"):
+                  if picked is None:
+                      ib["listen"] = "127.0.0.1"
+                      ib["listen_port"] = 1080
+                      picked = ib
+                      kept.append(ib)
+                  # 仅保留第一个代理型 inbound，避免端口/地址冲突
+              else:
+                  kept.append(ib)
+          if picked is None:
+              kept.append({"type": "mixed", "tag": "in_mixed",
+                           "listen": "127.0.0.1", "listen_port": 1080})
+          cfg["inbounds"] = kept
+          json.dump(cfg, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+          PY
+            # obfs-local（simple-obfs）供 shadowsocks plugin=obfs-local 节点使用；
+            # 安装失败不致命（sing-box 可能内建/走其他插件），先尝试静默安装
+            if ! command -v obfs-local >/dev/null 2>&1; then
+              sudo apt-get install -y -qq simple-obfs >/dev/null 2>&1 \
+                || echo "obfs-local install failed; sing-box obfs nodes may fail"
+            fi
+            pip install -q pysocks || { echo "pysocks install failed"; return 1; }
+            pip install -q curl-cffi >/dev/null 2>&1 \
+              || echo "curl-cffi failed, nodeseek falls back to urllib fingerprint"
+            /tmp/singbox/sing-box run --config /tmp/singbox-config.json >/tmp/singbox.log 2>&1 &
+            SSPID=$!
+            echo "SSPID=$SSPID" >> "$GITHUB_ENV"
+            for i in $(seq 1 30); do
+              if ss -tln 2>/dev/null | grep -q ":1080 "; then break; fi
+              sleep 0.5
+            done
+            if ! ss -tln 2>/dev/null | grep -q ":1080 "; then
+              echo "sing-box failed to listen on 1080; tail log:"; tail -n 20 /tmp/singbox.log || true
+              kill -9 "$SSPID" 2>/dev/null || true; return 1
+            fi
+            sleep 1
+            exit_ip=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 https://api.ipify.org 2>/dev/null || echo "")
+            if [ -z "$exit_ip" ]; then
+              echo "sing-box proxy forwarding failed; tearing down before fallback"; tail -n 20 /tmp/singbox.log || true
+              kill -9 "$SSPID" 2>/dev/null || true
+              sleep 1
+              return 1
+            fi
+            node_tag=$(python3 -c "import json; cfg=json.load(open('/tmp/singbox-config.json')); print((cfg.get('outbounds') or [{}])[0].get('tag','singbox'))" 2>/dev/null || echo "singbox")
+            echo "sing-box ready (pid $SSPID, outbound $node_tag, exit IP: $exit_ip)"
+            echo "AGENTROUTER_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
+            echo "NODESEEK_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
+            echo "2LIBRA_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
+            echo "CLOUDSTUDIO_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
+            ns_code=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
+            echo "SS proxy ready via sing-box on 127.0.0.1:1080 (pid $SSPID), nodeseek probe HTTP $ns_code"
+            stash_proxy_state singbox "$node_tag" "$exit_ip" "$ns_code"
+            return 0
+          }
+
           # mihomo（订阅原生格式）提供本地 SOCKS5/HTTP 混合代理端口（127.0.0.1:1080）：
           # proxy-provider 按 filter 只加载 TW-X1-3 单节点——CF clearance 绑定出口 IP，
           # 仅针对需要固定出口的 agentrouter 与 nodeseek 注入代理环境变量，
@@ -539,6 +623,12 @@ jobs:
               exit 0
             fi
             echo "⚠️ 自建代理暂不可用，回退至订阅与备用代理模式..."
+          fi
+
+          # 2. sing-box 原生 JSON 优先（用户提供的家宽节点 TW-1X/US-1X 配置，
+          #    防泄漏客户端绕开被阿里识别为代理的 socks5 中转）
+          if setup_singbox; then
+            exit 0
           fi
 
           if setup_mihomo; then
