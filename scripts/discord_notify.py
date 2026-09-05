@@ -43,10 +43,11 @@ DEFAULT_WEBHOOK_URL = (
     "tUZ1qvAHLHYmUOzakWTmoApidntcJsVYFd4cVhgr-znGwUcTWZbwmqEkaz9tHIqfpRdM"
 )
 
-COLOR_OK = 3066993      # 绿
-COLOR_FAIL = 15158332   # 红
-COLOR_PENDING = 9807270 # 灰
-COLOR_WARN = 0xF59E0B   # 琥珀（黄色预警：成功但带提示）
+COLOR_OK = 3066993              # 绿
+COLOR_FAIL = 15158332           # 红
+COLOR_PENDING = 9807270         # 灰
+COLOR_WARN = 0xF59E0B           # 琥珀（黄色预警：成功但带提示）
+COLOR_CIRCUIT_BROKEN = 0x991B1B  # 深红（熔断停用告警：单日达 8 次失败上限）
 
 # Discord embed 限制：description ≤ 4096、总 payload ≤ 6000
 FAIL_TEXT_MAX = 160
@@ -390,6 +391,89 @@ DEFAULT_FAILURE_TEMPLATE = {
 }
 
 
+# === 频道1：熔断停用告警卡（单日累计失败达 8 次上限，停止自动重试等待修复） ===
+
+DEFAULT_CIRCUIT_BREAKER_TEMPLATE = {
+    "username": "cat_checkin",
+    "embeds": [{
+        "title": "🛑 {{TASK_NAME}} · 达到 8 次失败上限触发熔断停用！",
+        "color": "{{COLOR}}",
+        "description": "{{DESCRIPTION}}",
+        "footer": {"text": "cat_checkin · {{TASK_ID}} · 熔断停用保护"},
+        "timestamp": "{{TIMESTAMP}}",
+    }],
+}
+
+
+def notify_circuit_breaker(
+    task_id: str,
+    reason: str = "",
+    output: str = "",
+    name: str = "",
+    script: str = "",
+    persist: bool = True,
+) -> bool:
+    """推送任务熔断停用告警卡（深红色 🛑）。
+
+    当任务单日累计尝试达 8 次失败上限触发熔断时调用。
+    同一任务同日仅推送一次熔断告警，避免刷屏。
+    """
+    state = _load_notify_state(task_id) if persist else {}
+    today = _bjt_today()
+
+    if str(state.get("circuit_broken_date") or "") == today:
+        print(f"ℹ️ 任务 {task_id} 今日已推送过熔断停用告警卡，本次静默")
+        return True
+
+    # 解析展示字段
+    info = None
+    try:
+        import report_fields
+        info = report_fields.extract_for(script, output or "")
+        assets = report_fields.assets_text(info) or "—"
+    except Exception:
+        assets = _assets_text(_extract_fields(output))
+
+    prev_ok_date = str(state.get("last_ok_date") or "").strip()
+    last_ok_text = _md_escape(_format_last_ok(prev_ok_date, with_days=True) if prev_ok_date else "无成功记录")
+    acct = _md_escape(_failed_accounts(output, info) or _extract_accounts(output))
+
+    lines = [
+        "🛑 **熔断保护**　单日累计失败已达 **8 次上限**，系统已触发熔断保护！",
+        "🚫 **调度暂停**　今日后续所有自动调度、定时重试与心跳轮询已**全面暂停**，防止无效撞墙和风控封锁加剧。",
+    ]
+    if reason:
+        lines.append(f"❗ **触发原因**　{_md_escape(reason)}")
+    lines.append(
+        f"💡 **上线指引**　排查修复后通过以下方式重新上线：\n"
+        f"　• 本地/CLI: `python3 scripts/circuit_breaker.py resume {task_id}`\n"
+        f"　• GitHub Actions: 手动 dispatch 运行并勾选 **reset_circuit**"
+    )
+    lines.append(f"👤 **账号**　{acct}")
+    lines.append(f"💰 **资产**　{_md_escape(assets)}")
+    lines.append(f"📅 **上次成功**　{last_ok_text}")
+
+    description = "\n".join(lines)
+    task_disp_name = name or task_id
+    replacements = {
+        "{{TASK_NAME}}": str(task_disp_name),
+        "{{TASK_ID}}": str(task_id),
+        "{{SCRIPT}}": str(script or ""),
+        "{{COLOR}}": str(COLOR_CIRCUIT_BROKEN),
+        "{{DESCRIPTION}}": description,
+        "{{TIMESTAMP}}": _timestamp_bjt(),
+    }
+    tpl = _load_template("discord_circuit_breaker.json", DEFAULT_CIRCUIT_BREAKER_TEMPLATE)
+    sent = _post_webhook(_render(tpl, replacements))
+
+    if persist:
+        state["circuit_broken_date"] = today
+        state["circuit_broken"] = True
+        state["updated_at"] = _timestamp_bjt()
+        _save_notify_state(task_id, state)
+    return sent
+
+
 # === 频道1：黄色提示卡（任务成功但带提示：续期失败 / 凭据即将过期） ===
 
 DEFAULT_WARN_TEMPLATE = {
@@ -485,10 +569,21 @@ def notify_task_result(
             "{{DESCRIPTION}}": description,
             "{{TIMESTAMP}}": _timestamp_bjt(),
         }
-        # 防轰炸：心跳轮询下同日反复失败会重复推卡——当日第 3 次尝试起静默
-        # （状态照常累计，次日 attempts 跨日重置后恢复推送）
-        if attempts > 2:
-            print(f"ℹ️ 任务 {task_id} 当日已推送过失败卡（attempts={attempts}），本次静默")
+        # 防轰炸与熔断告警分流：
+        # - 当 attempts >= 8 时：触发专属深红熔断停用告警卡；
+        # - 当 2 < attempts < 8 时：处于分时段重试窗口期，中间轮次静默防打扰；
+        # - 当 attempts <= 2 时：推送标准红色失败卡（附重试建议与失败明细）。
+        if attempts >= 8:
+            sent = notify_circuit_breaker(
+                task_id=task_id,
+                reason=f"单日累计尝试达 {attempts} 次失败上限",
+                output=output,
+                name=name,
+                script=script,
+                persist=persist,
+            )
+        elif attempts > 2:
+            print(f"ℹ️ 任务 {task_id} 处于分时段重试中（attempts={attempts}/8），中间重试轮次静默防打扰")
             sent = True
         else:
             tpl = _load_template("discord_failure.json", DEFAULT_FAILURE_TEMPLATE)

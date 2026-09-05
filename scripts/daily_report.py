@@ -53,13 +53,15 @@ def get_task_title(path: Path) -> str:
 
 
 def _normalize_status(val: Any) -> str:
-    """归一化任务状态为 'ok' | 'fail' | 'pending'。"""
+    """归一化任务状态为 'ok' | 'fail' | 'pending' | 'suspended'。"""
     if isinstance(val, str):
         v = val.lower().strip()
         if v in ("ok", "success", "true"):
             return "ok"
         if v in ("pending", "waiting", "scheduled", "uncollected"):
             return "pending"
+        if v in ("suspended", "circuit_broken", "stopped"):
+            return "suspended"
         return "fail"
     return "ok" if bool(val) else "fail"
 
@@ -89,6 +91,7 @@ def build_report(results: Iterable[Tuple[Any, Path, str, float]]) -> Tuple[str, 
 
     ok_count = sum(1 for st, *_ in rows if st == "ok")
     pending_count = sum(1 for st, *_ in rows if st == "pending")
+    suspended_count = sum(1 for st, *_ in rows if st == "suspended")
     total_count = len(rows)
     today_str = datetime.date.today().strftime("%Y-%m-%d")
 
@@ -121,6 +124,8 @@ def build_report(results: Iterable[Tuple[Any, Path, str, float]]) -> Tuple[str, 
     header_tags = ""
     if fail_count > 0:
         header_tags += f" [❌ {fail_count}项失败]"
+    if suspended_count > 0:
+        header_tags += f" [🛑 {suspended_count}项熔断停用]"
     if warn_count > 0:
         header_tags += f" [🟡 {warn_count}项注意]"
     if unconf_count > 0:
@@ -136,6 +141,7 @@ def build_report(results: Iterable[Tuple[Any, Path, str, float]]) -> Tuple[str, 
 
     stat_line = (
         f"📊 成功 {ok_count} | 失败 {fail_count} | 注意 {warn_count}"
+        + (f" | 熔断停用 {suspended_count}" if suspended_count else "")
         + (f" | 未配置 {unconf_count}" if unconf_count else "")
         + (f" | 待执行 {pending_count}" if pending_count > 0 else "")
         + f" | 共 {total_count}"
@@ -167,6 +173,11 @@ def build_report(results: Iterable[Tuple[Any, Path, str, float]]) -> Tuple[str, 
                 lines.append(f"  {output.strip()}")
             else:
                 lines.append("  任务尚未执行或处于独立调度窗口中")
+        elif st == "suspended":
+            status_icon = "🛑"
+            lines.append(f"{status_icon} {task_title} (单日达 8 次失败上限，已熔断停用)")
+            lines.append("  🛑 任务多次分时段重试仍失败，已触发熔断保护，暂停后续调度")
+            lines.append("  上线指引：CLI `python3 scripts/circuit_breaker.py resume <task_id>` 或 Actions 手动调度勾选 reset_circuit")
         else:
             unconf = unconf_by_idx.get(idx)
             if unconf:
@@ -369,6 +380,10 @@ def _build_task_card(status: Any, path: Path, output: str, elapsed: float, dname
         status_color = "#64748b"
         status_text = "⏳ 待执行"
         status_bg = "#f1f5f9"
+    elif st == "suspended":
+        status_color = "#991b1b"
+        status_text = "🛑 熔断停用（8次失败上限）"
+        status_bg = "#fee2e2"
     else:
         status_color = "#ce2b39"
         status_text = "❌ 失败"
@@ -416,13 +431,20 @@ def _build_task_card(status: Any, path: Path, output: str, elapsed: float, dname
             '<div style="padding:4px 0 0 0;color:#9aa4b0;font-size:11px;">'
             '非故障：在仓库 Secrets 配置对应凭据后，执行 gh workflow run checkin.yml -f tasks=<task_id> 验证</div>'
         )
+    elif st == "suspended":
+        body_html = (
+            f'<div style="padding:1px 0;color:#991b1b;font-weight:600;">🛑 单日失败已达 8 次上限，触发熔断保护！</div>'
+            f'<div style="padding:2px 0;color:#475569;">今日后续自动重试与调度已全部暂停，避免无效重试和风控加剧。排查修复后请手动重新上线。</div>'
+            f'<div style="padding:4px 0 0 0;color:#9aa4b0;font-size:11px;">'
+            f'上线方式：运行 <code>python3 scripts/circuit_breaker.py resume &lt;task_id&gt;</code> 或在 GitHub Actions 手动调度勾选 <b>reset_circuit</b></div>'
+        )
     else:
         body = _sanitize_output(_truncate_output(output, 1200))
         if not body and st == "pending":
             body = "任务尚未执行或处于独立调度窗口中"
         body_html = _html.escape(body).replace("\n", "<br>")
 
-    elapsed_str = f"{elapsed:.1f}s" if st != "pending" else "调度中"
+    elapsed_str = f"{elapsed:.1f}s" if st not in ("pending", "suspended") else ("已停用" if st == "suspended" else "调度中")
 
     return f"""
     <div style="margin:0 0 16px 0;border:1px solid #e3e6ea;border-left:3px solid {status_color};background:#fff;border-radius:6px;overflow:hidden;">
@@ -444,13 +466,14 @@ def build_email_html(results: List[Tuple[Any, Path, str, float]], stat_line: str
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     footer = f"由 cat_checkin 自动生成 · {now}"
 
-    # 按 失败 -> 待执行 -> 成功 排序
+    # 按 失败 -> 熔断停用 -> 待执行 -> 成功 排序
     rows: List[Tuple[str, Path, str, float, str]] = []
     for item in results:
         st = _normalize_status(item[0])
         rows.append((st, item[1], item[2], item[3], item[4] if len(item) > 4 else ""))
 
     failed = [r for r in rows if r[0] == "fail"]
+    suspended = [r for r in rows if r[0] == "suspended"]
     pending = [r for r in rows if r[0] == "pending"]
     succeeded = [r for r in rows if r[0] == "ok"]
 
@@ -462,6 +485,10 @@ def build_email_html(results: List[Tuple[Any, Path, str, float]], stat_line: str
     if failed:
         cards_html += '<div style="margin:12px 0 6px 0;font-size:12px;color:#ce2b39;font-weight:600;">⚠️ 失败任务</div>'
         for st, path, output, elapsed, dname in failed:
+            cards_html += _build_task_card(st, path, output, elapsed, dname)
+    if suspended:
+        cards_html += '<div style="margin:12px 0 6px 0;font-size:12px;color:#991b1b;font-weight:600;">🛑 熔断停用任务（等待修复后上线）</div>'
+        for st, path, output, elapsed, dname in suspended:
             cards_html += _build_task_card(st, path, output, elapsed, dname)
     if pending:
         cards_html += '<div style="margin:12px 0 6px 0;font-size:12px;color:#64748b;font-weight:600;">⏳ 待执行 / 独立调度任务</div>'

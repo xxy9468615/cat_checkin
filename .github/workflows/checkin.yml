@@ -22,6 +22,7 @@ on:
       - latvi_next_sign
       - workbuddy_travel_claim
       - daily_report
+      - checkin_retry
   workflow_dispatch:
     inputs:
       tasks:
@@ -29,6 +30,11 @@ on:
         required: false
         default: ''
         type: string
+      reset_circuit:
+        description: '重置并重新上线处于熔断状态的任务（等待修复后上线时勾选）'
+        required: false
+        default: false
+        type: boolean
       retry:
         description: '标记为报告自动重跑（防循环；人工触发保持 false）'
         required: false
@@ -563,10 +569,29 @@ jobs:
             echo "tasks=$INPUT_TASKS" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # 分时段重试接力事件：动态计算今日已到期且未熔断的重试任务集合
+          if [ "$EVENT_ACTION" = "checkin_retry" ]; then
+            due_tasks=$(python3 scripts/circuit_breaker.py get-due-retries 2>/dev/null || echo "")
+            if [ -n "$due_tasks" ]; then
+              echo "分时段重试接力：当前到期就绪任务为 $due_tasks"
+              echo "tasks=$due_tasks" >> "$GITHUB_OUTPUT"
+            else
+              echo "分时段重试接力：暂无到期就绪任务"
+              echo "tasks=none" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
           # 心跳轮询：滚动冷却型任务（是否执行由 DUE_ONLY + last_credit_ts 决定）
           # + tencent_cloudstudio（Keycloak SSO 会话闲置保活，每 4h 触碰续票）
+          # + 到期分时段重试任务拾取
           if [ "$EVENT_SCHEDULE" = "0 */4 * * *" ]; then
-            echo "tasks=modelscope,modelscope_ai,tencent_cloudstudio" >> "$GITHUB_OUTPUT"
+            due_tasks=$(python3 scripts/circuit_breaker.py get-due-retries 2>/dev/null || echo "")
+            if [ -n "$due_tasks" ]; then
+              echo "心跳轮询附加到期重试任务: $due_tasks"
+              echo "tasks=modelscope,modelscope_ai,tencent_cloudstudio,$due_tasks" >> "$GITHUB_OUTPUT"
+            else
+              echo "tasks=modelscope,modelscope_ai,tencent_cloudstudio" >> "$GITHUB_OUTPUT"
+            fi
             exit 0
           fi
           case "$EVENT_ACTION" in
@@ -592,10 +617,18 @@ jobs:
           # 到期过滤，未到期秒级跳过
           DUE_ONLY: ${{ (github.event.schedule == '0 */4 * * *' || inputs.due_only == true) && '1' || '0' }}
         run: |
+          RESET_FLAG=""
+          if [ "${{ inputs.reset_circuit }}" = "true" ]; then
+            RESET_FLAG="--reset-circuit"
+          fi
           if [ -n "$ORCH_TASKS" ]; then
-            python3 scripts/daily_orchestrator.py --tasks "$ORCH_TASKS"
+            if [ "$ORCH_TASKS" = "none" ]; then
+              echo "无到期任务执行，跳过调度"
+              exit 0
+            fi
+            python3 scripts/daily_orchestrator.py --tasks "$ORCH_TASKS" $RESET_FLAG
           else
-            python3 scripts/daily_orchestrator.py
+            python3 scripts/daily_orchestrator.py $RESET_FLAG
           fi
 
       - name: Send unified report
@@ -622,34 +655,52 @@ jobs:
           FAILED_MATRIX: ${{ steps.send_report.outputs.failed_matrix }}
         run: |
           set -uo pipefail
-          RETRIED=$(python3 - <<'EOF'
-          import datetime as dt, json, subprocess
-          tz = dt.timezone(dt.timedelta(hours=8))
-          today = dt.datetime.now(tz).strftime("%Y-%m-%d")
-          try:
-              out = subprocess.check_output(
-                  ["gh", "run", "list", "--workflow", "checkin.yml", "--event", "workflow_dispatch",
-                   "--limit", "10", "--json", "createdAt"], text=True)
-              runs = json.loads(out)
-          except Exception:
-              print("unknown", flush=True)
-          else:
-              hit = any(
-                  dt.datetime.fromisoformat(r["createdAt"].replace("Z", "+00:00"))
-                  .astimezone(tz).strftime("%Y-%m-%d") == today
-                  for r in runs)
-              print("true" if hit else "false", flush=True)
-          EOF
-          )
-          if [ "$RETRIED" != "false" ]; then
-            echo "Today already has a workflow_dispatch checkin run ($RETRIED), skip auto-retry"
+          # 1. 评估重试候选站点的重试资质与熔断状态（8次失败上限检查）
+          # 安全解析 key=value 输出，严格白名单导入环境变量，彻底避免 eval
+          while IFS='=' read -r key val; do
+            case "$key" in
+              TOTAL_CHECKED|SHOULD_RETRY|RETRYABLE_TASKS|DUE_TASKS|SUSPENDED_TASKS|NEXT_DELAY_SECONDS)
+                export "$key=$val"
+                ;;
+            esac
+          done < <(python3 scripts/circuit_breaker.py check-retry "$FAILED_MATRIX")
+          if [ -n "${SUSPENDED_TASKS:-}" ]; then
+            echo "🛑 任务已达 8 次失败上限触发熔断停用，停止自动重试（等待修复上线）: $SUSPENDED_TASKS"
+          fi
+          if [ "${SHOULD_RETRY:-false}" != "true" ]; then
+            echo "无可用重试任务（均已熔断或无需重跑），停止自动重试流程"
             exit 0
           fi
-          echo "Auto-retry failed sites: $FAILED_MATRIX"
-          if gh workflow run checkin.yml --ref "${GITHUB_REF_NAME:-main}" -f tasks="$FAILED_MATRIX" -f retry=true; then
-            echo "Retry dispatched"
+
+          echo "分时段候选重试任务: $RETRYABLE_TASKS (等待时延: ${NEXT_DELAY_SECONDS:-900}s)"
+
+          # 2. 优先尝试 QStash 延时接力（零 runner 费用等待，待到期后精准 dispatch 回调）
+          QSTASH_OK=$(python3 - "${NEXT_DELAY_SECONDS:-900}" <<'PY'
+          import sys, os
+          from common import schedule_repo_dispatch
+          delay = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 900
+          ok, msg = schedule_repo_dispatch("checkin_retry", delay)
+          print(f"ok={str(ok).lower()};msg={msg}")
+          PY
+          )
+          echo "QStash 调度结果: $QSTASH_OK"
+
+          if echo "$QSTASH_OK" | grep -q "ok=true"; then
+            echo "✅ QStash 已安排在 ${NEXT_DELAY_SECONDS:-900}s 后延时回调 checkin_retry，期间零占用 runner 计费分钟数"
+            exit 0
+          fi
+
+          # 3. 若未配置 QStash：
+          # 重试计划已在 Redis/本地 KV 中持久化，由心跳 cron (每 4h) 或下次定时 run 自动到期拾取；
+          # 若时延极短（<= 120s），则可原地微等后触发 workflow_dispatch
+          if [ "${NEXT_DELAY_SECONDS:-900}" -le 120 ]; then
+            echo "等待 ${NEXT_DELAY_SECONDS}s 短时冷却..."
+            sleep "${NEXT_DELAY_SECONDS}"
+            if gh workflow run checkin.yml --ref "${GITHUB_REF_NAME:-main}" -f tasks="$RETRYABLE_TASKS" -f retry=true; then
+              echo "即时重跑已派发"
+            fi
           else
-            echo "Retry dispatch failed, please check manually"
+            echo "分时段重试：任务重试计划已记录到 Upstash Redis/状态缓存中，将由每 4h 心跳轮询到期自动拾取，避免原地等待浪费 runner 额度。"
           fi
 
       - name: Save unified states

@@ -140,8 +140,11 @@ def collect_all_results(today: str, yesterday: str) -> Tuple[List[Tuple[bool, Pa
     out: List[Tuple[str, Path, str, float]] = []
     for _key, data in sorted(collected.items()):
         is_pending = bool(data.get("is_pending")) or data.get("status") == "pending"
+        is_suspended = bool(data.get("circuit_broken")) or data.get("status") == "suspended"
         if is_pending:
             st = "pending"
+        elif is_suspended:
+            st = "suspended"
         else:
             st = "ok" if bool(data.get("ok")) else "fail"
 
@@ -168,13 +171,22 @@ def _emit_failed_sites(collected: Dict[str, dict]) -> List[str]:
     - failed_sites  全部真实失败脚本名（含独立 workflow 站点，供日志/排查）
     - failed_matrix 其中属于 checkin.yml 矩阵的脚本（自动重跑仅 dispatch 这些）
     注意：待执行 (pending) 的站点不计入失败，不触发自动重跑；
-    凭据未配置（⚪，非故障）的站点同样不计入失败——重跑解决不了没配凭据。
+    凭据未配置（⚪，非故障）的站点同样不计入失败；
+    达到 8 次失败上限已熔断停用（🛑）的站点暂停重试，不计入 failed_matrix，等待修复后上线。
     """
+    suspended_sites = sorted(
+        {
+            str(d.get("script"))
+            for d in collected.values()
+            if (d.get("status") == "suspended" or d.get("circuit_broken"))
+        } - {""}
+    )
     unconf_sites = sorted(
         {
             str(d.get("script"))
             for d in collected.values()
-            if not d.get("ok") and not d.get("is_pending") and d.get("status") != "pending"
+            if not d.get("ok") and not d.get("is_pending") and d.get("status") not in ("pending", "suspended")
+            and not d.get("circuit_broken")
             and alert_levels.detect_unconfigured(str(d.get("output") or ""))
         } - {""}
     )
@@ -182,10 +194,13 @@ def _emit_failed_sites(collected: Dict[str, dict]) -> List[str]:
         {
             str(d.get("script"))
             for d in collected.values()
-            if not d.get("ok") and not d.get("is_pending") and d.get("status") != "pending"
-        } - {""} - set(unconf_sites)
+            if not d.get("ok") and not d.get("is_pending") and d.get("status") not in ("pending", "suspended")
+            and not d.get("circuit_broken")
+        } - {""} - set(unconf_sites) - set(suspended_sites)
     )
     failed_matrix = [s for s in CHECKIN_MATRIX_SCRIPTS if s in failed_scripts]
+    if suspended_sites:
+        print(f"🛑 任务已熔断停用（单日达8次失败上限，暂停自动重跑，等待修复上线）：{', '.join(suspended_sites)}")
     if unconf_sites:
         print(f"⚪ 凭据未配置（按跳过处理，不触发重跑）：{', '.join(unconf_sites)}")
     if failed_scripts:
@@ -242,7 +257,13 @@ def archive_daily_summary(collected: Dict[str, dict], today: str) -> None:
             extracted.setdefault("assets", legacy.get("assets", ""))
             extracted.setdefault("reward", legacy.get("reward", ""))
         is_pending = bool(d.get("is_pending")) or d.get("status") == "pending"
-        st = "pending" if is_pending else ("ok" if bool(d.get("ok")) else "fail")
+        is_suspended = bool(d.get("circuit_broken")) or d.get("status") == "suspended"
+        if is_pending:
+            st = "pending"
+        elif is_suspended:
+            st = "suspended"
+        else:
+            st = "ok" if bool(d.get("ok")) else "fail"
         if st == "fail" and alert_levels.detect_unconfigured(output_str):
             st = "unconfigured"  # ⚪ 凭据未配置（非故障）：不计失败、不影响成功率
         # 🟡 黄色预警归档：ok 站点的续期失败/凭据即将过期提示（fail 站点红线已覆盖）
@@ -264,6 +285,7 @@ def archive_daily_summary(collected: Dict[str, dict], today: str) -> None:
     total = len(sites)
     success = sum(1 for s in sites.values() if s["status"] == "ok")
     failed = sum(1 for s in sites.values() if s["status"] == "fail")
+    suspended = sum(1 for s in sites.values() if s["status"] == "suspended")
     pending = sum(1 for s in sites.values() if s["status"] == "pending")
     unconfigured = sum(1 for s in sites.values() if s["status"] == "unconfigured")
     warned = sum(1 for s in sites.values() if s.get("level") == "warn")
@@ -273,6 +295,7 @@ def archive_daily_summary(collected: Dict[str, dict], today: str) -> None:
         "total": total,
         "success": success,
         "failed": failed,
+        "suspended": suspended,
         "pending": pending,
         "unconfigured": unconfigured,
         "warned": warned,

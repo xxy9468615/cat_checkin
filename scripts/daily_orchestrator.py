@@ -15,6 +15,14 @@ from common import BJT, upstash_redis_command
 from alert_levels import detect_unconfigured
 from discord_notify import notify_task_result, notify_unconfigured
 from task_registry import TASKS, resolve_execution_queue
+from circuit_breaker import (
+    is_task_suspended,
+    record_task_outcome,
+    resume_task,
+    resume_all_tasks,
+    save_suspended_result_record,
+    MAX_DAILY_ATTEMPTS,
+)
 TRAVEL_EVENT_RE = re.compile(r"TRAVEL_EVENT\s+state=(\w+)\s+arrive_at=(\d+)")
 MAX_CLAIM_ROUNDS, CLAIM_MARGIN_SEC, LATVI_ENTER_EARLY_SEC = 3, 15*60, 120
 # 显式任务模式（手动 dispatch/自动重跑）的回访等待上限：猫还在放风且回程超出该窗口时
@@ -22,17 +30,24 @@ MAX_CLAIM_ROUNDS, CLAIM_MARGIN_SEC, LATVI_ENTER_EARLY_SEC = 3, 15*60, 120
 EXPLICIT_CLAIM_MAX_WAIT_SEC = 30 * 60
 
 
-def _merge_result(prev: Any, ok: bool, unconf: bool) -> Any:
-    """多轮执行结果合并（True=有成功轮 / False=有真实失败轮 / "unconfigured"=仅有未配置轮）。
+def _merge_result(prev: Any, ok: bool, unconf: bool, suspended: bool = False) -> Any:
+    """多轮执行结果合并（True=有成功轮 / False=有真实失败轮 / "suspended"=已熔断停用 / "unconfigured"=仅有未配置轮）。
 
-    优先级 True > False > "unconfigured"：任一轮成功即成功；真实失败压过未配置
-    （如上午未配凭据、下午配好了但 Cookie 错——最终应报失败让人看到）。
+    优先级 True > False > "suspended" > "unconfigured"：
+    - 任一轮成功即成功；
+    - 若此前或当前成功过，保持 True；
+    - 若触发了熔断且之前没有成功轮，结果收敛为 "suspended"；
+    - 真实失败压过未配置。
     """
+    if prev is True or ok is True:
+        return True
+    if suspended:
+        return "suspended"
     cur: Any = "unconfigured" if unconf else ok
     if prev is None:
         return cur
-    if prev is True or cur is True:
-        return True
+    if prev == "suspended":
+        return "suspended"
     if prev is False or cur is False:
         return False
     return "unconfigured"
@@ -193,15 +208,36 @@ class Orchestrator:
         # ⚪ 凭据未配置（非故障）：新任务 Secret 尚未配置时按跳过处理——
         # 不推红色失败卡、不触发自动重跑、不计入 run 失败退出码（重跑解决不了没配凭据）
         unconf = (not ok) and bool(detect_unconfigured(out or ""))
+        suspended = False
+        circuit_info = {}
+        if not unconf:
+            try:
+                circuit_info, newly_tripped = record_task_outcome(tid, ok=ok, output=out or "")
+                suspended = bool(circuit_info.get("status") == "suspended")
+            except Exception as exc:
+                print(f"WARN: circuit breaker 状态记录异常: {exc}", file=sys.stderr)
+
         prev = self.results.get(tid)
-        self.results[tid] = _merge_result(prev, ok, unconf)
-        tag = "OK" if ok else ("SKIP" if unconf else "FAIL")
+        self.results[tid] = _merge_result(prev, ok, unconf, suspended=suspended)
+        tag = "OK" if ok else ("SKIP" if unconf else ("SUSPENDED" if suspended else "FAIL"))
         print(f"\n{'='*60}\n[{tag}] [{tid}] done (ok={ok})\n{'-'*60}")
         if out:
             print(out)
         print(f"{'='*60}")
         if unconf:
             print(f"  ⚪ 凭据未配置，按跳过处理（不推失败卡/不触发重跑）")
+        elif suspended:
+            print(f"  🛑 任务已达 {MAX_DAILY_ATTEMPTS} 次重试上限，触发熔断停用！后续自动调度将跳过，等待人工修复后上线")
+        elif not ok:
+            next_retry_at = circuit_info.get("next_retry_at")
+            attempts = circuit_info.get("attempts", 1)
+            if next_retry_at:
+                if next_retry_at <= self.hard_deadline:
+                    self.push(next_retry_at, "task", cfg)
+                    wait_min = int(max(0, next_retry_at - time.time()) / 60)
+                    print(f"  🔁 [分时段重试] [{tid}] 安排在 {_fmt_bjt(next_retry_at)} 进行第 {attempts+1}/{MAX_DAILY_ATTEMPTS} 次重试 (等待 ~{wait_min}m)")
+                else:
+                    print(f"  ⏳ [分时段重试] [{tid}] 下次重试时刻 {_fmt_bjt(next_retry_at)} 超出当前 run 硬墙 ({_fmt_bjt(self.hard_deadline)})，交由跨 run 延时接力")
         # 频道1 失败提醒（Discord）：任务失败/超时/异常的瞬间推失败卡；成功只记状态不推；
         # 凭据未配置推黄色提示卡（同任务同日一次）
         # （best-effort，绝不阻塞调度；每日日报走邮件，由 unified_report 统一汇总发送）
@@ -253,6 +289,14 @@ class Orchestrator:
                     print(f"dropping event [{self._label(kind, cfg)}] past hard wall")
                     self.dropped += 1
                     continue
+                # 检查是否已熔断停用（8次失败上限，等待修复后上线）
+                if cfg:
+                    tid = cfg["id"]
+                    if is_task_suspended(tid):
+                        print(f"🛑 [CIRCUIT_BREAKER] 任务 [{tid}] 已熔断停用（8次失败上限），跳过执行，等待修复后上线")
+                        save_suspended_result_record(tid, "已熔断停用，跳过执行")
+                        self.results[tid] = "suspended"
+                        continue
                 # 心跳轮询（DUE_ONLY=1）：滚动冷却任务未到期则秒级跳过，
                 # 是否执行完全由 last_credit_ts 状态决定，与 cron 时刻无关
                 if due_only and cfg:
@@ -297,12 +341,16 @@ class Orchestrator:
             return 1
         failed = [k for k, v in self.results.items() if v is False]
         skipped = [k for k, v in self.results.items() if v == "unconfigured"]
+        suspended = [k for k, v in self.results.items() if v == "suspended"]
         for tid, res in self.results.items():
-            mark = "OK" if res is True else ("SKIP(未配置)" if res == "unconfigured" else "FAIL")
+            mark = "OK" if res is True else ("SKIP(未配置)" if res == "unconfigured" else ("SUSPENDED(已熔断)" if res == "suspended" else "FAIL"))
             print(f"  {mark} {tid}")
         if skipped:
             # ⚪ 未配置凭据的站点：退出码不受影响，也不会进入 failed_matrix 触发重跑
             print(f"skipped (credentials not configured): {', '.join(skipped)}")
+        if suspended:
+            # 🛑 达到 8 次失败上限已熔断停用的站点：退出码不受影响，等待修复后上线
+            print(f"suspended (circuit broken, 8-attempt limit reached): {', '.join(suspended)}")
         if failed:
             print(f"failed: {', '.join(failed)}")
             return 1
@@ -346,9 +394,27 @@ def build_explicit_timeline(orch: Orchestrator, raw: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Daily Unified Orchestrator")
     parser.add_argument("--tasks", type=str, default="", help="comma-separated task list (explicit mode)")
+    parser.add_argument("--reset-circuit", action="store_true", help="reset circuit breaker state and resume tasks")
+    parser.add_argument("--reset-circuit-tasks", type=str, default="", help="comma-separated task list to resume from circuit breaker")
     args = parser.parse_args()
     print(f"Daily orchestrator start @ {bjt_now().strftime('%Y-%m-%d %H:%M:%S')} BJT")
     is_explicit = bool(args.tasks.strip())
+
+    if args.reset_circuit or args.reset_circuit_tasks:
+        target_tasks = [t.strip() for t in args.reset_circuit_tasks.split(",") if t.strip()]
+        if target_tasks:
+            for t in target_tasks:
+                resume_task(t, reason="命令行显式指定恢复上线 (--reset-circuit-tasks)")
+                print(f"🔄 [CIRCUIT_BREAKER] 任务 [{t}] 熔断状态已重置上线")
+        elif args.reset_circuit:
+            if is_explicit:
+                for t in [t.strip() for t in args.tasks.split(",") if t.strip()]:
+                    resume_task(t, reason="手动任务调度恢复上线 (--reset-circuit)")
+                    print(f"🔄 [CIRCUIT_BREAKER] 任务 [{t}] 熔断状态已重置上线")
+            else:
+                resume_all_tasks(reason="全局调度恢复上线 (--reset-circuit)")
+                print("🔄 [CIRCUIT_BREAKER] 全部任务熔断状态已重置上线")
+
     now_ts = time.time()
     if is_explicit:
         hard_deadline = now_ts + 86400
