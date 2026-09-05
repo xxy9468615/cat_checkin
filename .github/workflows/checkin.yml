@@ -182,6 +182,7 @@ jobs:
       AGENTROUTER_EMAIL_2: ${{ secrets.AGENTROUTER_EMAIL_2 }}
       AGENTROUTER_PASSWORD_2: ${{ secrets.AGENTROUTER_PASSWORD_2 }}
       AGENTROUTER_ACCOUNTS: ${{ secrets.AGENTROUTER_ACCOUNTS }}
+      AGENTROUTER_COOKIE: ${{ secrets.AGENTROUTER_COOKIE || secrets.AGENTROUTER_COOKIES }}
       AGENTROUTER_API_URL: https://ps.air-outer.com
       AGENTROUTER_STATE_FILE: .agentrouter_state.json
       AGENTROUTER_PROXY: socks5://127.0.0.1:1080

@@ -51,6 +51,10 @@ from common import Http, env, env_seq, load_kv_state, main_guard, mask_str, save
 PREFIX = "AGENTROUTER_"
 DEFAULT_API_URL = "https://ps.air-outer.com"
 
+# 预置 Cookie（护栏）：把已通过 Aliyun WAF 质询的 acw_tc / session 等整串 Cookie
+# 注入 CookieJar，登录请求自动携带，绕开挑战页（需出口 IP 与该 Cookie 匹配才有效）。
+_PRESET_COOKIE = os.getenv(f"{PREFIX}COOKIE", "").strip() or os.getenv(f"{PREFIX}COOKIES", "").strip()
+
 # 会话状态持久化文件（本地缓存，权威源为 Upstash Redis）
 STATE_FILE = Path(os.getenv("AGENTROUTER_STATE_FILE", ".agentrouter_state.json"))
 REDIS_KEY = f"{os.getenv('CAT_CHECKIN_REDIS_PREFIX', 'cat_checkin:')}agentrouter:state"
@@ -78,6 +82,43 @@ def _session_from_jar(h: Http) -> str:
         if isinstance(c, Cookie) and c.name == "session":
             return c.value or ""
     return ""
+
+
+def _seed_preset_cookies(h: Http) -> int:
+    """注入预置护栏 Cookie（acw_tc 等）到 CookieJar。
+
+    阿里 WAF 通过质询后签发的 acw_tc cookie 相当于护栏通行证：请求带它则直接放行，
+    不再吐挑战页。用 AGENTROUTER_COOKIE（完整浏览器 Cookie 串）预埋进 jar。
+    注意：acw_tc 绑定出口 IP 与域名，出口变化后需重新获取（失效表现为重出挑战页）。
+    返回注入条数。
+    """
+    if not _PRESET_COOKIE:
+        return 0
+    count = 0
+    for raw in _PRESET_COOKIE.split(";"):
+        raw = raw.strip()
+        if not raw or "=" not in raw:
+            continue
+        name, _, value = raw.partition("=")
+        name, value = name.strip(), value.strip()
+        if not name or not value:
+            continue
+        for existing in list(h.jar):
+            if isinstance(existing, Cookie) and existing.name == name:
+                h.jar.clear(existing.domain, existing.path, existing.name)
+        c = Cookie(
+            version=0, name=name, value=value,
+            port=None, port_specified=False,
+            domain=".air-outer.com", domain_specified=True, domain_initial_dot=False,
+            path="/", path_specified=True,
+            secure=True, expires=None, discard=True,
+            comment=None, comment_url=None,
+            rest={}, rfc2109=False,
+        )
+        h.jar.set_cookie(c)
+        count += 1
+    print(f"🛡️ 预置护栏 Cookie 注入 {count} 条 (acw_tc/session; 需与当前出口 IP 匹配)")
+    return count
 
 
 def _warmup(h: Http, base: str) -> None:
@@ -212,6 +253,7 @@ def _run_one(idx: int, total: int, account: dict, base: str) -> str:
 
     proxy = os.getenv(f"{PREFIX}PROXY", "").strip()
     h = Http(proxy=proxy)
+    _seed_preset_cookies(h)   # 预埋 acw_tc/session 护栏 Cookie，绕开 Aliyun WAF 挑战页
 
     # --- 1. 登录 = 签到 ---
     sign_confirmed, checked_in, uid, session, token = _login(h, username, password, base)
