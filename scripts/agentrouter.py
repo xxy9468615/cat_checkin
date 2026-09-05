@@ -51,6 +51,11 @@ from common import Http, env, env_seq, load_kv_state, main_guard, mask_str, save
 PREFIX = "AGENTROUTER_"
 DEFAULT_API_URL = "https://ps.air-outer.com"
 
+# 指纹方案（阿里 WAF 对 urllib 裸 TLS/socks5 链路识别打标，浏览器指纹放行）：
+#   chrome124 — curl_cffi 最新 Chrome TLS1.3/HTTP2 指纹，实测对 aliyun_waf 放行。
+# 走 common.Http(impersonate=...) 链路，仍复用预置护栏 Cookie 与代理出口环境变量。
+_FINGERPRINT = os.getenv(f"{PREFIX}FINGERPRINT", "chrome124").strip() or "chrome124"
+
 # 预置 Cookie（护栏）：把已通过 Aliyun WAF 质询的 acw_tc / session 等整串 Cookie
 # 注入 CookieJar，登录请求自动携带，绕开挑战页（需出口 IP 与该 Cookie 匹配才有效）。
 _PRESET_COOKIE = os.getenv(f"{PREFIX}COOKIE", "").strip() or os.getenv(f"{PREFIX}COOKIES", "").strip()
@@ -121,6 +126,71 @@ def _seed_preset_cookies(h: Http) -> int:
     return count
 
 
+def _browser_cookies(h: Http, sess) -> None:
+    """将 Http 的 CookieJar（含预置护栏 cookie）迁移到 curl_cffi 会话，供指纹链路复用。"""
+    from http.cookiejar import Cookie as CJ_Cookie
+    try:
+        sess.cookies.clear()
+    except Exception:
+        pass
+    for c in h.jar:
+        if not isinstance(c, CJ_Cookie):
+            continue
+        try:
+            sess.cookies.set(
+                c.name, c.value or "",
+                domain=c.domain, path=getattr(c, "path", "/"),
+                secure=bool(getattr(c, "secure", True)),
+            )
+        except Exception:
+            continue
+
+
+def perform_login(h: Http, base: str, username: str, password: str) -> tuple[int, str, dict]:
+    """浏览器指纹链路登录：POST /api/user/login?turnstile=，返回 (状态码, 原始文本, json)。
+
+    登录成功后 Set-Cookie session 由底座 CookieJar 自动捕获；护栏 cookie 由 _browser_cookies 注入。
+    """
+    from curl_cffi import requests as cr
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "User-Agent": _UA,
+        "Origin": base,
+        "Referer": f"{base}/login",
+        "Cache-Control": "no-store",
+        "Pragma": "no-cache",
+    }
+    sess = cr.Session(impersonate=_FINGERPRINT, timeout=15)
+    try:
+        _browser_cookies(h, sess)
+        # 预热首页，收集 Aliyun WAF（acw_tc）前缀 cookie——curl_cffi 指纹链路下同样需要
+        try:
+            sess.get(base + "/", headers={"User-Agent": _UA,
+                                          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                                          "Referer": base}, timeout=10)
+        except Exception:
+            pass
+        resp = sess.post(base + "/api/user/login?turnstile=",
+                         headers=headers,
+                         json={"username": username, "password": password})
+        return resp.status_code, resp.text, dict(resp.headers)
+    finally:
+        sess.close()
+
+
+def perform_get(h: Http, url: str, headers: dict) -> tuple[int, str]:
+    """浏览器指纹链路 GET，返回 (status, text)。配合 perform_login 使用，实现 /api/user/self 等。"""
+    from curl_cffi import requests as cr
+    sess = cr.Session(impersonate=_FINGERPRINT, timeout=15)
+    try:
+        _browser_cookies(h, sess)
+        resp = sess.get(url, headers=headers)
+        return resp.status_code, resp.text
+    finally:
+        sess.close()
+
+
 def _warmup(h: Http, base: str) -> None:
     """预热首页：收集 acw_tc 等 Aliyun WAF 前置 cookie，降低风控拦截概率。"""
     try:
@@ -137,12 +207,43 @@ def _login(h: Http, username: str, password: str, base: str) -> tuple[bool, str,
     """登录并触发每日签到。
 
     返回 (是否已确认今日签到, checked_in 原始值, uid, session, access_token)。
-    签到语义：登录成功即视为今日签到已完成（本部署签到=登录）：
-      checked_in=true  → 本次登录完成今日签到（或今日已确认）
+    签到语义：登录成功即算今日签到完成（本部署签到=登录）：
+      checked_in=true  → 本次签到完成今日签到（或今日已确认）
       checked_in=false → 今日已签到过（幂等）
-    """
-    _warmup(h, base)
 
+    优先浏览器指纹链路（curl_cffi chrome124，绕 Aliyun WAF 指纹识别），
+    失败或库缺失时回退原 urllib + socks5 链路。
+    """
+    from common import Http as _Http
+
+    # ---------- 指纹链路 ----------
+    if _FINGERPRINT:
+        try:
+            from curl_cffi import requests as cr  # noqa: F401
+        except Exception:
+            print("⚠️ curl_cffi 不可用，回退到原始 urllib 登录链路")
+        else:
+            code, text, hdrs = perform_login(h, base, username, password)
+            data = {}
+            try:
+                data = json.loads(text)
+            except Exception:
+                data = {}
+            if code == 200 and isinstance(data, dict) and data.get("success"):
+                user_data = data.get("data") or {}
+                if isinstance(user_data, dict) and user_data.get("id"):
+                    uid = str(user_data["id"])
+                    checked_in = bool(user_data.get("checked_in"))
+                    session = _session_from_jar(h)
+                    access_token = user_data.get("access_token") or ""
+                    return True, checked_in, uid, session, access_token
+            # 指纹链路未成功：记录原因后回退 urllib 链路
+            err_hint = text[:200].replace("\n", " ")
+            print(f"⟳ 指纹链路未成功 (HTTP {code}): {err_hint}")
+            # fallthrough → urllib
+
+    # ---------- 原始 urllib + socks5 链路 ----------
+    _warmup(h, base)
     headers = {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
@@ -161,12 +262,11 @@ def _login(h: Http, username: str, password: str, base: str) -> tuple[bool, str,
         text = resp.text[:500] if resp.text else ""
         hint = ""
 
-        # ① Aliyun WAF 挑战页（滑块验证码）——代理出口 IP 仍被标记
+        # ① Aliyun WAF 挑战页（滑块验证码）——浏览器出口 IP 或指纹仍被标记
         if "aliyun_waf" in text or "aliyunCaptcha" in text or "访问验证" in text:
             hint = (
-                "（Aliyun WAF 滑块验证码挑战页，当前出口 IP 仍被 WAF 标记。"
-                "已配置 AGENTROUTER_PROXY 时请检查代理 IP 是否干净；"
-                "未配置代理时请确认 SS 代理已启用并正确配置）"
+                "（Aliyun WAF 挑战页仍出现——已尝试浏览器指纹链路；若仍拦截，"
+                "说明出口 IP 或护栏 cookie 失效，需更新 AGENTROUTER_COOKIE）"
             )
         elif "Turnstile" in err_msg or "turnstile" in text.lower():
             hint = "（站点已启用 Turnstile 挑战校验，需要有效 turnstile token，无法自动登录）"
@@ -186,7 +286,7 @@ def _login(h: Http, username: str, password: str, base: str) -> tuple[bool, str,
     session = _session_from_jar(h)
     access_token = user_data.get("access_token") or ""
 
-    # 登录成功即视为今日签到完成（本部署签到=登录）
+    # 登录成功即本场今日签到（本部署签到=登录）
     sign_confirmed = True
     return sign_confirmed, checked_in, uid, session, access_token
 
@@ -194,7 +294,8 @@ def _login(h: Http, username: str, password: str, base: str) -> tuple[bool, str,
 def _fetch_self(h: Http, base: str, uid: str, token: str = "") -> dict:
     """GET /api/user/self 取真实余额。该站强制要求 Cookie + New-API-User 头。
 
-    注意：session cookie 已由 Http 的 CookieJar 在登录时自动捕获，无需手动设置 Cookie 头。
+    优先浏览器指纹链路（与登录一致，避免 urllib 指纹被 WAF 拦）；失败回退 urllib。
+    session cookie 已由 CookieJar 自动携带。
     """
     headers = {
         "Accept": "application/json, text/plain, */*",
@@ -207,6 +308,20 @@ def _fetch_self(h: Http, base: str, uid: str, token: str = "") -> dict:
     }
     if token:
         headers["Authorization"] = f"Bearer {token}" if not token.startswith("Bearer ") else token
+    if _FINGERPRINT:
+        try:
+            from curl_cffi import requests as cr  # noqa: F401
+        except Exception:
+            pass
+        else:
+            try:
+                code, text = perform_get(h, f"{base}/api/user/self", headers)
+                data = json.loads(text) if text else {}
+                if code == 200 and isinstance(data, dict) and data.get("success") and isinstance(data.get("data"), dict):
+                    return data["data"]
+                print(f"ℹ️ 指纹链路 self 未成功 (HTTP {code})，回退 urllib")
+            except Exception as e:
+                print(f"ℹ️ 指纹链路 self 异常 {e}，回退 urllib")
     resp = h.request("GET", f"{base}/api/user/self", headers=headers)
     data = resp.json({})
     if resp.code == 200 and isinstance(data, dict) and data.get("success") and isinstance(data.get("data"), dict):
@@ -252,7 +367,7 @@ def _run_one(idx: int, total: int, account: dict, base: str) -> str:
         raise RuntimeError(f"账号{idx} 缺少邮箱或密码，请配置 {PREFIX}EMAIL / {PREFIX}PASSWORD 或 {PREFIX}ACCOUNTS")
 
     proxy = os.getenv(f"{PREFIX}PROXY", "").strip()
-    h = Http(proxy=proxy)
+    h = Http(proxy=proxy, impersonate=_FINGERPRINT)
     _seed_preset_cookies(h)   # 预埋 acw_tc/session 护栏 Cookie，绕开 Aliyun WAF 挑战页
 
     # --- 1. 登录 = 签到 ---

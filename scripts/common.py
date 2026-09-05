@@ -17,7 +17,7 @@ import urllib.parse
 import urllib.request
 import zlib
 from pathlib import Path
-from http.cookiejar import CookieJar
+from http.cookiejar import Cookie, CookieJar
 from typing import Any, Dict, Iterable, List, Optional, Union
 
 # 保存原生未被猴子补丁污染的 socket，用于跨代理/直连切换时彻底隔离与还原
@@ -217,7 +217,17 @@ class Http:
         follow_redirects: bool = False,
         proxy: Union[str, ProxyEndpoint] = "",
         task_name: str = "",
+        impersonate: str = "",
     ):
+        # 浏览器 TLS/HTTP2 指纹模拟（如 "chrome124"），走 curl_cffi 发起请求，
+        # 绕过 Aliyun WAF 等对 urllib 裸 TLS 指纹的识别。空串 = 保持纯 urllib 链路。
+        self.impersonate = impersonate or ""
+        if self.impersonate:
+            try:
+                import curl_cffi  # noqa: F401   # 缺失时回退 urllib 而不致命
+            except Exception:
+                self.impersonate = ""
+                print(f"⚠️ curl_cffi 不可用，Http(impersonate=...) 回退到 urllib")
         self.jar = CookieJar()
         self.proxy_endpoint: Optional[ProxyEndpoint] = None
         self.has_proxy: bool = False
@@ -331,6 +341,21 @@ class Http:
         headers.setdefault("Accept", "application/json, text/plain, */*")
         headers.setdefault("Connection", "close")
 
+        # 浏览器 TLS/HTTP2 指纹链路：配置了 impersonate 时优先走 curl_cffi，
+        # 复用本实例的 CookieJar 与代理配置，突破 Aliyun WAF/Cloudflare 的指纹识别。
+        if self.impersonate:
+            try:
+                return self._request_impersonated(
+                    method, url, headers=headers, data=data,
+                    json_data=json_data, form=form, timeout=timeout,
+                )
+            except curl_cffi.RequestsError:
+                # 网络级失败（DNS/连接/TLS 握手/超时）收敛为合成 -1 响应，让 @retry 生效
+                return Response(-1, None, "curl_cffi network error".encode(), url)
+            except Exception:
+                # 配置或解析级异常：绝不吞掉业务失败，但也不占用重试次数——直接透传
+                raise
+
         # 代理模式安全守门员：当通过任何代理（HTTP / SOCKS）传输时，严禁明文 HTTP 裸奔传输
         if (getattr(self, "proxy_endpoint", None) or getattr(self, "has_proxy", False)) and url.lower().startswith("http://"):
             # 自动防御性升级为安全 HTTPS，确保流量强制受 TLS 端到端强校验保护，中间人无法嗅探
@@ -367,6 +392,67 @@ class Http:
             # @retry —— 同样收敛为合成 -1 响应，让 retry 对慢 CDN / 连接抖动真正生效
             #（urllib.error.URLError 本身是 OSError 子类，放最后只兜住非 URLError 的网络异常）。
             return Response(-1, None, str(exc).encode("utf-8", "replace"), url)
+
+    def _request_impersonated(self, method: str, url: str, *, headers: dict,
+                              data: Any = None, json_data: Any = None,
+                              form: Optional[Dict[str, Any]] = None,
+                              timeout: int = 60) -> Response:
+        """curl_cffi 指纹链路：以浏览器的 TLS/HTTP2/JA3 指纹发出请求。
+
+        复用本实例的 CookieJar（含预置护栏 Cookie）、代理出口与代理安全守门员逻辑。
+        返回统一 Response(code/text/json)，与 urllib 链路完全兼容。
+        """
+        # 代理模式安全守门员：同上，明文 HTTP 一律升级为 HTTPS
+        if (getattr(self, "proxy_endpoint", None) or getattr(self, "has_proxy", False)) and url.lower().startswith("http://"):
+            url = "https://" + url[7:]
+
+        from curl_cffi import requests as cr
+        sess_kwargs = {"impersonate": self.impersonate, "timeout": timeout}
+        # 代理出口：优先走具体的 ProxyEndpoint（含 socks5/http），与 urllib 链路一致
+        if getattr(self, "proxy_endpoint", None):
+            sess_kwargs["proxies"] = {
+                "http": self.proxy_endpoint.url,
+                "https": self.proxy_endpoint.url,
+            }
+        elif getattr(self, "has_proxy", False):
+            # 仅有代理标记但无 endpoint 对象（sockshandler 全局 patch 类）——curl_cffi 原生
+            # 支持 socks5:// 地址，直接用代理 URL 等价表达
+            sess_kwargs["proxies"] = {
+                "http": "socks5://127.0.0.1:1080",
+                "https": "socks5://127.0.0.1:1080",
+            }
+
+        sess = cr.Session(**sess_kwargs)
+        try:
+            # 清空会话级 cookie，仅从本实例 CookieJar 迁移到 curl_cffi，保证预置护栏 cookie 生效
+            sess.cookies.clear()
+            for c in self.jar:
+                if not isinstance(c, Cookie):
+                    continue
+                try:
+                    sess.cookies.set(
+                        c.name, c.value or "",
+                        domain=c.domain, path=getattr(c, "path", "/"),
+                        secure=bool(getattr(c, "secure", True)),
+                    )
+                except Exception:
+                    continue
+            body = None
+            if json_data is not None:
+                body = json.dumps(json_data, ensure_ascii=False, separators=(",", ":")).encode()
+                headers.setdefault("Content-Type", "application/json")
+            elif form is not None:
+                body = urllib.parse.urlencode(form).encode()
+                headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+            elif data is not None:
+                body = data.encode() if isinstance(data, str) else data
+            kw = {"headers": headers}
+            if body is not None:
+                kw["data"] = body
+            resp = sess.request(method.upper(), url, **kw)
+            return Response(resp.status_code, resp.headers, resp.content, str(resp.url))
+        finally:
+            sess.close()
 
 
 def qstash_publish(
