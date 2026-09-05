@@ -328,27 +328,22 @@ jobs:
             latvi-state-
             agentrouter-state-
 
-      - name: Setup proxy egress (Self-hosted / SS / Backup)
+      - name: Setup proxy egress (Self-hosted / sing-box / Backup)
         if: inputs.direct != true
         env:
           SELF_HOSTED_PROXIES: ${{ secrets.SELF_HOSTED_PROXIES || secrets.CUSTOM_PROXIES }}
           AGENTROUTER_SINGBOX_CONFIG: ${{ secrets.AGENTROUTER_SINGBOX_CONFIG }}
-          AGENTROUTER_SS_CONFIG: ${{ secrets.AGENTROUTER_SS_CONFIG }}
-          AGENTROUTER_SS_SUB_URL: ${{ secrets.AGENTROUTER_SS_SUB_URL }}
-          AGENTROUTER_SS_SHA256: ${{ secrets.AGENTROUTER_SS_SHA256 }}
           AGENTROUTER_BACKUP_PROXIES: ${{ secrets.AGENTROUTER_BACKUP_PROXIES }}
         run: |
           set -euo pipefail
-          # 可选组件全程软失败：主 SS 出口与备用代理全部不可用时只让 agentrouter
-          # 红卡（公平失败），不能杀死整条主流水线让 16 个签到任务全部不跑。
-          # AGENTROUTER_BACKUP_PROXIES：每行一条 socks5:// 或 http(s):// 代理，
-          # 支持 user:pass@host:port 与行内 # 注释；仅在本地 sslocal 不可用时
-          # 按序探测，取第一条能通 AgentRouter API 的，经 GITHUB_ENV 覆盖 job 级
-          # 默认 AGENTROUTER_PROXY=socks5://127.0.0.1:1080。
-          # 代理出口状态入数据库（Upstash Redis，与任务结果同 raw hash 的 proxy_setup
-          # 字段，14 天 TTL）：GH 日志保留期不可控且偶发拉取失败，排查代理/出口问题
-          # 以 Redis 为准。字段不带 date 键——unified_report 汇聚有 date 门禁不会误收。
-          # best-effort：任何失败静默，绝不影响代理链路本身
+          # 代理链路收敛为三种机制（2026-09-05 清理，便于诊断）：
+          #   1. 自建代理（SELF_HOSTED_PROXIES，最高优先）
+          #   2. sing-box 原生 JSON（AGENTROUTER_SINGBOX_CONFIG，唯一隧道客户端，
+          #      承载 agentrouter/nodeseek/2libra/cloudstudio 的固定家宽出口）
+          #   3. 备用代理池（AGENTROUTER_BACKUP_PROXIES，红卡前最后保险）
+          # 已删：mihomo 订阅拉取、sslocal(shadowsocks-rust) 两套独立隧道——旧环境下
+          # 多客户端争抢 1080、多套 DNS 域混用，干扰排查。
+          # 代理出口状态入 Redis（proxy_setup 字段，14 天 TTL）：排查以 Redis 为准。
           stash_proxy_state() {
             [ -n "$UPSTASH_REDIS_REST_URL" ] && [ -n "$UPSTASH_REDIS_REST_TOKEN" ] || return 0
             python3 - "$1" "$2" "$3" "$4" <<'PY'
@@ -377,83 +372,15 @@ jobs:
           PY
           }
 
-          setup_ss() {
-            curl -sL --max-time 60 -o /tmp/ss.tar.xz \
-              https://github.com/shadowsocks/shadowsocks-rust/releases/download/v1.23.4/shadowsocks-v1.23.4.x86_64-unknown-linux-musl.tar.xz \
-              || { echo "sslocal download failed"; return 1; }
-            # 供应链校验：配置了 AGENTROUTER_SS_SHA256 secret 时强制核对（未配置则跳过）
-            if [ -n "$AGENTROUTER_SS_SHA256" ]; then
-              echo "$AGENTROUTER_SS_SHA256  /tmp/ss.tar.xz" | sha256sum -c - \
-                || { echo "sslocal checksum MISMATCH"; return 1; }
-            fi
-            tar xf /tmp/ss.tar.xz -C /tmp
-            test -x /tmp/sslocal || { echo "sslocal missing"; return 1; }
-            if ! command -v obfs-local >/dev/null 2>&1; then
-              sudo apt-get install -y -qq simple-obfs >/dev/null 2>&1 \
-                || echo "obfs-local install failed; SS proxy may not work with obfs nodes"
-            fi
-            # printf 而非 heredoc：quoted heredoc 不展开变量，且 secret 中的反斜杠/引号可原样落盘
-            printf '%s' "$AGENTROUTER_SS_CONFIG" > /tmp/ss-config.json
-            test -s /tmp/ss-config.json || { echo "AGENTROUTER_SS_CONFIG empty"; return 1; }
-            python3 - <<'PY' || return 1
-          import json, shutil, sys
-          p = "/tmp/ss-config.json"
-          try:
-              cfg = json.load(open(p, encoding="utf-8"))
-          except Exception as e:
-              print(f"AGENTROUTER_SS_CONFIG not valid JSON: {e}")
-              sys.exit(1)
-          cfg["local_address"] = "127.0.0.1"
-          cfg["local_port"] = 1080
-          if cfg.get("plugin"):
-              resolved = shutil.which(str(cfg["plugin"])) or str(cfg["plugin"])
-              cfg["plugin"] = resolved
-          json.dump(cfg, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-          PY
-            pip install -q pysocks || { echo "pysocks install failed"; return 1; }
-            pip install -q curl-cffi >/dev/null 2>&1 \
-              || echo "curl-cffi install failed; nodeseek falls back to urllib fingerprint"
-            /tmp/sslocal -c /tmp/ss-config.json &
-            SSPID=$!
-            echo "SSPID=$SSPID" >> "$GITHUB_ENV"
-            SSPORT=1080
-            echo "Waiting for SS proxy on port $SSPORT..."
-            for i in $(seq 1 20); do
-              if ss -tln 2>/dev/null | grep -q ":$SSPORT "; then
-                break
-              fi
-              sleep 0.5
-            done
-            for i in 1 2 3; do
-              ip=$(curl -sS -x "socks5://127.0.0.1:$SSPORT" -m 8 https://api.ipify.org 2>/dev/null || echo "")
-              if [ -n "$ip" ]; then
-                echo "SS proxy ready (pid $SSPID, port $SSPORT, exit $ip)"
-                echo "AGENTROUTER_PROXY=socks5://127.0.0.1:$SSPORT" >> "$GITHUB_ENV"
-                echo "NODESEEK_PROXY=socks5://127.0.0.1:$SSPORT" >> "$GITHUB_ENV"
-                echo "2LIBRA_PROXY=socks5://127.0.0.1:$SSPORT" >> "$GITHUB_ENV"
-                echo "CLOUDSTUDIO_PROXY=socks5://127.0.0.1:$SSPORT" >> "$GITHUB_ENV"
-                stash_proxy_state sslocal "sslocal" "$ip" ""
-                return 0
-              fi
-              sleep 1
-            done
-            echo "SS proxy failed (check AGENTROUTER_SS_CONFIG)"
-            return 1
-          }
-
-          # sing-box：优先使用用户提供的原生 JSON 配置（AGENTROUTER_SINGBOX_CONFIG，
-          # 由用户直接提供，不走订阅拉取/转换）。仅做轻量归一化：把本机监听强制锚定到
-          # 127.0.0.1:1080（多 inbound 只保留第一个代理型 inbound，避免端口冲突/外泄），
-          # 其余 outbounds/routes/dns 全按原样交付给 sing-box。启动后探测出口 IP，
-          # 与 mihomo/sslocal 一致注入代理环境变量并存 proxy_setup 状态。
+          # sing-box：用户直接提供的原生 JSON 配置（不走订阅拉取/转换）。
+          # 修复 DNS：注入显式 dns 段（公共 UDP/TCP DNS + sniff），解决域名 NXDOMAIN
+          # 泄漏（如 sing-box 直连 railgun.dnsbot.net 时 exchange6/exchange4 NXDOMAIN）。
+          # inbound 强制锚定 127.0.0.1:1080（仅保留一个代理型 inbound），其余原样交付。
           setup_singbox() {
             test -n "$AGENTROUTER_SINGBOX_CONFIG" || { echo "AGENTROUTER_SINGBOX_CONFIG empty"; return 1; }
-            curl -sL --max-time 60 -o /tmp/singbox.tar.gz \
-              https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64-musl.tar.gz \
-              || { echo "sing-box download failed"; return 1; }
+            curl -sL --max-time 60 -o /tmp/singbox.tar.gz               https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64-musl.tar.gz               || { echo "sing-box download failed"; return 1; }
             mkdir -p /tmp/singbox
-            tar xzf /tmp/singbox.tar.gz -C /tmp/singbox --strip-components=1 \
-              || { echo "sing-box extract failed"; return 1; }
+            tar xzf /tmp/singbox.tar.gz -C /tmp/singbox --strip-components=1               || { echo "sing-box extract failed"; return 1; }
             test -x /tmp/singbox/sing-box || { echo "sing-box binary missing"; return 1; }
             printf '%s' "$AGENTROUTER_SINGBOX_CONFIG" > /tmp/singbox-config.json
             test -s /tmp/singbox-config.json || { echo "AGENTROUTER_SINGBOX_CONFIG empty"; return 1; }
@@ -465,6 +392,7 @@ jobs:
           except Exception as e:
               print(f"AGENTROUTER_SINGBOX_CONFIG not valid JSON: {e}")
               sys.exit(1)
+          # 仅保留一个代理型 inbound，锚定本地 1080
           inbounds = cfg.get("inbounds") or []
           picked = None
           kept = []
@@ -475,24 +403,37 @@ jobs:
                       ib["listen_port"] = 1080
                       picked = ib
                       kept.append(ib)
-                  # 仅保留第一个代理型 inbound，避免端口/地址冲突
               else:
                   kept.append(ib)
           if picked is None:
               kept.append({"type": "mixed", "tag": "in_mixed",
                            "listen": "127.0.0.1", "listen_port": 1080})
           cfg["inbounds"] = kept
+          # 注入显式 DNS：公共 DoH + 传统解析，避免系统 resolver 在 CI 的 NXDOMAIN 抖动
+          dns = cfg.get("dns") or {}
+          if not dns.get("servers"):
+              dns["servers"] = [
+                  {"tag": "google", "address": "8.8.8.8"},
+                  {"tag": "cloudflare", "address": "1.1.1.1"},
+              ]
+          dns.setdefault("strategy", "ipv4_only")
+          if not dns.get("sniff"):
+              dns["sniff"] = True
+          if not dns.get("final"):
+              dns["final"] = dns["servers"][0]["tag"]
+          cfg["dns"] = dns
+          if "route" not in cfg:
+              cfg["route"] = {}
+          routes = cfg["route"]
+          # 确保 DNS 查询经隧道出站（避免直连公共 DNS 仍被 CF/WAF 按数据中心解析）
+          routes.setdefault("rules", [])
           json.dump(cfg, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
           PY
-            # obfs-local（simple-obfs）供 shadowsocks plugin=obfs-local 节点使用；
-            # 安装失败不致命（sing-box 可能内建/走其他插件），先尝试静默安装
+            # obfs-local（simple-obfs）供 shadowsocks plugin=obfs-local 节点使用；可选
             if ! command -v obfs-local >/dev/null 2>&1; then
-              sudo apt-get install -y -qq simple-obfs >/dev/null 2>&1 \
-                || echo "obfs-local install failed; sing-box obfs nodes may fail"
+              sudo apt-get install -y -qq simple-obfs >/dev/null 2>&1                 || echo "obfs-local install failed; sing-box obfs nodes may fail"
             fi
             pip install -q pysocks || { echo "pysocks install failed"; return 1; }
-            pip install -q curl-cffi >/dev/null 2>&1 \
-              || echo "curl-cffi failed, nodeseek falls back to urllib fingerprint"
             /tmp/singbox/sing-box run --config /tmp/singbox-config.json >/tmp/singbox.log 2>&1 &
             SSPID=$!
             echo "SSPID=$SSPID" >> "$GITHUB_ENV"
@@ -500,11 +441,11 @@ jobs:
               if ss -tln 2>/dev/null | grep -q ":1080 "; then break; fi
               sleep 0.5
             done
+            sleep 1
             if ! ss -tln 2>/dev/null | grep -q ":1080 "; then
               echo "sing-box failed to listen on 1080; tail log:"; tail -n 20 /tmp/singbox.log || true
               kill -9 "$SSPID" 2>/dev/null || true; return 1
             fi
-            sleep 1
             exit_ip=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 https://api.ipify.org 2>/dev/null || echo "")
             if [ -z "$exit_ip" ]; then
               echo "sing-box proxy forwarding failed; tearing down before fallback"; tail -n 20 /tmp/singbox.log || true
@@ -514,6 +455,7 @@ jobs:
             fi
             node_tag=$(python3 -c "import json; cfg=json.load(open('/tmp/singbox-config.json')); print((cfg.get('outbounds') or [{}])[0].get('tag','singbox'))" 2>/dev/null || echo "singbox")
             echo "sing-box ready (pid $SSPID, outbound $node_tag, exit IP: $exit_ip)"
+            # 为依赖固定出口的任务注入代理环境变量
             echo "AGENTROUTER_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             echo "NODESEEK_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             echo "2LIBRA_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
@@ -521,78 +463,6 @@ jobs:
             ns_code=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
             echo "SS proxy ready via sing-box on 127.0.0.1:1080 (pid $SSPID), nodeseek probe HTTP $ns_code"
             stash_proxy_state singbox "$node_tag" "$exit_ip" "$ns_code"
-            return 0
-          }
-
-          # mihomo（订阅原生格式）提供本地 SOCKS5/HTTP 混合代理端口（127.0.0.1:1080）：
-          # proxy-provider 按 filter 只加载 TW-X1-3 单节点——CF clearance 绑定出口 IP，
-          # 仅针对需要固定出口的 agentrouter 与 nodeseek 注入代理环境变量，
-          # 国内常规站点保持直连，杜绝全局 TUN/DNS 劫持导致国内 SLB 跨域重置。
-          setup_mihomo() {
-            test -n "$AGENTROUTER_SS_SUB_URL" || { echo "AGENTROUTER_SS_SUB_URL empty"; return 1; }
-            curl -sL --max-time 60 -o /tmp/mihomo.gz \
-              https://github.com/MetaCubeX/mihomo/releases/download/v1.19.30/mihomo-linux-amd64-v1-go123-v1.19.30.gz \
-              || { echo "mihomo download failed"; return 1; }
-            mkdir -p /tmp/mihomo
-            gunzip -c /tmp/mihomo.gz > /tmp/mihomo/mihomo && chmod +x /tmp/mihomo/mihomo \
-              || { echo "mihomo extract failed"; return 1; }
-            cat > /tmp/mh-config.yaml <<MHEOF
-          mode: rule
-          log-level: warning
-          ipv6: false
-          mixed-port: 1080
-          proxy-providers:
-            railgun:
-              type: http
-              url: "$AGENTROUTER_SS_SUB_URL"
-              interval: 86400
-              path: /tmp/mihomo/prov.yaml
-              # 只加载 TW-X1-3（锚定行尾，避免误配其他编号）；订阅里其余节点全部不进组
-              filter: "TW-X1-3$"
-              health-check:
-                enable: true
-                url: "https://www.gstatic.com/generate_204"
-                interval: 300
-          external-controller: 127.0.0.1:9090
-          proxy-groups:
-            - name: PROXY
-              type: select
-              use: ["railgun"]
-          rules:
-            - MATCH,PROXY
-          MHEOF
-            pip install -q pysocks || { echo "pysocks install failed"; return 1; }
-            pip install -q curl-cffi >/dev/null 2>&1 \
-              || echo "curl-cffi install failed; nodeseek falls back to urllib fingerprint"
-            /tmp/mihomo/mihomo -d /tmp/mihomo -f /tmp/mh-config.yaml >/dev/null 2>&1 &
-            SSPID=$!
-            echo "SSPID=$SSPID" >> "$GITHUB_ENV"
-            for i in $(seq 1 30); do
-              if ss -tln 2>/dev/null | grep -q ":1080 "; then break; fi
-              sleep 0.5
-            done
-            if ! ss -tln 2>/dev/null | grep -q ":1080 "; then
-              echo "mihomo mixed-port 1080 failed to start"; kill -9 "$SSPID" 2>/dev/null || true; return 1
-            fi
-            sleep 1
-            exit_ip=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 https://api.ipify.org 2>/dev/null || echo "")
-            if [ -z "$exit_ip" ]; then
-              echo "mihomo proxy forwarding failed; tearing down before sslocal fallback"
-              kill -9 "$SSPID" 2>/dev/null || true
-              sleep 1
-              return 1
-            fi
-            cur_node=$(curl -sS -m 5 http://127.0.0.1:9090/proxies/PROXY \
-              | python3 -c "import json,sys; print(json.load(sys.stdin).get('now','?'))" 2>/dev/null || echo "?")
-            echo "mihomo pinned node: $cur_node, exit IP: $exit_ip"
-            # 仅向需要代理出口的任务注入环境变量
-            echo "AGENTROUTER_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
-            echo "NODESEEK_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
-            echo "2LIBRA_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
-            echo "CLOUDSTUDIO_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
-            ns_code=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
-            echo "SS proxy ready via mihomo on 127.0.0.1:1080 (pid $SSPID), nodeseek probe HTTP $ns_code"
-            stash_proxy_state mihomo "$cur_node" "$exit_ip" "$ns_code"
             return 0
           }
 
@@ -614,37 +484,27 @@ jobs:
             return 1
           }
 
-          # sing-box 路径也需要 ss-config.json：提前落盘（setup_ss 内会重复写，幂等）
-          printf '%s' "$AGENTROUTER_SS_CONFIG" > /tmp/ss-config.json
-
-          # 1. 自建代理优先（配置了自建代理时直接探测，优先于机场订阅）
+          # 1. 自建代理优先（配置了自建代理时直接探测，优先于 sing-box 隧道）
           if [ -n "$SELF_HOSTED_PROXIES" ]; then
             echo "检测到配置了自建代理 (SELF_HOSTED_PROXIES)，优先执行自建代理探测..."
             if probe_proxy_list "自建" "$SELF_HOSTED_PROXIES"; then
               exit 0
             fi
-            echo "⚠️ 自建代理暂不可用，回退至订阅与备用代理模式..."
+            echo "⚠️ 自建代理暂不可用，回退至 sing-box 与备用代理..."
           fi
 
-          # 2. sing-box 原生 JSON 优先（用户提供的家宽节点 TW-1X/US-1X 配置，
-          #    防泄漏客户端绕开被阿里识别为代理的 socks5 中转）
+          # 2. sing-box 原生 JSON（用户提供的家宽节点 TW-1X/US-1X 出口）
           if setup_singbox; then
             exit 0
           fi
 
-          if setup_mihomo; then
-            exit 0
-          fi
-          if setup_ss; then
-            exit 0
-          fi
-
-          echo "SS/订阅代理不可用，正在探测备用代理池..."
+          # 3. 备用代理池
+          echo "隧道/订阅代理不可用，正在探测备用代理池..."
           if probe_proxy_list "备用" "$AGENTROUTER_BACKUP_PROXIES"; then
             exit 0
           fi
 
-          echo "所有代理均不可用 (或全部为死代理)；agentrouter 将按设计触发公平失败"
+          echo "所有代理均不可用（或全部为死代理）；agentrouter 将按设计触发公平失败"
           stash_proxy_state none "" "" ""
 
       - name: Direct mode (clear proxy env, runner IP 直连)
@@ -779,14 +639,12 @@ jobs:
             .notify_state_*.json
           key: unified-states-${{ github.run_id }}
 
-      - name: Cleanup SS proxy
+      - name: Cleanup sing-box tunnel
         if: always()
         run: |
           kill "${SSPID:-}" 2>/dev/null || true
           sudo -n kill "${SSPID:-}" 2>/dev/null || true
           sudo -n pkill -f '[s]ing-box' 2>/dev/null || true
-          sudo -n pkill -f '[m]ihomo' 2>/dev/null || true
-          pkill -f '[s]slocal' 2>/dev/null || true
 
       - name: Upload unified results
         if: always()

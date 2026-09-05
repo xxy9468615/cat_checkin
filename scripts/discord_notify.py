@@ -200,7 +200,7 @@ _ERROR_HINTS = [
      True, "人工登录一次后重跑"),
     (r"超时|timeout", "执行超时：站点响应缓慢或网络受限，下一轮运行将自动重试",
      True, "可重跑（多为瞬时网络问题）"),
-    (r"代理|proxy|socks", "代理通道不可用：请检查 AGENTROUTER_SS_CONFIG 或备用代理配置",
+    (r"代理|proxy|socks", "代理通道不可用：请检查 AGENTROUTER_SINGBOX_CONFIG / 自建代理 或备用代理配置",
      True, "修复代理后重跑"),
 ]
 
