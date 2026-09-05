@@ -146,12 +146,27 @@ def _browser_cookies(h: Http, sess) -> None:
             continue
 
 
+def _fingerprint_session(h: Http):
+    """基于 Http 实例构建 curl_cffi 指纹会话，并透传同一代理出口（socks5/http）。"""
+    from curl_cffi import requests as cr
+    sess_kwargs = {"impersonate": _FINGERPRINT, "timeout": 15}
+    ep = getattr(h, "proxy_endpoint", None)
+    proxy_url = getattr(ep, "url", "") if ep else ""
+    if proxy_url:
+        sess_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+    elif getattr(h, "has_proxy", False):
+        # 无 endpoint 但标记有代理（sockshandler 全局 patch 类）——回退本机代理
+        sess_kwargs["proxies"] = {"http": "socks5://127.0.0.1:1080",
+                                  "https": "socks5://127.0.0.1:1080"}
+    return cr.Session(**sess_kwargs)
+
+
 def perform_login(h: Http, base: str, username: str, password: str) -> tuple[int, str, dict]:
     """浏览器指纹链路登录：POST /api/user/login?turnstile=，返回 (状态码, 原始文本, json)。
 
     登录成功后 Set-Cookie session 由底座 CookieJar 自动捕获；护栏 cookie 由 _browser_cookies 注入。
+    该链路透传 AGENTROUTER_PROXY 代理出口，保证出口 IP 与护栏 cookie 匹配。
     """
-    from curl_cffi import requests as cr
     headers = {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
@@ -161,7 +176,7 @@ def perform_login(h: Http, base: str, username: str, password: str) -> tuple[int
         "Cache-Control": "no-store",
         "Pragma": "no-cache",
     }
-    sess = cr.Session(impersonate=_FINGERPRINT, timeout=15)
+    sess = _fingerprint_session(h)
     try:
         _browser_cookies(h, sess)
         # 预热首页，收集 Aliyun WAF（acw_tc）前缀 cookie——curl_cffi 指纹链路下同样需要
@@ -181,8 +196,7 @@ def perform_login(h: Http, base: str, username: str, password: str) -> tuple[int
 
 def perform_get(h: Http, url: str, headers: dict) -> tuple[int, str]:
     """浏览器指纹链路 GET，返回 (status, text)。配合 perform_login 使用，实现 /api/user/self 等。"""
-    from curl_cffi import requests as cr
-    sess = cr.Session(impersonate=_FINGERPRINT, timeout=15)
+    sess = _fingerprint_session(h)
     try:
         _browser_cookies(h, sess)
         resp = sess.get(url, headers=headers)
