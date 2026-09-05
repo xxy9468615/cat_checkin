@@ -459,7 +459,13 @@ jobs:
               sudo apt-get install -y -qq simple-obfs >/dev/null 2>&1                 || echo "obfs-local install failed; sing-box obfs nodes may fail"
             fi
             pip install -q pysocks || { echo "pysocks install failed"; return 1; }
+            # outbound server 若为域名（如 railgun.dnsbot.net）且未显式配置 domain_strategy，
+            # sing-box 1.x 需此兼容开关，否则 decode 直接退出
+            export ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true
             /tmp/singbox/sing-box run --config /tmp/singbox-config.json >/tmp/singbox.log 2>&1 &
+            SSPID=$!
+            echo "SSPID=$SSPID" >> "$GITHUB_ENV"
+            echo "ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true" >> "$GITHUB_ENV"
             SSPID=$!
             echo "SSPID=$SSPID" >> "$GITHUB_ENV"
             for i in $(seq 1 30); do
