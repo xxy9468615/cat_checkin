@@ -409,9 +409,10 @@ jobs:
               kept.append({"type": "mixed", "tag": "in_mixed",
                            "listen": "127.0.0.1", "listen_port": 1080})
           cfg["inbounds"] = kept
-          # 注入显式 DNS：公共 UDP DNS + sniff，避免系统 resolver 在 CI 的 NXDOMAIN 抖动
-          # 注意 sing-box ≥1.12 已弃用/1.14 移除 legacy DNS server 格式（{"tag","address"}），
-          # 必须显式带 type。这里对已有 servers 做迁移，统一补全为新格式。
+          # 注入显式 DNS：公共 UDP DNS，避免系统 resolver 在 CI 的 NXDOMAIN 抖动。
+          # 注意：sing-box DNS server 无 sniff 字段（sniff 属于 route/inbound 层）；
+          # DNS 顶层只放 servers/strategy/final。≥1.12 已弃用、1.14 移除 legacy
+          # {"tag","address"} 格式，必须显式带 type；这里对已有 servers 做迁移。
           dns = cfg.get("dns") or {}
           servers = dns.get("servers")
           if not servers:
@@ -443,8 +444,6 @@ jobs:
               ]
           dns["servers"] = migrated
           dns.setdefault("strategy", "ipv4_only")
-          if not dns.get("sniff"):
-              dns["sniff"] = True
           if not dns.get("final"):
               dns["final"] = dns["servers"][0]["tag"]
           cfg["dns"] = dns
