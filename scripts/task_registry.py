@@ -222,6 +222,18 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "tags": ["00:50", "matrix", "daily"],
     },
 
+    # --- 夸克网盘（pan.quark.cn 每日签到领容量、资产统计与 __puus 滑动保活，
+    #     App 抓包串 query 鉴权；2026-09-07 用户提供 kps_wg/sign_wg 抓包后启用）---
+    "quark": {
+        "id": "quark",
+        "script": "quark.py",
+        "name": "夸克网盘 签到",
+        "result": "quark.json",
+        "timeout": 300,
+        "account": "",
+        "tags": ["00:50", "matrix", "daily"],
+    },
+
     # --- 多账号站点（单 run 阶段 A 内联并发；旧 QStash 回程接力已退役） ---
     "workbuddy-account-1": {
         "id": "workbuddy-account-1",

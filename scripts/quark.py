@@ -14,7 +14,8 @@
 
 环境变量：
 - QUARK_COOKIE_1, QUARK_COOKIE_2...（网页完整 Cookie；Redis 中有更新版本时优先）
-- QUARK_MPARAM_1...（可选：App 三参数，"kps=..&sign=..&vcode=.." 任意分隔符）
+- QUARK_MPARAM_1...（可选：App 抓包串整串粘贴即可——支持 Android 网关变体
+  kps_wg/sign_wg/vcode/_ts/_nonce/_sign 原样重放，或经典 "kps=..&sign=..&vcode=.."）
 """
 from __future__ import annotations
 
@@ -68,7 +69,7 @@ def _resp_dict(resp: Any) -> Dict[str, Any]:
 
 
 def _parse_mparam(raw: str) -> Dict[str, str]:
-    r"""解析 App 三参数：kps/sign/vcode，任意分隔符。
+    r"""解析经典 App 三参数：kps/sign/vcode（vcode 可选），任意分隔符。
 
     负向断言防止误匹配 cookie 里的 __kps（'_' 属于 \w）。
     """
@@ -77,7 +78,48 @@ def _parse_mparam(raw: str) -> Dict[str, str]:
         m = re.search(rf"(?<![A-Za-z0-9_]){key}=([^;&\s]+)", raw or "")
         if m:
             out[key] = m.group(1)
-    return out if len(out) == 3 else {}
+    return out if len(out) >= 2 else {}
+
+
+def _mparam_candidates(raw: str) -> List[str]:
+    r"""把用户抓包串转换为 growth 接口的候选 query 列表（按保真度排序）。
+
+    1. Android 抓包（kps_wg/sign_wg + _ts/_nonce/_sign 网关签名）：首选整串
+       原样重放（值已含 URL 编码，勿再 quote）；降级为剔除时敏参数并重命名
+       kps_wg→kps、sign_wg→sign 的经典形态。
+    2. PC 抓包（kps/sign/vcode）：重拼标准前缀。含 % 的值视为已编码不再 quote。
+    """
+    raw = (raw or "").strip().lstrip("?").strip()
+    if not raw:
+        return []
+    if "kps_wg=" in raw:
+        out = [raw]
+        pairs = []
+        for kv in raw.split("&"):
+            if "=" not in kv:
+                continue
+            k, _, v = kv.partition("=")
+            if k in ("_ts", "_nonce", "_sign", "salt"):
+                continue
+            if k == "kps_wg":
+                k = "kps"
+            elif k == "sign_wg":
+                k = "sign"
+            pairs.append(f"{k}={v}")
+        out.append("&".join(pairs))
+        return out
+
+    p = _parse_mparam(raw)
+    if "kps" not in p or "sign" not in p:
+        return [raw] if "=" in raw else []
+
+    def _q(v: str) -> str:
+        return v if "%" in v else quote(v, safe="")
+
+    q = f"pr=ucpro&fr=pc&uc_param_str=&kps={_q(p['kps'])}&sign={_q(p['sign'])}"
+    if p.get("vcode"):
+        q += f"&vcode={_q(p['vcode'])}"
+    return [q]
 
 
 def _fmt_size(num: Any) -> str:
@@ -160,37 +202,40 @@ def _member_overview(h: Http, cookie: str) -> Tuple[str, str, Any]:
     return member_line, space_line, resp
 
 
-def _growth_sign(h: Http, cookie: str, mparam: Dict[str, str]) -> Tuple[str, bool]:
+def _growth_sign(h: Http, cookie: str, mparam_raw: str) -> Tuple[str, bool]:
     """移动端 growth 接口签到（三参数 query 鉴权，与社区实现同源）。
 
-    返回 (文案, 是否达成签到)。
+    mparam_raw 支持整串抓包重放与经典三参数两种形态，候选按保真度依次尝试
+    （最多 2 种形态，属业务级降级而非失败重试）。返回 (文案, 是否达成签到)。
     """
-    q = (
-        f"pr=ucpro&fr=pc&uc_param_str="
-        f"&kps={quote(mparam['kps'], safe='')}"
-        f"&sign={quote(mparam['sign'], safe='')}"
-        f"&vcode={quote(mparam['vcode'], safe='')}"
-    )
     headers = {
         "Cookie": cookie,
         "User-Agent": UA_CLIENT,
         "Content-Type": "application/json",
         "Referer": f"{PAN_HOST}/",
     }
-    resp = h.request("GET", f"{M_HOST}/1/clouddrive/capacity/growth/info?{q}", headers=headers)
-    info = _resp_dict(resp)
-    if resp.code != 200 or info.get("code") not in (0, None):
-        return f"签到状态查询失败（HTTP {resp.code} {info.get('message', '')[:40]}），三参数可能已失效", False
+    info: Dict[str, Any] = {}
+    used_q = ""
+    last_note = ""
+    for q in _mparam_candidates(mparam_raw):
+        resp = h.request("GET", f"{M_HOST}/1/clouddrive/capacity/growth/info?{q}", headers=headers)
+        info = _resp_dict(resp)
+        if resp.code == 200 and info.get("code") in (0, None) \
+                and (info.get("data") or {}).get("cap_sign"):
+            used_q = q
+            break
+        last_note = f"HTTP {resp.code} {str(info.get('message', ''))[:40]}"
+    if not used_q:
+        return f"签到状态查询失败（{last_note}），三参数可能已失效", False
+
     cap = (info.get("data") or {}).get("cap_sign") or {}
-    if not cap:
-        return "签到状态查询返回空（三参数可能已失效，请重新抓包）", False
     reward_mb = int((cap.get("sign_daily_reward") or 0) / 1024 / 1024)
     progress = cap.get("sign_progress", 0)
     target = cap.get("sign_target", 0)
     if cap.get("sign_daily"):
         return f"今日已签到（+{reward_mb}MB，连签 {progress}/{target} 天）", True
     resp = h.request(
-        "POST", f"{M_HOST}/1/clouddrive/capacity/growth/sign?{q}",
+        "POST", f"{M_HOST}/1/clouddrive/capacity/growth/sign?{used_q}",
         headers=headers, json_data={"sign_cyclic": True},
     )
     d = _resp_dict(resp)
@@ -201,8 +246,8 @@ def _growth_sign(h: Http, cookie: str, mparam: Dict[str, str]) -> Tuple[str, boo
     return f"签到失败（{msg[:60]}）", False
 
 
-def _run_one(idx: int, total: int, cookie: str, mparam: Optional[Dict[str, str]]) -> Tuple[bool, str]:
-    """单个账号完整流程。"""
+def _run_one(idx: int, total: int, cookie: str, mparam_raw: Optional[str]) -> Tuple[bool, str]:
+    """单个账号完整流程。mparam_raw 为用户抓包原始串（支持整串重放/三参数）。"""
     h = Http()
     prefix_redis = f"cat_checkin:state:quark_{idx}"
     state_file = f".quark_state_{idx}.json"
@@ -220,8 +265,8 @@ def _run_one(idx: int, total: int, cookie: str, mparam: Optional[Dict[str, str]]
     # 捕获滑动票：服务端对每次调用做 Set-Cookie(__puus) 24h 续期
     lines: List[str] = []
     ok = True
-    if mparam:
-        sign_line, sign_ok = _growth_sign(h, cookie, mparam)
+    if mparam_raw:
+        sign_line, sign_ok = _growth_sign(h, cookie, mparam_raw)
         lines.append(f"• 签到: {sign_line}")
         ok = ok and sign_ok
     else:
@@ -261,7 +306,7 @@ def main() -> None:
         if not cookie.strip():
             continue
         done += 1
-        mparam = _parse_mparam(mparams[idx - 1]) if idx <= len(mparams) else {}
+        mparam = mparams[idx - 1].strip() if idx <= len(mparams) else ""
         try:
             ok, _ = _run_one(idx, total, cookie.strip(), mparam or None)
         except Exception as exc:  # noqa: BLE001

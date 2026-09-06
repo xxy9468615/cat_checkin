@@ -167,6 +167,8 @@ jobs:
       52POJIE_PROXY: ${{ secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
       QUARK_cookie: ${{ secrets.QUARK_COOKIE_1 }}
       QUARK_COOKIE_1: ${{ secrets.QUARK_COOKIE_1 }}
+      QUARK_mparam: ${{ secrets.QUARK_MPARAM_1 }}
+      QUARK_MPARAM_1: ${{ secrets.QUARK_MPARAM_1 }}
       CLOUD189_username: ${{ secrets.CLOUD189_USERNAME_1 }}
       CLOUD189_USERNAME_1: ${{ secrets.CLOUD189_USERNAME_1 }}
       CLOUD189_password: ${{ secrets.CLOUD189_PASSWORD_1 }}
@@ -229,6 +231,7 @@ jobs:
             .alipan_state*.json
             .smzdm_state*.json
             .52pojie_state*.json
+            .quark_state*.json
             .notify_state_*.json
           key: unified-states-${{ github.run_id }}
           restore-keys: |
@@ -668,6 +671,7 @@ jobs:
             .alipan_state*.json
             .smzdm_state*.json
             .52pojie_state*.json
+            .quark_state*.json
             .notify_state_*.json
           key: unified-states-${{ github.run_id }}
 
