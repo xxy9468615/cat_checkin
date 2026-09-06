@@ -88,211 +88,114 @@ jobs:
       QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
       # GH_PAT 不挂 job 级 env（2026-09-06 审计）：仅注入 orchestrator / send_report /
       # auto-retry 步骤与 report-fallback 报告步骤，避免全部任务子进程持有仓库写权限令牌。
-      GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
-      GLADOS_COOKIE_1: ${{ secrets.GLADOS_COOKIE_1 || secrets.GLADOS_COOKIES }}
+      GLADOS_COOKIE_1: ${{ secrets.GLADOS_COOKIE_1 }}
       GLADOS_COOKIE_2: ${{ secrets.GLADOS_COOKIE_2 }}
       GLADOS_COOKIE_3: ${{ secrets.GLADOS_COOKIE_3 }}
-      GLADOS_ACCOUNTS: ${{ secrets.GLADOS_ACCOUNTS }}
-      GLADOS_ACCOUNT_1: ${{ secrets.GLADOS_ACCOUNT_1 || secrets.GLADOS_ACCOUNTS }}
-      GLADOS_ACCOUNT_2: ${{ secrets.GLADOS_ACCOUNT_2 }}
       GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
       GLADOS_AUTO_EXCHANGE: "true"
       GLADOS_DOMAINS: glados.cloud
-      RAILGUN_COOKIES: ${{ secrets.RAILGUN_COOKIES }}
-      RAILGUN_COOKIE_1: ${{ secrets.RAILGUN_COOKIE_1 || secrets.RAILGUN_COOKIES }}
+      RAILGUN_COOKIE_1: ${{ secrets.RAILGUN_COOKIE_1 }}
       RAILGUN_COOKIE_2: ${{ secrets.RAILGUN_COOKIE_2 }}
       RAILGUN_COOKIE_3: ${{ secrets.RAILGUN_COOKIE_3 }}
-      RAILGUN_ACCOUNTS: ${{ secrets.RAILGUN_ACCOUNTS }}
-      RAILGUN_ACCOUNT_1: ${{ secrets.RAILGUN_ACCOUNT_1 || secrets.RAILGUN_ACCOUNTS }}
-      RAILGUN_ACCOUNT_2: ${{ secrets.RAILGUN_ACCOUNT_2 }}
-      RAILGUN_EXCHANGE_PLAN: ${{ secrets.RAILGUN_EXCHANGE_PLAN }}
       RAILGUN_AUTO_EXCHANGE: "true"
       RAILGUN_DOMAINS: railgun.info
-      "2LIBRA_COOKIES": ${{ secrets.TWO_LIBRA_COOKIES }}
-      "2LIBRA_COOKIE_1": ${{ secrets.TWO_LIBRA_COOKIE_1 || secrets.TWO_LIBRA_COOKIES }}
-      "2LIBRA_COOKIE_2": ${{ secrets.TWO_LIBRA_COOKIE_2 }}
-      "2LIBRA_COOKIE_3": ${{ secrets.TWO_LIBRA_COOKIE_3 }}
-      "2LIBRA_PROXY": ${{ secrets.TWO_LIBRA_PROXY }}
-      BIANJIE_AI_ACCOUNTS: ${{ secrets.BIANJIE_AI_ACCOUNTS }}
-      BIANJIE_AI_USERNAME_1: ${{ secrets.BIANJIE_AI_USERNAME_1 || secrets.BIANJIE_AI_USERNAME }}
-      BIANJIE_AI_PASSWORD_1: ${{ secrets.BIANJIE_AI_PASSWORD_1 || secrets.BIANJIE_AI_PASSWORD }}
+      "2LIBRA_COOKIE_1": ${{ secrets.TWO_LIBRA_COOKIE_1 }}
+      BIANJIE_AI_USERNAME_1: ${{ secrets.BIANJIE_AI_USERNAME_1 }}
+      BIANJIE_AI_PASSWORD_1: ${{ secrets.BIANJIE_AI_PASSWORD_1 }}
       BIANJIE_AI_USERNAME_2: ${{ secrets.BIANJIE_AI_USERNAME_2 }}
       BIANJIE_AI_PASSWORD_2: ${{ secrets.BIANJIE_AI_PASSWORD_2 }}
-      MOXING_username: ${{ secrets.MOXING_USERNAME_1 || secrets.MOXING_USERNAME }}
-      MOXING_password: ${{ secrets.MOXING_PASSWORD_1 || secrets.MOXING_PASSWORD }}
-      MOXING_USERNAME_1: ${{ secrets.MOXING_USERNAME_1 || secrets.MOXING_USERNAME }}
-      MOXING_PASSWORD_1: ${{ secrets.MOXING_PASSWORD_1 || secrets.MOXING_PASSWORD }}
-      MOXING_USERNAME_2: ${{ secrets.MOXING_USERNAME_2 }}
-      MOXING_PASSWORD_2: ${{ secrets.MOXING_PASSWORD_2 }}
+      MOXING_username: ${{ secrets.MOXING_USERNAME }}
+      MOXING_password: ${{ secrets.MOXING_PASSWORD }}
+      MOXING_USERNAME_1: ${{ secrets.MOXING_USERNAME }}
+      MOXING_PASSWORD_1: ${{ secrets.MOXING_PASSWORD }}
       MOXING_Domain: https://moxing.chat
       MOXING_UA: ${{ secrets.MOXING_UA }}
-      UGNAS_cookie: ${{ secrets.UGNAS_COOKIE_1 || secrets.UGNAS_COOKIE }}
-      UGNAS_COOKIE_1: ${{ secrets.UGNAS_COOKIE_1 || secrets.UGNAS_COOKIE }}
-      UGNAS_COOKIE_2: ${{ secrets.UGNAS_COOKIE_2 }}
-      CLOUDSTUDIO_cookie: ${{ secrets.CLOUDSTUDIO_COOKIE_1 || secrets.CLOUDSTUDIO_COOKIE }}
-      CLOUDSTUDIO_COOKIE_1: ${{ secrets.CLOUDSTUDIO_COOKIE_1 || secrets.CLOUDSTUDIO_COOKIE }}
-      CLOUDSTUDIO_COOKIE_2: ${{ secrets.CLOUDSTUDIO_COOKIE_2 }}
-      CLOUDSTUDIO_PROXY: ${{ secrets.CLOUDSTUDIO_PROXY }}
-      CLOUDSTUDIO_xsrf: ${{ secrets.CLOUDSTUDIO_XSRF }}
-      NAIXI_username: ${{ secrets.NAIXI_USERNAME_1 || secrets.NAIXI_USERNAME }}
-      NAIXI_PASSWORD: ${{ secrets.NAIXI_PASSWORD_1 || secrets.NAIXI_PASSWORD }}
-      NAIXI_USERNAME_1: ${{ secrets.NAIXI_USERNAME_1 || secrets.NAIXI_USERNAME }}
-      NAIXI_PASSWORD_1: ${{ secrets.NAIXI_PASSWORD_1 || secrets.NAIXI_PASSWORD }}
-      NAIXI_USERNAME_2: ${{ secrets.NAIXI_USERNAME_2 }}
-      NAIXI_PASSWORD_2: ${{ secrets.NAIXI_PASSWORD_2 }}
-      DJI_cookie: ${{ secrets.DJI_COOKIE_1 || secrets.DJI_COOKIE }}
-      DJI_COOKIE_1: ${{ secrets.DJI_COOKIE_1 || secrets.DJI_COOKIE }}
-      DJI_COOKIE_2: ${{ secrets.DJI_COOKIE_2 }}
-      PCBETA_cookie: ${{ secrets.PCBETA_COOKIE_1 || secrets.PCBETA_COOKIE }}
-      PCBETA_COOKIE_1: ${{ secrets.PCBETA_COOKIE_1 || secrets.PCBETA_COOKIE }}
-      PCBETA_COOKIE_2: ${{ secrets.PCBETA_COOKIE_2 }}
-      PCBETA_username: ${{ secrets.PCBETA_USERNAME_1 || secrets.PCBETA_USERNAME }}
-      PCBETA_USERNAME_1: ${{ secrets.PCBETA_USERNAME_1 || secrets.PCBETA_USERNAME }}
-      PCBETA_password: ${{ secrets.PCBETA_PASSWORD_1 || secrets.PCBETA_PASSWORD }}
-      PCBETA_PASSWORD_1: ${{ secrets.PCBETA_PASSWORD_1 || secrets.PCBETA_PASSWORD }}
-      PCBETA_USERNAME_2: ${{ secrets.PCBETA_USERNAME_2 }}
-      PCBETA_PASSWORD_2: ${{ secrets.PCBETA_PASSWORD_2 }}
-      MONKEYCODE_ACCOUNTS: ${{ secrets.MONKEY_CODE_ACCOUNTS || secrets.MONKEYCODE_ACCOUNTS || secrets.MONKEY_CODE_ACCOUNT || secrets.MONKEYCODE_ACCOUNT }}
-      MONKEYCODE_ACCOUNT_1: ${{ secrets.MONKEY_CODE_ACCOUNT_1 || secrets.MONKEYCODE_ACCOUNT_1 }}
-      MONKEYCODE_ACCOUNT_2: ${{ secrets.MONKEY_CODE_ACCOUNT_2 || secrets.MONKEYCODE_ACCOUNT_2 }}
-      MONKEYCODE_cookie: ${{ secrets.MONKEY_CODE_COOKIE_1 || secrets.MONKEYCODE_COOKIE_1 || secrets.MONKEY_CODE_COOKIE || secrets.MONKEYCODE_COOKIE || secrets.MONKEY_CODE_COOKIES || secrets.MONKEYCODE_COOKIES }}
-      MONKEYCODE_COOKIE_1: ${{ secrets.MONKEY_CODE_COOKIE_1 || secrets.MONKEYCODE_COOKIE_1 || secrets.MONKEY_CODE_COOKIE || secrets.MONKEYCODE_COOKIE }}
-      MONKEYCODE_COOKIE_2: ${{ secrets.MONKEY_CODE_COOKIE_2 || secrets.MONKEYCODE_COOKIE_2 }}
-      MONKEYCODE_COOKIE_3: ${{ secrets.MONKEY_CODE_COOKIE_3 || secrets.MONKEYCODE_COOKIE_3 }}
-      MONKEYCODE_email: ${{ secrets.MONKEY_CODE_EMAIL_1 || secrets.MONKEYCODE_EMAIL_1 || secrets.MONKEY_CODE_EMAIL || secrets.MONKEYCODE_EMAIL }}
-      MONKEYCODE_password: ${{ secrets.MONKEY_CODE_PASSWORD_1 || secrets.MONKEYCODE_PASSWORD_1 || secrets.MONKEY_CODE_PASSWORD || secrets.MONKEYCODE_PASSWORD }}
-      MONKEYCODE_EMAIL_1: ${{ secrets.MONKEY_CODE_EMAIL_1 || secrets.MONKEYCODE_EMAIL_1 || secrets.MONKEY_CODE_EMAIL || secrets.MONKEYCODE_EMAIL }}
-      MONKEYCODE_PASSWORD_1: ${{ secrets.MONKEY_CODE_PASSWORD_1 || secrets.MONKEYCODE_PASSWORD_1 || secrets.MONKEY_CODE_PASSWORD || secrets.MONKEYCODE_PASSWORD }}
-      MONKEYCODE_EMAIL_2: ${{ secrets.MONKEY_CODE_EMAIL_2 || secrets.MONKEYCODE_EMAIL_2 }}
-      MONKEYCODE_PASSWORD_2: ${{ secrets.MONKEY_CODE_PASSWORD_2 || secrets.MONKEYCODE_PASSWORD_2 }}
-      MONKEYCODE_EMAIL_3: ${{ secrets.MONKEY_CODE_EMAIL_3 || secrets.MONKEYCODE_EMAIL_3 }}
-      MONKEYCODE_PASSWORD_3: ${{ secrets.MONKEY_CODE_PASSWORD_3 || secrets.MONKEYCODE_PASSWORD_3 }}
-      SOPHNET_TOKENS: ${{ secrets.SOPHNET_TOKENS }}
-      SOPHNET_TOKEN_1: ${{ secrets.SOPHNET_TOKEN_1 || secrets.SOPHNET_TOKEN }}
-      SOPHNET_REFRESH_TOKEN_1: ${{ secrets.SOPHNET_REFRESH_TOKEN_1 || secrets.SOPHNET_REFRESH_TOKEN }}
+      UGNAS_cookie: ${{ secrets.UGNAS_COOKIE_1 }}
+      UGNAS_COOKIE_1: ${{ secrets.UGNAS_COOKIE_1 }}
+      CLOUDSTUDIO_cookie: ${{ secrets.CLOUDSTUDIO_COOKIE_1 }}
+      CLOUDSTUDIO_COOKIE_1: ${{ secrets.CLOUDSTUDIO_COOKIE_1 }}
+      NAIXI_username: ${{ secrets.NAIXI_USERNAME_1 }}
+      NAIXI_PASSWORD: ${{ secrets.NAIXI_PASSWORD_1 }}
+      NAIXI_USERNAME_1: ${{ secrets.NAIXI_USERNAME_1 }}
+      NAIXI_PASSWORD_1: ${{ secrets.NAIXI_PASSWORD_1 }}
+      DJI_cookie: ${{ secrets.DJI_COOKIE_1 }}
+      DJI_COOKIE_1: ${{ secrets.DJI_COOKIE_1 }}
+      PCBETA_cookie: ${{ secrets.PCBETA_COOKIE_1 }}
+      PCBETA_COOKIE_1: ${{ secrets.PCBETA_COOKIE_1 }}
+      PCBETA_username: ${{ secrets.PCBETA_USERNAME_1 }}
+      PCBETA_USERNAME_1: ${{ secrets.PCBETA_USERNAME_1 }}
+      PCBETA_password: ${{ secrets.PCBETA_PASSWORD_1 }}
+      PCBETA_PASSWORD_1: ${{ secrets.PCBETA_PASSWORD_1 }}
+      MONKEYCODE_email: ${{ secrets.MONKEYCODE_EMAIL_1 }}
+      MONKEYCODE_password: ${{ secrets.MONKEYCODE_PASSWORD_1 }}
+      MONKEYCODE_EMAIL_1: ${{ secrets.MONKEYCODE_EMAIL_1 }}
+      MONKEYCODE_PASSWORD_1: ${{ secrets.MONKEYCODE_PASSWORD_1 }}
+      MONKEYCODE_EMAIL_2: ${{ secrets.MONKEYCODE_EMAIL_2 }}
+      MONKEYCODE_PASSWORD_2: ${{ secrets.MONKEYCODE_PASSWORD_2 }}
+      SOPHNET_TOKEN_1: ${{ secrets.SOPHNET_TOKEN_1 }}
+      SOPHNET_REFRESH_TOKEN_1: ${{ secrets.SOPHNET_REFRESH_TOKEN_1 }}
       SOPHNET_TOKEN_2: ${{ secrets.SOPHNET_TOKEN_2 }}
       SOPHNET_REFRESH_TOKEN_2: ${{ secrets.SOPHNET_REFRESH_TOKEN_2 }}
-      AI_ROUTER_TOKEN: ${{ secrets.AI_ROUTER_TOKEN }}
-      AI_ROUTER_REFRESH_TOKEN: ${{ secrets.AI_ROUTER_REFRESH_TOKEN }}
-      AI_ROUTER_TOKEN_1: ${{ secrets.AI_ROUTER_TOKEN_1 || secrets.AI_ROUTER_TOKEN }}
-      AI_ROUTER_REFRESH_TOKEN_1: ${{ secrets.AI_ROUTER_REFRESH_TOKEN_1 || secrets.AI_ROUTER_REFRESH_TOKEN }}
-      AI_ROUTER_EMAIL: ${{ secrets.AI_ROUTER_EMAIL }}
-      AI_ROUTER_USERNAME: ${{ secrets.AI_ROUTER_USERNAME }}
-      AI_ROUTER_PASSWORD: ${{ secrets.AI_ROUTER_PASSWORD }}
-      AI_ROUTER_EMAIL_1: ${{ secrets.AI_ROUTER_EMAIL_1 || secrets.AI_ROUTER_EMAIL || secrets.AI_ROUTER_USERNAME }}
-      AI_ROUTER_PASSWORD_1: ${{ secrets.AI_ROUTER_PASSWORD_1 || secrets.AI_ROUTER_PASSWORD }}
-      AI_ROUTER_EMAIL_2: ${{ secrets.AI_ROUTER_EMAIL_2 }}
-      AI_ROUTER_PASSWORD_2: ${{ secrets.AI_ROUTER_PASSWORD_2 }}
-      AI_ROUTER_COOKIE: ${{ secrets.AI_ROUTER_COOKIE }}
-      AI_ROUTER_COOKIE_1: ${{ secrets.AI_ROUTER_COOKIE_1 || secrets.AI_ROUTER_COOKIE }}
-      AI_ROUTER_COOKIE_2: ${{ secrets.AI_ROUTER_COOKIE_2 }}
-      AI_ROUTER_ACCOUNTS: ${{ secrets.AI_ROUTER_ACCOUNTS }}
-      AGENTROUTER_EMAIL: ${{ secrets.AGENTROUTER_EMAIL }}
-      AGENTROUTER_PASSWORD: ${{ secrets.AGENTROUTER_PASSWORD }}
-      AGENTROUTER_EMAIL_1: ${{ secrets.AGENTROUTER_EMAIL_1 || secrets.AGENTROUTER_EMAIL }}
-      AGENTROUTER_PASSWORD_1: ${{ secrets.AGENTROUTER_PASSWORD_1 || secrets.AGENTROUTER_PASSWORD }}
-      AGENTROUTER_EMAIL_2: ${{ secrets.AGENTROUTER_EMAIL_2 }}
-      AGENTROUTER_PASSWORD_2: ${{ secrets.AGENTROUTER_PASSWORD_2 }}
-      AGENTROUTER_ACCOUNTS: ${{ secrets.AGENTROUTER_ACCOUNTS }}
-      AGENTROUTER_COOKIE: ${{ secrets.AGENTROUTER_COOKIE || secrets.AGENTROUTER_COOKIES }}
+      AI_ROUTER_REFRESH_TOKEN_1: ${{ secrets.AI_ROUTER_REFRESH_TOKEN_1 }}
+      AGENTROUTER_EMAIL_1: ${{ secrets.AGENTROUTER_EMAIL_1 }}
+      AGENTROUTER_PASSWORD_1: ${{ secrets.AGENTROUTER_PASSWORD_1 }}
+      AGENTROUTER_COOKIE: ${{ secrets.AGENTROUTER_COOKIE }}
       AGENTROUTER_API_URL: https://ps.air-outer.com
       AGENTROUTER_STATE_FILE: .agentrouter_state.json
       # AGENTROUTER_PROXY 不再 job 级硬编码（2026-09-06 代理收敛）：sing-box 启动
       # 成功时由 egress 步骤写入 GITHUB_ENV，失败时任务显式报错而非盲试 localhost
-      U1S1_TOKEN: ${{ secrets.U1S1_TOKEN }}
-      U1S1_TOKEN_1: ${{ secrets.U1S1_TOKEN_1 || secrets.U1S1_TOKEN }}
-      U1S1_TOKEN_2: ${{ secrets.U1S1_TOKEN_2 }}
-      U1S1_COOKIE: ${{ secrets.U1S1_COOKIE }}
-      U1S1_COOKIE_1: ${{ secrets.U1S1_COOKIE_1 || secrets.U1S1_COOKIE }}
-      U1S1_COOKIE_2: ${{ secrets.U1S1_COOKIE_2 }}
-      JUEJIN_cookie: ${{ secrets.JUEJIN_COOKIE_1 || secrets.JUEJIN_COOKIE }}
-      JUEJIN_COOKIE_1: ${{ secrets.JUEJIN_COOKIE_1 || secrets.JUEJIN_COOKIE }}
+      U1S1_TOKEN_1: ${{ secrets.U1S1_TOKEN_1 }}
+      JUEJIN_cookie: ${{ secrets.JUEJIN_COOKIE_1 }}
+      JUEJIN_COOKIE_1: ${{ secrets.JUEJIN_COOKIE_1 }}
       JUEJIN_COOKIE_2: ${{ secrets.JUEJIN_COOKIE_2 }}
-      JUEJIN_COOKIE_3: ${{ secrets.JUEJIN_COOKIE_3 }}
-      NODESEEK_cookie: ${{ secrets.NODESEEK_COOKIE_1 || secrets.NODESEEK_COOKIE }}
-      NODESEEK_COOKIE_1: ${{ secrets.NODESEEK_COOKIE_1 || secrets.NODESEEK_COOKIE }}
-      NODESEEK_COOKIE_2: ${{ secrets.NODESEEK_COOKIE_2 }}
-      NODESEEK_COOKIE_3: ${{ secrets.NODESEEK_COOKIE_3 }}
+      NODESEEK_cookie: ${{ secrets.NODESEEK_COOKIE_1 }}
+      NODESEEK_COOKIE_1: ${{ secrets.NODESEEK_COOKIE_1 }}
       # 硬空：CF clearance 绑定出口 IP，nodeseek 必须走工作流固定出口（TUN/SS），
       # 独立代理 secret 一律不认（换出口=触发质询）
       NODESEEK_PROXY: ""
-      AISTUDIO_cookie: ${{ secrets.AISTUDIO_COOKIE_1 || secrets.AISTUDIO_COOKIE }}
-      AISTUDIO_COOKIE_1: ${{ secrets.AISTUDIO_COOKIE_1 || secrets.AISTUDIO_COOKIE }}
+      AISTUDIO_cookie: ${{ secrets.AISTUDIO_COOKIE_1 }}
+      AISTUDIO_COOKIE_1: ${{ secrets.AISTUDIO_COOKIE_1 }}
       AISTUDIO_COOKIE_2: ${{ secrets.AISTUDIO_COOKIE_2 }}
-      AISTUDIO_COOKIE_3: ${{ secrets.AISTUDIO_COOKIE_3 }}
-      ALIPAN_refresh_token: ${{ secrets.ALIPAN_REFRESH_TOKEN_1 || secrets.ALIPAN_REFRESH_TOKEN || secrets.ALIPAN_TOKEN_1 || secrets.ALIPAN_TOKEN }}
-      ALIPAN_REFRESH_TOKEN_1: ${{ secrets.ALIPAN_REFRESH_TOKEN_1 || secrets.ALIPAN_REFRESH_TOKEN || secrets.ALIPAN_TOKEN_1 || secrets.ALIPAN_TOKEN }}
-      ALIPAN_REFRESH_TOKEN_2: ${{ secrets.ALIPAN_REFRESH_TOKEN_2 || secrets.ALIPAN_TOKEN_2 }}
-      ALIPAN_REFRESH_TOKEN_3: ${{ secrets.ALIPAN_REFRESH_TOKEN_3 || secrets.ALIPAN_TOKEN_3 }}
-      ALIPAN_TOKEN_1: ${{ secrets.ALIPAN_TOKEN_1 || secrets.ALIPAN_REFRESH_TOKEN_1 || secrets.ALIPAN_TOKEN || secrets.ALIPAN_REFRESH_TOKEN }}
-      ALIPAN_TOKEN_2: ${{ secrets.ALIPAN_TOKEN_2 || secrets.ALIPAN_REFRESH_TOKEN_2 }}
-      ALIPAN_TOKEN_3: ${{ secrets.ALIPAN_TOKEN_3 || secrets.ALIPAN_REFRESH_TOKEN_3 }}
-      SMZDM_cookie: ${{ secrets.SMZDM_COOKIE_1 || secrets.SMZDM_COOKIE }}
-      SMZDM_COOKIE_1: ${{ secrets.SMZDM_COOKIE_1 || secrets.SMZDM_COOKIE }}
-      SMZDM_COOKIE_2: ${{ secrets.SMZDM_COOKIE_2 }}
-      SMZDM_COOKIE_3: ${{ secrets.SMZDM_COOKIE_3 }}
+      ALIPAN_refresh_token: ${{ secrets.ALIPAN_REFRESH_TOKEN_1 }}
+      ALIPAN_REFRESH_TOKEN_1: ${{ secrets.ALIPAN_REFRESH_TOKEN_1 }}
+      ALIPAN_TOKEN_1: ${{ secrets.ALIPAN_REFRESH_TOKEN_1 }}
+      SMZDM_cookie: ${{ secrets.SMZDM_COOKIE_1 }}
+      SMZDM_COOKIE_1: ${{ secrets.SMZDM_COOKIE_1 }}
       SMZDM_PROXY: ${{ secrets.SMZDM_PROXY }}
-      SMZDM_BACKUP_PROXIES: ${{ secrets.SMZDM_BACKUP_PROXIES }}
-      52POJIE_cookie: ${{ secrets.WUAI_COOKIE_1 || secrets.WUAI_COOKIE || secrets.POJIE_COOKIE_1 || secrets.POJIE_COOKIE || secrets['52POJIE_COOKIE_1'] || secrets['52POJIE_COOKIE'] }}
-      52POJIE_COOKIE_1: ${{ secrets.WUAI_COOKIE_1 || secrets.WUAI_COOKIE || secrets.POJIE_COOKIE_1 || secrets.POJIE_COOKIE || secrets['52POJIE_COOKIE_1'] || secrets['52POJIE_COOKIE'] }}
-      52POJIE_COOKIE_2: ${{ secrets.WUAI_COOKIE_2 || secrets.POJIE_COOKIE_2 || secrets['52POJIE_COOKIE_2'] }}
-      52POJIE_COOKIE_3: ${{ secrets.WUAI_COOKIE_3 || secrets.POJIE_COOKIE_3 || secrets['52POJIE_COOKIE_3'] }}
-      52POJIE_PROXY: ${{ secrets['52POJIE_PROXY'] || secrets.WUAI_PROXY || secrets.POJIE_PROXY || secrets.SMZDM_PROXY }}
-      QUARK_cookie: ${{ secrets.QUARK_COOKIE_1 || secrets.QUARK_COOKIE }}
-      QUARK_COOKIE_1: ${{ secrets.QUARK_COOKIE_1 || secrets.QUARK_COOKIE }}
-      QUARK_COOKIE_2: ${{ secrets.QUARK_COOKIE_2 }}
-      QUARK_MPARAM_1: ${{ secrets.QUARK_MPARAM_1 }}
-      QUARK_MPARAM_2: ${{ secrets.QUARK_MPARAM_2 }}
+      52POJIE_cookie: ${{ secrets.WUAI_COOKIE_1 }}
+      52POJIE_COOKIE_1: ${{ secrets.WUAI_COOKIE_1 }}
+      52POJIE_PROXY: ${{ secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
+      QUARK_cookie: ${{ secrets.QUARK_COOKIE_1 }}
+      QUARK_COOKIE_1: ${{ secrets.QUARK_COOKIE_1 }}
       CLOUD189_username: ${{ secrets.CLOUD189_USERNAME_1 }}
       CLOUD189_USERNAME_1: ${{ secrets.CLOUD189_USERNAME_1 }}
-      CLOUD189_USERNAME_2: ${{ secrets.CLOUD189_USERNAME_2 }}
       CLOUD189_password: ${{ secrets.CLOUD189_PASSWORD_1 }}
       CLOUD189_PASSWORD_1: ${{ secrets.CLOUD189_PASSWORD_1 }}
-      CLOUD189_PASSWORD_2: ${{ secrets.CLOUD189_PASSWORD_2 }}
       CLOUD189_cookie: ${{ secrets.CLOUD189_COOKIE_1 }}
       CLOUD189_COOKIE_1: ${{ secrets.CLOUD189_COOKIE_1 }}
-      CLOUD189_PROXY: ${{ secrets.CLOUD189_PROXY || secrets['52POJIE_PROXY'] || secrets.WUAI_PROXY || secrets.POJIE_PROXY || secrets.SMZDM_PROXY }}
-      CLOUD189_BACKUP_PROXIES: ${{ secrets.CLOUD189_BACKUP_PROXIES || secrets.SMZDM_BACKUP_PROXIES }}
-      WORKBUDDY_COOKIE: ${{ secrets.WORKBUDDY_COOKIE }}
-      WORKBUDDY_COOKIE_1: ${{ secrets.WORKBUDDY_COOKIE_1 || secrets.WORKBUDDY_COOKIE }}
-      WORKBUDDY_COOKIE_2: ${{ secrets.WORKBUDDY_COOKIE_2 }}
-      WORKBUDDY_COOKIE_3: ${{ secrets.WORKBUDDY_COOKIE_3 }}
+      CLOUD189_PROXY: ${{ secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
       # 插件 OAuth refresh_token（60/90 天滚动续期，优先于 7 天硬上限的 Cookie）
-      WORKBUDDY_REFRESH_TOKEN: ${{ secrets.WORKBUDDY_REFRESH_TOKEN }}
       WORKBUDDY_REFRESH_TOKEN_1: ${{ secrets.WORKBUDDY_REFRESH_TOKEN_1 }}
       WORKBUDDY_REFRESH_TOKEN_2: ${{ secrets.WORKBUDDY_REFRESH_TOKEN_2 }}
       WORKBUDDY_WAIT_TRAVEL: "true"
-      MODELSCOPE_TOKEN: ${{ secrets.MODELSCOPE_TOKEN_1 || secrets.MODELSCOPE_TOKEN || secrets.MODELSCOPE_API_TOKEN || secrets.MODELSCOPE_ACCESS_TOKEN }}
-      MODELSCOPE_TOKEN_1: ${{ secrets.MODELSCOPE_TOKEN_1 || secrets.MODELSCOPE_TOKEN || secrets.MODELSCOPE_API_TOKEN || secrets.MODELSCOPE_ACCESS_TOKEN }}
+      MODELSCOPE_TOKEN: ${{ secrets.MODELSCOPE_TOKEN_1 }}
+      MODELSCOPE_TOKEN_1: ${{ secrets.MODELSCOPE_TOKEN_1 }}
       MODELSCOPE_TOKEN_2: ${{ secrets.MODELSCOPE_TOKEN_2 }}
-      MODELSCOPE_TOKEN_3: ${{ secrets.MODELSCOPE_TOKEN_3 }}
-      MODELSCOPE_TOKEN_4: ${{ secrets.MODELSCOPE_TOKEN_4 }}
-      MODELSCOPE_TOKEN_5: ${{ secrets.MODELSCOPE_TOKEN_5 }}
-      MODELSCOPE_API_TOKEN: ${{ secrets.MODELSCOPE_API_TOKEN || secrets.MODELSCOPE_TOKEN }}
-      MODELSCOPE_cookie: ${{ secrets.MODELSCOPE_COOKIE_1 || secrets.MODELSCOPE_COOKIE }}
-      MODELSCOPE_COOKIE_1: ${{ secrets.MODELSCOPE_COOKIE_1 || secrets.MODELSCOPE_COOKIE }}
+      MODELSCOPE_cookie: ${{ secrets.MODELSCOPE_COOKIE_1 }}
+      MODELSCOPE_COOKIE_1: ${{ secrets.MODELSCOPE_COOKIE_1 }}
       MODELSCOPE_COOKIE_2: ${{ secrets.MODELSCOPE_COOKIE_2 }}
-      MODELSCOPE_COOKIE_3: ${{ secrets.MODELSCOPE_COOKIE_3 }}
-      MODELSCOPE_COOKIE_4: ${{ secrets.MODELSCOPE_COOKIE_4 }}
-      MODELSCOPE_COOKIE_5: ${{ secrets.MODELSCOPE_COOKIE_5 }}
-      MODELSCOPE_HOST: ${{ secrets.MODELSCOPE_HOST }}
-      MODELSCOPE_PROXY: ${{ secrets.MODELSCOPE_PROXY }}
-      MODELSCOPE_AI_TOKEN: ${{ secrets.MODELSCOPE_AI_TOKEN_1 || secrets.MODELSCOPE_AI_TOKEN }}
-      MODELSCOPE_AI_TOKEN_1: ${{ secrets.MODELSCOPE_AI_TOKEN_1 || secrets.MODELSCOPE_AI_TOKEN }}
+      MODELSCOPE_AI_TOKEN: ${{ secrets.MODELSCOPE_AI_TOKEN_1 }}
+      MODELSCOPE_AI_TOKEN_1: ${{ secrets.MODELSCOPE_AI_TOKEN_1 }}
       MODELSCOPE_AI_TOKEN_2: ${{ secrets.MODELSCOPE_AI_TOKEN_2 }}
       MODELSCOPE_AI_TOKEN_3: ${{ secrets.MODELSCOPE_AI_TOKEN_3 }}
-      MODELSCOPE_AI_TOKEN_4: ${{ secrets.MODELSCOPE_AI_TOKEN_4 }}
-      MODELSCOPE_AI_TOKEN_5: ${{ secrets.MODELSCOPE_AI_TOKEN_5 }}
-      MODELSCOPE_AI_COOKIE: ${{ secrets.MODELSCOPE_AI_COOKIE_1 || secrets.MODELSCOPE_AI_COOKIE }}
-      MODELSCOPE_AI_COOKIE_1: ${{ secrets.MODELSCOPE_AI_COOKIE_1 || secrets.MODELSCOPE_AI_COOKIE }}
+      MODELSCOPE_AI_COOKIE: ${{ secrets.MODELSCOPE_AI_COOKIE_1 }}
+      MODELSCOPE_AI_COOKIE_1: ${{ secrets.MODELSCOPE_AI_COOKIE_1 }}
       MODELSCOPE_AI_COOKIE_2: ${{ secrets.MODELSCOPE_AI_COOKIE_2 }}
       MODELSCOPE_AI_COOKIE_3: ${{ secrets.MODELSCOPE_AI_COOKIE_3 }}
-      MODELSCOPE_AI_COOKIE_4: ${{ secrets.MODELSCOPE_AI_COOKIE_4 }}
-      MODELSCOPE_AI_COOKIE_5: ${{ secrets.MODELSCOPE_AI_COOKIE_5 }}
-      LATVI_EMAIL: ${{ secrets.LATVI_EMAIL_1 || secrets.LATVI_EMAIL }}
-      LATVI_PASSWORD: ${{ secrets.LATVI_PASSWORD_1 || secrets.LATVI_PASSWORD }}
-      LATVI_EMAIL_1: ${{ secrets.LATVI_EMAIL_1 || secrets.LATVI_EMAIL }}
-      LATVI_PASSWORD_1: ${{ secrets.LATVI_PASSWORD_1 || secrets.LATVI_PASSWORD }}
+      LATVI_EMAIL: ${{ secrets.LATVI_EMAIL }}
+      LATVI_PASSWORD: ${{ secrets.LATVI_PASSWORD }}
+      LATVI_EMAIL_1: ${{ secrets.LATVI_EMAIL }}
+      LATVI_PASSWORD_1: ${{ secrets.LATVI_PASSWORD }}
       LATVI_STATE_FILE: .latvi_state.json
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
       RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
