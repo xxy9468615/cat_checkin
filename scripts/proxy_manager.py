@@ -25,7 +25,7 @@ class ProxyEndpoint:
     """代理节点描述结构。"""
 
     name: str  # 统一识别名称，如 "自建-香港-01"
-    url: str  # 完整可用代理连接串，如 "socks5://user:pass@1.2.3.4:1080"
+    url: str  # 完整可用代理连接串，如 "socks5://<user>:<pass>@1.2.3.4:1080"
     safe_url: str  # 脱敏后的安全连接串，如 "socks5://***:***@1.***.***.4:****"
     protocol: str  # "socks5", "http", "https"
     host: str  # "1.2.3.4"
@@ -91,7 +91,7 @@ def mask_proxy_url(url: str) -> str:
     """对代理 URL 进行严格多层脱敏处理（隐去密码、掩码主机、隐去敏感端口）。
 
     示例:
-    socks5://admin:secret123@1.2.3.4:1080 -> socks5://***:***@1.***.***.4:****
+    socks5://<user>:<pass>@1.2.3.4:1080 -> socks5://***:***@1.***.***.4:****
     http://5.6.7.8:8080 -> http://5.***.***.8:****
     """
     if not url:
@@ -116,16 +116,16 @@ def parse_proxy_line(
 
     支持语法规范：
     1. URI Fragment 格式（推荐，标准 URL 规范）：
-       socks5://user:pass@1.2.3.4:1080#自建-香港-01
+       socks5://<user>:<pass>@1.2.3.4:1080#自建-香港-01
        http://5.6.7.8:8080#自建-美西-02
     2. 中括号 / 尖括号前缀语法：
-       [自建-HK-01] socks5://user:pass@1.2.3.4:1080
+       [自建-HK-01] socks5://<user>:<pass>@1.2.3.4:1080
        【自建-日本住宅】 http://1.2.3.4:8080
     3. 键值对语法：
-       自建-HK-01 = socks5://user:pass@1.2.3.4:1080
-       自建-US: socks5://user:pass@1.2.3.4:1080
+       自建-HK-01 = socks5://<user>:<pass>@1.2.3.4:1080
+       自建-US: socks5://<user>:<pass>@1.2.3.4:1080
     4. 裸 URL / host:port 降级（自动推导规范名称）：
-       socks5://user:pass@1.2.3.4:1080 -> 名称: [自建节点-1.2.3.4:1080]
+       socks5://<user>:<pass>@1.2.3.4:1080 -> 名称: [自建节点-1.2.3.4:1080]
        1.2.3.4:1080 -> 默认 socks5://1.2.3.4:1080
 
     返回 ProxyEndpoint 对象，解析失败或为空行返回 None。

@@ -336,11 +336,8 @@ jobs:
           AGENTROUTER_SINGBOX_CONFIG: ${{ secrets.AGENTROUTER_SINGBOX_CONFIG }}
         run: |
           set -euo pipefail
-          # 代理出站收敛（2026-09-06 清理）：sing-box 原生 JSON 为唯一出站隧道，
-          # 承载 agentrouter/nodeseek/2libra/cloudstudio 的固定家宽出口。
-          # 已删：mihomo 订阅拉取、sslocal(shadowsocks-rust) 两套独立隧道（2026-09-05）；
-          #       自建代理池（SELF_HOSTED_PROXIES/CUSTOM_PROXIES）与全局备用池
-          #       （AGENTROUTER_BACKUP_PROXIES）及其探测机器（2026-09-06）。
+          # 代理出站唯一机制：sing-box 原生 JSON（承载 agentrouter/nodeseek/2libra/cloudstudio
+          # 固定家宽出口；mihomo/sslocal/自建与备用代理池均已删除，2026-09-06 收敛）。
           # 代理出口状态入 Redis（proxy_setup 字段，14 天 TTL）：排查以 Redis 为准。
           stash_proxy_state() {
             [ -n "$UPSTASH_REDIS_REST_URL" ] && [ -n "$UPSTASH_REDIS_REST_TOKEN" ] || return 0
