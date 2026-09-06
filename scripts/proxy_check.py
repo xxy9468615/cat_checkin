@@ -81,16 +81,9 @@ def _get_urllib_opener(endpoint: ProxyEndpoint, timeout: float = 8.0) -> urllib.
     if endpoint.protocol in ("http", "https"):
         handlers.append(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
     else:
-        # socks5
-        try:
-            import socks
-        except ImportError:
-            raise RuntimeError("缺少 pysocks 依赖，无法测试 socks5 代理")
-        u = urllib.parse.urlparse(proxy_url)
-        # 建立独立 socket handler
-        socks_handler = urllib.request.ProxyHandler({})
-        # 为了隔离多线程，利用 pysocks 创建单独的连接 opener
-        handlers.append(socks_handler)
+        # socks5：实际探测走 _probe_via_curl_or_urllib 的 curl_cffi/curl 分支，
+        # 此处仅以直连 opener 兜底（历史全局 patch 分支已随代理收敛移除）
+        handlers.append(urllib.request.ProxyHandler({}))
     return urllib.request.build_opener(*handlers)
 
 
@@ -251,7 +244,7 @@ def run_proxy_healthcheck(
     if custom_proxies:
         endpoints = custom_proxies
     else:
-        endpoints = get_all_proxy_endpoints(include_self_hosted=True, include_backups=True)
+        endpoints = get_all_proxy_endpoints()
 
     if not endpoints:
         print("ℹ️ 未发现任何配置的代理节点（已扫描 SELF_HOSTED_PROXIES, 业务专属 PROXY 等）。")

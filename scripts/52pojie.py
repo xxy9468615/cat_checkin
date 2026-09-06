@@ -176,8 +176,8 @@ def _load_accounts() -> List[str]:
 
 
 def _get_candidate_proxies() -> List[str]:
-    """解析候选代理列表，支持带统一识别名称与自建代理优先调度。"""
-    endpoints = get_all_proxy_endpoints(task_prefix="52POJIE", include_self_hosted=True)
+    """解析候选代理列表，支持带统一识别名称与任务级代理调度。"""
+    endpoints = get_all_proxy_endpoints(task_prefix="52POJIE")
     if endpoints:
         return [ep.url for ep in endpoints]
     raw = (

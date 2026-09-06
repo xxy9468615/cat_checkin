@@ -80,8 +80,8 @@ def _resp_dict(resp: Any) -> Dict[str, Any]:
 
 def _get_candidate_proxies() -> List[ProxyEndpoint]:
     """获取天翼云盘可用的 CN 代理出口列表（优先复用仓库 SMZDM / 52POJIE 等境内代理通道）。"""
-    # 严格仅拉取 CN 境内代理出口，排除 AGENTROUTER_BACKUP_PROXIES 等境外代理；最多保留前 3 个候选节点
-    endpoints = get_all_proxy_endpoints(task_prefix="CLOUD189", include_self_hosted=True, include_backups=False)
+    # 严格仅拉取 CN 境内代理出口（全局备用池已随 2026-09-06 代理收敛移除，天然不含境外代理）；最多保留前 3 个候选节点
+    endpoints = get_all_proxy_endpoints(task_prefix="CLOUD189")
     if endpoints:
         return endpoints[:3]
     raw = (

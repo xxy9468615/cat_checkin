@@ -85,22 +85,20 @@ class TestProxyManager(unittest.TestCase):
         self.assertEqual(eps[2].display_name, "【自建-韩国】")
         self.assertEqual(eps[2].url, "socks5://12.0.0.3:1080")
 
-    def test_self_hosted_priority_scheduling(self):
+    def test_task_specific_only_scheduling(self):
+        # 全局池（自建/备用）已废弃（2026-09-06 代理收敛）：即使残留在环境中
+        # 也不参与调度，仅任务级 {TASK}_PROXY 族变量生效
         env = {
             "SELF_HOSTED_PROXIES": "socks5://1.1.1.1:1080#自建-主节点",
-            "52POJIE_PROXY": "http://2.2.2.2:8080#业务代理",
             "AGENTROUTER_BACKUP_PROXIES": "http://3.3.3.3:8080#全局备用",
+            "52POJIE_PROXY": "http://2.2.2.2:8080#业务代理",
         }
         with patch.dict(os.environ, env, clear=True):
             endpoints = get_all_proxy_endpoints(task_prefix="52POJIE")
-            self.assertEqual(len(endpoints), 3)
-            # 自建代理排在最前
-            self.assertEqual(endpoints[0].name, "自建-主节点")
-            self.assertTrue(endpoints[0].is_self_hosted)
-            # 其次是业务专属代理
-            self.assertEqual(endpoints[1].name, "业务代理")
-            # 最后是全局备用
-            self.assertEqual(endpoints[2].name, "全局备用")
+            self.assertEqual(len(endpoints), 1)
+            self.assertEqual(endpoints[0].name, "业务代理")
+            self.assertEqual(endpoints[0].url, "http://2.2.2.2:8080")
+            self.assertFalse(endpoints[0].is_self_hosted)
 
     def test_dead_proxy_alert_format(self):
         ep = ProxyEndpoint(

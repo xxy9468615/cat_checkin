@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""统一代理管理、自建代理解析与健康检测模块。
+"""统一代理解析与任务级代理调度模块。
 
 功能特性：
 1. 统一识别名称解析（支持 URI Fragment #名称、[名称] 前缀、键值对等多种语法规范）。
-2. 自建代理（Self-hosted Proxy）逻辑支持与优先级调度（SELF_HOSTED_PROXIES > 业务代理 > 全局备用代理）。
+2. 任务级代理调度（{TASK}_PROXY / {TASK}_PROXIES / {TASK}_BACKUP_PROXIES，含国内站点
+   跨任务别名复用）。全局外部代理池（SELF_HOSTED_PROXIES / AGENTROUTER_BACKUP_PROXIES）
+   已于 2026-09-06 移除，CI 出站统一收敛为 sing-box 隧道。
 3. 敏感凭据自动脱敏（打印日志绝不泄漏账号密码）。
 4. 候选代理列表解析与去重。
-5. 死代理诊断与替换指引生成。
+5. 死代理诊断提示文本生成。
 """
 
 from __future__ import annotations
@@ -300,19 +302,17 @@ def parse_proxies_text(
     return results
 
 
-def get_all_proxy_endpoints(
-    task_prefix: str = "",
-    include_self_hosted: bool = True,
-    include_backups: bool = True,
-) -> List[ProxyEndpoint]:
-    """获取指定任务前缀或全局的所有候选代理列表（自建代理优先排序并去重）。
+def get_all_proxy_endpoints(task_prefix: str = "") -> List[ProxyEndpoint]:
+    """获取指定任务前缀的所有候选代理列表（按来源顺序去重）。
 
-    优先级顺序：
-    1. SELF_HOSTED_PROXIES / SELF_HOSTED_PROXY / CUSTOM_PROXIES (自建代理，最高优先级)
-    2. {task_prefix}_PROXY / {task_prefix}_PROXIES (站点专属主代理)
-    3. {task_prefix}_BACKUP_PROXIES (站点专属备用代理池)
-    4. AGENTROUTER_BACKUP_PROXIES (CI 级高可用代理池)
-    5. 全局 PROXY / BACKUP_PROXIES
+    来源顺序：
+    1. {task_prefix}_PROXY / {task_prefix}_PROXIES / {task_prefix}_BACKUP_PROXIES
+    2. 国内站点跨任务别名复用（52POJIE/WUAI/POJIE ↔ SMZDM、CLOUD189）
+    3. task_prefix 为空时：扫描全部含 PROXY 的站点级环境变量（诊断工具用）
+
+    已移除（2026-09-06）：全局自建池（SELF_HOSTED_PROXIES/CUSTOM_PROXIES）与
+    全局备用池（AGENTROUTER_BACKUP_PROXIES/BACKUP_PROXIES）——CI 出站统一走
+    sing-box 隧道，这些变量即使仍在 secrets 中也不会再被读取。
     """
     task_prefix = task_prefix.strip().upper().rstrip("_")
     candidates: List[ProxyEndpoint] = []
@@ -334,15 +334,7 @@ def get_all_proxy_endpoints(
                     seen_urls.add(ep.url)
                     candidates.append(ep)
 
-    # 1. 自建代理配置池 (自建优先级最高)
-    if include_self_hosted:
-        _collect(
-            ["SELF_HOSTED_PROXIES", "SELF_HOSTED_PROXY", "CUSTOM_PROXIES", "CUSTOM_PROXY"],
-            is_self=True,
-            default_prefix="自建节点",
-        )
-
-    # 2. 站点专属代理
+    # 站点专属代理
     if task_prefix:
         task_specific_keys = [
             f"{task_prefix}_PROXY",
@@ -360,9 +352,10 @@ def get_all_proxy_endpoints(
             default_prefix=f"{task_prefix}代理",
         )
     else:
-        # 全局扫描：找出所有站点特定的 PROXY 环境变量
+        # 全局扫描：找出所有站点特定的 PROXY 环境变量（仅诊断工具使用）
         site_proxy_keys = []
         known_global = {
+            # 已废弃的全局池变量：保持排除，防止残留 secrets 静默生效
             "SELF_HOSTED_PROXIES", "SELF_HOSTED_PROXY", "CUSTOM_PROXIES", "CUSTOM_PROXY",
             "AGENTROUTER_BACKUP_PROXIES", "SMZDM_BACKUP_PROXIES", "BACKUP_PROXIES", "PROXY",
             "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
@@ -374,49 +367,21 @@ def get_all_proxy_endpoints(
         if site_proxy_keys:
             _collect(site_proxy_keys, is_self=False, default_prefix="业务代理")
 
-    # 3. 全局高可用备用代理池
-    if include_backups:
-        _collect(
-            [
-                "AGENTROUTER_BACKUP_PROXIES",
-                "SMZDM_BACKUP_PROXIES",
-                "BACKUP_PROXIES",
-                "PROXY",
-            ],
-            is_self=False,
-            default_prefix="备用节点",
-        )
-
     return candidates
 
 
-def get_task_proxy_endpoints(
-    task_name: str,
-    include_self_hosted: bool = True,
-    include_backups: bool = True,
-) -> List[ProxyEndpoint]:
+def get_task_proxy_endpoints(task_name: str) -> List[ProxyEndpoint]:
     """为全仓库任意签到任务获取合规、全协议正规化且安全隔离的候选代理列表。
 
     支持全代理协议：HTTP, HTTPS, SOCKS5, SOCKS5h, SOCKS4, SOCKS4a。
     调度特性：
     1. 自动正规化任务名（如 "juejin" -> "JUEJIN", "cloud189" -> "CLOUD189", "52pojie" -> "52POJIE"）
-    2. 自建代理优先调度（SELF_HOSTED_PROXIES / CUSTOM_PROXIES）
-    3. 任务专属代理（{TASK}_PROXY, {TASK}_BACKUP_PROXIES）
-    4. 国内站点（如 52POJIE, CLOUD189, SMZDM）智能复用仓库共享 CN 代理出口
-    5. 全局高可用备用代理池安全回退
-    6. 节点敏感 IP、端口与密码统一脱敏
+    2. 任务专属代理（{TASK}_PROXY, {TASK}_PROXIES, {TASK}_BACKUP_PROXIES）
+    3. 国内站点（如 52POJIE, CLOUD189, SMZDM）智能复用仓库共享 CN 代理出口
+    4. 节点敏感 IP、端口与密码统一脱敏
     """
     clean_task = re.sub(r"[^a-zA-Z0-9_]", "", task_name).upper()
-    return get_all_proxy_endpoints(
-        task_prefix=clean_task,
-        include_self_hosted=include_self_hosted,
-        include_backups=include_backups,
-    )
-
-
-def get_candidate_proxy_urls(task_prefix: str = "") -> List[str]:
-    """返回所有可用代理的纯 URL 字符串列表（向后兼容纯 URL 消费代码）。"""
-    return [ep.url for ep in get_all_proxy_endpoints(task_prefix=task_prefix)]
+    return get_all_proxy_endpoints(task_prefix=clean_task)
 
 
 def format_dead_proxy_alert(endpoint: ProxyEndpoint, error_msg: str = "") -> str:
@@ -427,91 +392,4 @@ def format_dead_proxy_alert(endpoint: ProxyEndpoint, error_msg: str = "") -> str
         f"❌ 代理失效 {endpoint.display_name}{src_info}{err_desc}\n"
         f"   💡 该代理已不可达(死代理)，请及时在 GitHub Secrets 或环境变量中更新替换！"
     )
-
-
-def probe_first_working_proxy(
-    label: str, raw_text: str, state_file: str = "/tmp/proxy_active.json"
-) -> bool:
-    """在 CI 环境下探测一组候选代理，选取首个连通节点写入 GITHUB_ENV。"""
-    import subprocess
-    import json
-
-    endpoints = parse_proxies_text(raw_text, default_name_prefix=f"{label}节点")
-    if not endpoints:
-        return False
-
-    print(f"🔍 开始探测 {label} 代理池 (共 {len(endpoints)} 个节点)...")
-    github_env = os.getenv("GITHUB_ENV", "")
-
-    for ep in endpoints:
-        print(f"  ⏳ 正在探测 {ep.display_name}...")
-        cmd_ip = ["curl", "-sS", "-x", ep.url, "-m", "8", "https://api.ipify.org"]
-        try:
-            r_ip = subprocess.run(cmd_ip, capture_output=True, text=True, timeout=10)
-            exit_ip = r_ip.stdout.strip()
-        except Exception:
-            exit_ip = ""
-
-        if not exit_ip:
-            print(f"  {format_dead_proxy_alert(ep, '公网出口超时或无法连接')}")
-            continue
-
-        cmd_api = [
-            "curl",
-            "-sS",
-            "-x",
-            ep.url,
-            "-m",
-            "10",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            "https://ps.air-outer.com",
-        ]
-        try:
-            r_api = subprocess.run(cmd_api, capture_output=True, text=True, timeout=12)
-            api_code = r_api.stdout.strip()
-        except Exception:
-            api_code = "000"
-
-        print(
-            f"  ✅ {label}代理存活就绪: {ep.display_name} (API HTTP {api_code})"
-        )
-
-        if github_env and os.path.exists(github_env):
-            with open(github_env, "a", encoding="utf-8") as f:
-                f.write(f"AGENTROUTER_PROXY={ep.url}\n")
-                f.write(f"NODESEEK_PROXY={ep.url}\n")
-                f.write(f"2LIBRA_PROXY={ep.url}\n")
-                f.write(f"CLOUDSTUDIO_PROXY={ep.url}\n")
-
-        try:
-            with open(state_file, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "mode": f"{label}代理",
-                        "node": ep.name,
-                        "exit_ip": mask_host(exit_ip),
-                        "probe": api_code,
-                    },
-                    f,
-                )
-        except Exception:
-            pass
-
-        return True
-
-    print(f"❌ {label}代理池全部不可达 (死代理)")
-    return False
-
-
-if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) >= 4 and sys.argv[1] == "probe":
-        _label = sys.argv[2]
-        _raw = sys.argv[3]
-        _ok = probe_first_working_proxy(_label, _raw)
-        sys.exit(0 if _ok else 1)
 

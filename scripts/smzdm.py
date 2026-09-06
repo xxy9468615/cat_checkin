@@ -149,8 +149,8 @@ def _calc_cookie_expiry(cookie_str: str, state: Dict[str, Any]) -> Optional[int]
 
 
 def _get_candidate_proxies() -> List[str]:
-    """解析候选代理列表，支持带统一识别名称与自建代理优先调度。"""
-    endpoints = get_all_proxy_endpoints(task_prefix="SMZDM", include_self_hosted=True)
+    """解析候选代理列表，支持带统一识别名称与任务级代理调度。"""
+    endpoints = get_all_proxy_endpoints(task_prefix="SMZDM")
     if endpoints:
         return [ep.url for ep in endpoints]
     raw = os.getenv("SMZDM_PROXY") or os.getenv("SMZDM_BACKUP_PROXIES") or os.getenv("PROXY") or ""

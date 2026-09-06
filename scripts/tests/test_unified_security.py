@@ -112,39 +112,36 @@ class TestUnifiedSecurity(unittest.TestCase):
         )
 
     def test_all_tasks_native_proxy_capability(self):
-        """验证全仓库所有签到任务均原生具备代理功能与容灾候选获取能力。"""
-        test_tasks = [
-            "cloud189",
-            "smzdm",
-            "52pojie",
-            "juejin",
-            "alipan",
-            "glados",
-            "dji",
-            "aistudio",
-            "modelscope",
-        ]
+        """验证任务级代理解析：配置 {TASK}_PROXY 的任务可获取候选，已废弃的
+        全局池变量（自建/备用）不再参与任何任务的调度。"""
         mock_env = {
+            # 已废弃的全局池：即使残留在 secrets 中也必须被忽略
             "SELF_HOSTED_PROXIES": "socks5://user:pass@112.64.135.45:1080#自建-上海联通",
+            "AGENTROUTER_BACKUP_PROXIES": "http://113.1.2.4:8080#全局备用",
+            # 任务级代理
             "SMZDM_PROXY": "http://113.1.2.3:8080#SMZDM-国内住宅",
             "JUEJIN_PROXY": "socks5h://user:pwd@114.1.2.3:1080#掘金专线",
         }
         with patch.dict(os.environ, mock_env, clear=True):
-            for task in test_tasks:
-                with self.subTest(task=task):
-                    eps = proxy_manager.get_task_proxy_endpoints(task)
-                    self.assertTrue(
-                        len(eps) >= 1,
-                        f"任务 {task} 必须原生支持获取候选代理",
-                    )
-                    # 自建代理优先级最高
-                    self.assertIn("自建-上海联通", eps[0].name)
-
-            # 验证 Juejin 专属代理正确获取
+            # 任务级代理正确获取
+            smzdm_eps = proxy_manager.get_task_proxy_endpoints("smzdm")
+            self.assertEqual(len(smzdm_eps), 1)
+            self.assertIn("SMZDM-国内住宅", smzdm_eps[0].name)
             juejin_eps = proxy_manager.get_task_proxy_endpoints("juejin")
             self.assertTrue(any("掘金专线" in ep.name for ep in juejin_eps))
 
-            # 验证任务自适应：Http(task_name="juejin") 能够自动感知
+            # 全局池变量已废弃：不得进入任何任务的候选列表
+            for task in ("smzdm", "juejin", "cloud189", "52pojie", "glados", "dji"):
+                eps = proxy_manager.get_task_proxy_endpoints(task)
+                self.assertFalse(
+                    any("自建-上海联通" in ep.name or "全局备用" in ep.name for ep in eps),
+                    f"任务 {task} 不应再读取已废弃的全局代理池",
+                )
+
+            # 未配置任务级代理的任务返回空候选（不报错）
+            self.assertEqual(proxy_manager.get_task_proxy_endpoints("alipan"), [])
+
+            # 任务自适应：Http(task_name="juejin") 能够自动感知
             h_juejin = common.Http(task_name="juejin")
             self.assertTrue(h_juejin.has_proxy)
 

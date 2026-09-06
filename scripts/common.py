@@ -28,7 +28,6 @@ try:
         ProxyEndpoint,
         format_dead_proxy_alert,
         get_all_proxy_endpoints,
-        get_candidate_proxy_urls,
         get_task_proxy_endpoints,
         mask_proxy_url,
         parse_proxies_text,
@@ -40,7 +39,6 @@ except ImportError:
             ProxyEndpoint,
             format_dead_proxy_alert,
             get_all_proxy_endpoints,
-            get_candidate_proxy_urls,
             get_task_proxy_endpoints,
             mask_proxy_url,
             parse_proxies_text,
@@ -51,7 +49,6 @@ except ImportError:
             ProxyEndpoint,
             format_dead_proxy_alert,
             get_all_proxy_endpoints,
-            get_candidate_proxy_urls,
             get_task_proxy_endpoints,
             mask_proxy_url,
             parse_proxies_text,
@@ -275,8 +272,8 @@ class Http:
             if proxy_str:
                 self.has_proxy = True
                 # - http(s):// 走 urllib 原生 ProxyHandler（HTTPS 经 CONNECT 隧道，隧道内走端到端 TLS）
-                # - socks5(h)://, socks4(a):// 优先使用 sockshandler.SocksiPyHandler（强制 rdns=True 远程 DNS，隔离全局 socket）
-                #   兜底回退为 pysocks 全局 monkey-patch socket，并在后续/直连时及时还原
+                # - socks5(h)://, socks4(a):// 使用 sockshandler.SocksiPyHandler
+                #   （强制 rdns=True 远程 DNS，隔离全局 socket）
                 if proxy_str.lower().startswith(("http://", "https://")):
                     socket.socket = _ORIG_SOCKET
                     handlers.append(
@@ -292,40 +289,27 @@ class Http:
                     u = urllib.parse.urlparse(
                         proxy_str if "://" in proxy_str else f"socks5://{proxy_str}"
                     )
-                    used_handler = False
-                    try:
-                        import sockshandler
-                        scheme_lower = u.scheme.lower()
-                        ptype = (
-                            sockshandler.socks.SOCKS4
-                            if scheme_lower.startswith("socks4")
-                            else sockshandler.socks.SOCKS5
-                        )
-                        handlers.append(
-                            sockshandler.SocksiPyHandler(
-                                ptype,
-                                u.hostname or "",
-                                u.port or 1080,
-                                True,  # rdns=True: 强制远程 DNS 解析，彻底杜绝本地 DNS 劫持与域名泄露
-                                urllib.parse.unquote(u.username) if u.username else None,
-                                urllib.parse.unquote(u.password) if u.password else None,
-                            )
-                        )
-                        socket.socket = _ORIG_SOCKET
-                        used_handler = True
-                    except Exception:
-                        pass
-
-                    if not used_handler:
-                        socks.set_default_proxy(
-                            socks.SOCKS5,
+                    # sockshandler 随 pysocks 一并提供；不再回退 pysocks 全局
+                    # set_default_proxy monkey-patch（进程级 socket 污染会波及
+                    # 同进程其他请求路径——2026-09-06 代理收敛清理），失败即显式报错
+                    import sockshandler
+                    scheme_lower = u.scheme.lower()
+                    ptype = (
+                        sockshandler.socks.SOCKS4
+                        if scheme_lower.startswith("socks4")
+                        else sockshandler.socks.SOCKS5
+                    )
+                    handlers.append(
+                        sockshandler.SocksiPyHandler(
+                            ptype,
                             u.hostname or "",
                             u.port or 1080,
-                            rdns=True,  # 强制远程 DNS
-                            username=urllib.parse.unquote(u.username) if u.username else None,
-                            password=urllib.parse.unquote(u.password) if u.password else None,
+                            True,  # rdns=True: 强制远程 DNS 解析，彻底杜绝本地 DNS 劫持与域名泄露
+                            urllib.parse.unquote(u.username) if u.username else None,
+                            urllib.parse.unquote(u.password) if u.password else None,
                         )
-                        socket.socket = socks.socksocket
+                    )
+                    socket.socket = _ORIG_SOCKET
             else:
                 socket.socket = _ORIG_SOCKET
         else:

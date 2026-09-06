@@ -194,7 +194,8 @@ jobs:
       AGENTROUTER_COOKIE: ${{ secrets.AGENTROUTER_COOKIE || secrets.AGENTROUTER_COOKIES }}
       AGENTROUTER_API_URL: https://ps.air-outer.com
       AGENTROUTER_STATE_FILE: .agentrouter_state.json
-      AGENTROUTER_PROXY: socks5://127.0.0.1:1080
+      # AGENTROUTER_PROXY 不再 job 级硬编码（2026-09-06 代理收敛）：sing-box 启动
+      # 成功时由 egress 步骤写入 GITHUB_ENV，失败时任务显式报错而非盲试 localhost
       U1S1_TOKEN: ${{ secrets.U1S1_TOKEN }}
       U1S1_TOKEN_1: ${{ secrets.U1S1_TOKEN_1 || secrets.U1S1_TOKEN }}
       U1S1_TOKEN_2: ${{ secrets.U1S1_TOKEN_2 }}
@@ -341,21 +342,17 @@ jobs:
             latvi-state-
             agentrouter-state-
 
-      - name: Setup proxy egress (Self-hosted / sing-box / Backup)
+      - name: Setup sing-box egress (唯一出站)
         if: inputs.direct != true
         env:
-          SELF_HOSTED_PROXIES: ${{ secrets.SELF_HOSTED_PROXIES || secrets.CUSTOM_PROXIES }}
           AGENTROUTER_SINGBOX_CONFIG: ${{ secrets.AGENTROUTER_SINGBOX_CONFIG }}
-          AGENTROUTER_BACKUP_PROXIES: ${{ secrets.AGENTROUTER_BACKUP_PROXIES }}
         run: |
           set -euo pipefail
-          # 代理链路收敛为三种机制（2026-09-05 清理，便于诊断）：
-          #   1. 自建代理（SELF_HOSTED_PROXIES，最高优先）
-          #   2. sing-box 原生 JSON（AGENTROUTER_SINGBOX_CONFIG，唯一隧道客户端，
-          #      承载 agentrouter/nodeseek/2libra/cloudstudio 的固定家宽出口）
-          #   3. 备用代理池（AGENTROUTER_BACKUP_PROXIES，红卡前最后保险）
-          # 已删：mihomo 订阅拉取、sslocal(shadowsocks-rust) 两套独立隧道——旧环境下
-          # 多客户端争抢 1080、多套 DNS 域混用，干扰排查。
+          # 代理出站收敛（2026-09-06 清理）：sing-box 原生 JSON 为唯一出站隧道，
+          # 承载 agentrouter/nodeseek/2libra/cloudstudio 的固定家宽出口。
+          # 已删：mihomo 订阅拉取、sslocal(shadowsocks-rust) 两套独立隧道（2026-09-05）；
+          #       自建代理池（SELF_HOSTED_PROXIES/CUSTOM_PROXIES）与全局备用池
+          #       （AGENTROUTER_BACKUP_PROXIES）及其探测机器（2026-09-06）。
           # 代理出口状态入 Redis（proxy_setup 字段，14 天 TTL）：排查以 Redis 为准。
           stash_proxy_state() {
             [ -n "$UPSTASH_REDIS_REST_URL" ] && [ -n "$UPSTASH_REDIS_REST_TOKEN" ] || return 0
@@ -515,46 +512,12 @@ jobs:
             return 0
           }
 
-          probe_proxy_list() {
-            local label="$1"
-            local raw_text="$2"
-            [ -n "$raw_text" ] || return 1
-            if python3 scripts/proxy_manager.py probe "$label" "$raw_text"; then
-              if [ -f /tmp/proxy_active.json ]; then
-                local p_mode p_node p_exit p_probe
-                p_mode=$(python3 -c "import json; print(json.load(open('/tmp/proxy_active.json')).get('mode',''))")
-                p_node=$(python3 -c "import json; print(json.load(open('/tmp/proxy_active.json')).get('node',''))")
-                p_exit=$(python3 -c "import json; print(json.load(open('/tmp/proxy_active.json')).get('exit_ip',''))")
-                p_probe=$(python3 -c "import json; print(json.load(open('/tmp/proxy_active.json')).get('probe',''))")
-                stash_proxy_state "$p_mode" "$p_node" "$p_exit" "$p_probe"
-              fi
-              return 0
-            fi
-            return 1
-          }
-
-          # 1. 自建代理优先（配置了自建代理时直接探测，优先于 sing-box 隧道）
-          if [ -n "$SELF_HOSTED_PROXIES" ]; then
-            echo "检测到配置了自建代理 (SELF_HOSTED_PROXIES)，优先执行自建代理探测..."
-            if probe_proxy_list "自建" "$SELF_HOSTED_PROXIES"; then
-              exit 0
-            fi
-            echo "⚠️ 自建代理暂不可用，回退至 sing-box 与备用代理..."
+          # sing-box 是唯一出站：启动失败时记录状态后按设计公平失败
+          # （agentrouter 等指纹任务会显式报错，绝不静默直连）
+          if ! setup_singbox; then
+            echo "所有代理均不可用（sing-box 启动/探活失败）；agentrouter 将按设计触发公平失败"
+            stash_proxy_state none "" "" ""
           fi
-
-          # 2. sing-box 原生 JSON（用户提供的家宽节点 TW-1X/US-1X 出口）
-          if setup_singbox; then
-            exit 0
-          fi
-
-          # 3. 备用代理池
-          echo "隧道/订阅代理不可用，正在探测备用代理池..."
-          if probe_proxy_list "备用" "$AGENTROUTER_BACKUP_PROXIES"; then
-            exit 0
-          fi
-
-          echo "所有代理均不可用（或全部为死代理）；agentrouter 将按设计触发公平失败"
-          stash_proxy_state none "" "" ""
 
       - name: Direct mode (clear proxy env, runner IP 直连)
         if: inputs.direct == true

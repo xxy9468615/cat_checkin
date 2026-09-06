@@ -82,8 +82,8 @@ def _parse_cookie_info(cookie_str: str) -> Tuple[str, str, Optional[int]]:
 
 
 def _proxy_candidates(raw: str) -> List[str]:
-    """NODESEEK_PROXY 多代理解析：自建代理优先，支持统一识别名称。"""
-    endpoints = get_all_proxy_endpoints(task_prefix="NODESEEK", include_self_hosted=True)
+    """NODESEEK_PROXY 多代理解析：任务级代理优先，支持统一识别名称。"""
+    endpoints = get_all_proxy_endpoints(task_prefix="NODESEEK")
     if endpoints:
         return [ep.url for ep in endpoints]
     if not raw:
