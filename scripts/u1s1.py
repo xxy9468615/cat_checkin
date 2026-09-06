@@ -134,7 +134,11 @@ def _run_instr(blob: str) -> dict:
         f.write(harness)
         path = f.name
     try:
-        out = subprocess.run([node, path], capture_output=True, text=True, timeout=60)
+        # 安全（2026-09-06 审计）：挑战 JS 来自远端服务端，执行环境最小化——
+        # 仅透传 PATH，避免恶意/被投毒的 JS 读取 runner 环境中的全部凭据。
+        node_env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")}
+        out = subprocess.run([node, path], capture_output=True, text=True, timeout=60,
+                             env=node_env)
     finally:
         os.unlink(path)
     ensure(out.returncode == 0 and "STATE:" in out.stdout,
