@@ -19,7 +19,8 @@ daily_report.py HTML 卡片 + 今日概览小结），浏览与归档体验优�
        warn_date / warn_texts（黄色预警去重与留痕）。
 
 Environment:
-  DISCORD_WEBHOOK_URL  Discord Webhook 地址；未设置时使用下方内置默认 URL。
+  DISCORD_WEBHOOK_URL  Discord Webhook 地址；未设置时跳过 Discord 推送
+                       （安全要求：webhook 含 token，绝不硬编码进源码）。
 所有推送均为 best-effort：任何异常只打印警告，绝不阻塞/中断主流程。
 """
 from __future__ import annotations
@@ -37,11 +38,8 @@ TEMPLATE_DIR = BASE_DIR / "templates"
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-# 内置默认 Webhook（env DISCORD_WEBHOOK_URL 优先；更换地址时改 env 或此处）
-DEFAULT_WEBHOOK_URL = (
-    "https://discord.com/api/webhooks/1542881396656316459/"
-    "tUZ1qvAHLHYmUOzakWTmoApidntcJsVYFd4cVhgr-znGwUcTWZbwmqEkaz9tHIqfpRdM"
-)
+# 安全（2026-09-06 审计）：Webhook URL 含 token，禁止硬编码进源码——
+# 历史内置默认值曾提交至本公开仓库（已要求在 Discord 侧吊销），现仅从 env 提供。
 
 COLOR_OK = 3066993              # 绿
 COLOR_FAIL = 15158332           # 红
@@ -64,7 +62,8 @@ _CREDENTIAL_LINE_KEYWORDS = ("refresh", "new rt", "rt =", "新 token", "令牌",
 
 
 def webhook_url() -> str:
-    return (os.getenv("DISCORD_WEBHOOK_URL") or "").strip() or DEFAULT_WEBHOOK_URL
+    """仅从环境变量读取 Webhook；无内置默认（历史硬编码值已泄露吊销）。"""
+    return (os.getenv("DISCORD_WEBHOOK_URL") or "").strip()
 
 
 def _load_template(name: str, fallback: Dict[str, Any]) -> Dict[str, Any]:
@@ -102,12 +101,16 @@ def _coerce_embed_colors(payload: Dict[str, Any]) -> None:
 
 def _post_webhook(payload: Dict[str, Any]) -> bool:
     """POST 到 Discord Webhook。common.Http 自带 429/5xx 指数退避重试。"""
+    url = webhook_url()
+    if not url:
+        print("⚠️ 未配置 DISCORD_WEBHOOK_URL，跳过 Discord 推送（配置方式见 .env.example）")
+        return False
     try:
         _coerce_embed_colors(payload)
         import common as _common
         resp = _common.Http().request(
             "POST",
-            webhook_url(),
+            url,
             headers={"Content-Type": "application/json"},
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             timeout=15,
