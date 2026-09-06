@@ -54,6 +54,7 @@ docs
 archive/
 old/
 legacy/
+scripts/unregistered/
 新增任务计划.md
 CLAUDE.md
 SECURITY_AUDIT_REPORT.md
