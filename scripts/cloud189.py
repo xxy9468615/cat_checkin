@@ -31,6 +31,7 @@ import base64
 import os
 import random
 import re
+import secrets
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -131,7 +132,9 @@ def _rsa_encrypt_hex(pub_key: str, text: str) -> str:
     pad_len = k - 3 - len(msg)
     if pad_len < 8:
         raise RuntimeError("RSA 明文过长")
-    padding = bytes(random.randrange(1, 256) for _ in range(pad_len))
+    # PKCS#1 v1.5 填充要求非零随机字节：用 CSPRNG（原 random.randrange 为 Mersenne
+    # Twister，非密码学安全——2026-09-06 审计修复）
+    padding = bytes(secrets.randbelow(255) + 1 for _ in range(pad_len))
     block = b"\x00\x02" + padding + b"\x00" + msg
     cipher = pow(int.from_bytes(block, "big"), e, n)
     return cipher.to_bytes(k, "big").hex()
