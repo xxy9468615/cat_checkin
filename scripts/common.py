@@ -530,7 +530,7 @@ def schedule_repo_dispatch(event_type: str, delay_seconds: int) -> tuple[bool, s
     """
     qstash_url = os.getenv("QSTASH_URL") or os.getenv("WORKBUDDY_QSTASH_URL")
     qstash_token = os.getenv("QSTASH_TOKEN") or os.getenv("WORKBUDDY_QSTASH_TOKEN")
-    gh_pat = os.getenv("GH_PAT") or os.getenv("WORKFLOW_TOKEN")
+    gh_pat = os.getenv("GH_PAT") or os.getenv("GH_TOKEN") or os.getenv("WORKFLOW_TOKEN")
     repo = os.getenv("GITHUB_REPO", "")
 
     missing = [
