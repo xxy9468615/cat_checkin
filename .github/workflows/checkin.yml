@@ -209,14 +209,14 @@ jobs:
       MAIL_TO: ${{ secrets.MAIL_TO }}
 
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4（SHA 固定，2026-09-06 审计）
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1（SHA 固定，node24）
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5（SHA 固定）
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0（SHA 固定，node24）
         with:
           python-version: "3.12"
 
       - name: Restore unified states
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4（SHA 固定）
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0（SHA 固定，node24）
         with:
           path: |
             .ai_router_state.json
@@ -655,7 +655,7 @@ jobs:
 
       - name: Save unified states
         if: always()
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4（SHA 固定）
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0（SHA 固定，node24）
         with:
           path: |
             .ai_router_state.json
@@ -680,7 +680,7 @@ jobs:
 
       - name: Upload unified results
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4（SHA 固定）
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1（SHA 固定，node24）
         with:
           name: unified-results
           path: .task_results/
@@ -704,9 +704,9 @@ jobs:
       contents: read
       actions: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4（SHA 固定，2026-09-06 审计）
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1（SHA 固定，node24）
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5（SHA 固定）
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0（SHA 固定，node24）
         with:
           python-version: "3.12"
 
