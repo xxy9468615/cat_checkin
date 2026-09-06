@@ -46,7 +46,7 @@ on:
         default: false
         type: boolean
       direct:
-        description: '诊断：跳过 SS/代理，任务用 runner 自身 IP 直连（nodeseek 排查用）'
+        description: '诊断：跳过代理出站（sing-box 不启动），任务用 runner 自身 IP 直连（nodeseek 排查用）'
         required: false
         default: false
         type: boolean
@@ -405,7 +405,17 @@ jobs:
           except Exception as e:
               print(f"AGENTROUTER_SINGBOX_CONFIG not valid JSON: {e}")
               sys.exit(1)
-          # 仅保留一个代理型 inbound，锚定本地 1080
+          # ── 传输安全加固（2026-09-06）──────────────────────────────────────
+          # 1) 出站 TLS 校验 fail-closed：拒绝 insecure（跳过证书验证）出站，
+          #    防止隧道流量被静默中间人
+          for ob in (cfg.get("outbounds") or []):
+              tls = ob.get("tls") if isinstance(ob, dict) else None
+              if isinstance(tls, dict) and tls.get("insecure"):
+                  print(f"❌ outbound [{ob.get('tag', '?')}] 配置了 tls.insecure=true，拒绝启动。"
+                        "请在 AGENTROUTER_SINGBOX_CONFIG 中移除 insecure 并配置受信证书/server_name。")
+                  sys.exit(1)
+          # 2) 仅保留一个代理型 inbound，锚定本地 1080 并统一收敛为 socks 类型
+          #    （消费方全部是 socks5://127.0.0.1:1080，去除 mixed/http 额外暴露面）
           inbounds = cfg.get("inbounds") or []
           picked = None
           kept = []
@@ -414,18 +424,26 @@ jobs:
                   if picked is None:
                       ib["listen"] = "127.0.0.1"
                       ib["listen_port"] = 1080
+                      ib["type"] = "socks"
                       picked = ib
                       kept.append(ib)
               else:
                   kept.append(ib)
           if picked is None:
-              kept.append({"type": "mixed", "tag": "in_mixed",
+              kept.append({"type": "socks", "tag": "in_socks",
                            "listen": "127.0.0.1", "listen_port": 1080})
           cfg["inbounds"] = kept
-          # 注入显式 DNS：公共 UDP DNS，避免系统 resolver 在 CI 的 NXDOMAIN 抖动。
-          # 注意：sing-box DNS server 无 sniff 字段（sniff 属于 route/inbound 层）；
-          # DNS 顶层只放 servers/strategy/final。≥1.12 已弃用、1.14 移除 legacy
-          # {"tag","address"} 格式，必须显式带 type；这里对已有 servers 做迁移。
+          # 3) 注入显式 DNS：默认加密 DNS（DoT/DoH），防明文 UDP DNS 被劫持/篡改，
+          #    并避免系统 resolver 在 CI 的 NXDOMAIN 抖动。
+          #    ≥1.12 已弃用、1.14 移除 legacy {"tag","address"} 格式，必须显式带
+          #    type；这里对已有 servers 做迁移（URL 正确拆分 host/port，DoT 默认 853）。
+          import ipaddress as _ip, urllib.parse as _up
+          def _is_ip(host) -> bool:
+              try:
+                  _ip.ip_address(str(host).strip("[]"))
+                  return True
+              except ValueError:
+                  return False
           dns = cfg.get("dns") or {}
           servers = dns.get("servers")
           if not servers:
@@ -440,9 +458,11 @@ jobs:
               if "address" in d and "type" not in d:
                   addr = d.pop("address")
                   if isinstance(addr, str) and addr.startswith(("https://", "tls://")):
-                      d["server"] = addr.split("://", 1)[1]
-                      d["server_port"] = 443
+                      u = _up.urlsplit(addr)
+                      d["server"] = u.hostname or addr.split("://", 1)[1]
                       d["type"] = "https" if addr.startswith("https://") else "tls"
+                      if "server_port" not in d:
+                          d["server_port"] = u.port or (443 if d["type"] == "https" else 853)
                   else:
                       d["server"] = addr
                       d["type"] = "udp"
@@ -451,10 +471,25 @@ jobs:
               d.setdefault("tag", f"dns{idx}")
               migrated.append(d)
           if not migrated:
+              # 默认加密 DNS：DoT(Google) + DoH(Cloudflare)，不再使用明文 UDP
               migrated = [
-                  {"type": "udp", "tag": "google", "server": "8.8.8.8"},
-                  {"type": "udp", "tag": "cloudflare", "server": "1.1.1.1"},
+                  {"type": "tls", "tag": "dns-google-tls",
+                   "server": "8.8.8.8", "server_port": 853},
+                  {"type": "https", "tag": "dns-cloudflare-https",
+                   "server": "1.1.1.1", "server_port": 443},
               ]
+          # 引导 resolver：取首个 IP 直连可寻址的 DNS 服务器；没有则前置一个。
+          # 1.12+ 要求域名型 DNS 服务器与域名型 outbound 都必须显式挂 resolver，
+          # 否则 decode 直接报 missing domain resolver。
+          bootstrap = next(
+              (s for s in migrated if _is_ip(s.get("server", ""))), None)
+          if bootstrap is None:
+              bootstrap = {"type": "tls", "tag": "dns-bootstrap",
+                           "server": "8.8.8.8", "server_port": 853}
+              migrated.insert(0, bootstrap)
+          for s in migrated:
+              if not _is_ip(s.get("server", "")):
+                  s.setdefault("domain_resolver", {"server": bootstrap["tag"]})
           dns["servers"] = migrated
           dns.setdefault("strategy", "ipv4_only")
           if not dns.get("final"):
@@ -463,24 +498,35 @@ jobs:
           if "route" not in cfg:
               cfg["route"] = {}
           routes = cfg["route"]
-          # 确保 DNS 查询经隧道出站（避免直连公共 DNS 仍被 CF/WAF 按数据中心解析）
-          routes.setdefault("rules", [])
+          # 4) 路由规则（幂等注入到最前）：sniff 供域名嗅探/分流，DNS 请求统一
+          #    hijack 进 sing-box DNS 模块（1.11+ action 语义，替代 legacy dns-out）
+          rules = routes.get("rules") or []
+          has_sniff = any(isinstance(r, dict) and r.get("action") == "sniff" for r in rules)
+          has_dns_hijack = any(isinstance(r, dict) and r.get("action") == "hijack-dns" for r in rules)
+          injected = []
+          if not has_sniff:
+              injected.append({"action": "sniff"})
+          if not has_dns_hijack:
+              injected.append({"protocol": "dns", "action": "hijack-dns"})
+          if injected:
+              routes["rules"] = injected + rules
+          # 5) 解析机制现代化：route.default_domain_resolver 指向首个 DNS 服务器，
+          #    域名型 outbound server（如 railgun.dnsbot.net）由它解析——替代已弃用的
+          #    ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER 兼容开关
+          routes.setdefault("default_domain_resolver",
+                            {"server": bootstrap["tag"]})
+          cfg["route"] = routes
           json.dump(cfg, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
           PY
-            # obfs-local（simple-obfs）供 shadowsocks plugin=obfs-local 节点使用；可选
-            if ! command -v obfs-local >/dev/null 2>&1; then
-              sudo apt-get install -y -qq simple-obfs >/dev/null 2>&1                 || echo "obfs-local install failed; sing-box obfs nodes may fail"
+            # 启动前配置校验（fail-closed）：check 不过（含注入段不被 1.14 接受）即中止
+            if ! check_out=$(/tmp/singbox/sing-box check --config /tmp/singbox-config.json 2>&1); then
+              echo "sing-box config check failed: $check_out"
+              return 1
             fi
             pip install -q "pysocks==1.7.1" || { echo "pysocks install failed"; return 1; }
-            # outbound server 若为域名（如 railgun.dnsbot.net）且未显式配置 domain_strategy，
-            # sing-box 1.x 需此兼容开关，否则 decode 直接退出
-            export ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true
             /tmp/singbox/sing-box run --config /tmp/singbox-config.json >/tmp/singbox.log 2>&1 &
-            SSPID=$!
-            echo "SSPID=$SSPID" >> "$GITHUB_ENV"
-            echo "ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true" >> "$GITHUB_ENV"
-            SSPID=$!
-            echo "SSPID=$SSPID" >> "$GITHUB_ENV"
+            SINGBOX_PID=$!
+            echo "SINGBOX_PID=$SINGBOX_PID" >> "$GITHUB_ENV"
             for i in $(seq 1 30); do
               if ss -tln 2>/dev/null | grep -q ":1080 "; then break; fi
               sleep 0.5
@@ -488,26 +534,26 @@ jobs:
             sleep 1
             if ! ss -tln 2>/dev/null | grep -q ":1080 "; then
               echo "sing-box failed to listen on 1080; tail log:"; tail -n 20 /tmp/singbox.log || true
-              kill -9 "$SSPID" 2>/dev/null || true; return 1
+              kill -9 "$SINGBOX_PID" 2>/dev/null || true; return 1
             fi
             exit_ip=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 https://api.ipify.org 2>/dev/null || echo "")
             if [ -z "$exit_ip" ]; then
               echo "sing-box proxy forwarding failed; tearing down before fallback"; tail -n 20 /tmp/singbox.log || true
-              kill -9 "$SSPID" 2>/dev/null || true
+              kill -9 "$SINGBOX_PID" 2>/dev/null || true
               sleep 1
               return 1
             fi
             node_tag=$(python3 -c "import json; cfg=json.load(open('/tmp/singbox-config.json')); print((cfg.get('outbounds') or [{}])[0].get('tag','singbox'))" 2>/dev/null || echo "singbox")
             # 出口 IP 脱敏后入公开日志（与 proxy_manager.mask_host 同风格）；完整值仅入 Redis
             masked_ip=$(printf '%s' "$exit_ip" | awk -F. 'NF==4{print $1".***.***."$4; next} {print substr($0,1,2)"***"}')
-            echo "sing-box ready (pid $SSPID, outbound $node_tag, exit IP: $masked_ip)"
+            echo "sing-box ready (pid $SINGBOX_PID, outbound $node_tag, exit IP: $masked_ip)"
             # 为依赖固定出口的任务注入代理环境变量
             echo "AGENTROUTER_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             echo "NODESEEK_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             echo "2LIBRA_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             echo "CLOUDSTUDIO_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             ns_code=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
-            echo "SS proxy ready via sing-box on 127.0.0.1:1080 (pid $SSPID), nodeseek probe HTTP $ns_code"
+            echo "sing-box egress ready on 127.0.0.1:1080 (pid $SINGBOX_PID), nodeseek probe HTTP $ns_code"
             stash_proxy_state singbox "$node_tag" "$exit_ip" "$ns_code"
             return 0
           }
@@ -524,6 +570,8 @@ jobs:
         run: |
           echo "NODESEEK_PROXY=" >> "$GITHUB_ENV"
           echo "AGENTROUTER_PROXY=" >> "$GITHUB_ENV"
+          echo "2LIBRA_PROXY=" >> "$GITHUB_ENV"
+          echo "CLOUDSTUDIO_PROXY=" >> "$GITHUB_ENV"
           echo "direct 诊断模式：跳过代理，任务用 runner IP 直连"
       - name: no_cffi mode (nodeseek 强制 urllib)
         if: inputs.no_cffi == true
@@ -706,8 +754,8 @@ jobs:
       - name: Cleanup sing-box tunnel
         if: always()
         run: |
-          kill "${SSPID:-}" 2>/dev/null || true
-          sudo -n kill "${SSPID:-}" 2>/dev/null || true
+          kill "${SINGBOX_PID:-}" 2>/dev/null || true
+          sudo -n kill "${SINGBOX_PID:-}" 2>/dev/null || true
           sudo -n pkill -f '[s]ing-box' 2>/dev/null || true
 
       - name: Upload unified results
