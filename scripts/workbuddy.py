@@ -227,9 +227,10 @@ def _persist_refresh_token_secret(idx: int, new_token: str) -> bool:
     try:
         run_env = dict(os.environ)
         run_env["GH_TOKEN"] = pat
+        # token 经 stdin 传递（2026-09-06 审计）：--body 会使其瞬时出现在进程表 argv 中
         proc = subprocess.run(
-            ["gh", "secret", "set", f"WORKBUDDY_REFRESH_TOKEN_{idx}", "--body", new_token, "--repo", repo],
-            env=run_env, capture_output=True, text=True, timeout=90,
+            ["gh", "secret", "set", f"WORKBUDDY_REFRESH_TOKEN_{idx}", "--repo", repo],
+            input=new_token, env=run_env, capture_output=True, text=True, timeout=90,
         )
         if proc.returncode != 0:
             _dbg(f"[workbuddy] Secret 回写失败（不影响 Redis 主通道）：{(proc.stderr or '').strip()[:120]}")
