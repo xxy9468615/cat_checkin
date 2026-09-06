@@ -107,6 +107,9 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "result": "tencent_cloudstudio.json",
         "timeout": 300,
         "account": "",
+        # 12h 滚动冷却（2026-09-06）：SSO 会话保活每天两次即可；此前无冷却元数据
+        # 导致每次心跳必跑、心跳永不空转
+        "sched": {"type": "rolling", "period_h": 12},
         "tags": ["00:50", "matrix", "daily"],
     },
     "ugnas_club": {

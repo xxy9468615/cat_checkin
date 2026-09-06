@@ -36,6 +36,7 @@ import hashlib
 import os
 import re
 import sys
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from common import Http, env_seq, find, findall, load_kv_state, main_guard, mask_str, save_kv_state
@@ -410,6 +411,26 @@ def _run_one(raw_cookie: str, xsrf_override: str, idx: int, total: int) -> Tuple
     return True, f"{prefix_label}{report}"
 
 
+def _persist_last_credit_ts(task_id: str) -> None:
+    """把本次签到成功时刻写入通知状态（心跳 12h 滚动冷却的调度状态来源）。
+
+    与 modelscope 的 last_credit_ts 通道同构（{prefix}:state:notify:{task_id}）；
+    TASK_ID 缺失（本地手动运行）时跳过，冷却判定由 orchestrator 读取。
+    """
+    if not task_id:
+        return
+    try:
+        prefix = (os.getenv("CAT_CHECKIN_REDIS_PREFIX") or "cat_checkin:").rstrip(":")
+        state_file = f".notify_state_{task_id}.json"
+        state = load_kv_state(f"{prefix}:state:notify:{task_id}", state_file)
+        state["last_credit_ts"] = time.time()
+        state["updated_at"] = int(time.time())
+        save_kv_state(f"{prefix}:state:notify:{task_id}", state_file, state)
+        print("  [sched] last_credit_ts → now（12h 滚动冷却重新计时）")
+    except Exception as exc:
+        print(f"  ⚠️ last_credit_ts 持久化失败: {exc}")
+
+
 def main():
     print("【Tencent CloudStudio 签到】")
     proxy = _get_proxy()
@@ -439,6 +460,9 @@ def main():
     ok_count = sum(1 for ok, _ in results if ok)
     if total > 1:
         print(f"\n========== 签到总结 ==========\n成功 {ok_count}/{total}")
+
+    if ok_count > 0:
+        _persist_last_credit_ts((os.getenv("TASK_ID") or "").strip())
 
     if ok_count != total:
         sys.exit(1)

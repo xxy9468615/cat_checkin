@@ -24,10 +24,6 @@ from circuit_breaker import (
     MAX_DAILY_ATTEMPTS,
 )
 TRAVEL_EVENT_RE = re.compile(r"TRAVEL_EVENT\s+state=(\w+)\s+arrive_at=(\d+)")
-MAX_CLAIM_ROUNDS, CLAIM_MARGIN_SEC, LATVI_ENTER_EARLY_SEC = 3, 15*60, 120
-# 显式任务模式（手动 dispatch/自动重跑）的回访等待上限：猫还在放风且回程超出该窗口时
-# 不再原地干等（曾出现等 4h 阻塞并发队列），顺延到下一次 run 收奖励
-EXPLICIT_CLAIM_MAX_WAIT_SEC = 30 * 60
 
 
 def _merge_result(prev: Any, ok: bool, unconf: bool, suspended: bool = False) -> Any:
@@ -83,16 +79,12 @@ def _read_latvi_last_sign() -> Optional[float]:
         except Exception:
             pass
     return None
-def latvi_plan() -> Dict[str, Any]:
-    fit_deadline = _hm_today_ts(os.getenv("LATVI_FIT_DEADLINE", "19:30"))
+def _latvi_signed_today() -> bool:
+    """latvi 今日是否已签（与 latvi.py 的当日去重口径一致，供 --plan 评估）。"""
     last = _read_latvi_last_sign()
-    if last is None:
-        return {"mode": "immediate", "window_open": None, "fire_at": time.time() + 5}
-    window_open = last + 86400
-    if window_open > fit_deadline:
-        return {"mode": "skip", "window_open": window_open, "fire_at": None}
-    fire_at = max(time.time() + 30, window_open - LATVI_ENTER_EARLY_SEC)
-    return {"mode": "scheduled", "window_open": window_open, "fire_at": fire_at}
+    if not last:
+        return False
+    return datetime.fromtimestamp(last, BJT).date() == bjt_now().date()
 def build_task_env(cfg: Dict[str, Any]) -> Dict[str, str]:
     env = os.environ.copy()
     env.setdefault("TZ", "Asia/Shanghai")
@@ -120,9 +112,11 @@ def build_task_env(cfg: Dict[str, Any]) -> Dict[str, str]:
         # 子进程内账号重编号为 1，workbuddy.py 的 Redis 滚动票键靠它映射真实账号
         env["WORKBUDDY_ACCOUNT_IDX"] = n
         env["WORKBUDDY_WAIT_TRAVEL"] = "true"
-        env["WORKBUDDY_NO_RELAY"] = "1"
+        # WORKBUDDY_NO_RELAY 不再注入（2026-09-06 运行模型改造）：领奖回程由
+        # workbuddy 自身经 QStash 派发 workbuddy_travel_claim 接力，run 即时结束
     if cfg["id"] == "latvi":
-        env["LATVI_NO_RELAY"] = "1"
+        # LATVI_NO_RELAY 不再注入：窗口等待由 latvi 自接力（latvi_next_sign）承载，
+        # 主 run 不再为 18:00 窗口原地挂起数小时
         env.setdefault("LATVI_STATE_FILE", ".latvi_state.json")
     # 通用注入：registry 任务的私有环境变量（如 modelscope 的 MODELSCOPE_SITE）、
     # 结果文件名（同脚本多实例隔离落盘，如 modelscope_ai.json）与邮件卡片标题
@@ -180,16 +174,13 @@ def run_task_subprocess(cfg: Dict[str, Any]) -> Tuple[bool, str]:
         out = f"[orchestrator kill >{cap}s]\n{(out or '')}"
     return proc.returncode == 0, (out or "").strip()
 class Orchestrator:
-    def __init__(self, hard_deadline: float, claim_max_wait: Optional[float] = None) -> None:
+    def __init__(self, hard_deadline: float) -> None:
         self.hard_deadline = hard_deadline
-        self.claim_max_wait = claim_max_wait
         self.heap: List[Tuple[float, int, str, Optional[Dict[str, Any]]]] = []
         self.seq = 0
         self.results: Dict[str, Any] = {}
-        self.claim_rounds: Dict[str, int] = {}
         self.executor = ThreadPoolExecutor(max_workers=int(os.getenv("BATCH_PARALLEL", "4")))
         self.futures: Dict[Future, Tuple[str, Optional[Dict[str, Any]]]] = {}
-        self.latvi_fire_at: Optional[float] = None
         self.dropped = 0
     def push(self, fire_at: float, kind: str, cfg: Optional[Dict[str, Any]] = None) -> None:
         heapq.heappush(self.heap, (fire_at, self.seq, kind, cfg))
@@ -199,10 +190,6 @@ class Orchestrator:
     def _submit(self, kind: str, cfg: Optional[Dict[str, Any]]) -> None:
         fut = self.executor.submit(run_task_subprocess, cfg or {})
         self.futures[fut] = (kind, cfg)
-    def _claim_cutoff(self) -> float:
-        anchor = self.latvi_fire_at if self.latvi_fire_at else self.hard_deadline - 300
-        margin = CLAIM_MARGIN_SEC if self.latvi_fire_at else 20*60
-        return anchor - margin
     def _on_task_done(self, cfg: Dict[str, Any], ok: bool, out: str) -> None:
         tid = cfg["id"]
         # ⚪ 凭据未配置（非故障）：新任务 Secret 尚未配置时按跳过处理——
@@ -232,12 +219,11 @@ class Orchestrator:
             next_retry_at = circuit_info.get("next_retry_at")
             attempts = circuit_info.get("attempts", 1)
             if next_retry_at:
-                if next_retry_at <= self.hard_deadline:
-                    self.push(next_retry_at, "task", cfg)
-                    wait_min = int(max(0, next_retry_at - time.time()) / 60)
-                    print(f"  🔁 [分时段重试] [{tid}] 安排在 {_fmt_bjt(next_retry_at)} 进行第 {attempts+1}/{MAX_DAILY_ATTEMPTS} 次重试 (等待 ~{wait_min}m)")
-                else:
-                    print(f"  ⏳ [分时段重试] [{tid}] 下次重试时刻 {_fmt_bjt(next_retry_at)} 超出当前 run 硬墙 ({_fmt_bjt(self.hard_deadline)})，交由跨 run 延时接力")
+                # 2026-09-06 运行模型改造：不再把重试压入进程内堆等待（曾导致 run
+                # 为 15m~3h 重试梯子挂起数小时）。重试统一跨 run 承载：
+                # workflow auto-retry 经 QStash 延时回调 checkin_retry，心跳
+                # （30min）get-due-retries 到期拾取兜底。
+                print(f"  🔁 [分时段重试] [{tid}] 第 {attempts+1}/{MAX_DAILY_ATTEMPTS} 次重试安排在 {_fmt_bjt(next_retry_at)}，交由延时接力（本 run 不等待）")
         # 频道1 失败提醒（Discord）：任务失败/超时/异常的瞬间推失败卡；成功只记状态不推；
         # 凭据未配置推黄色提示卡（同任务同日一次）
         # （best-effort，绝不阻塞调度；每日日报走邮件，由 unified_report 统一汇总发送）
@@ -259,26 +245,10 @@ class Orchestrator:
                 )
         except Exception as exc:
             print(f"WARN: Discord 失败提醒推送失败: {exc}", file=sys.stderr)
-        matches = TRAVEL_EVENT_RE.findall(out or "")
-        if matches:
-            state, arrive_raw = matches[-1]
-            arrive_at = int(arrive_raw)
-            rounds = self.claim_rounds.get(tid, 0)
-            cutoff = self._claim_cutoff()
-            claim_fire = arrive_at + 60
-            if state == "traveling" and rounds < MAX_CLAIM_ROUNDS:
-                if claim_fire <= cutoff:
-                    if self.claim_max_wait and claim_fire - time.time() > self.claim_max_wait:
-                        print(
-                            f"  -> claim @ {_fmt_bjt(claim_fire)} beyond "
-                            f"{int(self.claim_max_wait // 60)}min explicit-mode wait cap, deferred to next run"
-                        )
-                    else:
-                        self.push(claim_fire, "task", cfg)
-                        self.claim_rounds[tid] = rounds + 1
-                        print(f"  -> enqueued claim round {rounds+1} @ {_fmt_bjt(claim_fire)} (cutoff {_fmt_bjt(cutoff)})")
-                else:
-                    print(f"  -> claim @ {_fmt_bjt(claim_fire)} past cutoff {_fmt_bjt(cutoff)}, deferred to next run")
+        # workbuddy 领奖回程不再由 orchestrator 进程内排队回访（TRAVEL_EVENT 仅留
+        # 日志观测）：workbuddy 自接力 workbuddy_travel_claim 承载，run 即时结束
+        for _m in TRAVEL_EVENT_RE.findall(out or "")[-1:]:
+            print(f"  -> travel event {_m[0]} (回程由 workbuddy 接力派发，本 run 不等待)")
     def run(self) -> int:
         due_only = os.getenv("DUE_ONLY", "0").lower() in {"1", "true", "yes"}
         while self.heap or self.futures:
@@ -363,40 +333,80 @@ def build_default_timeline(orch: Orchestrator) -> None:
     ms_fire = max(now, _hm_today_ts("09:10"))
     for ms_id in ("modelscope", "modelscope_ai"):
         orch.push(ms_fire, "task", TASKS[ms_id])
-    plan = latvi_plan()
+    # latvi（2026-09-06 运行模型改造）：不再按窗口-120s 堆排布（曾令主 run 为
+    # 18:00 窗口原地挂起 ~4h）。立即入队，由 relay 模式自接力：窗口远 → 派发
+    # latvi_next_sign 后本 run 即结束；≤240s → 原地短睡签到；今日已签 → 秒退。
     latvi_cfg = TASKS["latvi"]
-    if plan["mode"] == "skip":
-        print(f"Latvi window {_fmt_bjt(plan['window_open'])} past fit deadline {os.getenv('LATVI_FIT_DEADLINE','19:30')}, skipping today; next run will re-anchor")
+    last = _read_latvi_last_sign()
+    window_open = (last + 86400) if last else None
+    fit_deadline = _hm_today_ts(os.getenv("LATVI_FIT_DEADLINE", "19:30"))
+    latvi_skip = bool(window_open and window_open > fit_deadline)
+    if latvi_skip:
+        print(f"Latvi window {_fmt_bjt(window_open)} past fit deadline {os.getenv('LATVI_FIT_DEADLINE','19:30')}, skipping today; next run will re-anchor")
     else:
-        orch.latvi_fire_at = plan["fire_at"]
-        orch.push(plan["fire_at"], "task", latvi_cfg)
+        orch.push(now, "task", latvi_cfg)
     print("Timeline:")
-    print(f"  immediate ({len(stage_a)} tasks, concurrency {os.getenv('BATCH_PARALLEL','4')}): " + ", ".join(t["id"] for t in stage_a))
+    print(f"  immediate ({len(stage_a) + (0 if latvi_skip else 1)} tasks, concurrency {os.getenv('BATCH_PARALLEL','4')}): "
+          + ", ".join([t["id"] for t in stage_a] + ([] if latvi_skip else ["latvi"])))
     print(f"  modelscope + modelscope_ai @ {_fmt_bjt(ms_fire)} (gate 09:10)")
-    if plan["mode"] == "skip":
-        print(f"  latvi: skipped (window {_fmt_bjt(plan['window_open'])} past deadline)")
-    else:
-        wo = plan.get("window_open")
-        basis = f"last {datetime.fromtimestamp(wo - 86400, BJT).strftime('%m-%d %H:%M:%S')} +24h" if wo else "no history"
-        print(f"  latvi @ {_fmt_bjt(plan['fire_at'])} (basis: {basis}{', window '+_fmt_bjt(wo) if wo else ''})")
-        if wo:
-            print(f"  next window estimate: {datetime.fromtimestamp(wo + 86400, BJT).strftime('%m-%d %H:%M:%S')}")
+    if window_open:
+        basis = f"last {datetime.fromtimestamp(window_open - 86400, BJT).strftime('%m-%d %H:%M:%S')} +24h"
+        print(f"  latvi: relay mode ({basis}, window {_fmt_bjt(window_open)}; "
+              f"{'skipped past fit deadline' if latvi_skip else '窗口远时自派发接力，本 run 不等待'})")
+        print(f"  next window estimate: {datetime.fromtimestamp(window_open + 86400, BJT).strftime('%m-%d %H:%M:%S')}")
 def build_explicit_timeline(orch: Orchestrator, raw: str) -> None:
     queue = resolve_execution_queue(input_tasks=raw)
     now = time.time()
     ids = []
     for cfg in queue:
         orch.push(now, "task", cfg)
-        if cfg["id"] == "latvi":
-            orch.latvi_fire_at = now
         ids.append(cfg["id"])
     print(f"Explicit tasks: {', '.join(ids)}")
+
+def plan_due_tasks(raw_tasks: str, due_only: bool) -> List[str]:
+    """评估当前时刻会立即执行的任务集（--plan 模式，不启动任何子进程）。
+
+    与 Orchestrator.run 的实际过滤口径一致：
+    - 熔断停用任务一律跳过；
+    - due_only（心跳）模式：rolling 冷却任务按 last_credit_ts 判定，latvi 按
+      「今日是否已签」判定（无 sched 元数据，按其自身去重语义特判）；
+    - 非 due_only（显式列表/主 cron）：候选内全部视为到期——重试列表由
+      circuit_breaker.get-due-retries 预过滤，主 cron 默认全量。
+    """
+    if raw_tasks.strip():
+        cfgs = resolve_execution_queue(input_tasks=raw_tasks)
+    else:
+        cfgs = [t for t in TASKS.values() if "matrix" in t["tags"] or "workbuddy" in t["tags"]]
+        cfgs += [TASKS[i] for i in ("modelscope", "modelscope_ai", "latvi") if i in TASKS]
+    now = time.time()
+    due: List[str] = []
+    for cfg in cfgs:
+        tid = cfg["id"]
+        if is_task_suspended(tid):
+            continue
+        if due_only:
+            if tid == "latvi":
+                if _latvi_signed_today():
+                    continue
+            else:
+                due_at = _cooldown_due_at(cfg)
+                if due_at and due_at > now:
+                    continue
+        due.append(tid)
+    return due
 def main() -> None:
     parser = argparse.ArgumentParser(description="Daily Unified Orchestrator")
     parser.add_argument("--tasks", type=str, default="", help="comma-separated task list (explicit mode)")
     parser.add_argument("--reset-circuit", action="store_true", help="reset circuit breaker state and resume tasks")
     parser.add_argument("--reset-circuit-tasks", type=str, default="", help="comma-separated task list to resume from circuit breaker")
+    parser.add_argument("--plan", action="store_true", help="evaluate the due task set and exit without executing anything (prints DUE_TASKS=<list|none>)")
+    parser.add_argument("--due-only", action="store_true", help="plan mode: apply heartbeat DUE_ONLY filtering (rolling cooldown / latvi signed-today)")
     args = parser.parse_args()
+    if args.plan:
+        # 空转判定入口：CI 在启动代理/装依赖之前调用，none 时整条流水线秒退
+        due = plan_due_tasks(args.tasks, due_only=args.due_only)
+        print(f"DUE_TASKS={','.join(due) if due else 'none'}")
+        sys.exit(0)
     print(f"Daily orchestrator start @ {bjt_now().strftime('%Y-%m-%d %H:%M:%S')} BJT")
     is_explicit = bool(args.tasks.strip())
 
@@ -429,7 +439,7 @@ def main() -> None:
             hard_deadline = wall_ts
             hard_wall_str = f"{configured_wall} BJT"
 
-    orch = Orchestrator(hard_deadline, claim_max_wait=EXPLICIT_CLAIM_MAX_WAIT_SEC if is_explicit else None)
+    orch = Orchestrator(hard_deadline)
     if is_explicit:
         build_explicit_timeline(orch, args.tasks)
     else:

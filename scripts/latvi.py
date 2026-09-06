@@ -146,15 +146,8 @@ def main():
 
     # 计算等待时间（24h 冷却 + 随机余量）
     wait_sec = _calc_wait_seconds()
-    if _is_no_relay():
-        # 内联模式：orchestrator 已按 last_sign+24h 精确排布进场时刻（提前 ~2min），
-        # 此处 wait 通常 ≤ 130s，直接原地等待让冷却重试循环精确收尾
-        if wait_sec > INLINE_WAIT_MAX:
-            hh, rem = divmod(wait_sec, 3600)
-            mm, ss = divmod(rem, 60)
-            print(f"ℹ️ 内联模式：距窗口尚有 {hh}小时{mm}分{ss}秒，原地等待（不调度接力）")
-    elif wait_sec > INLINE_WAIT_MAX:
-        # 旧接力/兜底模式：距窗口尚远不阻塞 Runner，调度 QStash 接力
+    if wait_sec > INLINE_WAIT_MAX and not _is_no_relay():
+        # 距窗口尚远不阻塞 Runner：调度 QStash 延时接力（零占用计费分钟）
         schedule_delay = wait_sec + 60
         ok, detail = schedule_repo_dispatch(DISPATCH_EVENT, schedule_delay)
         if ok:
@@ -163,9 +156,13 @@ def main():
             mm, ss = divmod(rem, 60)
             print(f"🔔 距签到窗口尚有 {hh}小时{mm}分{ss}秒，已调度 {eta.strftime('%H:%M')} 接力签到（本次运行结束）")
             return
-        print(f"⚠️ 延时调度失败（{detail}），回退为原地等待签到窗口")
+        # 2026-09-06 运行模型改造：接力派发失败时不再回退进程内长睡（曾可挂起
+        # Runner 数小时）。交由心跳（30 分钟）轮询重试派发，直至窗口到达。
+        print(f"⚠️ 延时调度失败（{detail}）；不在进程内长等待，交由心跳轮询重试")
+        return
 
     if wait_sec > 0:
+        # 内联短等待（≤240s 到窗口；或显式 LATVI_NO_RELAY=1 的本地手动模式）
         h, rem = divmod(wait_sec, 3600)
         m, s = divmod(rem, 60)
         print(f"⏳ 等待 {h}小时{m}分{s}秒 到达签到窗口...")
