@@ -165,8 +165,7 @@ jobs:
       52POJIE_cookie: ${{ secrets.WUAI_COOKIE_1 }}
       52POJIE_COOKIE_1: ${{ secrets.WUAI_COOKIE_1 }}
       52POJIE_PROXY: ${{ secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
-      QUARK_cookie: ${{ secrets.QUARK_COOKIE_1 }}
-      QUARK_COOKIE_1: ${{ secrets.QUARK_COOKIE_1 }}
+      # 夸克签到走 App 设备签名串（QUARK_MPARAM_1）独立鉴权，无需网页会话 Cookie
       QUARK_mparam: ${{ secrets.QUARK_MPARAM_1 }}
       QUARK_MPARAM_1: ${{ secrets.QUARK_MPARAM_1 }}
       CLOUD189_username: ${{ secrets.CLOUD189_USERNAME_1 }}
