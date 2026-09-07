@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 # cron: 0 9 * * *
 # new Env("夸克网盘 签到")
-"""夸克网盘（pan.quark.cn）每日签到、成长值/连签与网盘资产统计，会话滑动保活。
+"""夸克网盘（pan.quark.cn）每日签到、成长值/连签与网盘资产统计。
 
-功能：
-1. 每日签到（移动端 growth 接口，需 App 三参数 kps/sign/vcode——Reqable 抓
-   PC 客户端「签到领容量」页请求一次获得，长期有效）
-2. 资产统计：会员类型/到期、总容量/已用、累计签到奖励（extend_capacity_composition）
-3. __puus 24h 滑动票自动捕获 + Redis 回写（cat_checkin:state:quark_{idx}）：
-   每日 API 调用即触发服务端 Set-Cookie 滑动续期，回写后长期免维护；
-   主会话 __pus 为签发起 14 天硬窗口（实测），到期需扫码换票（CAS su.quark.cn）
-4. 多账号隔离运行与昵称脱敏
+鉴权架构（2026-09-07 实测定型）：
+1. 每日签到（移动端 growth 接口）：**App 抓包设备签名串独立鉴权**（kps_wg/sign_wg
+   设备绑定、长期有效），无需任何会话 Cookie——整串重放即可，免维护
+2. 资产统计（可选增强）：会员类型/到期、总容量/已用、累计签到奖励——需要网页
+   会话票 QUARK_COOKIE（__pus ~14 天硬窗口，到期需重新扫码；__puus 24h 滑动票
+   自动捕获 + Redis 回写长期续命）。不配置网页票则只跑签到
 
 环境变量：
-- QUARK_COOKIE_1, QUARK_COOKIE_2...（网页完整 Cookie；Redis 中有更新版本时优先）
-- QUARK_MPARAM_1...（可选：App 抓包串整串粘贴即可——支持 Android 网关变体
+- QUARK_MPARAM_1...（签到必需：App 抓包串整串粘贴——支持 Android 网关变体
   kps_wg/sign_wg/vcode/_ts/_nonce/_sign 原样重放，或经典 "kps=..&sign=..&vcode=.."）
+- QUARK_COOKIE_1, ...（可选：网页完整 Cookie，仅用于资产统计；Redis 有更新版时优先）
 """
 from __future__ import annotations
 
@@ -202,18 +200,21 @@ def _member_overview(h: Http, cookie: str) -> Tuple[str, str, Any]:
     return member_line, space_line, resp
 
 
-def _growth_sign(h: Http, cookie: str, mparam_raw: str) -> Tuple[str, bool]:
-    """移动端 growth 接口签到（三参数 query 鉴权，与社区实现同源）。
+def _growth_sign(h: Http, cookie: Optional[str], mparam_raw: str) -> Tuple[str, bool]:
+    """移动端 growth 接口签到。
 
     mparam_raw 支持整串抓包重放与经典三参数两种形态，候选按保真度依次尝试
-    （最多 2 种形态，属业务级降级而非失败重试）。返回 (文案, 是否达成签到)。
+    （最多 2 种形态，属业务级降级而非失败重试）。实测（2026-09-07）设备签名串
+    可独立鉴权，cookie 参数仅在网页会话票可用时附带（补充身份一致性）。
+    返回 (文案, 是否达成签到)。
     """
     headers = {
-        "Cookie": cookie,
         "User-Agent": UA_CLIENT,
         "Content-Type": "application/json",
         "Referer": f"{PAN_HOST}/",
     }
+    if cookie:
+        headers["Cookie"] = cookie
     info: Dict[str, Any] = {}
     used_q = ""
     last_note = ""
@@ -246,49 +247,62 @@ def _growth_sign(h: Http, cookie: str, mparam_raw: str) -> Tuple[str, bool]:
     return f"签到失败（{msg[:60]}）", False
 
 
-def _run_one(idx: int, total: int, cookie: str, mparam_raw: Optional[str]) -> Tuple[bool, str]:
-    """单个账号完整流程。mparam_raw 为用户抓包原始串（支持整串重放/三参数）。"""
+def _run_one(idx: int, total: int, cookie: Optional[str], mparam_raw: Optional[str]) -> Tuple[bool, str]:
+    """单个账号完整流程。
+
+    鉴权架构（2026-09-07 实测定型）：
+    - 签到 growth 接口凭 App 设备签名串（mparam）独立鉴权，**无需任何会话 Cookie**；
+    - 网页会话票（QUARK_COOKIE，__pus ~14 天硬窗口）仅用于资产统计（容量/会员到期），
+      属可选增强，不配置即跑纯签到模式。
+    """
     h = Http()
-    prefix_redis = f"cat_checkin:state:quark_{idx}"
-    state_file = f".quark_state_{idx}.json"
-    state = load_kv_state(prefix_redis, state_file) or {}
-
-    # Redis 中有滑动续期过的更新版 cookie 时优先（__puus 24h 滑动，secret 是引导票）
-    saved_cookie = str(state.get("cookie") or "")
-    if saved_cookie:
-        cookie = saved_cookie
-
-    nickname = _account_info(h, cookie)
-    masked = mask_str(nickname)
-    print(f"[{idx}/{total}] 👤 用户: 【{masked}】")
-
-    # 捕获滑动票：服务端对每次调用做 Set-Cookie(__puus) 24h 续期
     lines: List[str] = []
     ok = True
+    identity = f"APP设备票·账号{idx}"
+
+    cookie = (cookie or "").strip()
+    if cookie:
+        # 网页会话票路径：Redis 滑动续期版优先（__puus 24h 滑动，secret 是引导票）
+        prefix_redis = f"cat_checkin:state:quark_{idx}"
+        state_file = f".quark_state_{idx}.json"
+        state = load_kv_state(prefix_redis, state_file) or {}
+        saved_cookie = str(state.get("cookie") or "")
+        if saved_cookie:
+            cookie = saved_cookie
+        try:
+            identity = mask_str(_account_info(h, cookie))
+        except Exception as exc:  # noqa: BLE001
+            # 统计票失效不阻断签到（App 设备票与网页会话相互独立）
+            lines.append(f"• 统计: 网页票失效（{str(exc)[:40]}），仅跑签到")
+
+    print(f"[{idx}/{total}] 👤 用户: 【{identity}】")
+
     if mparam_raw:
-        sign_line, sign_ok = _growth_sign(h, cookie, mparam_raw)
+        sign_line, sign_ok = _growth_sign(h, cookie if cookie else None, mparam_raw)
         lines.append(f"• 签到: {sign_line}")
         ok = ok and sign_ok
     else:
-        lines.append("• 签到: ⚠️ 未配置 App 三参数（QUARK_MPARAM），本次仅完成资产统计与保活")
+        lines.append("• 签到: ⚠️ 未配置 App 抓包串（QUARK_MPARAM），本次仅完成资产统计与保活")
 
-    member_line, space_line, member_resp = _member_overview(h, cookie)
-    lines.append(f"• 空间: {space_line}")
-    lines.append(f"• 会员: {member_line}")
+    if cookie:
+        member_line, space_line, member_resp = _member_overview(h, cookie)
+        lines.append(f"• 空间: {space_line}")
+        lines.append(f"• 会员: {member_line}")
 
-    # 滑动票回写：member 响应带最新 __puus 时更新 Redis（远端权威，下次运行优先）
-    new_puus = _capture_puus(member_resp)
-    if new_puus:
-        m = re.search(r"__puus=([^;]+)", cookie)
-        old_puus = m.group(1) if m else ""
-        if new_puus != old_puus:
-            cookie = re.sub(r"__puus=[^;]*", f"__puus={new_puus}", cookie)
-            if "__puus=" not in cookie:
-                cookie = f"{cookie}; __puus={new_puus}"
-            state["cookie"] = cookie
-            state["puus_rotated_at"] = int(time.time())
-            save_kv_state(prefix_redis, state_file, state)
-            lines.append("• [keepalive] __puus 已滑动续期（Redis 回写）")
+        # 滑动票回写：member 响应带最新 __puus 时更新 Redis（远端权威，下次运行优先）
+        new_puus = _capture_puus(member_resp)
+        if new_puus:
+            m = re.search(r"__puus=([^;]+)", cookie)
+            old_puus = m.group(1) if m else ""
+            if new_puus != old_puus:
+                cookie = re.sub(r"__puus=[^;]*", f"__puus={new_puus}", cookie)
+                if "__puus=" not in cookie:
+                    cookie = f"{cookie}; __puus={new_puus}"
+                state = load_kv_state(f"cat_checkin:state:quark_{idx}", f".quark_state_{idx}.json") or {}
+                state["cookie"] = cookie
+                state["puus_rotated_at"] = int(time.time())
+                save_kv_state(f"cat_checkin:state:quark_{idx}", f".quark_state_{idx}.json", state)
+                lines.append("• [keepalive] __puus 已滑动续期（Redis 回写）")
 
     for ln in lines:
         print(ln)
@@ -296,19 +310,23 @@ def _run_one(idx: int, total: int, cookie: str, mparam_raw: Optional[str]) -> Tu
 
 
 def main() -> None:
-    cookies = env_seq("QUARK_", "cookie", required=True)
+    cookies = env_seq("QUARK_", "cookie", required=False, default=[])
     mparams = env_seq("QUARK_", "mparam", required=False, default=[])
-    total = len(cookies)
+    total = max(len(cookies), len(mparams))
+    if total == 0:
+        print("签到失败：缺少环境变量 QUARK_MPARAM_1（签到）或 QUARK_COOKIE_1（仅统计）")
+        sys.exit(1)
     print(f"【夸克网盘 签到】共 {total} 个账号")
     failed = 0
     done = 0
-    for idx, cookie in enumerate(cookies, start=1):
-        if not cookie.strip():
+    for idx in range(1, total + 1):
+        cookie = cookies[idx - 1].strip() if idx <= len(cookies) else ""
+        mparam = mparams[idx - 1].strip() if idx <= len(mparams) else ""
+        if not cookie and not mparam:
             continue
         done += 1
-        mparam = mparams[idx - 1].strip() if idx <= len(mparams) else ""
         try:
-            ok, _ = _run_one(idx, total, cookie.strip(), mparam or None)
+            ok, _ = _run_one(idx, total, cookie or None, mparam or None)
         except Exception as exc:  # noqa: BLE001
             ok = False
             print(f"❌ 账号 {idx} 处理失败: {exc}")
