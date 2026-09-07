@@ -131,12 +131,9 @@ EXPECT = {
     "quark": lambda r: (
         len(r["lines"]) == 1
         and "签到成功" in r["lines"][0]
-        and "+10MB" in r["lines"][0]
-        and "连签 3/7 天" in r["lines"][0]
-        and "空间145.7MB/3TB" in r["lines"][0].replace(" ", "")
-        and "累计签到奖励 130MB" in r["lines"][0]
-        and "VIP（10-23 到期）" in r["lines"][0]
-        and "滑动续期✓" in r["lines"][0]
+        and "+20MB" in r["lines"][0]
+        and "连签 2/7 天" in r["lines"][0]
+        and r["summary"] == ""
     ),
     "cloud189": lambda r: (
         len(r["lines"]) == 1

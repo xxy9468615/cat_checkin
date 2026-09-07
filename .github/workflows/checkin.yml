@@ -230,7 +230,6 @@ jobs:
             .alipan_state*.json
             .smzdm_state*.json
             .52pojie_state*.json
-            .quark_state*.json
             .notify_state_*.json
           key: unified-states-${{ github.run_id }}
           restore-keys: |
@@ -670,7 +669,6 @@ jobs:
             .alipan_state*.json
             .smzdm_state*.json
             .52pojie_state*.json
-            .quark_state*.json
             .notify_state_*.json
           key: unified-states-${{ github.run_id }}
 

@@ -1,60 +1,34 @@
 #!/usr/bin/env python3
 # cron: 0 9 * * *
 # new Env("夸克网盘 签到")
-"""夸克网盘（pan.quark.cn）每日签到、成长值/连签与网盘资产统计。
+"""夸克网盘（pan.quark.cn）每日签到领容量。
 
-鉴权架构（2026-09-07 实测定型）：
-1. 每日签到（移动端 growth 接口）：**App 抓包设备签名串独立鉴权**（kps_wg/sign_wg
-   设备绑定、长期有效），无需任何会话 Cookie——整串重放即可，免维护
-2. 资产统计（可选增强）：会员类型/到期、总容量/已用、累计签到奖励——需要网页
-   会话票 QUARK_COOKIE（__pus ~14 天硬窗口，到期需重新扫码；__puus 24h 滑动票
-   自动捕获 + Redis 回写长期续命）。不配置网页票则只跑签到
+鉴权（2026-09-07 实测定型）：growth 签到接口凭 **App 抓包设备签名串独立鉴权**，
+无需任何会话 Cookie（kps_wg/sign_wg 设备绑定、长期有效，整串重放即可）。
+历史网页会话票方案（__pus 14 天窗口 + __puus 滑动续期 + 容量/会员到期统计）
+已随 QUARK_COOKIE_1 退役，如需恢复见 git 历史 d2249b6。
 
 环境变量：
-- QUARK_MPARAM_1...（签到必需：App 抓包串整串粘贴——支持 Android 网关变体
+- QUARK_MPARAM_1...（App 抓包串整串粘贴：Android 网关变体
   kps_wg/sign_wg/vcode/_ts/_nonce/_sign 原样重放，或经典 "kps=..&sign=..&vcode=.."）
-- QUARK_COOKIE_1, ...（可选：网页完整 Cookie，仅用于资产统计；Redis 有更新版时优先）
 """
 from __future__ import annotations
 
-import json
 import re
 import sys
-import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
-from common import (
-    Http,
-    env_seq,
-    load_kv_state,
-    main_guard,
-    mask_str,
-    save_kv_state,
-)
+from common import Http, env_seq, main_guard
 
 PAN_HOST = "https://pan.quark.cn"
-PC_HOST = "https://drive-pc.quark.cn"
 M_HOST = "https://drive-m.quark.cn"
-UA_WEB = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0"
-)
 # 移动端 growth 接口按客户端 UA 网关放行，与 Cp0204/quark-auto-save 一致
 UA_CLIENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) quark-cloud-drive/3.14.2 Chrome/112.0.5615.165 "
     "Electron/24.1.3.8 Safari/537.36 Channel/pckk_other_ch"
 )
-
-MEMBER_TYPE_MAP = {
-    "NORMAL": "普通用户",
-    "EXP_SVIP": "88VIP",
-    "SUPER_VIP": "SVIP",
-    "Z_VIP": "SVIP+",
-    "VIP": "VIP",
-    "MINI_VIP": "MINI VIP",
-}
 
 
 def _resp_dict(resp: Any) -> Dict[str, Any]:
@@ -120,92 +94,10 @@ def _mparam_candidates(raw: str) -> List[str]:
     return [q]
 
 
-def _fmt_size(num: Any) -> str:
-    """字节数人性化（与夸克前端口径一致，1024 进制）。"""
-    try:
-        n = float(num)
-    except (TypeError, ValueError):
-        return "未知"
-    units = ["B", "KB", "MB", "GB", "TB"]
-    v = n
-    for u in units:
-        if v < 1024 or u == units[-1]:
-            return f"{v:.1f}{u}".replace(".0", "") if u != "B" else f"{int(v)}B"
-        v /= 1024
-    return f"{v:.1f}TB"
+def _growth_sign(h: Http, mparam_raw: str) -> Tuple[str, bool]:
+    """移动端 growth 接口签到（设备签名串独立鉴权，无会话态）。
 
-
-def _fmt_ts_ms(ts: Any) -> str:
-    """毫秒时间戳 → MM-DD；无效返回空串。"""
-    try:
-        ts = int(ts)
-        if ts <= 0:
-            return ""
-        from datetime import datetime, timedelta, timezone
-
-        tz = timezone(timedelta(hours=8))
-        return datetime.fromtimestamp(ts / 1000, tz).strftime("%m-%d")
-    except (TypeError, ValueError):
-        return ""
-
-
-def _capture_puus(resp: Any) -> str:
-    """从响应头捕获滑动票 __puus（服务端每次调用按 24h 滑动重签）。"""
-    try:
-        raws: List[str] = []
-        get_all = getattr(resp.headers, "get_all", None)
-        if get_all:
-            raws = get_all("Set-Cookie") or []
-        else:
-            v = resp.headers.get("Set-Cookie") or ""
-            raws = [v] if v else []
-        for raw in raws:
-            m = re.search(r"__puus=([^;]+)", raw)
-            if m:
-                return m.group(1).strip()
-    except Exception:
-        pass
-    return ""
-
-
-def _account_info(h: Http, cookie: str) -> str:
-    """校验会话并取昵称；会话失效抛 RuntimeError。"""
-    resp = h.request(
-        "GET", f"{PAN_HOST}/account/info?fr=pc&platform=pc",
-        headers={"Cookie": cookie, "User-Agent": UA_WEB, "Referer": f"{PAN_HOST}/"},
-    )
-    data = _resp_dict(resp).get("data") or {}
-    if resp.code != 200 or not data:
-        raise RuntimeError(f"会话失效（HTTP {resp.code}）→ 需扫码换票后更新 Cookie")
-    return str(data.get("nickname") or "用户")
-
-
-def _member_overview(h: Http, cookie: str) -> Tuple[str, str, Any]:
-    """会员与容量概览。返回 (会员行, 空间行, 原始响应)；失败降级为占位文案。"""
-    resp = h.request(
-        "GET", f"{PC_HOST}/1/clouddrive/member?pr=ucpro&fr=pc",
-        headers={"Cookie": cookie, "User-Agent": UA_WEB, "Referer": f"{PAN_HOST}/"},
-    )
-    d = _resp_dict(resp).get("data") or {}
-    if resp.code != 200 or not d:
-        return "获取失败", "获取失败", resp
-    mtype = MEMBER_TYPE_MAP.get(str(d.get("member_type")), str(d.get("member_type") or "未知"))
-    exp = _fmt_ts_ms(d.get("vip_exp_at") or d.get("exp_at"))
-    member_line = f"{mtype}（{exp} 到期）" if exp else mtype
-    total = _fmt_size(d.get("total_capacity"))
-    used = _fmt_size(d.get("use_capacity"))
-    sign_reward = (d.get("extend_capacity_composition") or {}).get("sign_reward")
-    reward_note = f"，累计签到奖励 {_fmt_size(sign_reward)}" if sign_reward else ""
-    space_line = f"已用 {used} / 总量 {total}{reward_note}"
-    return member_line, space_line, resp
-
-
-def _growth_sign(h: Http, cookie: Optional[str], mparam_raw: str) -> Tuple[str, bool]:
-    """移动端 growth 接口签到。
-
-    mparam_raw 支持整串抓包重放与经典三参数两种形态，候选按保真度依次尝试
-    （最多 2 种形态，属业务级降级而非失败重试）。实测（2026-09-07）设备签名串
-    可独立鉴权，cookie 参数仅在网页会话票可用时附带（补充身份一致性）。
+    mparam_raw 候选按保真度依次尝试（最多 2 种形态，属业务级降级而非失败重试）。
     返回 (文案, 是否达成签到)。
     """
     headers = {
@@ -213,8 +105,6 @@ def _growth_sign(h: Http, cookie: Optional[str], mparam_raw: str) -> Tuple[str, 
         "Content-Type": "application/json",
         "Referer": f"{PAN_HOST}/",
     }
-    if cookie:
-        headers["Cookie"] = cookie
     info: Dict[str, Any] = {}
     used_q = ""
     last_note = ""
@@ -227,7 +117,7 @@ def _growth_sign(h: Http, cookie: Optional[str], mparam_raw: str) -> Tuple[str, 
             break
         last_note = f"HTTP {resp.code} {str(info.get('message', ''))[:40]}"
     if not used_q:
-        return f"签到状态查询失败（{last_note}），三参数可能已失效", False
+        return f"签到状态查询失败（{last_note}），设备签名串可能已失效，请重新抓包", False
 
     cap = (info.get("data") or {}).get("cap_sign") or {}
     reward_mb = int((cap.get("sign_daily_reward") or 0) / 1024 / 1024)
@@ -247,86 +137,28 @@ def _growth_sign(h: Http, cookie: Optional[str], mparam_raw: str) -> Tuple[str, 
     return f"签到失败（{msg[:60]}）", False
 
 
-def _run_one(idx: int, total: int, cookie: Optional[str], mparam_raw: Optional[str]) -> Tuple[bool, str]:
-    """单个账号完整流程。
-
-    鉴权架构（2026-09-07 实测定型）：
-    - 签到 growth 接口凭 App 设备签名串（mparam）独立鉴权，**无需任何会话 Cookie**；
-    - 网页会话票（QUARK_COOKIE，__pus ~14 天硬窗口）仅用于资产统计（容量/会员到期），
-      属可选增强，不配置即跑纯签到模式。
-    """
+def _run_one(idx: int, total: int, mparam_raw: str) -> bool:
+    """单个账号签到流程（纯 App 设备票，无会话态）。"""
     h = Http()
-    lines: List[str] = []
-    ok = True
-    identity = f"APP设备票·账号{idx}"
-
-    cookie = (cookie or "").strip()
-    if cookie:
-        # 网页会话票路径：Redis 滑动续期版优先（__puus 24h 滑动，secret 是引导票）
-        prefix_redis = f"cat_checkin:state:quark_{idx}"
-        state_file = f".quark_state_{idx}.json"
-        state = load_kv_state(prefix_redis, state_file) or {}
-        saved_cookie = str(state.get("cookie") or "")
-        if saved_cookie:
-            cookie = saved_cookie
-        try:
-            identity = mask_str(_account_info(h, cookie))
-        except Exception as exc:  # noqa: BLE001
-            # 统计票失效不阻断签到（App 设备票与网页会话相互独立）
-            lines.append(f"• 统计: 网页票失效（{str(exc)[:40]}），仅跑签到")
-
-    print(f"[{idx}/{total}] 👤 用户: 【{identity}】")
-
-    if mparam_raw:
-        sign_line, sign_ok = _growth_sign(h, cookie if cookie else None, mparam_raw)
-        lines.append(f"• 签到: {sign_line}")
-        ok = ok and sign_ok
-    else:
-        lines.append("• 签到: ⚠️ 未配置 App 抓包串（QUARK_MPARAM），本次仅完成资产统计与保活")
-
-    if cookie:
-        member_line, space_line, member_resp = _member_overview(h, cookie)
-        lines.append(f"• 空间: {space_line}")
-        lines.append(f"• 会员: {member_line}")
-
-        # 滑动票回写：member 响应带最新 __puus 时更新 Redis（远端权威，下次运行优先）
-        new_puus = _capture_puus(member_resp)
-        if new_puus:
-            m = re.search(r"__puus=([^;]+)", cookie)
-            old_puus = m.group(1) if m else ""
-            if new_puus != old_puus:
-                cookie = re.sub(r"__puus=[^;]*", f"__puus={new_puus}", cookie)
-                if "__puus=" not in cookie:
-                    cookie = f"{cookie}; __puus={new_puus}"
-                state = load_kv_state(f"cat_checkin:state:quark_{idx}", f".quark_state_{idx}.json") or {}
-                state["cookie"] = cookie
-                state["puus_rotated_at"] = int(time.time())
-                save_kv_state(f"cat_checkin:state:quark_{idx}", f".quark_state_{idx}.json", state)
-                lines.append("• [keepalive] __puus 已滑动续期（Redis 回写）")
-
-    for ln in lines:
-        print(ln)
-    return ok, "；".join(lines)
+    print(f"[{idx}/{total}] 👤 用户: 【APP设备票·账号{idx}】")
+    sign_line, ok = _growth_sign(h, mparam_raw)
+    print(f"• 签到: {sign_line}")
+    return ok
 
 
 def main() -> None:
-    cookies = env_seq("QUARK_", "cookie", required=False, default=[])
-    mparams = env_seq("QUARK_", "mparam", required=False, default=[])
-    total = max(len(cookies), len(mparams))
-    if total == 0:
-        print("签到失败：缺少环境变量 QUARK_MPARAM_1（签到）或 QUARK_COOKIE_1（仅统计）")
-        sys.exit(1)
+    mparams = env_seq("QUARK_", "mparam", required=True)
+    total = len(mparams)
     print(f"【夸克网盘 签到】共 {total} 个账号")
     failed = 0
     done = 0
     for idx in range(1, total + 1):
-        cookie = cookies[idx - 1].strip() if idx <= len(cookies) else ""
-        mparam = mparams[idx - 1].strip() if idx <= len(mparams) else ""
-        if not cookie and not mparam:
+        mparam = mparams[idx - 1].strip()
+        if not mparam:
             continue
         done += 1
         try:
-            ok, _ = _run_one(idx, total, cookie or None, mparam or None)
+            ok = _run_one(idx, total, mparam)
         except Exception as exc:  # noqa: BLE001
             ok = False
             print(f"❌ 账号 {idx} 处理失败: {exc}")

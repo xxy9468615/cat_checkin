@@ -1237,7 +1237,7 @@ def ex_cloud189(output: str, res: Dict[str, Any]) -> None:
 
 
 def ex_quark(output: str, res: Dict[str, Any]) -> None:
-    """夸克网盘：👤 用户: 【xx】 + • 签到 / 空间 / 会员 / [keepalive] 行。"""
+    """夸克网盘（App 设备票纯签到）：👤 用户: 【xx】 + • 签到 行。"""
     cur: Any = None
     for raw in output.splitlines():
         ln = raw.strip()
@@ -1247,7 +1247,7 @@ def ex_quark(output: str, res: Dict[str, Any]) -> None:
                 cur.flush(res)
             cur = _Block(m.group(1))
             continue
-        if "签到失败" in ln or "处理失败" in ln or "会话失效" in ln:
+        if "签到失败" in ln or "处理失败" in ln:
             if cur:
                 cur.flush(res)
                 cur = None
@@ -1261,32 +1261,18 @@ def ex_quark(output: str, res: Dict[str, Any]) -> None:
             s = mm.group(1)
             if "【成功】" in s:
                 cur.parts.append("签到成功")
-                m2 = re.search(r"\+([\d.]+\wB)", s)
-                if m2:
-                    cur.parts.append(f"+{m2.group(1)}")
-                m3 = re.search(r"连签 (\d+/\d+ 天)", s)
-                if m3:
-                    cur.parts.append(f"连签 {m3.group(1)}")
             elif "已签到" in s:
-                m2 = re.search(r"\+([\d.]+\wB)", s)
-                cur.parts.append("今日已签" + (f" +{m2.group(1)}" if m2 else ""))
+                cur.parts.append("今日已签")
             elif "未配置" in s:
-                cur.parts.append("签到未配置(App 三参数缺失)")
+                cur.parts.append("签到未配置(App 设备票缺失)")
             else:
                 cur.parts.append(_clean(s))
-            continue
-        mm = re.search(r"• 空间:\s*已用\s+(.+?)\s*/\s*总量\s+(.+?)(?:，(.+))?$", ln)
-        if mm:
-            cur.parts.append(f"空间 {mm.group(1)}/{mm.group(2)}")
-            if mm.group(3):
-                cur.parts.append(_clean(mm.group(3)))
-            continue
-        mm = re.search(r"• 会员:\s*(.+)", ln)
-        if mm:
-            cur.parts.append(mm.group(1))
-            continue
-        if "[keepalive]" in ln:
-            cur.parts.append("滑动续期✓")
+            m2 = re.search(r"\+([\d.]+\wB)", s)
+            if m2:
+                cur.parts.append(f"+{m2.group(1)}")
+            m3 = re.search(r"连签 (\d+/\d+ 天)", s)
+            if m3:
+                cur.parts.append(f"连签 {m3.group(1)}")
             continue
     if cur:
         cur.flush(res)
