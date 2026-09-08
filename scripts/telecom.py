@@ -185,7 +185,7 @@ def _parse_account_config(raw: str, index: int) -> TelecomAccount:
             sign = v_val
         elif k_low in ("authorization", "auth"):
             auth = v_val
-        elif k_low in ("vx3b5xuq", "x-requested-with"):
+        elif k_low == "x-requested-with":
             extra_headers[k.strip()] = v_val
 
     # 2. 检查内嵌 JSON
@@ -571,6 +571,13 @@ def execute_telecom_task(client: TelecomClient) -> Dict[str, Any]:
                 res["lottery_res"] = "、".join(lottery_prizes) if lottery_prizes else "抽奖完成"
             else:
                 res["lottery_res"] = "今日已抽"
+                print("    [抽奖] 今日免费抽奖次数已用尽", flush=True)
+        else:
+            msg = tab_res.get("msg") or tab_res.get("resoultMsg") or "暂无活动"
+            res["lottery_res"] = f"今日已抽({msg})" if "已" in msg else msg
+            print(f"    [抽奖] 转盘响应: {msg}", flush=True)
+    else:
+        res["lottery_res"] = "今日已抽"
 
     # 4. 金豆日常浏览与聚合任务
     if client.sign and HAS_CRYPTO:
@@ -603,6 +610,9 @@ def execute_telecom_task(client: TelecomClient) -> Dict[str, Any]:
                         time.sleep(1)
         if tasks_done > 0:
             res["task_res"] = f"完成{tasks_done}项"
+        else:
+            res["task_res"] = "今日已完成" if ad_items else "暂无待领任务"
+        print(f"    [任务] 任务列表扫描: 共 {len(ad_items)} 项，本次完成 {tasks_done} 项", flush=True)
 
     # 5. 益豆乐园喂食任务（最多 10 次）
     if client.sign and HAS_CRYPTO:
@@ -627,6 +637,9 @@ def execute_telecom_task(client: TelecomClient) -> Dict[str, Any]:
                 break
         if feed_cnt > 0:
             res["food_res"] = f"喂食{feed_cnt}次"
+        else:
+            res["food_res"] = "今日已喂满"
+        print(f"    [乐园] 益豆乐园喂食: {res['food_res']}", flush=True)
 
     # 6. 查询总资产（金豆余额）
     if client.sign and HAS_CRYPTO:
@@ -637,9 +650,30 @@ def execute_telecom_task(client: TelecomClient) -> Dict[str, Any]:
             json_data={"para": _encrypt_rsa(info_payload)},
             headers={"sign": client.sign},
         )
-        total_bean = info_res.get("data", {}).get("coin") or info_res.get("data", {}).get("goldBean")
+        total_bean = (
+            info_res.get("data", {}).get("coin")
+            or info_res.get("data", {}).get("goldBean")
+            or info_res.get("data", {}).get("userInfo", {}).get("totalCoin")
+            or info_res.get("userInfo", {}).get("totalCoin")
+        )
+        if total_bean is None:
+            coin_res = client._req(
+                "POST",
+                "https://wappark.189.cn/jt-sign/api/home/userCoinInfo",
+                json_data={"para": _encrypt_rsa(info_payload)},
+                headers={"sign": client.sign},
+            )
+            total_bean = (
+                coin_res.get("data", {}).get("totalCoin")
+                or coin_res.get("data", {}).get("coin")
+                or coin_res.get("totalCoin")
+                or coin_res.get("coin")
+            )
         if total_bean is not None:
             res["total_bean"] = str(total_bean)
+            print(f"    [资产] 金豆总额: {res['total_bean']}", flush=True)
+        else:
+            res["total_bean"] = "同步中"
 
     # 最终状态收敛
     if res["status"] == "未开始":
