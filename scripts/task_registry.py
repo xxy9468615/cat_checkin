@@ -234,6 +234,17 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "tags": ["00:50", "matrix", "daily"],
     },
 
+    # --- 中国电信（营业厅 / 天翼生活 / 10000 每日签到、免费抽奖、任务金豆与资产统计）---
+    "telecom": {
+        "id": "telecom",
+        "script": "telecom.py",
+        "name": "中国电信 签到",
+        "result": "telecom.json",
+        "timeout": 300,
+        "account": "",
+        "tags": ["00:50", "matrix", "daily"],
+    },
+
     # --- 多账号站点（单 run 阶段 A 内联并发；旧 QStash 回程接力已退役） ---
     "workbuddy-account-1": {
         "id": "workbuddy-account-1",

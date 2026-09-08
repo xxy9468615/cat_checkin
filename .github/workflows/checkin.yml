@@ -175,6 +175,11 @@ jobs:
       CLOUD189_cookie: ${{ secrets.CLOUD189_COOKIE_1 }}
       CLOUD189_COOKIE_1: ${{ secrets.CLOUD189_COOKIE_1 }}
       CLOUD189_PROXY: ${{ secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
+      # 中国电信 App 抓包整串（按月轮转，免账密风控）
+      TELECOM_header: ${{ secrets.TELECOM_HEADER_1 }}
+      TELECOM_HEADER_1: ${{ secrets.TELECOM_HEADER_1 }}
+      TELECOM_HEADER_2: ${{ secrets.TELECOM_HEADER_2 }}
+      TELECOM_PROXY: ${{ secrets.TELECOM_PROXY || secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
       # 插件 OAuth refresh_token（60/90 天滚动续期，优先于 7 天硬上限的 Cookie）
       WORKBUDDY_REFRESH_TOKEN_1: ${{ secrets.WORKBUDDY_REFRESH_TOKEN_1 }}
       WORKBUDDY_REFRESH_TOKEN_2: ${{ secrets.WORKBUDDY_REFRESH_TOKEN_2 }}

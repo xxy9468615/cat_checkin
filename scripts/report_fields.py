@@ -1279,6 +1279,75 @@ def ex_quark(output: str, res: Dict[str, Any]) -> None:
     _add_summary(res, output)
 
 
+def ex_telecom(output: str, res: Dict[str, Any]) -> None:
+    """中国电信：👤 用户: 【xx】 + • 签到 / 抽奖 / 任务 / 乐园 / 资产 行。"""
+    cur: Any = None
+    for raw in output.splitlines():
+        ln = raw.strip()
+        m = re.search(r"👤 用户:\s*【(.+?)】", ln)
+        if m:
+            if cur:
+                cur.flush(res)
+            cur = _Block(m.group(1))
+            continue
+        if "签到失败" in ln or "❌" in ln:
+            if cur:
+                cur.flush(res)
+                cur = None
+            res["fail_lines"].append(_clean(ln))
+            res["error_lines"].append(ln)
+            continue
+        if cur is None:
+            continue
+        mm = re.search(r"• 签到:\s*(.+)", ln)
+        if mm:
+            s = mm.group(1)
+            if "【成功】" in s:
+                cur.parts.append("签到成功")
+            elif "已签" in s:
+                cur.parts.append("今日已签")
+            else:
+                m_st = re.search(r"【(.+?)】", s)
+                if m_st:
+                    cur.parts.append(m_st.group(1))
+            m_bean = re.search(r"\+(\d+)\s*金豆", s)
+            if m_bean:
+                cur.parts.append(f"+{m_bean.group(1)}金豆")
+                res["gains"].append(("金豆", _f(m_bean.group(1))))
+                res["badges"].append(("reward", f"+{m_bean.group(1)} 金豆"))
+            m_streak = re.search(r"连签天数:\s*【(\d+)】天", s)
+            if m_streak:
+                cur.parts.append(f"连签 {m_streak.group(1)} 天")
+                res["streak"] = max(res["streak"], int(m_streak.group(1)))
+                res["badges"].append(("streak", f"连签 {m_streak.group(1)} 天"))
+            continue
+        mm = re.search(r"• 抽奖:\s*【(.+?)】", ln)
+        if mm:
+            lottery_txt = mm.group(1)
+            if lottery_txt and lottery_txt != "今日已抽":
+                cur.parts.append(f"抽奖: {lottery_txt}")
+                res["badges"].append(("reward", f"抽奖 {lottery_txt}"))
+            elif lottery_txt == "今日已抽":
+                cur.parts.append("抽奖已完成")
+            continue
+        mm = re.search(r"• 任务:\s*【(.+?)】", ln)
+        if mm:
+            cur.parts.append(f"任务: {mm.group(1)}")
+            continue
+        mm = re.search(r"• 乐园:\s*【(.+?)】", ln)
+        if mm:
+            cur.parts.append(f"乐园: {mm.group(1)}")
+            continue
+        mm = re.search(r"• 资产:\s*金豆\s*【(" + NUM + r")】", ln)
+        if mm:
+            cur.parts.append(f"金豆 {_d(mm.group(1))}")
+            res["assets"].append(("金豆", _f(mm.group(1))))
+            continue
+    if cur:
+        cur.flush(res)
+    _add_summary(res, output)
+
+
 # 注册表：key = 脚本文件名（task_registry 的 script 字段 / 结果 JSON 的 script 字段）
 SCRIPT_EXTRACTORS = {
     "2libra.py": ex_2libra,
@@ -1302,6 +1371,7 @@ SCRIPT_EXTRACTORS = {
     "smzdm.py": ex_smzdm,
     "52pojie.py": ex_52pojie,
     "quark.py": ex_quark,
+    "telecom.py": ex_telecom,
     "cloud189.py": ex_cloud189,
     "workbuddy.py": ex_workbuddy,
     "modelscope.py": ex_modelscope,
