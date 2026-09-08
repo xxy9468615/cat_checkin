@@ -83,14 +83,35 @@ class TestTelecom(unittest.TestCase):
             "HTTP/2 200\n"
             "server: openresty\n"
             "content-type: application/json\n\n"
-            '{"userNum":"59520b8b61ce29e4f5f209bcfec473b6","resoultCode":"0",'
-            '"sign":"090130fc70bf4933a94a585358f3de80","accId":"xxx","resoultMsg":"请求成功"}'
+            '{"userNum":"mock_user_num_aabbccddeeff1122","resoultCode":"0",'
+            '"sign":"mock_sign_token_aabbccddeeff1122","accId":"xxx","resoultMsg":"请求成功"}'
         )
         fake_env = {"TELECOM_HEADER_1": multiline_capture}
         with patch.dict(os.environ, fake_env, clear=True):
             accounts = telecom.load_all_accounts()
             self.assertEqual(len(accounts), 1)
-            self.assertEqual(accounts[0].sign, "090130fc70bf4933a94a585358f3de80")
+            self.assertEqual(accounts[0].sign, "mock_sign_token_aabbccddeeff1122")
+
+    def test_parse_full_http_request_with_cookies(self):
+        """完整 HTTP 请求抓包解析（全量虚拟 Mock 数据：Cookie、UA、distinct_id 手机号反解与 sign）。"""
+        # MTg5MDAxMjM0NTY= 为虚拟手机号 18900123456 的 Base64
+        # UA 中的 MTIzNDU2!#!MTg5MDA 为 18900 与 123456 的分段 Base64
+        raw = (
+            "POST /jt-sign/webSign/homepage HTTP/2\n"
+            "host: wappark.189.cn\n"
+            "user-agent: CtClient;13.4.0;Android;9;mock_device;MTIzNDU2!#!MTg5MDA\n"
+            "sign: mock_sign_token_aabbccddeeff9988\n"
+            "cookie: 3k9kkc0re5ZOO=mock_cookie_val_1\n"
+            "cookie: zhizhendata2015jssdkcross=%7B%22distinct_id%22%3A%22MTg5MDAxMjM0NTY%3D%22%7D\n\n"
+            '{"para":"mock_payload_data"}'
+        )
+        acc = telecom._parse_account_config(raw, 1)
+        self.assertEqual(acc.sign, "mock_sign_token_aabbccddeeff9988")
+        self.assertEqual(acc.phone, "18900123456")
+        self.assertIn("CtClient;13.4.0", acc.user_agent)
+        self.assertIn("3k9kkc0re5ZOO", acc.cookie)
+        self.assertIn("zhizhendata2015jssdkcross", acc.cookie)
+        self.assertTrue(acc.has_credentials())
 
     def test_load_all_accounts_empty(self):
         """缺省无凭证处理。"""

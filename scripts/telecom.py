@@ -22,6 +22,7 @@ import re
 import string
 import sys
 import time
+import urllib.parse
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -130,11 +131,17 @@ class TelecomAccount:
         phone: str = "",
         sign: str = "",
         authorization: str = "",
+        cookie: str = "",
+        user_agent: str = "",
+        extra_headers: Optional[Dict[str, str]] = None,
     ):
         self.index = index
         self.phone = phone.strip()
         self.sign = sign.strip()
         self.authorization = authorization.strip()
+        self.cookie = cookie.strip()
+        self.user_agent = user_agent.strip()
+        self.extra_headers = extra_headers or {}
 
     @property
     def display_name(self) -> str:
@@ -149,79 +156,133 @@ class TelecomAccount:
 
 
 def _parse_account_config(raw: str, index: int) -> TelecomAccount:
-    """从抓包整串中智能解析 phone, sign, authorization。"""
+    """从抓包整串中智能解析 phone, sign, authorization, cookie, user_agent, extra_headers。"""
     raw = (raw or "").strip()
     if not raw:
         return TelecomAccount(index)
 
-    # 1. 优先尝试提取并解析 JSON（支持纯 JSON 或抓包响应/请求体中内嵌的 JSON）
+    phone = ""
+    sign = ""
+    auth = ""
+    cookies: List[str] = []
+    user_agent = ""
+    extra_headers: Dict[str, str] = {}
+
+    # 1. 逐行提取 Header
+    for line in raw.splitlines():
+        l = line.strip()
+        if not l or ":" not in l:
+            continue
+        k, v = l.split(":", 1)
+        k_low = k.strip().lower()
+        v_val = v.strip().strip("\"'")
+        if k_low == "cookie":
+            if v_val:
+                cookies.append(v_val)
+        elif k_low == "user-agent":
+            user_agent = v_val
+        elif k_low == "sign" and re.match(r"^[0-9a-zA-Z_-]{16,128}$", v_val):
+            sign = v_val
+        elif k_low in ("authorization", "auth"):
+            auth = v_val
+        elif k_low in ("vx3b5xuq", "x-requested-with"):
+            extra_headers[k.strip()] = v_val
+
+    # 2. 检查内嵌 JSON
     m_json = re.search(r"(\{[\s\S]*\})", raw)
     if m_json:
         try:
             d = json.loads(m_json.group(1))
             if isinstance(d, dict):
-                phone = str(d.get("phone") or d.get("mobile") or d.get("username") or "")
-                sign = str(d.get("sign") or d.get("sign_token") or "")
-                auth = str(d.get("authorization") or d.get("token") or d.get("auth") or "")
-                if sign or auth:
-                    return TelecomAccount(
-                        index=index,
-                        phone=phone,
-                        sign=sign,
-                        authorization=auth,
-                    )
+                if not phone:
+                    p = str(d.get("phone") or d.get("mobile") or d.get("username") or "")
+                    if re.match(r"^1\d{10}$", p):
+                        phone = p
+                if not sign:
+                    s = str(d.get("sign") or d.get("sign_token") or "")
+                    if s:
+                        sign = s
+                if not auth:
+                    a = str(d.get("authorization") or d.get("token") or d.get("auth") or "")
+                    if a:
+                        auth = a
         except Exception:
             pass
 
-    # 2. Key-Value 串或 Header 行串: phone=xxx; sign=yyy; auth=zzz 或换行分隔
-    if ("=" in raw or ":" in raw) and (";" in raw or "&" in raw or "\n" in raw or "sign" in raw.lower()):
-        kv: Dict[str, str] = {}
-        # 兼容换行、分号、与号
-        items = re.split(r"[;&\n]+", raw)
-        for item in items:
-            item = item.strip()
-            if not item:
-                continue
-            if "=" in item:
-                k, v = item.split("=", 1)
-                kv[k.strip().lower()] = v.strip().strip("\"'")
-            elif ":" in item:
-                k, v = item.split(":", 1)
-                kv[k.strip().lower()] = v.strip().strip("\"'")
-        if kv:
-            phone = kv.get("phone") or kv.get("mobile") or kv.get("username") or ""
-            sign = kv.get("sign") or kv.get("signtoken") or ""
-            auth = kv.get("authorization") or kv.get("token") or kv.get("auth") or ""
-            if any([phone, sign, auth]):
-                return TelecomAccount(index=index, phone=phone, sign=sign, authorization=auth)
-
-    # 3. 经典格式: 手机号#sign 或 手机号#sign#auth
-    if "#" in raw:
+    # 3. 经典格式: 手机号#sign 或 手机号#sign#auth（单行且无换行）
+    if "#" in raw and not ("\n" in raw or "{" in raw):
         parts = [p.strip() for p in raw.split("#")]
         if len(parts) == 2:
-            return TelecomAccount(index=index, phone=parts[0], sign=parts[1])
-        if len(parts) >= 3:
-            return TelecomAccount(index=index, phone=parts[0], sign=parts[1], authorization=parts[2])
+            phone = parts[0]
+            sign = parts[1]
+        elif len(parts) >= 3:
+            phone = parts[0]
+            sign = parts[1]
+            auth = parts[2]
 
-    # 4. 正则兜底提取 sign
-    m_sign = re.search(r"['\"]?sign['\"]?\s*[:=]\s*['\"]?([0-9a-zA-Z]{24,64})['\"]?", raw)
-    m_phone = re.search(r"['\"]?(?:phone|mobile|userLoginName)['\"]?\s*[:=]\s*['\"]?(\d{11})['\"]?", raw)
-    m_auth = re.search(r"['\"]?(?:authorization|token|auth)['\"]?\s*[:=]\s*['\"]?(Bearer\s+[^\s\"',;]+|[0-9a-zA-Z_-]{20,})['\"]?", raw, re.I)
-    if m_sign or m_auth:
-        return TelecomAccount(
-            index=index,
-            phone=m_phone.group(1) if m_phone else "",
-            sign=m_sign.group(1) if m_sign else "",
-            authorization=m_auth.group(1) if m_auth else "",
+    # 4. Key-Value 串或正则补充提取 sign 与 auth
+    if not sign:
+        m_sign = re.search(r"['\"]?sign['\"]?\s*[:=]\s*['\"]?([0-9a-zA-Z_-]{16,128})['\"]?", raw)
+        if m_sign:
+            sign = m_sign.group(1)
+    if not auth:
+        m_auth = re.search(
+            r"['\"]?(?:authorization|token|auth)['\"]?\s*[:=]\s*['\"]?(Bearer\s+[^\s\"',;]+|[0-9a-zA-Z_-]{16,128})['\"]?",
+            raw,
+            re.I,
         )
+        if m_auth:
+            auth = m_auth.group(1)
 
-    # 5. 单值推断（仅提供 sign 或 Bearer 串）
-    if raw.startswith("Bearer "):
-        return TelecomAccount(index=index, authorization=raw)
-    if len(raw) >= 32 and re.match(r"^[0-9a-zA-Z]+$", raw):
-        return TelecomAccount(index=index, sign=raw)
+    # 5. 提取明文手机号
+    if not phone:
+        m_phone = re.search(r"['\"]?(?:phone|mobile|userLoginName)['\"]?\s*[:=]\s*['\"]?(\d{11})['\"]?", raw)
+        if m_phone:
+            phone = m_phone.group(1)
 
-    return TelecomAccount(index=index, sign=raw)
+    # 6. 从 cookies / distinct_id 逆向解析手机号（神策/统计 SDK distinct_id base64 编码的手机号）
+    if not phone and (cookies or "distinct_id" in raw):
+        unq = urllib.parse.unquote(raw)
+        m_dist = re.search(r'\"distinct_id\"\s*:\s*\"([A-Za-z0-9+/=]{12,24})\"', unq)
+        if m_dist:
+            try:
+                b = base64.b64decode(m_dist.group(1)).decode("utf-8")
+                if re.match(r"^1\d{10}$", b):
+                    phone = b
+            except Exception:
+                pass
+
+    # 7. 从 CtClient User-Agent 逆向解析手机号 (如 NTUxMTA5!#!MTc3NjI -> 17762 + 551109)
+    if not phone and user_agent:
+        m_uaph = re.search(r"CtClient;[^;\r\n]+;([A-Za-z0-9+/=]+)!#!([A-Za-z0-9+/=]+)", user_agent)
+        if m_uaph:
+            try:
+                p1 = base64.b64decode(m_uaph.group(1)).decode("utf-8")
+                p2 = base64.b64decode(m_uaph.group(2)).decode("utf-8")
+                if re.match(r"^1\d{10}$", p2 + p1):
+                    phone = p2 + p1
+                elif re.match(r"^1\d{10}$", p1 + p2):
+                    phone = p1 + p2
+            except Exception:
+                pass
+
+    # 8. 单值推断（仅提供 sign 或 Bearer 串）
+    if not sign and not auth:
+        if raw.startswith("Bearer "):
+            auth = raw
+        elif len(raw) >= 32 and re.match(r"^[0-9a-zA-Z]+$", raw):
+            sign = raw
+
+    cookie_str = "; ".join(cookies)
+    return TelecomAccount(
+        index=index,
+        phone=phone,
+        sign=sign,
+        authorization=auth,
+        cookie=cookie_str,
+        user_agent=user_agent,
+        extra_headers=extra_headers,
+    )
 
 
 def load_all_accounts() -> List[TelecomAccount]:
@@ -261,6 +322,9 @@ class TelecomClient:
         self.phone = account.phone
         self.sign = account.sign
         self.authorization = account.authorization
+        self.cookie = account.cookie
+        self.user_agent = account.user_agent
+        self.extra_headers = dict(account.extra_headers)
         self.state_file = f".telecom_state_{account.index}.json"
         self.redis_key = f"cat_checkin:state:telecom_{account.index}"
 
@@ -273,7 +337,17 @@ class TelecomClient:
         data: Any = None,
         timeout: int = 15,
     ) -> Dict[str, Any]:
-        h = {"User-Agent": UA_MOBILE}
+        h = {
+            "User-Agent": self.user_agent or UA_MOBILE,
+            "Origin": "https://wappark.189.cn",
+            "Referer": "https://wappark.189.cn/resources/dist/signNew.html",
+            "X-Requested-With": "com.ct.client",
+            "Accept": "application/json, text/plain, */*",
+        }
+        if self.cookie:
+            h["Cookie"] = self.cookie
+        if self.extra_headers:
+            h.update(self.extra_headers)
         if headers:
             h.update(headers)
         try:
@@ -303,6 +377,10 @@ class TelecomClient:
             self.sign = str(state.get("sign"))
         if not self.authorization and state.get("authorization"):
             self.authorization = str(state.get("authorization"))
+        if not self.cookie and state.get("cookie"):
+            self.cookie = str(state.get("cookie"))
+        if not self.user_agent and state.get("user_agent"):
+            self.user_agent = str(state.get("user_agent"))
 
         if self.sign or self.authorization:
             print(f"    [keepalive] 成功加载账号缓存会话 (更新于: {state.get('updated_at', '未知')})", flush=True)
@@ -315,6 +393,8 @@ class TelecomClient:
             "phone": self.phone,
             "sign": self.sign,
             "authorization": self.authorization,
+            "cookie": self.cookie,
+            "user_agent": self.user_agent,
             "updated_at": datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S"),
         }
         save_kv_state(self.redis_key, self.state_file, state)
