@@ -44,7 +44,7 @@ test_data/
 *.bak
 *.backup
 *.old
-
+scripts/tests/
 # ---- 抓包与本地资料（永不提交）----
 *.har
 s5.txt
