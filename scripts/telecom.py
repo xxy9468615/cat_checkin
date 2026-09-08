@@ -227,13 +227,23 @@ def _parse_account_config(raw: str, index: int) -> TelecomAccount:
 def load_all_accounts() -> List[TelecomAccount]:
     """多账号序列加载：统一按 App 抓包整串（TELECOM_HEADER_1, TELECOM_HEADER_2...）设定。"""
     accounts: List[TelecomAccount] = []
-    hdr_seq = env_seq(PREFIX, "HEADER", default=[], required=False)
-    if not hdr_seq:
-        single = os.getenv("TELECOM_HEADER", "").strip()
-        if single:
-            hdr_seq = [single]
+    # 逐序号直接获取环境变量，保留整串内部的换行与结构，不被通用 env_seq 误按行切分
+    idx = 1
+    raw_list: List[str] = []
+    while True:
+        val = os.getenv(f"TELECOM_HEADER_{idx}") or os.getenv(f"telecom_header_{idx}")
+        if val not in (None, ""):
+            raw_list.append(val)
+            idx += 1
+        else:
+            break
 
-    for idx, item in enumerate(hdr_seq, 1):
+    if not raw_list:
+        single = os.getenv("TELECOM_HEADER", "").strip() or os.getenv("TELECOM_header", "").strip()
+        if single:
+            raw_list = [single]
+
+    for idx, item in enumerate(raw_list, 1):
         acc = _parse_account_config(item, idx)
         if acc.has_credentials():
             accounts.append(acc)
@@ -315,7 +325,19 @@ class TelecomClient:
         if not (self.sign or self.authorization):
             return False
 
-        # 若未指定手机号，尝试从金豆个人中心反查
+        # 若未指定手机号，优先尝试复用同账号序号的 CLOUD189 手机号配置
+        if not self.phone:
+            cloud189_user = (
+                os.getenv(f"CLOUD189_USERNAME_{self.acc.index}")
+                or os.getenv("CLOUD189_USERNAME")
+                or os.getenv("CLOUD189_username")
+                or ""
+            ).strip()
+            if re.match(r"^1\d{10}$", cloud189_user):
+                self.phone = cloud189_user
+                self.acc.phone = cloud189_user
+
+        # 若仍未指定手机号，尝试从金豆个人中心反查
         if self.sign and not self.phone and HAS_CRYPTO:
             try:
                 info_res = self._req(

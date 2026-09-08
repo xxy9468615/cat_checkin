@@ -77,6 +77,21 @@ class TestTelecom(unittest.TestCase):
             self.assertEqual(accounts[1].phone, "18933334444")
             self.assertEqual(accounts[1].sign, "sign_token_user_two")
 
+    def test_load_all_accounts_multiline(self):
+        """多行抓包整串应保持单账号而不被按行拆分。"""
+        multiline_capture = (
+            "HTTP/2 200\n"
+            "server: openresty\n"
+            "content-type: application/json\n\n"
+            '{"userNum":"59520b8b61ce29e4f5f209bcfec473b6","resoultCode":"0",'
+            '"sign":"090130fc70bf4933a94a585358f3de80","accId":"xxx","resoultMsg":"请求成功"}'
+        )
+        fake_env = {"TELECOM_HEADER_1": multiline_capture}
+        with patch.dict(os.environ, fake_env, clear=True):
+            accounts = telecom.load_all_accounts()
+            self.assertEqual(len(accounts), 1)
+            self.assertEqual(accounts[0].sign, "090130fc70bf4933a94a585358f3de80")
+
     def test_load_all_accounts_empty(self):
         """缺省无凭证处理。"""
         with patch.dict(os.environ, {}, clear=True):
