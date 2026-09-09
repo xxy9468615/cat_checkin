@@ -96,6 +96,41 @@ class PlanModeTests(unittest.TestCase):
         # modelscope 熔断跳过；其配对实例 modelscope_ai 独立判定，仍到期
         self.assertEqual(due, ["modelscope_ai", "juejin"])
 
+    def test_auto_plan_skips_successful_today(self):
+        """自动全量巡检模式（raw_tasks=""）：今日已成功的任务自动跳过，未成功的任务判定为到期。"""
+        fake_successful = {"glados", "smzdm", "telecom"}
+        with patch.object(orch_mod, "_get_today_successful_tasks", return_value=fake_successful), \
+             patch.object(orch_mod, "is_task_suspended", return_value=False), \
+             patch.object(orch_mod, "_latvi_signed_today", return_value=True), \
+             patch.object(orch_mod, "_cooldown_due_at", return_value=None), \
+             patch.object(orch_mod, "load_circuit_state", return_value={}):
+            due = plan_due_tasks("", due_only=False)
+        self.assertNotIn("glados", due)
+        self.assertNotIn("smzdm", due)
+        self.assertNotIn("telecom", due)
+        self.assertNotIn("latvi", due)
+        self.assertIn("alipan", due)
+        self.assertIn("52pojie", due)
+
+    def test_auto_plan_skips_tasks_in_backoff(self):
+        """今日失败但处于退避等待期（next_retry_at > now）的任务跳过，等待下次到期。"""
+        now = time.time()
+        today = orch_mod.bjt_now().strftime("%Y-%m-%d")
+        fake_circuit = {
+            "attempt_date": today,
+            "attempts": 2,
+            "next_retry_at": now + 1800,  # 30 分钟后到期
+        }
+        with patch.object(orch_mod, "_get_today_successful_tasks", return_value=set()), \
+             patch.object(orch_mod, "is_task_suspended", return_value=False), \
+             patch.object(orch_mod, "_latvi_signed_today", return_value=True), \
+             patch.object(orch_mod, "_cooldown_due_at", return_value=None), \
+             patch.object(orch_mod, "load_circuit_state",
+                          side_effect=lambda tid: fake_circuit if tid == "52pojie" else {}):
+            due = plan_due_tasks("", due_only=False)
+        self.assertNotIn("52pojie", due, "处于重试退避冷却期的任务不应立即到期")
+        self.assertIn("alipan", due)
+
 
 if __name__ == "__main__":
     unittest.main()

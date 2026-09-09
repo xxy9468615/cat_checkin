@@ -350,13 +350,20 @@ def main() -> None:
 
     push_enabled = os.getenv("DAILY_PUSH", "true").lower() not in {"0", "false", "no"}
     archive_only = os.getenv("ARCHIVE_ONLY", "0").lower() in {"1", "true", "yes"}
+    retry_report = env_bool("RETRY_REPORT")
+    report_fallback = os.getenv("REPORT_FALLBACK", "0").lower() in {"1", "true", "yes"}
+    pending_count = sum(1 for d in collected.values() if d.get("is_pending") or d.get("status") == "pending")
+
     if push_enabled and archive_only:
-        # 心跳轮询 run（DUE_ONLY 心跳 cron）：仅归档刷新当日汇总 + 输出 failed_matrix，
-        # 不发邮件、不写 marker（每日邮件日报仍由主 run 承担）
-        print("📡 心跳归档模式（ARCHIVE_ONLY）：跳过邮件推送，仅归档当日汇总")
+        print("📡 归档模式（ARCHIVE_ONLY）：跳过邮件推送，仅归档当日汇总")
         archive_daily_summary(collected, today)
         if fail_count:
             sys.exit(1)
+        return
+
+    if push_enabled and not retry_report and not report_fallback and pending_count > 3:
+        print(f"📡 仍有 {pending_count} 个任务待执行，日常邮件推迟至全量批次完成或晚间兜底（本次仅归档）")
+        archive_daily_summary(collected, today)
         return
     if push_enabled:
         if retry_report:

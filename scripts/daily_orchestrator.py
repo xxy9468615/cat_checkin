@@ -1,40 +1,45 @@
 #!/usr/bin/env python3
 # new Env("Daily Unified Orchestrator")
-"""Single-run inline daily check-in orchestrator."""
+"""Inline daily check-in orchestrator with automatic catch-up and circuit breaking."""
 from __future__ import annotations
-import argparse, heapq, json, os, re, signal, subprocess, sys, time
+
+import argparse
+import heapq
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait as wait_futures
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+
 BASE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BASE_DIR.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
+
 from common import BJT, upstash_redis_command
 from alert_levels import detect_unconfigured
 from discord_notify import notify_task_result, notify_unconfigured
 from task_registry import TASKS, resolve_execution_queue
 from circuit_breaker import (
     is_task_suspended,
+    load_circuit_state,
     record_task_outcome,
     resume_task,
     resume_all_tasks,
     save_suspended_result_record,
     MAX_DAILY_ATTEMPTS,
 )
+
 TRAVEL_EVENT_RE = re.compile(r"TRAVEL_EVENT\s+state=(\w+)\s+arrive_at=(\d+)")
 
 
 def _merge_result(prev: Any, ok: bool, unconf: bool, suspended: bool = False) -> Any:
-    """多轮执行结果合并（True=有成功轮 / False=有真实失败轮 / "suspended"=已熔断停用 / "unconfigured"=仅有未配置轮）。
-
-    优先级 True > False > "suspended" > "unconfigured"：
-    - 任一轮成功即成功；
-    - 若此前或当前成功过，保持 True；
-    - 若触发了熔断且之前没有成功轮，结果收敛为 "suspended"；
-    - 真实失败压过未配置。
-    """
     if prev is True or ok is True:
         return True
     if suspended:
@@ -48,14 +53,20 @@ def _merge_result(prev: Any, ok: bool, unconf: bool, suspended: bool = False) ->
         return False
     return "unconfigured"
 
+
 def bjt_now() -> datetime:
     return datetime.now(BJT)
+
+
 def _hm_today_ts(hm: str) -> float:
     h, m = (int(x) for x in hm.split(":"))
-    d = bjt_now().replace(hour=h, minute=m, second=0, microsecond=0)
-    return d.timestamp()
+    return bjt_now().replace(hour=h, minute=m, second=0, microsecond=0).timestamp()
+
+
 def _fmt_bjt(ts: float) -> str:
     return datetime.fromtimestamp(ts, BJT).strftime("%H:%M:%S")
+
+
 def _read_latvi_last_sign() -> Optional[float]:
     prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
     try:
@@ -66,8 +77,8 @@ def _read_latvi_last_sign() -> Optional[float]:
                 data = json.loads(raw) if isinstance(raw, str) else raw
                 if isinstance(data, dict) and data.get("last_sign_ts"):
                     return float(data["last_sign_ts"])
-    except Exception as e:
-        print(f"WARN: read Latvi Redis state failed: {e}", file=sys.stderr)
+    except Exception:
+        pass
     state_file = Path(os.getenv("LATVI_STATE_FILE", str(ROOT_DIR / ".latvi_state.json")))
     if not state_file.is_absolute():
         state_file = ROOT_DIR / state_file
@@ -79,12 +90,60 @@ def _read_latvi_last_sign() -> Optional[float]:
         except Exception:
             pass
     return None
+
+
 def _latvi_signed_today() -> bool:
-    """latvi 今日是否已签（与 latvi.py 的当日去重口径一致，供 --plan 评估）。"""
     last = _read_latvi_last_sign()
     if not last:
         return False
     return datetime.fromtimestamp(last, BJT).date() == bjt_now().date()
+
+
+def _get_today_successful_tasks() -> Set[str]:
+    """获取今日已成功执行的任务 ID 集合（通过 Redis 与本地结果目录双通道校验）。"""
+    today = bjt_now().strftime("%Y-%m-%d")
+    succeeded_tasks: Set[str] = set()
+    result_to_id = {cfg["result"]: tid for tid, cfg in TASKS.items()}
+
+    prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
+    raw_key = f"{prefix}:raw:{today}"
+    try:
+        ok, res = upstash_redis_command(["HGETALL", raw_key])
+        if ok and isinstance(res, dict):
+            raw_hash = res.get("result")
+            field_map = {}
+            if isinstance(raw_hash, dict):
+                field_map = raw_hash
+            elif isinstance(raw_hash, list):
+                for i in range(0, len(raw_hash), 2):
+                    if i + 1 < len(raw_hash):
+                        field_map[str(raw_hash[i])] = raw_hash[i + 1]
+            for field, val in field_map.items():
+                if field in result_to_id:
+                    try:
+                        data = json.loads(val) if isinstance(val, str) else val
+                        if isinstance(data, dict) and data.get("ok") is True and data.get("date") == today:
+                            succeeded_tasks.add(result_to_id[field])
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    out_dir = Path(os.getenv("TASK_OUTPUT_DIR", ".task_results"))
+    if out_dir.exists() and out_dir.is_dir():
+        for res_file, tid in result_to_id.items():
+            fpath = out_dir / res_file
+            if fpath.exists():
+                try:
+                    data = json.loads(fpath.read_text(encoding="utf-8"))
+                    if isinstance(data, dict) and data.get("ok") is True and data.get("date") == today:
+                        succeeded_tasks.add(tid)
+                except Exception:
+                    pass
+
+    return succeeded_tasks
+
+
 def build_task_env(cfg: Dict[str, Any]) -> Dict[str, str]:
     env = os.environ.copy()
     env.setdefault("TZ", "Asia/Shanghai")
@@ -96,13 +155,9 @@ def build_task_env(cfg: Dict[str, Any]) -> Dict[str, str]:
         cookie = os.getenv(f"WORKBUDDY_COOKIE_{n}", "") or (os.getenv("WORKBUDDY_COOKIE", "") if n == "1" else "")
         refresh = os.getenv(f"WORKBUDDY_REFRESH_TOKEN_{n}", "") or (os.getenv("WORKBUDDY_REFRESH_TOKEN", "") if n == "1" else "")
         if not cookie and not refresh:
-            # 缺失时若静默继承父进程的其他账号 cookie：两个并发子进程踩同一账号、
-            # 结果还写进账号 n 的 JSON 名下（张冠李戴且无告警）——必须显式失败
             raise RuntimeError(
-                f"workbuddy 账号 {n} 缺少 WORKBUDDY_COOKIE_{n}/WORKBUDDY_REFRESH_TOKEN_{n}（secret 未配置或为空），拒绝继承其他账号的凭据"
+                f"workbuddy 账号 {n} 缺少 WORKBUDDY_COOKIE_{n}/WORKBUDDY_REFRESH_TOKEN_{n}，拒绝继承其他账号凭据"
             )
-        # 隔离当前子进程凭证：清除所有 WORKBUDDY_COOKIE_*/REFRESH_TOKEN_*，
-        # 只保留当前账号的单个凭据与 _1 别名（refresh_token 优先，cookie 兜底）
         for k in list(env.keys()):
             if re.match(r"^(QL_)?WORKBUDDY_(COOKIE|REFRESH_TOKEN)(_\d+)?$", k, re.I):
                 del env[k]
@@ -110,32 +165,22 @@ def build_task_env(cfg: Dict[str, Any]) -> Dict[str, str]:
         env["WORKBUDDY_COOKIE_1"] = cookie
         env["WORKBUDDY_REFRESH_TOKEN"] = refresh
         env["WORKBUDDY_REFRESH_TOKEN_1"] = refresh
-        # 子进程内账号重编号为 1，workbuddy.py 的 Redis 滚动票键靠它映射真实账号
         env["WORKBUDDY_ACCOUNT_IDX"] = n
         env["WORKBUDDY_WAIT_TRAVEL"] = "true"
-        # WORKBUDDY_NO_RELAY 不再注入（2026-09-06 运行模型改造）：领奖回程由
-        # workbuddy 自身经 QStash 派发 workbuddy_travel_claim 接力，run 即时结束
     if cfg["id"] == "latvi":
-        # LATVI_NO_RELAY 不再注入：窗口等待由 latvi 自接力（latvi_next_sign）承载，
-        # 主 run 不再为 18:00 窗口原地挂起数小时
         env.setdefault("LATVI_STATE_FILE", ".latvi_state.json")
-    # 通用注入：registry 任务的私有环境变量（如 modelscope 的 MODELSCOPE_SITE）、
-    # 结果文件名（同脚本多实例隔离落盘，如 modelscope_ai.json）与邮件卡片标题
     for k, v in (cfg.get("env") or {}).items():
         env[str(k)] = str(v)
-    env["TASK_ID"] = cfg["id"]  # 供脚本回写调度状态（如 last_credit_ts）
+    env["TASK_ID"] = cfg["id"]
     if cfg.get("result"):
         env["TASK_RESULT_NAME"] = cfg["result"]
     if cfg.get("name"):
         env["TASK_TITLE"] = cfg["name"]
     return env
-def _cooldown_due_at(cfg: Dict[str, Any]) -> Optional[float]:
-    """滚动冷却型任务的下次到期时刻（epoch）；无 sched 元数据/无状态 → None（视为已到期）。
 
-    状态来源：脚本自身回写通知状态的 last_credit_ts（如 modelscope 的 daily_active
-    发放时刻）。这就是「按上次签到时间执行」的实现——心跳 cron 只提供轮询频率，
-    是否真正执行由该状态决定。
-    """
+
+def _cooldown_due_at(cfg: Dict[str, Any]) -> Optional[float]:
+    """滚动冷却型任务的下次到期时刻（epoch）；无 sched 元数据/无状态 → None（视为已到期）。"""
     sched = cfg.get("sched") or {}
     if sched.get("type") != "rolling":
         return None
@@ -158,7 +203,15 @@ def run_task_subprocess(cfg: Dict[str, Any]) -> Tuple[bool, str]:
     try:
         env = build_task_env(cfg)
         cmd = [sys.executable, "-u", str(BASE_DIR / "run_task.py"), cfg["script"]]
-        proc = subprocess.Popen(cmd, cwd=str(ROOT_DIR), env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT_DIR),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
     except Exception as exc:
         return False, f"failed to spawn: {exc}"
     try:
@@ -174,27 +227,30 @@ def run_task_subprocess(cfg: Dict[str, Any]) -> Tuple[bool, str]:
             out = ""
         out = f"[orchestrator kill >{cap}s]\n{(out or '')}"
     return proc.returncode == 0, (out or "").strip()
+
+
 class Orchestrator:
-    def __init__(self, hard_deadline: float) -> None:
-        self.hard_deadline = hard_deadline
+    def __init__(self, hard_deadline: float = 0.0) -> None:
+        self.hard_deadline = hard_deadline or (time.time() + 7200)
         self.heap: List[Tuple[float, int, str, Optional[Dict[str, Any]]]] = []
         self.seq = 0
         self.results: Dict[str, Any] = {}
         self.executor = ThreadPoolExecutor(max_workers=int(os.getenv("BATCH_PARALLEL", "4")))
         self.futures: Dict[Future, Tuple[str, Optional[Dict[str, Any]]]] = {}
-        self.dropped = 0
+
     def push(self, fire_at: float, kind: str, cfg: Optional[Dict[str, Any]] = None) -> None:
         heapq.heappush(self.heap, (fire_at, self.seq, kind, cfg))
         self.seq += 1
+
     def _label(self, kind: str, cfg: Optional[Dict[str, Any]]) -> str:
         return cfg["id"] if cfg else kind
+
     def _submit(self, kind: str, cfg: Optional[Dict[str, Any]]) -> None:
         fut = self.executor.submit(run_task_subprocess, cfg or {})
         self.futures[fut] = (kind, cfg)
+
     def _on_task_done(self, cfg: Dict[str, Any], ok: bool, out: str) -> None:
         tid = cfg["id"]
-        # ⚪ 凭据未配置（非故障）：新任务 Secret 尚未配置时按跳过处理——
-        # 不推红色失败卡、不触发自动重跑、不计入 run 失败退出码（重跑解决不了没配凭据）
         unconf = (not ok) and bool(detect_unconfigured(out or ""))
         suspended = False
         circuit_info = {}
@@ -213,21 +269,15 @@ class Orchestrator:
             print(out)
         print(f"{'='*60}")
         if unconf:
-            print(f"  ⚪ 凭据未配置，按跳过处理（不推失败卡/不触发重跑）")
+            print(f"  ⚪ 凭据未配置，按跳过处理")
         elif suspended:
-            print(f"  🛑 任务已达 {MAX_DAILY_ATTEMPTS} 次重试上限，触发熔断停用！后续自动调度将跳过，等待人工修复后上线")
+            print(f"  🛑 任务已达 {MAX_DAILY_ATTEMPTS} 次重试上限，触发熔断停用！等待人工修复后上线")
         elif not ok:
             next_retry_at = circuit_info.get("next_retry_at")
             attempts = circuit_info.get("attempts", 1)
             if next_retry_at:
-                # 2026-09-06 运行模型改造：不再把重试压入进程内堆等待（曾导致 run
-                # 为 15m~3h 重试梯子挂起数小时）。重试统一跨 run 承载：
-                # workflow auto-retry 经 QStash 延时回调 checkin_retry，心跳
-                # （30min）get-due-retries 到期拾取兜底。
-                print(f"  🔁 [分时段重试] [{tid}] 第 {attempts+1}/{MAX_DAILY_ATTEMPTS} 次重试安排在 {_fmt_bjt(next_retry_at)}，交由延时接力（本 run 不等待）")
-        # 频道1 失败提醒（Discord）：任务失败/超时/异常的瞬间推失败卡；成功只记状态不推；
-        # 凭据未配置推黄色提示卡（同任务同日一次）
-        # （best-effort，绝不阻塞调度；每日日报走邮件，由 unified_report 统一汇总发送）
+                print(f"  🔁 [分时段重试] [{tid}] 第 {attempts+1}/{MAX_DAILY_ATTEMPTS} 次重试安排在 {_fmt_bjt(next_retry_at)}")
+
         try:
             if unconf:
                 notify_unconfigured(
@@ -246,30 +296,23 @@ class Orchestrator:
                 )
         except Exception as exc:
             print(f"WARN: Discord 失败提醒推送失败: {exc}", file=sys.stderr)
-        # workbuddy 领奖回程不再由 orchestrator 进程内排队回访（TRAVEL_EVENT 仅留
-        # 日志观测）：workbuddy 自接力 workbuddy_travel_claim 承载，run 即时结束
+
         for _m in TRAVEL_EVENT_RE.findall(out or "")[-1:]:
             print(f"  -> travel event {_m[0]} (回程由 workbuddy 接力派发，本 run 不等待)")
+
     def run(self) -> int:
         due_only = os.getenv("DUE_ONLY", "0").lower() in {"1", "true", "yes"}
         while self.heap or self.futures:
             now = time.time()
             while self.heap and self.heap[0][0] <= now:
                 fire, _, kind, cfg = heapq.heappop(self.heap)
-                if fire > self.hard_deadline:
-                    print(f"dropping event [{self._label(kind, cfg)}] past hard wall")
-                    self.dropped += 1
-                    continue
-                # 检查是否已熔断停用（8次失败上限，等待修复后上线）
                 if cfg:
                     tid = cfg["id"]
                     if is_task_suspended(tid):
-                        print(f"🛑 [CIRCUIT_BREAKER] 任务 [{tid}] 已熔断停用（8次失败上限），跳过执行，等待修复后上线")
+                        print(f"🛑 [CIRCUIT_BREAKER] 任务 [{tid}] 已熔断停用，跳过执行")
                         save_suspended_result_record(tid, "已熔断停用，跳过执行")
                         self.results[tid] = "suspended"
                         continue
-                # 心跳轮询（DUE_ONLY=1）：滚动冷却任务未到期则秒级跳过，
-                # 是否执行完全由 last_credit_ts 状态决定，与 cron 时刻无关
                 if due_only and cfg:
                     due_at = _cooldown_due_at(cfg)
                     if due_at and due_at > now:
@@ -279,22 +322,11 @@ class Orchestrator:
             if not self.heap and not self.futures:
                 break
             if self.futures:
-                timeout: Optional[float] = None
-                if self.heap and self.heap[0][0] <= self.hard_deadline:
-                    timeout = max(0.0, self.heap[0][0] - time.time())
+                timeout = max(0.0, self.heap[0][0] - time.time()) if self.heap else None
                 done, _ = wait_futures(list(self.futures), timeout=timeout, return_when=FIRST_COMPLETED)
             else:
-                # concurrent.futures.wait 对空集合立即返回（忽略 timeout），
-                # futures 为空时必须 sleep 等堆顶事件，否则主循环 100% CPU 忙等数小时
                 top = self.heap[0][0]
-                if top > self.hard_deadline:
-                    # 堆有序：堆顶越硬墙则剩余事件全部必被丢弃，直接清堆退出
-                    while self.heap:
-                        fire, _, kind, cfg = heapq.heappop(self.heap)
-                        print(f"dropping event [{self._label(kind, cfg)}] past hard wall")
-                        self.dropped += 1
-                    break
-                time.sleep(min(top - time.time(), 60.0))
+                time.sleep(min(max(0.1, top - time.time()), 60.0))
                 continue
             for fut in done:
                 kind, cfg = self.futures.pop(fut)
@@ -304,12 +336,8 @@ class Orchestrator:
                     ok, out = False, f"orchestrator error: {exc}"
                 if cfg:
                     self._on_task_done(cfg, ok, out)
+
         print(f"\n{'#'*60}\nOrchestrator done: {len(self.results)} task instances")
-        if not self.results and self.dropped:
-            # 硬墙后启动的 run 全部事件被 drop 却 exit 0 → workflow 绿色但什么都没干，必须显式失败
-            print(f"WARNING: no tasks executed — {self.dropped} event(s) dropped past hard wall "
-                  f"{os.getenv('ORCH_HARD_DEADLINE', '19:55')} BJT（run 启动过晚）")
-            return 1
         failed = [k for k, v in self.results.items() if v is False]
         skipped = [k for k, v in self.results.items() if v == "unconfigured"]
         suspended = [k for k, v in self.results.items() if v == "suspended"]
@@ -317,44 +345,23 @@ class Orchestrator:
             mark = "OK" if res is True else ("SKIP(未配置)" if res == "unconfigured" else ("SUSPENDED(已熔断)" if res == "suspended" else "FAIL"))
             print(f"  {mark} {tid}")
         if skipped:
-            # ⚪ 未配置凭据的站点：退出码不受影响，也不会进入 failed_matrix 触发重跑
             print(f"skipped (credentials not configured): {', '.join(skipped)}")
         if suspended:
-            # 🛑 达到 8 次失败上限已熔断停用的站点：退出码不受影响，等待修复后上线
             print(f"suspended (circuit broken, 8-attempt limit reached): {', '.join(suspended)}")
         if failed:
             print(f"failed: {', '.join(failed)}")
             return 1
         return 0
+
+
 def build_default_timeline(orch: Orchestrator) -> None:
     now = time.time()
-    stage_a = [t for t in TASKS.values() if "matrix" in t["tags"] or "workbuddy" in t["tags"]]
-    for cfg in stage_a:
-        orch.push(now, "task", cfg)
-    ms_fire = max(now, _hm_today_ts("09:10"))
-    for ms_id in ("modelscope", "modelscope_ai"):
-        orch.push(ms_fire, "task", TASKS[ms_id])
-    # latvi（2026-09-06 运行模型改造）：不再按窗口-120s 堆排布（曾令主 run 为
-    # 18:00 窗口原地挂起 ~4h）。立即入队，由 relay 模式自接力：窗口远 → 派发
-    # latvi_next_sign 后本 run 即结束；≤240s → 原地短睡签到；今日已签 → 秒退。
-    latvi_cfg = TASKS["latvi"]
-    last = _read_latvi_last_sign()
-    window_open = (last + 86400) if last else None
-    fit_deadline = _hm_today_ts(os.getenv("LATVI_FIT_DEADLINE", "19:30"))
-    latvi_skip = bool(window_open and window_open > fit_deadline)
-    if latvi_skip:
-        print(f"Latvi window {_fmt_bjt(window_open)} past fit deadline {os.getenv('LATVI_FIT_DEADLINE','19:30')}, skipping today; next run will re-anchor")
-    else:
-        orch.push(now, "task", latvi_cfg)
-    print("Timeline:")
-    print(f"  immediate ({len(stage_a) + (0 if latvi_skip else 1)} tasks, concurrency {os.getenv('BATCH_PARALLEL','4')}): "
-          + ", ".join([t["id"] for t in stage_a] + ([] if latvi_skip else ["latvi"])))
-    print(f"  modelscope + modelscope_ai @ {_fmt_bjt(ms_fire)} (gate 09:10)")
-    if window_open:
-        basis = f"last {datetime.fromtimestamp(window_open - 86400, BJT).strftime('%m-%d %H:%M:%S')} +24h"
-        print(f"  latvi: relay mode ({basis}, window {_fmt_bjt(window_open)}; "
-              f"{'skipped past fit deadline' if latvi_skip else '窗口远时自派发接力，本 run 不等待'})")
-        print(f"  next window estimate: {datetime.fromtimestamp(window_open + 86400, BJT).strftime('%m-%d %H:%M:%S')}")
+    due_ids = plan_due_tasks("")
+    for tid in due_ids:
+        orch.push(now, "task", TASKS[tid])
+    print(f"Due tasks ({len(due_ids)}): {', '.join(due_ids)}")
+
+
 def build_explicit_timeline(orch: Orchestrator, raw: str) -> None:
     queue = resolve_execution_queue(input_tasks=raw)
     now = time.time()
@@ -364,37 +371,66 @@ def build_explicit_timeline(orch: Orchestrator, raw: str) -> None:
         ids.append(cfg["id"])
     print(f"Explicit tasks: {', '.join(ids)}")
 
-def plan_due_tasks(raw_tasks: str, due_only: bool) -> List[str]:
+
+def plan_due_tasks(raw_tasks: str = "", due_only: bool = False) -> List[str]:
     """评估当前时刻会立即执行的任务集（--plan 模式，不启动任何子进程）。
 
-    与 Orchestrator.run 的实际过滤口径一致：
-    - 熔断停用任务一律跳过；
-    - due_only（心跳）模式：rolling 冷却任务按 last_credit_ts 判定，latvi 按
-      「今日是否已签」判定（无 sched 元数据，按其自身去重语义特判）；
-    - 非 due_only（显式列表/主 cron）：候选内全部视为到期——重试列表由
-      circuit_breaker.get-due-retries 预过滤，主 cron 默认全量。
+    1. 若显式指定 raw_tasks：
+       按照指定的任务队列匹配。
+       若 due_only=True（显式心跳过滤），则对 rolling 任务和 latvi 做冷却判断；
+       若 due_only=False，候选任务中非熔断任务全部执行。
+    2. 若未指定 raw_tasks（日常调度 / 心跳兜底 / 漏跑自愈）：
+       全量巡检 TASKS 全部注册任务：
+       - 熔断停用 (suspended) -> 跳过；
+       - 今日已成功 (ok=True) -> 跳过；
+       - 今日已签的 latvi -> 跳过；
+       - 冷却中的 rolling 任务 (due_at > now) -> 跳过；
+       - 今日失败且处于退避等待期的任务 (next_retry_at > now) -> 跳过；
+       其余所有今日未完成、遗漏未执行或到期重试的任务均判定为 DUE。
     """
+    now = time.time()
+    today = bjt_now().strftime("%Y-%m-%d")
+
     if raw_tasks.strip():
         cfgs = resolve_execution_queue(input_tasks=raw_tasks)
-    else:
-        cfgs = [t for t in TASKS.values() if "matrix" in t["tags"] or "workbuddy" in t["tags"]]
-        cfgs += [TASKS[i] for i in ("modelscope", "modelscope_ai", "latvi") if i in TASKS]
-    now = time.time()
-    due: List[str] = []
-    for cfg in cfgs:
-        tid = cfg["id"]
+        due: List[str] = []
+        for cfg in cfgs:
+            tid = cfg["id"]
+            if is_task_suspended(tid):
+                continue
+            if due_only:
+                if tid == "latvi":
+                    if _latvi_signed_today():
+                        continue
+                else:
+                    due_at = _cooldown_due_at(cfg)
+                    if due_at and due_at > now:
+                        continue
+            due.append(tid)
+        return due
+
+    successful_today = _get_today_successful_tasks()
+    due = []
+    for tid, cfg in TASKS.items():
         if is_task_suspended(tid):
             continue
-        if due_only:
-            if tid == "latvi":
-                if _latvi_signed_today():
-                    continue
-            else:
-                due_at = _cooldown_due_at(cfg)
-                if due_at and due_at > now:
-                    continue
+        if tid in successful_today:
+            continue
+        if tid == "latvi":
+            if _latvi_signed_today():
+                continue
+        due_at = _cooldown_due_at(cfg)
+        if due_at and due_at > now:
+            continue
+        state = load_circuit_state(tid)
+        if str(state.get("attempt_date") or "") == today and int(state.get("attempts") or 0) > 0:
+            next_retry = float(state.get("next_retry_at") or 0)
+            if next_retry > now:
+                continue
         due.append(tid)
     return due
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Daily Unified Orchestrator")
     parser.add_argument("--tasks", type=str, default="", help="comma-separated task list (explicit mode)")
@@ -403,11 +439,12 @@ def main() -> None:
     parser.add_argument("--plan", action="store_true", help="evaluate the due task set and exit without executing anything (prints DUE_TASKS=<list|none>)")
     parser.add_argument("--due-only", action="store_true", help="plan mode: apply heartbeat DUE_ONLY filtering (rolling cooldown / latvi signed-today)")
     args = parser.parse_args()
+
     if args.plan:
-        # 空转判定入口：CI 在启动代理/装依赖之前调用，none 时整条流水线秒退
         due = plan_due_tasks(args.tasks, due_only=args.due_only)
         print(f"DUE_TASKS={','.join(due) if due else 'none'}")
         sys.exit(0)
+
     print(f"Daily orchestrator start @ {bjt_now().strftime('%Y-%m-%d %H:%M:%S')} BJT")
     is_explicit = bool(args.tasks.strip())
 
@@ -426,26 +463,13 @@ def main() -> None:
                 resume_all_tasks(reason="全局调度恢复上线 (--reset-circuit)")
                 print("🔄 [CIRCUIT_BREAKER] 全部任务熔断状态已重置上线")
 
-    now_ts = time.time()
-    if is_explicit:
-        hard_deadline = now_ts + 86400
-        hard_wall_str = "None (explicit task mode)"
-    else:
-        configured_wall = os.getenv("ORCH_HARD_DEADLINE", "19:55")
-        wall_ts = _hm_today_ts(configured_wall)
-        if wall_ts <= now_ts:
-            hard_deadline = now_ts + 6 * 3600
-            hard_wall_str = f"{configured_wall} BJT (past wall -> relaxed to +6h: {_fmt_bjt(hard_deadline)})"
-        else:
-            hard_deadline = wall_ts
-            hard_wall_str = f"{configured_wall} BJT"
-
-    orch = Orchestrator(hard_deadline)
+    orch = Orchestrator()
     if is_explicit:
         build_explicit_timeline(orch, args.tasks)
     else:
         build_default_timeline(orch)
-    print(f"Hard wall: {hard_wall_str}\n")
     sys.exit(orch.run())
+
+
 if __name__ == "__main__":
     main()

@@ -5,18 +5,12 @@ run-name: >-
 
 on:
   schedule:
-    # 主流水线：北京时间 14:00（UTC 06:00）单 run 全内联（任务完成即结束，
-    # 硬墙 19:55（ORCH_HARD_DEADLINE）；latvi/重试/领奖回程均由延时接力承载）
-    - cron: "0 6 * * *"
-    # 心跳轮询：每 30 分钟一次（2026-09-06 由 4h 提频）。precheck 先行判定到期
-    # 任务集：无到期则秒退（不启动代理/不装依赖）；有到期才执行滚动冷却任务
-    # （modelscope 双实例 / cloudstudio 12h 冷却 / latvi 今日已签自去重，
-    #  DUE_ONLY 按 last_credit_ts 状态决定）+ 到期分时段重试拾取。
-    # 高频的意义：QStash 接力回调丢失时最多 30 分钟被兜底拾取；GH 高峰延迟
-    # 调度时仍能覆盖各时段窗口
+    # 晨间主任务批次：北京时间 07:00（UTC 23:00 前一日）
+    - cron: "0 23 * * *"
+    # 30 分钟心跳与容灾自愈轮询（今日已全量完成秒退；有遗漏/未跑/到期重试则自动补跑）
     - cron: "*/30 * * * *"
-    # 报告兜底：北京时间 20:30（UTC 12:30，晚于硬墙 19:55（ORCH_HARD_DEADLINE）），仅走报告分支
-    - cron: "30 12 * * *"
+    # 晚间日报兜底：北京时间 21:30（UTC 13:30，若日间已发过则秒退）
+    - cron: "30 13 * * *"
   repository_dispatch:
     types:
       - checkin_morning
@@ -29,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       tasks:
-        description: '要执行的任务ID或脚本，逗号分隔（可选: all, matrix, workbuddy, glados, modelscope 等；留空按当日时间线默认）'
+        description: '要执行的任务ID或脚本，逗号分隔（可选: all, matrix, workbuddy, glados, modelscope 等；留空自动按今日未跑任务执行）'
         required: false
         default: ''
         type: string
@@ -59,19 +53,18 @@ on:
         default: false
         type: boolean
 
-# 最小权限（2026-09-06 审计）：GITHUB_TOKEN 仅用于 gh run list 与 PAT 缺失时的
-# workflow_dispatch 兜底（actions: write 隐含 read）；无任何步骤写仓库内容。
+# 最小权限：GITHUB_TOKEN 仅用于 actions 调度与运行状态查询
 permissions:
   contents: read
   actions: write
 
 # ============================================================
-# Job 1 — 统一编排主流水线（14:00 主 cron / 手动 / 旧接力兼容）
+# Job 1 — 统一编排主流水线（晨间主 run / 心跳自愈 / 调度接力）
 # ============================================================
 jobs:
   unified:
     if: >-
-      ${{ !(github.event_name == 'schedule' && github.event.schedule == '30 12 * * *')
+      ${{ !(github.event_name == 'schedule' && github.event.schedule == '30 13 * * *')
           && github.event.action != 'daily_report' }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -243,69 +236,57 @@ jobs:
             latvi-state-
             agentrouter-state-
 
-      # ── 到期前置判定（2026-09-06 运行模型改造）─────────────────────────
-      # 空转 run 在此秒退：不启动 sing-box、不装依赖、不跑测试。只有在确有
-      # 到期任务时才继续执行后续全部步骤。
+      # ── 到期前置判定与自愈调度 ─────────────────────────
       - name: Precheck due tasks (idle runs exit here)
         id: orch_tasks
         env:
-          # 输入经 env 间接传递，避免 ${{ }} 直接内插 shell（引号/命令注入面）
           INPUT_TASKS: ${{ inputs.tasks }}
           INPUT_DUE_ONLY: ${{ inputs.due_only }}
           EVENT_ACTION: ${{ github.event.action }}
           EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: |
           set -euo pipefail
-          DUE_ONLY_FLAG=""
-          IS_HEARTBEAT=false
-          if [ "$EVENT_SCHEDULE" = "*/30 * * * *" ] || [ "$INPUT_DUE_ONLY" = "true" ]; then
-            DUE_ONLY_FLAG="--due-only"
-            IS_HEARTBEAT=true
-          fi
           CANDIDATES=""
-          if [ -n "$INPUT_TASKS" ]; then
-            # 单行化防注入（2026-09-06 审计）：多行输入可注入额外键值对
+          if [ -n "${INPUT_TASKS:-}" ]; then
             CANDIDATES=$(printf '%s' "$INPUT_TASKS" | tr '\n' ' ')
-            echo "手动显式任务: $CANDIDATES（显式模式视为到期）"
-          elif [ "$EVENT_ACTION" = "checkin_retry" ]; then
-            CANDIDATES=$(python3 scripts/circuit_breaker.py get-due-retries 2>/dev/null || echo "")
-            echo "分时段重试接力: 到期就绪任务 = ${CANDIDATES:-<无>}"
-          elif [ "$IS_HEARTBEAT" = "true" ]; then
-            # 心跳：滚动冷却任务 + latvi（今日已签自去重，兼作接力链断裂兜底）
-            # + 到期分时段重试拾取；--plan 再按 last_credit_ts/已签过滤
-            CANDIDATES="modelscope,modelscope_ai,tencent_cloudstudio,latvi"
-            due_retries=$(python3 scripts/circuit_breaker.py get-due-retries 2>/dev/null || echo "")
-            if [ -n "$due_retries" ]; then
-              echo "心跳轮询附加到期重试任务: $due_retries"
-              CANDIDATES="$CANDIDATES,$due_retries"
+            echo "显式指定任务: $CANDIDATES"
+            DUE=$(python3 scripts/daily_orchestrator.py --plan --tasks "$CANDIDATES" | sed -n 's/^DUE_TASKS=//p')
+          elif [ "${EVENT_ACTION:-}" = "checkin_retry" ]; then
+            RETRY_CANDIDATES=$(python3 scripts/circuit_breaker.py get-due-retries 2>/dev/null || echo "")
+            echo "分时段重试接力: 就绪任务 = ${RETRY_CANDIDATES:-<无>}"
+            if [ -n "$RETRY_CANDIDATES" ]; then
+              DUE=$(python3 scripts/daily_orchestrator.py --plan --tasks "$RETRY_CANDIDATES" | sed -n 's/^DUE_TASKS=//p')
+            else
+              DUE=""
             fi
-          elif [ -n "$EVENT_SCHEDULE" ] && [ "$EVENT_SCHEDULE" != "0 6 * * *" ]; then
-            # schedule 事件兜底：显式匹配主 cron 才允许全量时间线；未识别的
-            # schedule（GitHub 延迟重放/未来新增行）一律降级为心跳任务集
-            echo "⚠️ 未识别的 schedule '$EVENT_SCHEDULE'，降级为心跳任务集"
-            CANDIDATES="modelscope,modelscope_ai,tencent_cloudstudio,latvi"
-            DUE_ONLY_FLAG="--due-only"
-          else
+          elif [ -n "${EVENT_ACTION:-}" ]; then
             case "$EVENT_ACTION" in
               latvi_next_sign|checkin_latvi) CANDIDATES="latvi" ;;
               workbuddy_travel_claim)        CANDIDATES="workbuddy" ;;
               checkin_modelscope)            CANDIDATES="modelscope,modelscope_ai" ;;
-              checkin_morning)               CANDIDATES="matrix,workbuddy" ;;
+              checkin_morning)               CANDIDATES="all" ;;
               *)                             CANDIDATES="" ;;
             esac
-          fi
-          if [ -n "$CANDIDATES" ]; then
-            DUE=$(python3 scripts/daily_orchestrator.py --plan --tasks "$CANDIDATES" $DUE_ONLY_FLAG | sed -n 's/^DUE_TASKS=//p')
+            if [ -n "$CANDIDATES" ]; then
+              DUE=$(python3 scripts/daily_orchestrator.py --plan --tasks "$CANDIDATES" | sed -n 's/^DUE_TASKS=//p')
+            else
+              DUE=$(python3 scripts/daily_orchestrator.py --plan | sed -n 's/^DUE_TASKS=//p')
+            fi
           else
-            # 主 cron / 无候选：默认全量时间线口径评估（全熔断时也会空转秒退）
+            # 定时调度与心跳轮询：状态驱动全量巡检，自动识别今日未完成/遗漏补跑/冷却就绪任务
+            DUE_ONLY_FLAG=""
+            if [ "${INPUT_DUE_ONLY:-false}" = "true" ]; then
+              DUE_ONLY_FLAG="--due-only"
+            fi
             DUE=$(python3 scripts/daily_orchestrator.py --plan $DUE_ONLY_FLAG | sed -n 's/^DUE_TASKS=//p')
           fi
-          echo "tasks=${CANDIDATES}" >> "$GITHUB_OUTPUT"
+
+          echo "tasks=${DUE:-none}" >> "$GITHUB_OUTPUT"
           echo "due_tasks=${DUE:-none}" >> "$GITHUB_OUTPUT"
           if [ "${DUE:-none}" = "none" ]; then
-            echo "🟢 空转 run：无到期任务，跳过代理/依赖/测试/执行（本 run 秒退）"
+            echo "🟢 空转 run：今日全部任务已完成或尚在冷却期（秒退）"
           else
-            echo "✅ 到期任务: $DUE"
+            echo "✅ 待执行/补跑任务: $DUE"
           fi
 
       - name: Direct mode (clear proxy env, runner IP 直连)
@@ -560,24 +541,15 @@ jobs:
         id: orchestrator
         if: steps.orch_tasks.outputs.due_tasks != 'none'
         env:
-          ORCH_TASKS: ${{ steps.orch_tasks.outputs.tasks }}
-          # 仅本步骤需要 PAT：latvi/workbuddy 子任务的 repository_dispatch 与 Secret 回写
+          ORCH_TASKS: ${{ steps.orch_tasks.outputs.due_tasks }}
           GH_PAT: ${{ secrets.GH_PAT }}
-          # 心跳轮询 run（30 分钟 cron 或手动 due_only）：滚动冷却任务按 last_credit_ts
-          # 到期过滤，未到期秒级跳过
-          DUE_ONLY: ${{ (github.event.schedule == '*/30 * * * *' || inputs.due_only == true) && '1' || '0' }}
-          # 输入经 env 间接传递，避免 ${{ }} 直接内插 shell
           RESET_CIRCUIT: ${{ inputs.reset_circuit }}
         run: |
           RESET_FLAG=""
           if [ "$RESET_CIRCUIT" = "true" ]; then
             RESET_FLAG="--reset-circuit"
           fi
-          if [ -n "$ORCH_TASKS" ]; then
-            if [ "$ORCH_TASKS" = "none" ]; then
-              echo "无到期任务执行，跳过调度"
-              exit 0
-            fi
+          if [ -n "$ORCH_TASKS" ] && [ "$ORCH_TASKS" != "none" ]; then
             python3 scripts/daily_orchestrator.py --tasks "$ORCH_TASKS" $RESET_FLAG
           else
             python3 scripts/daily_orchestrator.py $RESET_FLAG
@@ -593,11 +565,8 @@ jobs:
                && contains(fromJSON('["latvi_next_sign","checkin_latvi","checkin_morning","checkin_modelscope","workbuddy_travel_claim"]'), github.event.action))
         env:
           DAILY_PUSH: "true"
-          # PAT 供 secret_age 凭据年龄预警（secret_age.py 经 daily_report 导入）
           GH_PAT: ${{ secrets.GH_PAT }}
-          # 心跳轮询 run：仅归档刷新当日汇总，不发邮件/不写 marker（每日邮件由主 run 承担）
-          ARCHIVE_ONLY: ${{ (github.event.schedule == '*/30 * * * *' || inputs.due_only == true) && '1' || '0' }}
-          # 重跑 run 发送「[重跑]」补充邮件（不写当日 marker、不再触发递归重试）
+          ARCHIVE_ONLY: ${{ ((inputs.tasks != '' && inputs.tasks != 'all') || github.event.schedule == '*/30 * * * *' || inputs.due_only == true) && '1' || '0' }}
           RETRY_REPORT: ${{ inputs.retry == true && '1' || '0' }}
         run: python3 scripts/unified_report.py
 
@@ -820,6 +789,7 @@ jobs:
         env:
           TZ: Asia/Shanghai
           DAILY_PUSH: "true"
+          REPORT_FALLBACK: "1"
           TASK_OUTPUT_DIR: .task_results
           # 凭据年龄预警（secret_age.py）需要读 Secrets 的 updated_at
           GH_PAT: ${{ secrets.GH_PAT }}
