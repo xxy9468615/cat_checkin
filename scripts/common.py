@@ -333,10 +333,17 @@ class Http:
                     method, url, headers=headers, data=data,
                     json_data=json_data, form=form, timeout=timeout,
                 )
-            except curl_cffi.RequestsError:
-                # 网络级失败（DNS/连接/TLS 握手/超时）收敛为合成 -1 响应，让 @retry 生效
-                return Response(-1, None, "curl_cffi network error".encode(), url)
-            except Exception:
+            except Exception as exc:
+                # 捕获 curl_cffi 的网络级异常（DNS/连接/TLS握手/超时）并返回 -1 合成响应，让 @retry 生效
+                is_net_err = False
+                try:
+                    from curl_cffi.requests.errors import RequestsError
+                    if isinstance(exc, RequestsError):
+                        is_net_err = True
+                except Exception:
+                    pass
+                if is_net_err or "curl_cffi" in getattr(type(exc), "__module__", ""):
+                    return Response(-1, None, f"curl_cffi network error: {exc}".encode(), url)
                 # 配置或解析级异常：绝不吞掉业务失败，但也不占用重试次数——直接透传
                 raise
 
@@ -492,7 +499,7 @@ def qstash_publish(
     if content_dedup:
         headers["Upstash-Content-Based-Deduplication"] = "true"
 
-    resp = Http().request("POST", publish_url, headers=headers, data=body)
+    resp = Http(proxy="").request("POST", publish_url, headers=headers, data=body, timeout=15)
     if resp.code in (200, 201, 202):
         data = resp.json()
         msg_id = str(data.get("messageId", "") or "") if isinstance(data, dict) else ""
@@ -557,7 +564,7 @@ def _upstash_redis_request(url: str, token: str, body: str) -> tuple[bool, Any]:
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    resp = Http().request("POST", url, headers=headers, data=body)
+    resp = Http(proxy="").request("POST", url, headers=headers, data=body, timeout=15)
     if resp.code == 200:
         return True, resp.json()
     return False, f"HTTP {resp.code}: {resp.text[:200]}"
