@@ -90,6 +90,7 @@ def build_task_env(cfg: Dict[str, Any]) -> Dict[str, str]:
     env.setdefault("TZ", "Asia/Shanghai")
     env.setdefault("TASK_OUTPUT_DIR", ".task_results")
     env["TASK_TIMEOUT"] = str(cfg["timeout"])
+    env["PYTHONUNBUFFERED"] = "1"
     if cfg.get("account"):
         n = str(cfg["account"])
         cookie = os.getenv(f"WORKBUDDY_COOKIE_{n}", "") or (os.getenv("WORKBUDDY_COOKIE", "") if n == "1" else "")
@@ -156,7 +157,7 @@ def run_task_subprocess(cfg: Dict[str, Any]) -> Tuple[bool, str]:
     cap = cfg["timeout"] + 120
     try:
         env = build_task_env(cfg)
-        cmd = [sys.executable, str(BASE_DIR / "run_task.py"), cfg["script"]]
+        cmd = [sys.executable, "-u", str(BASE_DIR / "run_task.py"), cfg["script"]]
         proc = subprocess.Popen(cmd, cwd=str(ROOT_DIR), env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
     except Exception as exc:
         return False, f"failed to spawn: {exc}"

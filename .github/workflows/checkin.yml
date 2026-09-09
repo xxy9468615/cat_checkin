@@ -161,7 +161,7 @@ jobs:
       ALIPAN_TOKEN_1: ${{ secrets.ALIPAN_REFRESH_TOKEN_1 }}
       SMZDM_cookie: ${{ secrets.SMZDM_COOKIE_1 }}
       SMZDM_COOKIE_1: ${{ secrets.SMZDM_COOKIE_1 }}
-      SMZDM_PROXY: ${{ secrets.SMZDM_PROXY }}
+      SMZDM_PROXY: ${{ secrets.SMZDM_PROXY || secrets.WUAI_PROXY }}
       52POJIE_cookie: ${{ secrets.WUAI_COOKIE_1 }}
       52POJIE_COOKIE_1: ${{ secrets.WUAI_COOKIE_1 }}
       52POJIE_PROXY: ${{ secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}

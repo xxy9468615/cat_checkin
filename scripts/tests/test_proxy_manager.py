@@ -100,6 +100,17 @@ class TestProxyManager(unittest.TestCase):
             self.assertEqual(endpoints[0].url, "http://2.2.2.2:8080")
             self.assertFalse(endpoints[0].is_self_hosted)
 
+    def test_smzdm_domestic_proxy_reuse(self):
+        # 验证 SMZDM 能够自动复用 WUAI_PROXY 等境内 CN 代理出口
+        env = {
+            "WUAI_PROXY": "http://113.1.2.3:8080#国内CN节点",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            endpoints = get_all_proxy_endpoints(task_prefix="SMZDM")
+            self.assertEqual(len(endpoints), 1)
+            self.assertEqual(endpoints[0].name, "国内CN节点")
+            self.assertEqual(endpoints[0].url, "http://113.1.2.3:8080")
+
     def test_dead_proxy_alert_format(self):
         ep = ProxyEndpoint(
             name="自建-测试节点",

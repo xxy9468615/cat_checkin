@@ -190,7 +190,7 @@ def _post_app(
         "Cookie": cookie_str,
         "request_key": str(random.randint(10**15, 10**16)),
     }
-    r = h.request("POST", f"https://user-api.smzdm.com{endpoint}", form=fields, headers=headers, timeout=20)
+    r = h.request("POST", f"https://user-api.smzdm.com{endpoint}", form=fields, headers=headers, timeout=15)
     data: Dict[str, Any] = {}
     try:
         data = r.json()
@@ -274,9 +274,9 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
     # 1. 尝试通过候选出口（自建代理优先/备用代理/直连）发起 App 端原生签到
     for p in candidate_proxies:
         ep = parse_proxy_line(p) if p else None
-        p_label = ep.display_name if ep else "【未知代理】"
+        p_label = ep.display_name if ep else "【直连出站】"
         try:
-            cur_h = Http(follow_redirects=True, proxy=p)
+            cur_h = Http(follow_redirects=True, proxy=p, impersonate="chrome124")
             code, parsed, raw_text, sc_list = _post_app(
                 cur_h, "/checkin", sess, cur_cookie, extra=checkin_payload
             )
@@ -287,19 +287,22 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
                 collected_set_cookies.extend(sc_list)
                 used_proxy = p_label
                 break
-            elif len(candidate_proxies) > 1:
-                print(f"⚠️ 代理 {p_label} 响应异常 (HTTP {code})，正在尝试备用出口...")
+            elif code != 200:
+                if ep:
+                    print(f"  {format_dead_proxy_alert(ep, f'HTTP {code}')}", flush=True)
+                elif len(candidate_proxies) > 1:
+                    print(f"⚠️ 出口 {p_label} 响应异常 (HTTP {code})，正在尝试备用出口...", flush=True)
         except Exception as e:
             if ep:
-                print(f"  {format_dead_proxy_alert(ep, str(e))}")
+                print(f"  {format_dead_proxy_alert(ep, str(e))}", flush=True)
             elif len(candidate_proxies) > 1:
-                print(f"⚠️ 代理 {p_label} 连接失败 ({e})，正在尝试备用出口...")
+                print(f"⚠️ 出口 {p_label} 连接失败 ({e})，正在尝试备用出口...", flush=True)
 
     # 若所有代理均未接通且未尝试过直连，尝试直连兜底
     if not h and candidate_proxies != [""]:
-        print("⚠️ 所有代理均未接通，正在尝试直连兜底...")
+        print("⚠️ 所有代理均未接通，正在尝试直连兜底...", flush=True)
         try:
-            cur_h = Http(follow_redirects=True, proxy="")
+            cur_h = Http(follow_redirects=True, proxy="", impersonate="chrome124")
             code, parsed, raw_text, sc_list = _post_app(
                 cur_h, "/checkin", sess, cur_cookie, extra=checkin_payload
             )
@@ -308,6 +311,7 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
                 res_data = parsed
                 raw_resp_text = raw_text
                 collected_set_cookies.extend(sc_list)
+                used_proxy = "直连兜底"
         except Exception as e:
             raise RuntimeError(f"直连请求失败: {e}")
 

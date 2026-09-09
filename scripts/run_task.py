@@ -104,10 +104,12 @@ def main() -> None:
         # 独立进程组：超时可整组击杀。只杀直接子进程时，继承 stdout 管道的孙进程
         # （如浏览器子进程）不退出会让 communicate 迟迟拿不到 EOF，
         # 实际挂到 job 级超时才死
+        proc_env = os.environ.copy()
+        proc_env["PYTHONUNBUFFERED"] = "1"
         proc = subprocess.Popen(
-            [sys.executable, str(target_path)],
+            [sys.executable, "-u", str(target_path)],
             cwd=str(ROOT_DIR),
-            env=os.environ.copy(),
+            env=proc_env,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
