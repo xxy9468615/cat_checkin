@@ -197,7 +197,7 @@ def _post_app(
     except Exception:
         pass
 
-    sc = r.headers.get("Set-Cookie")
+    sc = r.headers.get("Set-Cookie") if getattr(r, "headers", None) else None
     set_cookies = [sc] if isinstance(sc, str) else (sc or [])
     return r.code, data, r.text, set_cookies
 
@@ -288,10 +288,11 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
                 used_proxy = p_label
                 break
             elif code != 200:
+                err_msg = f"HTTP {code}" if code != -1 else (raw_text[:60] if raw_text else "连接超时/拒绝")
                 if ep:
-                    print(f"  {format_dead_proxy_alert(ep, f'HTTP {code}')}", flush=True)
+                    print(f"  {format_dead_proxy_alert(ep, err_msg)}", flush=True)
                 elif len(candidate_proxies) > 1:
-                    print(f"⚠️ 出口 {p_label} 响应异常 (HTTP {code})，正在尝试备用出口...", flush=True)
+                    print(f"⚠️ 出口 {p_label} 响应异常 ({err_msg})，正在尝试备用出口...", flush=True)
         except Exception as e:
             if ep:
                 print(f"  {format_dead_proxy_alert(ep, str(e))}", flush=True)
