@@ -79,8 +79,7 @@ jobs:
       UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
       QSTASH_URL: ${{ secrets.QSTASH_URL }}
       QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
-      # GH_PAT 不挂 job 级 env（2026-09-06 审计）：仅注入 orchestrator / send_report /
-      # auto-retry 步骤与 report-fallback 报告步骤，避免全部任务子进程持有仓库写权限令牌。
+      # 权限最小化：GH_PAT 仅在必要步骤单独注入，避免任务子进程持有写权限令牌
       GLADOS_COOKIE_1: ${{ secrets.GLADOS_COOKIE_1 }}
       GLADOS_COOKIE_2: ${{ secrets.GLADOS_COOKIE_2 }}
       GLADOS_COOKIE_3: ${{ secrets.GLADOS_COOKIE_3 }}
@@ -97,30 +96,18 @@ jobs:
       BIANJIE_AI_PASSWORD_1: ${{ secrets.BIANJIE_AI_PASSWORD_1 }}
       BIANJIE_AI_USERNAME_2: ${{ secrets.BIANJIE_AI_USERNAME_2 }}
       BIANJIE_AI_PASSWORD_2: ${{ secrets.BIANJIE_AI_PASSWORD_2 }}
-      MOXING_username: ${{ secrets.MOXING_USERNAME }}
-      MOXING_password: ${{ secrets.MOXING_PASSWORD }}
       MOXING_USERNAME_1: ${{ secrets.MOXING_USERNAME }}
       MOXING_PASSWORD_1: ${{ secrets.MOXING_PASSWORD }}
-      MOXING_Domain: https://moxing.chat
+      MOXING_DOMAIN: https://moxing.chat
       MOXING_UA: ${{ secrets.MOXING_UA }}
-      UGNAS_cookie: ${{ secrets.UGNAS_COOKIE_1 }}
       UGNAS_COOKIE_1: ${{ secrets.UGNAS_COOKIE_1 }}
-      CLOUDSTUDIO_cookie: ${{ secrets.CLOUDSTUDIO_COOKIE_1 }}
       CLOUDSTUDIO_COOKIE_1: ${{ secrets.CLOUDSTUDIO_COOKIE_1 }}
-      NAIXI_username: ${{ secrets.NAIXI_USERNAME_1 }}
-      NAIXI_PASSWORD: ${{ secrets.NAIXI_PASSWORD_1 }}
       NAIXI_USERNAME_1: ${{ secrets.NAIXI_USERNAME_1 }}
       NAIXI_PASSWORD_1: ${{ secrets.NAIXI_PASSWORD_1 }}
-      DJI_cookie: ${{ secrets.DJI_COOKIE_1 }}
       DJI_COOKIE_1: ${{ secrets.DJI_COOKIE_1 }}
-      PCBETA_cookie: ${{ secrets.PCBETA_COOKIE_1 }}
       PCBETA_COOKIE_1: ${{ secrets.PCBETA_COOKIE_1 }}
-      PCBETA_username: ${{ secrets.PCBETA_USERNAME_1 }}
       PCBETA_USERNAME_1: ${{ secrets.PCBETA_USERNAME_1 }}
-      PCBETA_password: ${{ secrets.PCBETA_PASSWORD_1 }}
       PCBETA_PASSWORD_1: ${{ secrets.PCBETA_PASSWORD_1 }}
-      MONKEYCODE_email: ${{ secrets.MONKEYCODE_EMAIL_1 }}
-      MONKEYCODE_password: ${{ secrets.MONKEYCODE_PASSWORD_1 }}
       MONKEYCODE_EMAIL_1: ${{ secrets.MONKEYCODE_EMAIL_1 }}
       MONKEYCODE_PASSWORD_1: ${{ secrets.MONKEYCODE_PASSWORD_1 }}
       MONKEYCODE_EMAIL_2: ${{ secrets.MONKEYCODE_EMAIL_2 }}
@@ -135,64 +122,44 @@ jobs:
       AGENTROUTER_COOKIE: ${{ secrets.AGENTROUTER_COOKIE }}
       AGENTROUTER_API_URL: https://ps.air-outer.com
       AGENTROUTER_STATE_FILE: .agentrouter_state.json
-      # AGENTROUTER_PROXY 不再 job 级硬编码（2026-09-06 代理收敛）：sing-box 启动
-      # 成功时由 egress 步骤写入 GITHUB_ENV，失败时任务显式报错而非盲试 localhost
+      # 代理环境变量按需由 sing-box 出站步骤动态注入
       U1S1_TOKEN_1: ${{ secrets.U1S1_TOKEN_1 }}
-      JUEJIN_cookie: ${{ secrets.JUEJIN_COOKIE_1 }}
       JUEJIN_COOKIE_1: ${{ secrets.JUEJIN_COOKIE_1 }}
       JUEJIN_COOKIE_2: ${{ secrets.JUEJIN_COOKIE_2 }}
-      NODESEEK_cookie: ${{ secrets.NODESEEK_COOKIE_1 }}
       NODESEEK_COOKIE_1: ${{ secrets.NODESEEK_COOKIE_1 }}
-      # 硬空：CF clearance 绑定出口 IP，nodeseek 必须走工作流固定出口（TUN/SS），
-      # 独立代理 secret 一律不认（换出口=触发质询）
+      # 保持置空以强制使用工作流统一出站代理，避免节点不一致触发安全质询
       NODESEEK_PROXY: ""
-      AISTUDIO_cookie: ${{ secrets.AISTUDIO_COOKIE_1 }}
       AISTUDIO_COOKIE_1: ${{ secrets.AISTUDIO_COOKIE_1 }}
       AISTUDIO_COOKIE_2: ${{ secrets.AISTUDIO_COOKIE_2 }}
-      ALIPAN_refresh_token: ${{ secrets.ALIPAN_REFRESH_TOKEN_1 }}
       ALIPAN_REFRESH_TOKEN_1: ${{ secrets.ALIPAN_REFRESH_TOKEN_1 }}
-      ALIPAN_TOKEN_1: ${{ secrets.ALIPAN_REFRESH_TOKEN_1 }}
-      SMZDM_cookie: ${{ secrets.SMZDM_COOKIE_1 }}
       SMZDM_COOKIE_1: ${{ secrets.SMZDM_COOKIE_1 }}
       SMZDM_PROXY: ${{ secrets.SMZDM_PROXY || secrets.WUAI_PROXY }}
-      52POJIE_cookie: ${{ secrets.WUAI_COOKIE_1 }}
       52POJIE_COOKIE_1: ${{ secrets.WUAI_COOKIE_1 }}
       52POJIE_PROXY: ${{ secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
-      # 夸克签到走 App 设备签名串（QUARK_MPARAM_1）独立鉴权，无需网页会话 Cookie
-      QUARK_mparam: ${{ secrets.QUARK_MPARAM_1 }}
+      # 夸克 App 鉴权签名凭据
       QUARK_MPARAM_1: ${{ secrets.QUARK_MPARAM_1 }}
-      CLOUD189_username: ${{ secrets.CLOUD189_USERNAME_1 }}
       CLOUD189_USERNAME_1: ${{ secrets.CLOUD189_USERNAME_1 }}
-      CLOUD189_password: ${{ secrets.CLOUD189_PASSWORD_1 }}
       CLOUD189_PASSWORD_1: ${{ secrets.CLOUD189_PASSWORD_1 }}
-      CLOUD189_cookie: ${{ secrets.CLOUD189_COOKIE_1 }}
       CLOUD189_COOKIE_1: ${{ secrets.CLOUD189_COOKIE_1 }}
       CLOUD189_PROXY: ${{ secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
-      # 中国电信 App 抓包整串（按月轮转，免账密风控）
-      TELECOM_header: ${{ secrets.TELECOM_HEADER_1 }}
+      # 中国电信 App 请求头凭据
       TELECOM_HEADER_1: ${{ secrets.TELECOM_HEADER_1 }}
       TELECOM_HEADER_2: ${{ secrets.TELECOM_HEADER_2 }}
       TELECOM_PROXY: ${{ secrets.TELECOM_PROXY || secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
-      # 插件 OAuth refresh_token（60/90 天滚动续期，优先于 7 天硬上限的 Cookie）
+      # WorkBuddy OAuth 刷新令牌
       WORKBUDDY_REFRESH_TOKEN_1: ${{ secrets.WORKBUDDY_REFRESH_TOKEN_1 }}
       WORKBUDDY_REFRESH_TOKEN_2: ${{ secrets.WORKBUDDY_REFRESH_TOKEN_2 }}
       WORKBUDDY_WAIT_TRAVEL: "true"
-      MODELSCOPE_TOKEN: ${{ secrets.MODELSCOPE_TOKEN_1 }}
       MODELSCOPE_TOKEN_1: ${{ secrets.MODELSCOPE_TOKEN_1 }}
       MODELSCOPE_TOKEN_2: ${{ secrets.MODELSCOPE_TOKEN_2 }}
-      MODELSCOPE_cookie: ${{ secrets.MODELSCOPE_COOKIE_1 }}
       MODELSCOPE_COOKIE_1: ${{ secrets.MODELSCOPE_COOKIE_1 }}
       MODELSCOPE_COOKIE_2: ${{ secrets.MODELSCOPE_COOKIE_2 }}
-      MODELSCOPE_AI_TOKEN: ${{ secrets.MODELSCOPE_AI_TOKEN_1 }}
       MODELSCOPE_AI_TOKEN_1: ${{ secrets.MODELSCOPE_AI_TOKEN_1 }}
       MODELSCOPE_AI_TOKEN_2: ${{ secrets.MODELSCOPE_AI_TOKEN_2 }}
       MODELSCOPE_AI_TOKEN_3: ${{ secrets.MODELSCOPE_AI_TOKEN_3 }}
-      MODELSCOPE_AI_COOKIE: ${{ secrets.MODELSCOPE_AI_COOKIE_1 }}
       MODELSCOPE_AI_COOKIE_1: ${{ secrets.MODELSCOPE_AI_COOKIE_1 }}
       MODELSCOPE_AI_COOKIE_2: ${{ secrets.MODELSCOPE_AI_COOKIE_2 }}
       MODELSCOPE_AI_COOKIE_3: ${{ secrets.MODELSCOPE_AI_COOKIE_3 }}
-      LATVI_EMAIL: ${{ secrets.LATVI_EMAIL }}
-      LATVI_PASSWORD: ${{ secrets.LATVI_PASSWORD }}
       LATVI_EMAIL_1: ${{ secrets.LATVI_EMAIL }}
       LATVI_PASSWORD_1: ${{ secrets.LATVI_PASSWORD }}
       LATVI_STATE_FILE: .latvi_state.json
@@ -281,7 +248,6 @@ jobs:
             DUE=$(python3 scripts/daily_orchestrator.py --plan $DUE_ONLY_FLAG | sed -n 's/^DUE_TASKS=//p')
           fi
 
-          echo "tasks=${DUE:-none}" >> "$GITHUB_OUTPUT"
           echo "due_tasks=${DUE:-none}" >> "$GITHUB_OUTPUT"
           if [ "${DUE:-none}" = "none" ]; then
             echo "🟢 空转 run：今日全部任务已完成或尚在冷却期（秒退）"
@@ -317,15 +283,14 @@ jobs:
         if: steps.orch_tasks.outputs.due_tasks != 'none'
         run: echo "TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_ENV"
 
-      - name: Setup sing-box egress (唯一出站)
+      - name: Setup sing-box egress (统一出站)
         if: inputs.direct != true && steps.orch_tasks.outputs.due_tasks != 'none'
         env:
           AGENTROUTER_SINGBOX_CONFIG: ${{ secrets.AGENTROUTER_SINGBOX_CONFIG }}
         run: |
           set -euo pipefail
-          # 代理出站唯一机制：sing-box 原生 JSON（承载 agentrouter/nodeseek/2libra/cloudstudio
-          # 固定家宽出口；mihomo/sslocal/自建与备用代理池均已删除，2026-09-06 收敛）。
-          # 代理出口状态入 Redis（proxy_setup 字段，14 天 TTL）：排查以 Redis 为准。
+          # 统一代理出站通道：由 sing-box 承载固定出口代理
+          # 代理出口状态记录至 Redis（proxy_setup 字段，14 天 TTL），用于链路诊断
           stash_proxy_state() {
             [ -n "$UPSTASH_REDIS_REST_URL" ] && [ -n "$UPSTASH_REDIS_REST_TOKEN" ] || return 0
             python3 - "$1" "$2" "$3" "$4" <<'PY'
@@ -354,13 +319,11 @@ jobs:
           PY
           }
 
-          # sing-box：用户直接提供的原生 JSON 配置（不走订阅拉取/转换）。
-          # 修复 DNS：注入显式 dns 段（公共 UDP/TCP DNS + sniff），解决域名 NXDOMAIN
-          # 泄漏（如 sing-box 直连 railgun.dnsbot.net 时 exchange6/exchange4 NXDOMAIN）。
-          # inbound 强制锚定 127.0.0.1:1080（仅保留一个代理型 inbound），其余原样交付。
+          # sing-box 核心配置：加载配置并注入显式 DNS 与协议嗅探，防止 DNS 泄漏与解析抖动。
+          # inbound 统一收敛为本地 127.0.0.1:1080 SOCKS5 代理。
           setup_singbox() {
             test -n "$AGENTROUTER_SINGBOX_CONFIG" || { echo "AGENTROUTER_SINGBOX_CONFIG empty"; return 1; }
-            # 供应链防护（2026-09-06 审计）：固定版本 + SHA256 校验，二进制被篡改时直接失败
+            # 供应链安全加固：固定二进制版本并进行 SHA256 完整性校验
             SINGBOX_SHA256="d2d6b4543d850269214ced70ffe41b13b1595baa1b6f9c016466abfba162c4d4"
             curl -sL --max-time 60 -o /tmp/singbox.tar.gz               https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64-musl.tar.gz               || { echo "sing-box download failed"; return 1; }
             echo "$SINGBOX_SHA256  /tmp/singbox.tar.gz" | sha256sum -c - >/dev/null              || { echo "sing-box checksum mismatch, aborting"; return 1; }
@@ -377,17 +340,15 @@ jobs:
           except Exception as e:
               print(f"AGENTROUTER_SINGBOX_CONFIG not valid JSON: {e}")
               sys.exit(1)
-          # ── 传输安全加固（2026-09-06）──────────────────────────────────────
-          # 1) 出站 TLS 校验 fail-closed：拒绝 insecure（跳过证书验证）出站，
-          #    防止隧道流量被静默中间人
+          # ── 传输安全加固 ──────────────────────────────────────────────────
+          # 1) 出站 TLS 校验（Fail-Closed）：严格禁止 insecure 出站，防范中间人劫持
           for ob in (cfg.get("outbounds") or []):
               tls = ob.get("tls") if isinstance(ob, dict) else None
               if isinstance(tls, dict) and tls.get("insecure"):
                   print(f"❌ outbound [{ob.get('tag', '?')}] 配置了 tls.insecure=true，拒绝启动。"
                         "请在 AGENTROUTER_SINGBOX_CONFIG 中移除 insecure 并配置受信证书/server_name。")
                   sys.exit(1)
-          # 2) 仅保留一个代理型 inbound，锚定本地 1080 并统一收敛为 socks 类型
-          #    （消费方全部是 socks5://127.0.0.1:1080，去除 mixed/http 额外暴露面）
+          # 2) 最小化入站面：仅保留单个代理 inbound，统一收敛为 127.0.0.1:1080 SOCKS5
           inbounds = cfg.get("inbounds") or []
           picked = None
           kept = []
@@ -405,10 +366,7 @@ jobs:
               kept.append({"type": "socks", "tag": "in_socks",
                            "listen": "127.0.0.1", "listen_port": 1080})
           cfg["inbounds"] = kept
-          # 3) 注入显式 DNS：默认加密 DNS（DoT/DoH），防明文 UDP DNS 被劫持/篡改，
-          #    并避免系统 resolver 在 CI 的 NXDOMAIN 抖动。
-          #    ≥1.12 已弃用、1.14 移除 legacy {"tag","address"} 格式，必须显式带
-          #    type；这里对已有 servers 做迁移（URL 正确拆分 host/port，DoT 默认 853）。
+          # 3) 显式加密 DNS（DoT/DoH）：避免明文 DNS 劫持与系统解析抖动；规范化 servers 配置
           import ipaddress as _ip, urllib.parse as _up
           def _is_ip(host) -> bool:
               try:
@@ -450,9 +408,7 @@ jobs:
                   {"type": "https", "tag": "dns-cloudflare-https",
                    "server": "1.1.1.1", "server_port": 443},
               ]
-          # 引导 resolver：取首个 IP 直连可寻址的 DNS 服务器；没有则前置一个。
-          # 1.12+ 要求域名型 DNS 服务器与域名型 outbound 都必须显式挂 resolver，
-          # 否则 decode 直接报 missing domain resolver。
+          # 引导解析器：确保域名型 DNS 与 outbound 拥有直连 IP 的 bootstrap resolver
           bootstrap = next(
               (s for s in migrated if _is_ip(s.get("server", ""))), None)
           if bootstrap is None:
@@ -470,8 +426,7 @@ jobs:
           if "route" not in cfg:
               cfg["route"] = {}
           routes = cfg["route"]
-          # 4) 路由规则（幂等注入到最前）：sniff 供域名嗅探/分流，DNS 请求统一
-          #    hijack 进 sing-box DNS 模块（1.11+ action 语义，替代 legacy dns-out）
+          # 4) 路由策略：启用流量嗅探并劫持 DNS 请求交由 sing-box 核心解析
           rules = routes.get("rules") or []
           has_sniff = any(isinstance(r, dict) and r.get("action") == "sniff" for r in rules)
           has_dns_hijack = any(isinstance(r, dict) and r.get("action") == "hijack-dns" for r in rules)
@@ -482,20 +437,17 @@ jobs:
               injected.append({"protocol": "dns", "action": "hijack-dns"})
           if injected:
               routes["rules"] = injected + rules
-          # 5) 解析机制现代化：route.default_domain_resolver 指向首个 DNS 服务器，
-          #    域名型 outbound server（如 railgun.dnsbot.net）由它解析——替代已弃用的
-          #    ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER 兼容开关
+          # 5) 域名解析绑定：配置 default_domain_resolver 解析域名型 outbound
           routes.setdefault("default_domain_resolver",
                             {"server": bootstrap["tag"]})
           cfg["route"] = routes
           json.dump(cfg, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
           PY
-            # 启动前配置校验（fail-closed）：check 不过（含注入段不被 1.14 接受）即中止
+            # 启动前静态配置校验（Fail-Closed）：校验失败即刻中止
             if ! check_out=$(/tmp/singbox/sing-box check --config /tmp/singbox-config.json 2>&1); then
               echo "sing-box config check failed: $check_out"
               return 1
             fi
-            pip install -q "pysocks==1.7.1" || { echo "pysocks install failed"; return 1; }
             /tmp/singbox/sing-box run --config /tmp/singbox-config.json >/tmp/singbox.log 2>&1 &
             SINGBOX_PID=$!
             echo "SINGBOX_PID=$SINGBOX_PID" >> "$GITHUB_ENV"
@@ -516,7 +468,7 @@ jobs:
               return 1
             fi
             node_tag=$(python3 -c "import json; cfg=json.load(open('/tmp/singbox-config.json')); print((cfg.get('outbounds') or [{}])[0].get('tag','singbox'))" 2>/dev/null || echo "singbox")
-            # 出口 IP 脱敏后入公开日志（与 proxy_manager.mask_host 同风格）；完整值仅入 Redis
+            # 敏感信息脱敏：出口 IP 掩码后输出至日志，完整数据持久化至受保护的 Redis
             masked_ip=$(printf '%s' "$exit_ip" | awk -F. 'NF==4{print $1".***.***."$4; next} {print substr($0,1,2)"***"}')
             echo "sing-box ready (pid $SINGBOX_PID, outbound $node_tag, exit IP: $masked_ip)"
             # 为依赖固定出口的任务注入代理环境变量
@@ -530,10 +482,9 @@ jobs:
             return 0
           }
 
-          # sing-box 是唯一出站：启动失败时记录状态后按设计公平失败
-          # （agentrouter 等指纹任务会显式报错，绝不静默直连）
+          # sing-box 统一出站探活：启动失败时记录状态，依赖代理的任务按设计公平失败（避免无代理静默直连）
           if ! setup_singbox; then
-            echo "所有代理均不可用（sing-box 启动/探活失败）；agentrouter 将按设计触发公平失败"
+            echo "代理出口不可用（sing-box 启动/探活失败）；依赖代理的任务将按设计触发公平失败"
             stash_proxy_state none "" "" ""
           fi
 
@@ -560,7 +511,6 @@ jobs:
         if: >-
           always()
           && steps.orch_tasks.outputs.due_tasks != 'none'
-          && steps.orch_tasks.outputs.due_tasks != ''
           && !(github.event_name == 'repository_dispatch'
                && contains(fromJSON('["latvi_next_sign","checkin_latvi","checkin_morning","checkin_modelscope","workbuddy_travel_claim"]'), github.event.action))
         env:
@@ -616,7 +566,7 @@ jobs:
           fi
 
           # 3. 若未配置 QStash：
-          # 重试计划已在 Redis/本地 KV 中持久化，由心跳 cron (每 4h) 或下次定时 run 自动到期拾取；
+          # 重试计划已在 Redis/本地状态中持久化，由定时心跳轮询或下次定时运行到期拾取；
           # 若时延极短（<= 120s），则可原地微等后触发 workflow_dispatch
           if [ "${NEXT_DELAY_SECONDS:-900}" -le 120 ]; then
             echo "等待 ${NEXT_DELAY_SECONDS}s 短时冷却..."
@@ -625,7 +575,7 @@ jobs:
               echo "即时重跑已派发"
             fi
           else
-            echo "分时段重试：任务重试计划已记录到 Upstash Redis/状态缓存中，将由每 4h 心跳轮询到期自动拾取，避免原地等待浪费 runner 额度。"
+            echo "分时段重试：任务重试计划已记录到 Upstash Redis/状态缓存中，将由定时心跳轮询到期自动拾取，避免原地等待浪费 runner 额度。"
           fi
 
       - name: Save unified states
@@ -664,11 +614,11 @@ jobs:
           if-no-files-found: ignore # 空转 run 无结果文件，忽略即可
 
   # ============================================================
-  # Job 2 — 报告兜底（20:30 晚于硬墙，仅当主 run 未发报告时补发）
+  # Job 2 — 晚间报告兜底（仅当主流水线未发送日报时补发）
   # ============================================================
   report-fallback:
     if: >-
-      ${{ github.event_name == 'schedule' && github.event.schedule == '30 12 * * *'
+      ${{ github.event_name == 'schedule' && github.event.schedule == '30 13 * * *'
           || github.event.action == 'daily_report' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
