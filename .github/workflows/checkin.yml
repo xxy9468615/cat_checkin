@@ -213,18 +213,18 @@ jobs:
           EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: |
           set -euo pipefail
-          CANDIDATES=""
+          PLAN_ARGS=""
           if [ -n "${INPUT_TASKS:-}" ]; then
             CANDIDATES=$(printf '%s' "$INPUT_TASKS" | tr '\n' ' ')
             echo "显式指定任务: $CANDIDATES"
-            DUE=$(python3 scripts/daily_orchestrator.py --plan --tasks "$CANDIDATES" | sed -n 's/^DUE_TASKS=//p')
+            PLAN_ARGS="--tasks $CANDIDATES"
           elif [ "${EVENT_ACTION:-}" = "checkin_retry" ]; then
             RETRY_CANDIDATES=$(python3 scripts/circuit_breaker.py get-due-retries 2>/dev/null || echo "")
             echo "分时段重试接力: 就绪任务 = ${RETRY_CANDIDATES:-<无>}"
             if [ -n "$RETRY_CANDIDATES" ]; then
-              DUE=$(python3 scripts/daily_orchestrator.py --plan --tasks "$RETRY_CANDIDATES" | sed -n 's/^DUE_TASKS=//p')
+              PLAN_ARGS="--tasks $RETRY_CANDIDATES"
             else
-              DUE=""
+              PLAN_ARGS="--tasks none"
             fi
           elif [ -n "${EVENT_ACTION:-}" ]; then
             case "$EVENT_ACTION" in
@@ -235,22 +235,27 @@ jobs:
               *)                             CANDIDATES="" ;;
             esac
             if [ -n "$CANDIDATES" ]; then
-              DUE=$(python3 scripts/daily_orchestrator.py --plan --tasks "$CANDIDATES" | sed -n 's/^DUE_TASKS=//p')
-            else
-              DUE=$(python3 scripts/daily_orchestrator.py --plan | sed -n 's/^DUE_TASKS=//p')
+              PLAN_ARGS="--tasks $CANDIDATES"
             fi
           else
             # 定时调度与心跳轮询：状态驱动全量巡检，自动识别今日未完成/遗漏补跑/冷却就绪任务
-            DUE_ONLY_FLAG=""
-            if [ "${INPUT_DUE_ONLY:-false}" = "true" ]; then
-              DUE_ONLY_FLAG="--due-only"
+            if [ "$EVENT_SCHEDULE" = "*/30 * * * *" ] || [ "${INPUT_DUE_ONLY:-false}" = "true" ]; then
+              PLAN_ARGS="--due-only"
             fi
-            DUE=$(python3 scripts/daily_orchestrator.py --plan $DUE_ONLY_FLAG | sed -n 's/^DUE_TASKS=//p')
           fi
 
+          PLAN_OUT=$(python3 scripts/daily_orchestrator.py --plan $PLAN_ARGS)
+          DUE=$(echo "$PLAN_OUT" | sed -n 's/^DUE_TASKS=//p')
+          NEED_REPORT=$(echo "$PLAN_OUT" | sed -n 's/^NEED_REPORT=//p')
+
           echo "due_tasks=${DUE:-none}" >> "$GITHUB_OUTPUT"
+          echo "need_report=${NEED_REPORT:-false}" >> "$GITHUB_OUTPUT"
           if [ "${DUE:-none}" = "none" ]; then
-            echo "🟢 空转 run：今日全部任务已完成或尚在冷却期（秒退）"
+            if [ "${NEED_REPORT:-false}" = "true" ]; then
+              echo "📨 今日全部任务已在早前完成，本 run 仅补发统一日报推送"
+            else
+              echo "🟢 空转 run：今日全部任务已完成或尚在冷却期，且已推送日报（秒退）"
+            fi
           else
             echo "✅ 待执行/补跑任务: $DUE"
           fi
@@ -274,13 +279,8 @@ jobs:
         run: |
           pip install --no-cache-dir -r requirements.txt
 
-      - name: Run unit test suite
-        if: steps.orch_tasks.outputs.due_tasks != 'none'
-        run: |
-          python3 -m unittest discover -s scripts/tests/ -p "test_*.py"
-
       - name: Set TODAY
-        if: steps.orch_tasks.outputs.due_tasks != 'none'
+        if: steps.orch_tasks.outputs.due_tasks != 'none' || steps.orch_tasks.outputs.need_report == 'true'
         run: echo "TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_ENV"
 
       - name: Setup sing-box egress (统一出站)
@@ -510,13 +510,13 @@ jobs:
         id: send_report
         if: >-
           always()
-          && steps.orch_tasks.outputs.due_tasks != 'none'
+          && (steps.orch_tasks.outputs.due_tasks != 'none' || steps.orch_tasks.outputs.need_report == 'true')
           && !(github.event_name == 'repository_dispatch'
-               && contains(fromJSON('["latvi_next_sign","checkin_latvi","checkin_morning","checkin_modelscope","workbuddy_travel_claim"]'), github.event.action))
+               && contains(fromJSON('["latvi_next_sign","checkin_latvi","checkin_modelscope","workbuddy_travel_claim"]'), github.event.action))
         env:
           DAILY_PUSH: "true"
           GH_PAT: ${{ secrets.GH_PAT }}
-          ARCHIVE_ONLY: ${{ ((inputs.tasks != '' && inputs.tasks != 'all') || github.event.schedule == '*/30 * * * *' || inputs.due_only == true) && '1' || '0' }}
+          ARCHIVE_ONLY: ${{ (steps.orch_tasks.outputs.need_report != 'true' && ((inputs.tasks != '' && inputs.tasks != 'all') || github.event.schedule == '*/30 * * * *' || inputs.due_only == true)) && '1' || '0' }}
           RETRY_REPORT: ${{ inputs.retry == true && '1' || '0' }}
         run: python3 scripts/unified_report.py
 
@@ -552,6 +552,8 @@ jobs:
           # 2. 优先尝试 QStash 延时接力（零 runner 费用等待，待到期后精准 dispatch 回调）
           QSTASH_OK=$(python3 - "${NEXT_DELAY_SECONDS:-900}" <<'PY'
           import sys, os
+          from pathlib import Path
+          sys.path.insert(0, str(Path("scripts").resolve()))
           from common import schedule_repo_dispatch
           delay = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 900
           ok, msg = schedule_repo_dispatch("checkin_retry", delay)
@@ -703,35 +705,8 @@ jobs:
             echo "Report already sent today (Redis marker), skip"
             exit 0
           fi
-          API_SENT=$(python3 -c "
-          import json, subprocess, sys, datetime as dt
-          try:
-              out = subprocess.check_output(['gh', 'run', 'list', '--workflow', 'checkin.yml', '--status', 'success', '--json', 'databaseId,createdAt,event', '--limit', '20'], text=True)
-              runs = json.loads(out)
-              tz = dt.timezone(dt.timedelta(hours=8))
-              today = dt.datetime.now(tz).strftime('%Y-%m-%d')
-              sent = False
-              for r in runs:
-                  # 只认可能发过报告的 run：主 cron（schedule）与手动非重试（workflow_dispatch）；
-                  # repository_dispatch 接力 run 从不发报告，不能拿来推断「报告已发」
-                  if r.get('event') == 'repository_dispatch':
-                      continue
-                  created_utc = dt.datetime.fromisoformat(r['createdAt'].replace('Z', '+00:00'))
-                  created_bj = created_utc.astimezone(tz).strftime('%Y-%m-%d')
-                  if created_bj == today:
-                      sent = True
-                      break
-              print('true' if sent else 'false', flush=True)
-          except Exception as e:
-              import traceback; traceback.print_exc(file=sys.stderr)
-              print('false', flush=True)
-          ")
-          if [ "$API_SENT" = "true" ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Report already sent today (API check), skip"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Report not sent today, fallback sending needed"
 
       - name: Send unified report
         id: send_report

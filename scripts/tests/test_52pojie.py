@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import os
+import io
 import sys
 import unittest
 from pathlib import Path
@@ -125,9 +126,13 @@ class Test52Pojie(unittest.TestCase):
             (resp_credit, "", None),
         ]
 
-        ok, status = pojie._run_account("htVD_2132_auth=xxx; htVD_2132_lastcheckfeed=888%7C123", 1, 1)
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            ok, status = pojie._run_account("htVD_2132_auth=xxx; htVD_2132_lastcheckfeed=888%7C123", 1, 1)
+            output = mock_stdout.getvalue()
+
         self.assertTrue(ok)
         self.assertEqual(status, "成功")
+        self.assertIn("UID: 88***8", output)
         mock_save.assert_called_once()
 
     @patch.object(pojie, "save_kv_state")
@@ -143,12 +148,17 @@ class Test52Pojie(unittest.TestCase):
             (resp_credit, "", None),
         ]
 
-        ok, status = pojie._run_account("htVD_2132_auth=xxx", 1, 1)
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            ok, status = pojie._run_account("htVD_2132_auth=xxx", 1, 1)
+            output = mock_stdout.getvalue()
+
         self.assertTrue(ok)
         self.assertEqual(status, "今日已签")
+        self.assertIn("今日已签", output)
 
+    @patch.object(pojie, "load_kv_state", return_value={})
     @patch.object(pojie, "_http_request_with_failover")
-    def test_run_account_expired(self, mock_http):
+    def test_run_account_expired(self, mock_http, mock_load):
         resp_apply = MagicMock(code=200, text='<p class="alert_info">您需要先登录才能继续本操作</p>')
         resp_draw = MagicMock(code=200, text='<p class="alert_info">您需要先登录才能继续本操作</p>')
         mock_http.side_effect = [
@@ -156,8 +166,9 @@ class Test52Pojie(unittest.TestCase):
             (resp_draw, "", None),
         ]
 
-        with self.assertRaises(RuntimeError) as ctx:
-            pojie._run_account("htVD_2132_auth=expired", 1, 1)
+        with patch("sys.stdout", new_callable=io.StringIO):
+            with self.assertRaises(RuntimeError) as ctx:
+                pojie._run_account("htVD_2132_auth=expired", 1, 1)
         self.assertIn("Cookie 已失效", str(ctx.exception))
 
 

@@ -1,0 +1,43 @@
+name: Unit Tests & Code Quality
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'scripts/**'
+      - 'requirements.txt'
+      - '.github/workflows/test.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'scripts/**'
+      - 'requirements.txt'
+      - '.github/workflows/test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Run Unit Tests & Syntax Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (SHA 固定，node24)
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0 (SHA 固定，node24)
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Syntax check
+        run: python3 -m py_compile scripts/*.py
+
+      - name: Install dependencies
+        run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Run unit test suite
+        run: python3 -m unittest discover -s scripts/tests/ -p "test_*.py"

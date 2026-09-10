@@ -2,6 +2,7 @@
 """中国电信签到脚本单元测试。"""
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
@@ -199,7 +200,8 @@ class TestTelecom(unittest.TestCase):
 
         client._req = MagicMock(side_effect=fake_req)
         with patch.object(client, "restore_cached_session", return_value=True), \
-             patch.object(client, "save_session", return_value=None):
+             patch.object(client, "save_session", return_value=None), \
+             patch("sys.stdout", new_callable=io.StringIO):
             outcome = telecom.execute_telecom_task(client)
 
         self.assertEqual(outcome["status"], "成功")

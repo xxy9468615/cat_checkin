@@ -8,6 +8,7 @@ orchestrator 原地 sleep 干等（曾 4h），堵死同一并发组的后续 ru
 （QStash checkin_retry / workbuddy_travel_claim / latvi_next_sign +
 30 分钟心跳 get-due-retries 兜底），orchestrator 不再为任何未来事件驻留。
 """
+import io
 import os
 import sys
 import time
@@ -31,7 +32,8 @@ class NoWaitTests(unittest.TestCase):
     def _run(self, out):
         orch = Orchestrator(hard_deadline=time.time() + 86400)
         try:
-            orch._on_task_done(CFG, True, out)
+            with patch("sys.stdout", new_callable=io.StringIO):
+                orch._on_task_done(CFG, True, out)
             return orch
         finally:
             orch.executor.shutdown(wait=False, cancel_futures=True)
@@ -52,7 +54,8 @@ class NoWaitTests(unittest.TestCase):
             fake_circuit = {"next_retry_at": time.time() + 15 * 60, "attempts": 1, "status": "watching"}
             with patch.object(orch_mod, "record_task_outcome", return_value=(fake_circuit, False)), \
                  patch.object(orch_mod, "notify_task_result"), \
-                 patch.object(orch_mod, "notify_unconfigured"):
+                 patch.object(orch_mod, "notify_unconfigured"), \
+                 patch("sys.stdout", new_callable=io.StringIO):
                 orch._on_task_done(CFG, False, "boom")
             self.assertEqual(len(orch.heap), 0, f"heap={orch.heap}")
             self.assertEqual(orch.results[CFG["id"]], False)
@@ -130,6 +133,37 @@ class PlanModeTests(unittest.TestCase):
             due = plan_due_tasks("", due_only=False)
         self.assertNotIn("52pojie", due, "处于重试退避冷却期的任务不应立即到期")
         self.assertIn("alipan", due)
+
+    def test_auto_plan_due_only_night_skips_regular_tasks(self):
+        """夜间（00:00~06:59 BJT）心跳模式：不偷跑常规单日任务，仅允许 rolling 任务与未签 latvi。"""
+        from datetime import datetime
+        fake_bjt_night = datetime(2026, 9, 11, 2, 30, 0, tzinfo=orch_mod.BJT)
+        with patch.object(orch_mod, "bjt_now", return_value=fake_bjt_night), \
+             patch.object(orch_mod, "_get_today_successful_tasks", return_value=set()), \
+             patch.object(orch_mod, "is_task_suspended", return_value=False), \
+             patch.object(orch_mod, "_latvi_signed_today", return_value=False), \
+             patch.object(orch_mod, "_cooldown_due_at", return_value=None), \
+             patch.object(orch_mod, "load_circuit_state", return_value={}):
+            due = plan_due_tasks("", due_only=True)
+        self.assertNotIn("52pojie", due, "夜间心跳不应提前执行常规单日任务")
+        self.assertNotIn("smzdm", due, "夜间心跳不应提前执行常规单日任务")
+        self.assertNotIn("cloud189", due, "夜间心跳不应提前执行常规单日任务")
+        self.assertIn("modelscope", due, "rolling 任务应按冷却评估")
+        self.assertIn("latvi", due, "未签到的 latvi 应到期")
+
+    def test_auto_plan_due_only_daytime_includes_missed_tasks(self):
+        """白日（>=07:00 BJT）心跳模式：未成功的常规任务视为漏跑自愈，允许补跑。"""
+        from datetime import datetime
+        fake_bjt_day = datetime(2026, 9, 11, 9, 30, 0, tzinfo=orch_mod.BJT)
+        with patch.object(orch_mod, "bjt_now", return_value=fake_bjt_day), \
+             patch.object(orch_mod, "_get_today_successful_tasks", return_value={"smzdm"}), \
+             patch.object(orch_mod, "is_task_suspended", return_value=False), \
+             patch.object(orch_mod, "_latvi_signed_today", return_value=True), \
+             patch.object(orch_mod, "_cooldown_due_at", return_value=None), \
+             patch.object(orch_mod, "load_circuit_state", return_value={}):
+            due = plan_due_tasks("", due_only=True)
+        self.assertNotIn("smzdm", due, "今日已成功的任务应跳过")
+        self.assertIn("52pojie", due, "白日心跳模式下未成功的常规任务应触发漏跑自愈")
 
 
 if __name__ == "__main__":

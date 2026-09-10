@@ -50,17 +50,20 @@ class TestCircuitBreaker(unittest.TestCase):
         self.notify_patch = mock.patch(
             "discord_notify.notify_circuit_breaker", return_value=True
         )
+        self.print_patch = mock.patch("builtins.print")
 
         self.load_patch.start()
         self.save_patch.start()
         self.save_record_patch.start()
         self.notify_patch.start()
+        self.print_patch.start()
 
     def tearDown(self):
         self.load_patch.stop()
         self.save_patch.stop()
         self.save_record_patch.stop()
         self.notify_patch.stop()
+        self.print_patch.stop()
 
     def test_constants_and_ladder(self):
         """验证 8 次上限与分段重试梯度（15m -> 30m -> 45m -> 1h -> 1.5h -> 2h -> 3h）。"""

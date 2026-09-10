@@ -97,7 +97,8 @@ def load_kv_state(redis_key: str, state_file: str | os.PathLike) -> dict:
     state: dict = {}
     try:
         if os.path.exists(state_file):
-            data = json.loads(open(state_file, encoding="utf-8").read())
+            with open(state_file, encoding="utf-8") as f:
+                data = json.loads(f.read())
             if isinstance(data, dict):
                 state.update(data)
     except Exception as e:

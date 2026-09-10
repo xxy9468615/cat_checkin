@@ -390,6 +390,7 @@ def plan_due_tasks(raw_tasks: str = "", due_only: bool = False) -> List[str]:
     """
     now = time.time()
     today = bjt_now().strftime("%Y-%m-%d")
+    bjt_hour = bjt_now().hour
 
     if raw_tasks.strip():
         cfgs = resolve_execution_queue(input_tasks=raw_tasks)
@@ -423,12 +424,51 @@ def plan_due_tasks(raw_tasks: str = "", due_only: bool = False) -> List[str]:
         if due_at and due_at > now:
             continue
         state = load_circuit_state(tid)
-        if str(state.get("attempt_date") or "") == today and int(state.get("attempts") or 0) > 0:
+        has_failed_today = str(state.get("attempt_date") or "") == today and int(state.get("attempts") or 0) > 0
+        if has_failed_today:
             next_retry = float(state.get("next_retry_at") or 0)
             if next_retry > now:
                 continue
+        elif due_only and bjt_hour < 7:
+            # 心跳模式且在晨间主批次（07:00 BJT）前：不提前执行常规单日任务（避免夜间心跳偷跑主批次且抑制日报）
+            # 仅允许 rolling 任务、latvi 与到期重试任务执行
+            is_rolling = bool(cfg.get("sched") and cfg.get("sched", {}).get("type") == "rolling")
+            if not is_rolling and tid != "latvi":
+                continue
         due.append(tid)
     return due
+
+
+def check_daily_report_needed(due_tasks: List[str]) -> bool:
+    """评估今日是否需要发送或补发统一日报推送。"""
+    today = bjt_now().strftime("%Y-%m-%d")
+    prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
+    marker_key = f"{prefix}:sent:{today}"
+    try:
+        ok, res = upstash_redis_command(["GET", marker_key])
+        if ok and isinstance(res, dict):
+            raw = res.get("result")
+            if raw:
+                data = json.loads(raw) if isinstance(raw, str) else raw
+                if isinstance(data, dict) and data.get("date") == today:
+                    return False  # 今日已发，无需再发
+    except Exception:
+        pass
+
+    event_schedule = os.getenv("EVENT_SCHEDULE", "")
+    event_action = os.getenv("EVENT_ACTION", "")
+    input_tasks = os.getenv("INPUT_TASKS", "")
+    now_hour = bjt_now().hour
+
+    # 若今日尚未发送日报：
+    # 1) 晨间主任务批次（0 23 * * * = 07:00 BJT）
+    # 2) 手动/派发全量（action=checkin_morning / tasks=all）
+    # 3) 白日（>=07:00 BJT）且今日任务已全量完成（due_tasks 为空），需补发早前心跳完成但未发的日报
+    if event_schedule == "0 23 * * *" or event_action == "checkin_morning" or input_tasks == "all":
+        return True
+    if now_hour >= 7 and not due_tasks:
+        return True
+    return False
 
 
 def main() -> None:
@@ -442,7 +482,9 @@ def main() -> None:
 
     if args.plan:
         due = plan_due_tasks(args.tasks, due_only=args.due_only)
+        need_report = check_daily_report_needed(due)
         print(f"DUE_TASKS={','.join(due) if due else 'none'}")
+        print(f"NEED_REPORT={'true' if need_report else 'false'}")
         sys.exit(0)
 
     print(f"Daily orchestrator start @ {bjt_now().strftime('%Y-%m-%d %H:%M:%S')} BJT")
