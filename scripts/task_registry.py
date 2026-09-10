@@ -160,6 +160,16 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
+    # --- OPPO商城（HeyTap 每日签到打卡、连签里程碑与日常任务积分）---
+    "oppo": {
+        "id": "oppo",
+        "script": "oppo.py",
+        "name": "OPPO商城 签到与赚积分",
+        "result": "oppo.json",
+        "timeout": 300,
+        "account": "",
+        "tags": ["00:50", "matrix", "daily"],
+    },
     # --- NodeSeek（nodeseek.com 每日随机/固定鸡腿签到，支持代理出口）---
     "nodeseek": {
         "id": "nodeseek",

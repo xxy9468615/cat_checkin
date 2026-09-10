@@ -111,6 +111,17 @@ class TestProxyManager(unittest.TestCase):
             self.assertEqual(endpoints[0].name, "国内CN节点")
             self.assertEqual(endpoints[0].url, "http://113.1.2.3:8080")
 
+    def test_oppo_domestic_proxy_reuse(self):
+        # 验证 OPPO 能够自动复用 52POJIE / WUAI / SMZDM 等境内 CN 代理出口
+        env = {
+            "52POJIE_PROXY": "http://114.1.2.3:8080#吾爱国内CN出口",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            endpoints = get_all_proxy_endpoints(task_prefix="OPPO")
+            self.assertEqual(len(endpoints), 1)
+            self.assertEqual(endpoints[0].name, "吾爱国内CN出口")
+            self.assertEqual(endpoints[0].url, "http://114.1.2.3:8080")
+
     def test_dead_proxy_alert_format(self):
         ep = ProxyEndpoint(
             name="自建-测试节点",

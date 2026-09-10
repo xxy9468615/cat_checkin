@@ -307,7 +307,7 @@ def get_all_proxy_endpoints(task_prefix: str = "") -> List[ProxyEndpoint]:
 
     来源顺序：
     1. {task_prefix}_PROXY / {task_prefix}_PROXIES / {task_prefix}_BACKUP_PROXIES
-    2. 国内站点跨任务别名复用（52POJIE/WUAI/POJIE ↔ SMZDM、CLOUD189）
+    2. 国内站点跨任务别名复用（52POJIE/WUAI/POJIE ↔ SMZDM、CLOUD189、TELECOM、OPPO）
     3. task_prefix 为空时：扫描全部含 PROXY 的站点级环境变量（诊断工具用）
 
     已移除（2026-09-06）：全局自建池（SELF_HOSTED_PROXIES/CUSTOM_PROXIES）与
@@ -341,7 +341,7 @@ def get_all_proxy_endpoints(task_prefix: str = "") -> List[ProxyEndpoint]:
             f"{task_prefix}_PROXIES",
             f"{task_prefix}_BACKUP_PROXIES",
         ]
-        # 特殊兼容映射（国内服务复用仓库 CN 代理出口：SMZDM / 52POJIE / CLOUD189 / TELECOM 等）
+        # 特殊兼容映射（国内服务复用仓库 CN 代理出口：SMZDM / 52POJIE / CLOUD189 / TELECOM / OPPO 等）
         if task_prefix in ("52POJIE", "WUAI", "POJIE"):
             task_specific_keys.extend(["WUAI_PROXY", "POJIE_PROXY", "SMZDM_PROXY", "SMZDM_BACKUP_PROXIES", "TELECOM_PROXY"])
         elif task_prefix == "SMZDM":
@@ -350,6 +350,8 @@ def get_all_proxy_endpoints(task_prefix: str = "") -> List[ProxyEndpoint]:
             task_specific_keys.extend(["52POJIE_PROXY", "WUAI_PROXY", "POJIE_PROXY", "SMZDM_PROXY", "SMZDM_BACKUP_PROXIES", "TELECOM_PROXY"])
         elif task_prefix == "TELECOM":
             task_specific_keys.extend(["WUAI_PROXY", "POJIE_PROXY", "52POJIE_PROXY", "SMZDM_PROXY", "SMZDM_BACKUP_PROXIES"])
+        elif task_prefix == "OPPO":
+            task_specific_keys.extend(["52POJIE_PROXY", "WUAI_PROXY", "POJIE_PROXY", "SMZDM_PROXY", "SMZDM_BACKUP_PROXIES", "TELECOM_PROXY"])
         _collect(
             task_specific_keys,
             is_self=False,
@@ -381,7 +383,7 @@ def get_task_proxy_endpoints(task_name: str) -> List[ProxyEndpoint]:
     调度特性：
     1. 自动正规化任务名（如 "juejin" -> "JUEJIN", "cloud189" -> "CLOUD189", "52pojie" -> "52POJIE"）
     2. 任务专属代理（{TASK}_PROXY, {TASK}_PROXIES, {TASK}_BACKUP_PROXIES）
-    3. 国内站点（如 52POJIE, CLOUD189, SMZDM）智能复用仓库共享 CN 代理出口
+    3. 国内站点（如 52POJIE, CLOUD189, SMZDM, TELECOM, OPPO）智能复用仓库共享 CN 代理出口
     4. 节点敏感 IP、端口与密码统一脱敏
     """
     clean_task = re.sub(r"[^a-zA-Z0-9_]", "", task_name).upper()

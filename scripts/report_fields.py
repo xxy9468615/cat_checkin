@@ -1348,8 +1348,61 @@ def ex_telecom(output: str, res: Dict[str, Any]) -> None:
     _add_summary(res, output)
 
 
+def ex_oppo(output: str, res: Dict[str, Any]) -> None:
+    """OPPO 商城：👤 用户: ... + 签到 / 任务 / 积分余额 行。"""
+    cur: Any = None
+    tasks_done = 0
+    task_pts = 0
+    for raw in output.splitlines():
+        ln = raw.strip()
+        m = re.search(r"\[\d+/\d+\]\s*👤\s*用户:\s*(.+)", ln)
+        if m:
+            if cur:
+                cur.flush(res)
+            cur = _Block(m.group(1))
+            continue
+        if cur is None:
+            continue
+        if "签到成功" in ln or "今日已签到" in ln:
+            sign_status = "签到成功 (+10 积分)" if "签到成功" in ln else "今日已签到"
+            cur.parts.append(sign_status)
+            if "签到成功" in ln:
+                res["badges"].append(("reward", "签到 +10 积分"))
+                res["gains"].append(("积分", 10.0))
+            continue
+        m_task = re.search(r"(?:领奖成功|完成):\s*(.+?)\s*\(\+(\d+)\s*积分\)", ln)
+        if m_task:
+            tasks_done += 1
+            task_pts += int(m_task.group(2))
+            continue
+        m_cr = re.search(r"账户积分余额:\s*(\d+)(?:\s*\((Lv\.\d+)[^)]*\))?", ln)
+        if m_cr:
+            pts = m_cr.group(1)
+            lvl = m_cr.group(2) or ""
+            cur.parts.append(f"积分 {pts}" + (f" ({lvl})" if lvl else ""))
+            res["badges"].append(("asset", f"积分 {pts}"))
+            res["assets"].append(("积分", _f(pts)))
+            if lvl:
+                res["badges"].append(("info", lvl))
+            continue
+        if "❌" in ln or "失败" in ln:
+            res["fail_lines"].append(_clean(ln))
+            res["error_lines"].append(ln)
+
+    if tasks_done > 0:
+        res["badges"].append(("reward", f"浏览任务 +{task_pts} 积分"))
+        res["gains"].append(("积分", float(task_pts)))
+        if cur:
+            cur.parts.append(f"完成 {tasks_done} 项日常任务 (+{task_pts}分)")
+
+    if cur:
+        cur.flush(res)
+    _add_summary(res, output)
+
+
 # 注册表：key = 脚本文件名（task_registry 的 script 字段 / 结果 JSON 的 script 字段）
 SCRIPT_EXTRACTORS = {
+    "oppo.py": ex_oppo,
     "2libra.py": ex_2libra,
     "glados.py": ex_glados,
     "railgun.py": ex_railgun,

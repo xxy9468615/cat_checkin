@@ -146,6 +146,10 @@ jobs:
       TELECOM_HEADER_1: ${{ secrets.TELECOM_HEADER_1 }}
       TELECOM_HEADER_2: ${{ secrets.TELECOM_HEADER_2 }}
       TELECOM_PROXY: ${{ secrets.TELECOM_PROXY || secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
+      # OPPO 商城打卡与赚积分
+      OPPO_COOKIE_1: ${{ secrets.OPPO_COOKIE_1 }}
+      OPPO_COOKIE_2: ${{ secrets.OPPO_COOKIE_2 }}
+      OPPO_PROXY: ${{ secrets.OPPO_PROXY || secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
       # WorkBuddy OAuth 刷新令牌
       WORKBUDDY_REFRESH_TOKEN_1: ${{ secrets.WORKBUDDY_REFRESH_TOKEN_1 }}
       WORKBUDDY_REFRESH_TOKEN_2: ${{ secrets.WORKBUDDY_REFRESH_TOKEN_2 }}
