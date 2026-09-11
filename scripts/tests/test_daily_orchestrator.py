@@ -32,7 +32,10 @@ class NoWaitTests(unittest.TestCase):
     def _run(self, out):
         orch = Orchestrator(hard_deadline=time.time() + 86400)
         try:
-            with patch("sys.stdout", new_callable=io.StringIO):
+            with patch.object(orch_mod, "record_task_outcome", return_value=({}, False)), \
+                 patch.object(orch_mod, "notify_task_result"), \
+                 patch.object(orch_mod, "notify_unconfigured"), \
+                 patch("sys.stdout", new_callable=io.StringIO):
                 orch._on_task_done(CFG, True, out)
             return orch
         finally:
