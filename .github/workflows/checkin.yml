@@ -466,7 +466,18 @@ jobs:
               echo "sing-box failed to listen on 1080; tail log:"; tail -n 20 /tmp/singbox.log || true
               kill -9 "$SINGBOX_PID" 2>/dev/null || true; return 1
             fi
-            exit_ip=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 https://api.ipify.org 2>/dev/null || echo "")
+            # 出口探测加重试与备用目标：TW-X1-3 节点晨间偶发抖动（TCP 握手慢/单点限流），
+            # 单次 12s 失败即拆除会造成整轮假故障（agentrouter/nodeseek 等连锁公平失败）。
+            # 3 次重试 + ip.sb 备用目标，最坏 ~50s 换取抖动容错。
+            exit_ip=""
+            for attempt in 1 2 3; do
+              exit_ip=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 https://api.ipify.org 2>/dev/null || echo "")
+              [ -n "$exit_ip" ] && break
+              exit_ip=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 https://ip.sb 2>/dev/null || echo "")
+              [ -n "$exit_ip" ] && break
+              echo "sing-box egress probe attempt $attempt failed, retrying in 5s..."
+              sleep 5
+            done
             if [ -z "$exit_ip" ]; then
               echo "sing-box proxy forwarding failed; tearing down before fallback"; tail -n 20 /tmp/singbox.log || true
               kill -9 "$SINGBOX_PID" 2>/dev/null || true

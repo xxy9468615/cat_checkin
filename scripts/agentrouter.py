@@ -46,7 +46,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from common import Http, env, env_seq, load_kv_state, main_guard, mask_str, save_kv_state
+from common import Http, env, env_seq, load_kv_state, main_guard, mask_str, sanitize_snippet, save_kv_state
 
 PREFIX = "AGENTROUTER_"
 DEFAULT_API_URL = "https://ps.air-outer.com"
@@ -89,7 +89,22 @@ def _session_from_jar(h: Http) -> str:
     return ""
 
 
-def _seed_preset_cookies(h: Http) -> int:
+def _preset_cookie_domain(base: str) -> str:
+    """从 API 基础地址推导护栏 Cookie 的 Cookie domain（末两段注册域，带前导点）。
+
+    原实现对 .air-outer.com 硬编码——切换回 agentrouter.org 等域名时预置
+    Cookie 会静默失配（浏览器不发送 → WAF 挑战页重新出现），故按 base 动态推导。
+    """
+    host = re.sub(r"^[a-z]+://", "", (base or DEFAULT_API_URL), flags=re.I).split("/", 1)[0]
+    host = host.rsplit(":", 1)[0]  # 剥离端口
+    host = host.split("@")[-1]  # 防御 userinfo 形态
+    parts = [p for p in host.lower().split(".") if p]
+    if len(parts) >= 2:
+        return "." + ".".join(parts[-2:])
+    return f".{host}" if host else ".air-outer.com"
+
+
+def _seed_preset_cookies(h: Http, base: str) -> int:
     """注入预置护栏 Cookie（acw_tc 等）到 CookieJar。
 
     阿里 WAF 通过质询后签发的 acw_tc cookie 相当于护栏通行证：请求带它则直接放行，
@@ -99,6 +114,7 @@ def _seed_preset_cookies(h: Http) -> int:
     """
     if not _PRESET_COOKIE:
         return 0
+    cookie_domain = _preset_cookie_domain(base)
     count = 0
     for raw in _PRESET_COOKIE.split(";"):
         raw = raw.strip()
@@ -114,7 +130,7 @@ def _seed_preset_cookies(h: Http) -> int:
         c = Cookie(
             version=0, name=name, value=value,
             port=None, port_specified=False,
-            domain=".air-outer.com", domain_specified=True, domain_initial_dot=False,
+            domain=cookie_domain, domain_specified=True, domain_initial_dot=False,
             path="/", path_specified=True,
             secure=True, expires=None, discard=True,
             comment=None, comment_url=None,
@@ -122,7 +138,7 @@ def _seed_preset_cookies(h: Http) -> int:
         )
         h.jar.set_cookie(c)
         count += 1
-    print(f"🛡️ 预置护栏 Cookie 注入 {count} 条 (acw_tc/session; 需与当前出口 IP 匹配)")
+    print(f"🛡️ 预置护栏 Cookie 注入 {count} 条 → {cookie_domain} (acw_tc/session; 需与当前出口 IP 匹配)")
     return count
 
 
@@ -161,13 +177,16 @@ def _fingerprint_session(h: Http):
     proxy_url = getattr(ep, "url", "") if ep else ""
     if not proxy_url:
         # 底座未解析出 endpoint（未显式传且代理管理器无候选时）——回退 env
-        proxy_url = os.getenv(f"{PREFIX}PROXY", "").strip()
+        proxy_url = (os.getenv(f"{PREFIX}PROXY", "").strip()
+                     or os.getenv("SINGBOX_SOCKS_URL", "").strip())
     if proxy_url:
         sess_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
     else:
         raise RuntimeError(
-            "agentrouter 指纹链路未拿到任何代理出口（AGENTROUTER_PROXY 未配置且无候选代理）。"
-            "为避免 curl_cffi 直连数据中心 IP 被阿里 WAF 掐断（SSL_ERROR_SYSCALL），拒绝直连。")
+            "agentrouter 指纹链路未拿到任何代理出口：AGENTROUTER_PROXY 未注入"
+            "（sing-box 启动或出口探测失败，请查 workflow 'Setup sing-box egress' 步骤日志），"
+            "且无候选代理。为避免 curl_cffi 直连数据中心 IP 被阿里 WAF 掐断"
+            "（SSL_ERROR_SYSCALL），拒绝直连。")
     return cr.Session(**sess_kwargs)
 
 
@@ -261,8 +280,8 @@ def _login(h: Http, username: str, password: str, base: str) -> tuple[bool, str,
                     session = _session_from_jar(h)
                     access_token = user_data.get("access_token") or ""
                     return True, checked_in, uid, session, access_token
-            # 指纹链路未成功：记录原因后回退 urllib 链路
-            err_hint = text[:200].replace("\n", " ")
+            # 指纹链路未成功：记录原因后回退 urllib 链路（响应片段脱敏后进公开日志）
+            err_hint = sanitize_snippet(text, limit=200)
             print(f"⟳ 指纹链路未成功 (HTTP {code}): {err_hint}")
             # fallthrough → urllib
 
@@ -282,7 +301,8 @@ def _login(h: Http, username: str, password: str, base: str) -> tuple[bool, str,
     data = resp.json({})
 
     if resp.code != 200 or not isinstance(data, dict) or not data.get("success"):
-        err_msg = data.get("message") if isinstance(data, dict) else ""
+        # or ""：服务端可能返回 {"success":false} 无 message 字段，None 参与 in 判断会 TypeError
+        err_msg = (data.get("message") if isinstance(data, dict) else "") or ""
         text = resp.text[:500] if resp.text else ""
         hint = ""
 
@@ -392,7 +412,7 @@ def _run_one(idx: int, total: int, account: dict, base: str) -> str:
 
     proxy = os.getenv(f"{PREFIX}PROXY", "").strip()
     h = Http(proxy=proxy, impersonate=_FINGERPRINT)
-    _seed_preset_cookies(h)   # 预埋 acw_tc/session 护栏 Cookie，绕开 Aliyun WAF 挑战页
+    _seed_preset_cookies(h, base)   # 预埋 acw_tc/session 护栏 Cookie，绕开 Aliyun WAF 挑战页
 
     # --- 1. 登录 = 签到 ---
     sign_confirmed, checked_in, uid, session, token = _login(h, username, password, base)
