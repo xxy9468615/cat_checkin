@@ -136,6 +136,9 @@ jobs:
       ALIPAN_REFRESH_TOKEN_1: ${{ secrets.ALIPAN_REFRESH_TOKEN_1 }}
       SMZDM_COOKIE_1: ${{ secrets.SMZDM_COOKIE_1 }}
       SMZDM_PROXY: ${{ secrets.SMZDM_PROXY || secrets.WUAI_PROXY }}
+      # CN 代理备用池：主出口（WUAI_PROXY，单点晨间离线）之外的容灾候选，
+      # 被 proxy_manager 的 52POJIE/CLOUD189/TELECOM/OPPO 别名链自动复用
+      SMZDM_BACKUP_PROXIES: ${{ secrets.SMZDM_BACKUP_PROXIES }}
       52POJIE_COOKIE_1: ${{ secrets.WUAI_COOKIE_1 }}
       52POJIE_PROXY: ${{ secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
       # 夸克 App 鉴权签名凭据
