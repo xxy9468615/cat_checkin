@@ -258,6 +258,11 @@ def _login(h: Http, username: str, password: str) -> str:
     res = _resp_dict(r)
     if str(res.get("result")) != "0":
         msg = str(res.get("msg") or r.code)
+        if r.code == -1 or not res:
+            # HTTP -1 = 合成响应（网络层失败：代理不可达/被重置/超时）。文案不得包含
+            # "密码错误/验证码"——候选轮换循环按这些子串判定凭证错误中止，含糊的
+            # 猜测性提示会把网络故障误判成凭证错误，吞掉后续候选与直连兜底
+            raise RuntimeError(f"登录失败（{msg}）：网络层异常，多为代理出口不可用")
         raise RuntimeError(f"登录失败（{msg}）——可能触发验证码或密码错误")
 
     # 4. 换取 sessionKey 并种下 COOKIE_LOGIN_USER 会话票
