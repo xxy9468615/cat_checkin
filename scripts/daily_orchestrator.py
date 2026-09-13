@@ -77,8 +77,8 @@ def _read_latvi_last_sign() -> Optional[float]:
                 data = json.loads(raw) if isinstance(raw, str) else raw
                 if isinstance(data, dict) and data.get("last_sign_ts"):
                     return float(data["last_sign_ts"])
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"WARN: latvi 上次签到时间 Redis 读取失败，回退本地状态文件: {exc}", file=sys.stderr)
     state_file = Path(os.getenv("LATVI_STATE_FILE", str(ROOT_DIR / ".latvi_state.json")))
     if not state_file.is_absolute():
         state_file = ROOT_DIR / state_file
@@ -126,8 +126,9 @@ def _get_today_successful_tasks() -> Set[str]:
                             succeeded_tasks.add(result_to_id[field])
                     except Exception:
                         pass
-    except Exception:
-        pass
+    except Exception as exc:
+        # Redis 不可用时成功集合将缺失，任务可能被重复执行——必须留痕
+        print(f"WARN: 今日已成功任务集合 Redis 读取失败（{raw_key}）: {exc}", file=sys.stderr)
 
     out_dir = Path(os.getenv("TASK_OUTPUT_DIR", ".task_results"))
     if out_dir.exists() and out_dir.is_dir():
@@ -138,8 +139,8 @@ def _get_today_successful_tasks() -> Set[str]:
                     data = json.loads(fpath.read_text(encoding="utf-8"))
                     if isinstance(data, dict) and data.get("ok") is True and data.get("date") == today:
                         succeeded_tasks.add(tid)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(f"WARN: 本地结果文件解析失败，{tid} 可能被重复执行: {fpath} ({exc})", file=sys.stderr)
 
     return succeeded_tasks
 
@@ -452,8 +453,9 @@ def check_daily_report_needed(due_tasks: List[str]) -> bool:
                 data = json.loads(raw) if isinstance(raw, str) else raw
                 if isinstance(data, dict) and data.get("date") == today:
                     return False  # 今日已发，无需再发
-    except Exception:
-        pass
+    except Exception as exc:
+        # 幂等标记读取失败可能导致日报重复发送——留痕便于排查
+        print(f"WARN: 日报已发标记读取失败（{marker_key}）: {exc}", file=sys.stderr)
 
     event_schedule = os.getenv("EVENT_SCHEDULE", "")
     event_action = os.getenv("EVENT_ACTION", "")
