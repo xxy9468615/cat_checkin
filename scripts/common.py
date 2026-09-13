@@ -272,6 +272,9 @@ class Http:
 
             if proxy_str:
                 self.has_proxy = True
+                # curl_cffi 链路需要代理 URL 本体；parse_proxy_line 失败时 endpoint
+                # 对象为 None，此处记录原始 URL 供其使用，避免静默假设默认端口
+                self.proxy_url: str = proxy_str
                 # - http(s):// 走 urllib 原生 ProxyHandler（HTTPS 经 CONNECT 隧道，隧道内走端到端 TLS）
                 # - socks5(h)://, socks4(a):// 使用 sockshandler.SocksiPyHandler
                 #   （强制 rdns=True 远程 DNS，隔离全局 socket）
@@ -408,10 +411,21 @@ class Http:
             }
         elif getattr(self, "has_proxy", False):
             # 仅有代理标记但无 endpoint 对象（sockshandler 全局 patch 类）——curl_cffi 原生
-            # 支持 socks5:// 地址，直接用代理 URL 等价表达
+            # 支持 socks5:// 地址。优先用实例记录的原始代理 URL；信息缺失时才回退
+            # SINGBOX_SOCKS_URL（缺省为本机 sing-box inbound），并显式告警
+            inst_url = getattr(self, "proxy_url", "")
+            if inst_url:
+                proxy_url = inst_url
+            else:
+                proxy_url = os.getenv("SINGBOX_SOCKS_URL", "socks5://127.0.0.1:1080")
+                print(
+                    f"⚠️ curl_cffi 链路未拿到显式代理 endpoint，使用兜底代理出口 "
+                    f"[{mask_str(proxy_url)}]（可经 SINGBOX_SOCKS_URL 覆盖）",
+                    file=sys.stderr,
+                )
             sess_kwargs["proxies"] = {
-                "http": "socks5://127.0.0.1:1080",
-                "https": "socks5://127.0.0.1:1080",
+                "http": proxy_url,
+                "https": proxy_url,
             }
 
         sess = cr.Session(**sess_kwargs)
