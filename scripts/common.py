@@ -696,13 +696,39 @@ def env_seq(prefix: str, name: str, default: list[str] | None = None, required: 
         raise RuntimeError(f"缺少环境变量：{clean_prefix}{name}_1 或 {clean_prefix}{name}")
     return default if default is not None else []
 
+_SNIPPET_SENSITIVE_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
+    # Set-Cookie / Cookie 头：响应回显中最直接的凭据载体
+    (re.compile(r"(?i)(set-cookie\s*:\s*)[^\r\n;]+"), r"\1<masked>"),
+    (re.compile(r"(?i)(cookie\s*:\s*)[^\r\n]+"), r"\1<masked>"),
+    # Authorization / Bearer 头
+    (re.compile(r"(?i)(authorization\s*:\s*(?:bearer\s+)?)\S+"), r"\1<masked>"),
+    # token/apikey 类键值对（JSON 或 query 形态）
+    (re.compile(
+        r"(?i)((?:access[_-]?token|refresh[_-]?token|api[_-]?key|session[_-]?id|"
+        r"csrf[_-]?token|token|sign(?:ature)?)['\"]?\s*[:=]\s*['\"]?)[A-Za-z0-9_\-+/=.]{8,}"
+    ), r"\1<masked>"),
+    # 兜底：>=20 位且含数字的高熵串（hex/base64 形态，大概率是 token/签名/密文；
+    # 要求含数字以避免误杀普通长单词/URL 路径）
+    (re.compile(r"\b(?=[A-Za-z0-9+/=_\-]*\d)[A-Za-z0-9+/=_\-]{20,}\b"), "<masked>"),
+)
+
+def sanitize_snippet(text: str, limit: int = 300) -> str:
+    """失败诊断片段脱敏：抹除 Cookie/token 形态内容后去换行截断。
+
+    异常消息会经 run_task 输出进入公开 Actions 日志、Discord 卡片与邮件日报，
+    任何携带服务端原始响应的文本必须先过这里。
+    """
+    s = text or ""
+    for pat, repl in _SNIPPET_SENSITIVE_PATTERNS:
+        s = pat.sub(repl, s)
+    return s.replace("\n", " ")[:limit]
+
 def must_match(pattern: str, text: str, label: str, flags: int = 0) -> str:
     m = re.search(pattern, text, flags)
     if not m:
-        # 失败时附响应片段(截断 300 字、去换行),便于诊断服务端返回了什么(重定向/风控/模板变更)
-        snippet = (text or "").replace("\n", " ")[:300]
+        # 失败时附脱敏后的响应片段,便于诊断服务端返回了什么(重定向/风控/模板变更)
         if text:
-            raise RuntimeError(f"未提取到 {label}（响应片段: {snippet}）")
+            raise RuntimeError(f"未提取到 {label}（响应片段: {sanitize_snippet(text)}）")
         raise RuntimeError(f"未提取到 {label}（空响应）")
     return m.group(1) if m.groups() else m.group(0)
 
