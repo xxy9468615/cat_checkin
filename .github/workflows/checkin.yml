@@ -9,7 +9,9 @@ on:
     - cron: "0 23 * * *"
     # 30 分钟心跳与容灾自愈轮询（今日已全量完成秒退；有遗漏/未跑/到期重试则自动补跑）
     - cron: "*/30 * * * *"
-    # 晚间日报兜底：北京时间 21:30（UTC 13:30，若日间已发过则秒退）
+    # 每日汇总日报主发送：北京时间 20:00（UTC 12:00）——唯一日常发信点
+    - cron: "0 12 * * *"
+    # 日报失败补发：北京时间 21:30（UTC 13:30，20:00 已成功发送则秒退）
     - cron: "30 13 * * *"
   repository_dispatch:
     types:
@@ -64,7 +66,7 @@ permissions:
 jobs:
   unified:
     if: >-
-      ${{ !(github.event_name == 'schedule' && github.event.schedule == '30 13 * * *')
+      ${{ !(github.event_name == 'schedule' && (github.event.schedule == '30 13 * * *' || github.event.schedule == '0 12 * * *'))
           && github.event.action != 'daily_report' }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -510,7 +512,9 @@ jobs:
             python3 scripts/daily_orchestrator.py $RESET_FLAG
           fi
 
-      - name: Send unified report
+      # 日报邮件已收敛到 report-fallback job（20:00 主发 + 21:30 补发）；
+      # 此步骤只归档当日汇总并输出 failed_matrix 供自动重跑，绝不发邮件
+      - name: Archive daily summary
         id: send_report
         if: >-
           always()
@@ -519,8 +523,8 @@ jobs:
                && contains(fromJSON('["latvi_next_sign","checkin_latvi","checkin_modelscope","workbuddy_travel_claim"]'), github.event.action))
         env:
           DAILY_PUSH: "true"
+          ARCHIVE_ONLY: "1"
           GH_PAT: ${{ secrets.GH_PAT }}
-          ARCHIVE_ONLY: ${{ (steps.orch_tasks.outputs.need_report != 'true' && ((inputs.tasks != '' && inputs.tasks != 'all') || github.event.schedule == '*/30 * * * *' || inputs.due_only == true)) && '1' || '0' }}
           RETRY_REPORT: ${{ inputs.retry == true && '1' || '0' }}
         run: python3 scripts/unified_report.py
 
@@ -620,11 +624,12 @@ jobs:
           if-no-files-found: ignore # 空转 run 无结果文件，忽略即可
 
   # ============================================================
-  # Job 2 — 晚间报告兜底（仅当主流水线未发送日报时补发）
+  # Job 2 — 每日汇总日报（20:00 BJT 主发；21:30 BJT 失败补发）
+  # 幂等：Redis sent marker + QStash 投递核查，已成功发送则秒退
   # ============================================================
   report-fallback:
     if: >-
-      ${{ github.event_name == 'schedule' && github.event.schedule == '30 13 * * *'
+      ${{ github.event_name == 'schedule' && (github.event.schedule == '0 12 * * *' || github.event.schedule == '30 13 * * *')
           || github.event.action == 'daily_report' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

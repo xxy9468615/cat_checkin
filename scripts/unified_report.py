@@ -2,8 +2,14 @@
 # new Env("每日统一通知汇总")
 """统一汇总报告：汇聚当日签到结果，经邮件推送（Discord 仅承担失败即时提醒）。
 
-由 checkin.yml 的 unified（内联，orchestrator 结束后）与 report-fallback（20:30 兜底）
-两个 job 触发。优先从 Upstash Redis `cat_checkin:raw:<TODAY>`（HGETALL）汇聚，
+触发与分工（2026-09-13 日报去重改造）：
+- unified job（晨间批次/心跳/重跑）：仅 ARCHIVE_ONLY=1 归档 + 输出 failed_matrix，
+  不发邮件；
+- report-fallback job：每日 20:00 BJT（cron 0 12 * * *）主发汇总日报，
+  21:30 BJT（cron 30 13 * * *）失败补发，manual 经 daily_report dispatch；
+  幂等由 Redis sent marker + QStash 投递核查保障。
+
+优先从 Upstash Redis `cat_checkin:raw:<TODAY>`（HGETALL）汇聚，
 兜底扫描 `.task_results/` 本地 JSON；Latvi 若今日无结果则回退昨日（24h 冷却跨日）。
 
 2026-08-29 日报回归邮件通道（HTML 卡片 + 今日概览小结，浏览/归档体验优于 Discord），
@@ -368,17 +374,18 @@ def main() -> None:
     if push_enabled:
         if retry_report:
             title = f"[重跑] {title}"
-        # Resend 主通道（QStash 持久投递）+ SMTP 备选；全失败 → exit 1 等 20:30 兜底
+        # Resend 主通道（QStash 持久投递，retries=0 防重复投递）+ SMTP 备选；
+        # 全失败 → exit 1 等 21:30 补发
         sent_resend, resend_msg_id = send_resend(title, report, results)
         sent_smtp = False
         if not sent_resend:
             print("⚠️ Resend 主通道失败，回退 SMTP 备选通道")
             sent_smtp = send_email(title, report, results)
         if not (sent_smtp or sent_resend):
-            print("❌ 所有邮件通道推送失败：不写发送标记并退出非零，等待 20:30 兜底重试")
+            print("❌ 所有邮件通道推送失败：不写发送标记并退出非零，等待 21:30 补发")
             sys.exit(1)
         if retry_report:
-            # 重跑补充邮件：不写当日 sent marker（不挡 20:30 兜底、不冒充主报告），
+            # 重跑补充邮件：不写当日 sent marker（不挡 20:00 主发/21:30 补发、不冒充主报告），
             # 只把重跑后的最新结果再归档一次（raw hash 已含全量，覆盖为最新状态）
             print("🔁 重跑补充报告已发送（不写当日发送标记）")
             archive_daily_summary(collected, today)
@@ -386,7 +393,7 @@ def main() -> None:
         # 邮件已送达或已交接 QStash（至少一个通道）才写当日标记：checkin.yml 兜底去重靠它。
         marker = {"date": today, "sent_at": dt.datetime.now(tz).isoformat()}
         if resend_msg_id:
-            marker["resend_msg_id"] = resend_msg_id  # QStash msg_id，供 20:30 兜底投递核查
+            marker["resend_msg_id"] = resend_msg_id  # QStash msg_id，供 21:30 补发投递核查
         Path(".report_sent").write_text(
             json.dumps(marker, ensure_ascii=False),
             encoding="utf-8",

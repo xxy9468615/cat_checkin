@@ -769,7 +769,10 @@ def send_resend(subject: str, report: str, results: List[Tuple[bool, Path, str, 
                 "Content-Type": "application/json",
                 "Accept": "application/json",
             },
-            retries=2,
+            # retries=0：QStash 是 at-least-once，服务端重试在「Resend 已收件但响应
+            # 超时/瞬时 5xx」时会重复投递同一封邮件。关闭重试后，投递失败经
+            # check_qstash_delivery 判定 delivery=failed，由 21:30 幂等补发兜底。
+            retries=0,
             content_dedup=True,
         )
         if ok:
