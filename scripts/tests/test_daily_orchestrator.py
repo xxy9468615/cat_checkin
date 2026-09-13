@@ -30,7 +30,7 @@ class NoWaitTests(unittest.TestCase):
     """编排器不得为任何未来事件（重试/领奖回程）在进程内排队驻留。"""
 
     def _run(self, out):
-        orch = Orchestrator(hard_deadline=time.time() + 86400)
+        orch = Orchestrator()
         try:
             with patch.object(orch_mod, "record_task_outcome", return_value=({}, False)), \
                  patch.object(orch_mod, "notify_task_result"), \
@@ -52,7 +52,7 @@ class NoWaitTests(unittest.TestCase):
 
     def test_retry_not_enqueued_after_failure(self):
         """失败任务的 next_retry_at 不得压入进程内堆（交由延时接力）。"""
-        orch = Orchestrator(hard_deadline=time.time() + 86400)
+        orch = Orchestrator()
         try:
             fake_circuit = {"next_retry_at": time.time() + 15 * 60, "attempts": 1, "status": "watching"}
             with patch.object(orch_mod, "record_task_outcome", return_value=(fake_circuit, False)), \

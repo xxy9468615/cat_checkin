@@ -64,7 +64,7 @@ def main() -> None:
 
     try:
         if os.getenv("TASK_TIMEOUT"):
-            timeout = int(os.getenv("TASK_TIMEOUT", "300"))
+            timeout = int(os.getenv("TASK_TIMEOUT"))
         else:
             try:
                 from task_registry import TASKS

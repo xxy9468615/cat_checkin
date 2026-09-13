@@ -231,8 +231,9 @@ def run_task_subprocess(cfg: Dict[str, Any]) -> Tuple[bool, str]:
 
 
 class Orchestrator:
-    def __init__(self, hard_deadline: float = 0.0) -> None:
-        self.hard_deadline = hard_deadline or (time.time() + 7200)
+    def __init__(self) -> None:
+        # 2026-09-06 运行模型改造后不再有进程内硬截止时间：
+        # 重试/回程均跨 run 延时接力，orchestrator 只处理当下到期的事件
         self.heap: List[Tuple[float, int, str, Optional[Dict[str, Any]]]] = []
         self.seq = 0
         self.results: Dict[str, Any] = {}

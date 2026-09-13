@@ -255,7 +255,7 @@ class TestDailyOrchestratorCircuitIntegration(unittest.TestCase):
         import daily_orchestrator
 
         import time
-        orch = daily_orchestrator.Orchestrator(hard_deadline=time.time() + 3600)
+        orch = daily_orchestrator.Orchestrator()
 
         # 模拟仅测试 agentrouter，并将其标记为已熔断
         with mock.patch.object(daily_orchestrator, "is_task_suspended", return_value=True):
