@@ -349,10 +349,42 @@ jobs:
           except Exception as e:
               print(f"AGENTROUTER_SINGBOX_CONFIG not valid JSON: {e}")
               sys.exit(1)
-          # ── 传输安全加固 ──────────────────────────────────────────────────
-          # 1) 出站 TLS 校验（Fail-Closed）：严格禁止 insecure 出站，防范中间人劫持
-          for ob in (cfg.get("outbounds") or []):
-              tls = ob.get("tls") if isinstance(ob, dict) else None
+          # ── 传输安全加固与格式兼容 ────────────────────────────────────────
+          # 1) 出站协议与参数规范化（兼容 Clash/Mihomo 订阅与导出格式）及 Fail-Closed 安全核验
+          TYPE_MAP = {
+              "ss": "shadowsocks",
+              "ss2022": "shadowsocks",
+              "hy2": "hysteria2",
+              "socks5": "socks",
+              "socks4": "socks",
+              "socks4a": "socks",
+              "url-test": "urltest",
+          }
+          outbounds = cfg.get("outbounds") or []
+          for idx, ob in enumerate(outbounds):
+              if not isinstance(ob, dict):
+                  continue
+              # 协议类型别名归一化（如 ss -> shadowsocks, hy2 -> hysteria2）
+              raw_type = str(ob.get("type", "")).strip().lower()
+              if raw_type in TYPE_MAP:
+                  ob["type"] = TYPE_MAP[raw_type]
+              # 字段兼容性归一化
+              if "name" in ob and "tag" not in ob:
+                  ob["tag"] = ob.pop("name")
+              if "port" in ob and "server_port" not in ob:
+                  try:
+                      ob["server_port"] = int(ob.pop("port"))
+                  except (ValueError, TypeError):
+                      pass
+              if ob.get("type") == "shadowsocks":
+                  # Clash 格式 cipher 转换为 sing-box 规范的 method 字段
+                  if "cipher" in ob and "method" not in ob:
+                      ob["method"] = ob.pop("cipher")
+              elif ob.get("type") in ("selector", "urltest"):
+                  if "proxies" in ob and "outbounds" not in ob:
+                      ob["outbounds"] = ob.pop("proxies")
+              # 严格禁止 insecure 出站，防范中间人劫持
+              tls = ob.get("tls")
               if isinstance(tls, dict) and tls.get("insecure"):
                   print(f"❌ outbound [{ob.get('tag', '?')}] 配置了 tls.insecure=true，拒绝启动。"
                         "请在 AGENTROUTER_SINGBOX_CONFIG 中移除 insecure 并配置受信证书/server_name。")
@@ -471,13 +503,14 @@ jobs:
             fi
             # 出口探测加重试与备用目标：TW-X1-3 节点晨间偶发抖动（TCP 握手慢/单点限流），
             # 单次 12s 失败即拆除会造成整轮假故障（agentrouter/nodeseek 等连锁公平失败）。
-            # 3 次重试 + ip.sb 备用目标，最坏 ~50s 换取抖动容错。
+            # 3 次重试 + socks5h 远程 DNS + ip.sb/icanhazip 备用目标，最坏 ~50s 换取抖动容错。
             exit_ip=""
             for attempt in 1 2 3; do
-              exit_ip=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 https://api.ipify.org 2>/dev/null || echo "")
-              [ -n "$exit_ip" ] && break
-              exit_ip=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 https://ip.sb 2>/dev/null || echo "")
-              [ -n "$exit_ip" ] && break
+              for probe_url in "https://api.ipify.org" "https://ip.sb" "https://icanhazip.com"; do
+                exit_ip=$(curl -sS -x "socks5h://127.0.0.1:1080" -m 10 "$probe_url" 2>/dev/null || curl -sS -x "socks5://127.0.0.1:1080" -m 10 "$probe_url" 2>/dev/null || echo "")
+                exit_ip=$(printf '%s' "$exit_ip" | tr -d '[:space:]')
+                [ -n "$exit_ip" ] && break 2
+              done
               echo "sing-box egress probe attempt $attempt failed, retrying in 5s..."
               sleep 5
             done

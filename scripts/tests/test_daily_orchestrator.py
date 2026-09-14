@@ -69,6 +69,17 @@ class NoWaitTests(unittest.TestCase):
 class PlanModeTests(unittest.TestCase):
     """--plan 到期评估：不执行任何子进程，输出与 run 过滤口径一致。"""
 
+    def test_plan_none_or_empty_returns_empty(self):
+        """显式传入 none/empty/null 时不抛出 ValueError，安全返回空到期任务列表。"""
+        self.assertEqual(plan_due_tasks("none"), [])
+        self.assertEqual(plan_due_tasks("NONE"), [])
+        self.assertEqual(plan_due_tasks("empty"), [])
+        self.assertEqual(plan_due_tasks("null"), [])
+        from task_registry import resolve_execution_queue
+        self.assertEqual(resolve_execution_queue("none"), [])
+        self.assertEqual(resolve_execution_queue("NONE"), [])
+        self.assertEqual(resolve_execution_queue(""), [])
+
     def test_due_only_filters_cooldown_and_signed_latvi(self):
         env = {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:test:"}
         with patch.dict(os.environ, env, clear=False), \

@@ -331,12 +331,19 @@ def resolve_execution_queue(input_tasks: str = "") -> List[Dict[str, Any]]:
     且原 cron 匹配用带冒号写法（"16:50"）永远匹配不到 GitHub cron 格式，属死代码。
     """
     raw_tasks = (input_tasks or "").strip()
+    if not raw_tasks or raw_tasks.lower() in ("none", "null", "nil", "empty", "[]"):
+        return []
 
     wanted_keys = [k.strip() for k in raw_tasks.replace(" ", ",").split(",") if k.strip()]
+    if not wanted_keys or all(k.lower() in ("none", "null", "nil", "empty", "[]") for k in wanted_keys):
+        return []
+
     matched: List[Dict[str, Any]] = []
     matched_keys: set[str] = set()
 
     for key in wanted_keys:
+        if key.lower() in ("none", "null", "nil", "empty", "[]"):
+            continue
         # 关键字全选 / 分组别名
         if key.lower() in ("all", "full", "all_tasks"):
             for t in TASKS.values():

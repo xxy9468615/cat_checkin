@@ -395,6 +395,8 @@ def plan_due_tasks(raw_tasks: str = "", due_only: bool = False) -> List[str]:
     bjt_hour = bjt_now().hour
 
     if raw_tasks.strip():
+        if raw_tasks.strip().lower() in ("none", "null", "nil", "empty", "[]"):
+            return []
         cfgs = resolve_execution_queue(input_tasks=raw_tasks)
         due: List[str] = []
         for cfg in cfgs:
