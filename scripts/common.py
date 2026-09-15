@@ -523,6 +523,58 @@ def qstash_publish(
     return False, f"HTTP {resp.code}{': ' + detail if detail else ''}"
 
 
+def create_qstash_schedule(
+    destination: str,
+    cron: str,
+    body: str,
+    *,
+    method: str = "POST",
+    forward_headers: Optional[Dict[str, str]] = None,
+    schedule_id: str = "",
+    retries: Optional[int] = None,
+    timezone_name: str = "",
+) -> tuple[bool, str]:
+    """创建/覆盖一条 QStash Cron 定时投递（幂等：同 schedule_id 即 update）。
+
+    用途：GitHub Actions 的 schedule 事件只承诺「大致按时」，实测可漂移数小时
+    甚至整体丢投（本仓库 4 条 cron 一天只落地约 9 次而非约 52 次）。日报这类
+    「必须在固定时刻送达」的任务改用 QStash 精确定时，cron 仅保留为兜底。
+
+    - destination: 目标 API 完整 URL
+    - cron: POSIX cron（UTC）；timezone_name 非空时以 CRON_TZ 前缀注入
+    - schedule_id: 自定义 ID；已存在则原地更新，避免重复排程
+    返回 (是否成功, scheduleId 或失败说明)。
+    """
+    qstash_url = os.getenv("QSTASH_URL") or os.getenv("WORKBUDDY_QSTASH_URL")
+    qstash_token = os.getenv("QSTASH_TOKEN") or os.getenv("WORKBUDDY_QSTASH_TOKEN")
+    if not qstash_url or not qstash_token:
+        return False, "未配置 QStash(QSTASH_URL, QSTASH_TOKEN)"
+
+    base = qstash_url.split("/v2/publish", 1)[0].rstrip("/")
+    url = f"{base}/v2/schedules/{destination}"
+
+    headers: Dict[str, str] = {
+        "Authorization": f"Bearer {qstash_token}",
+        "Content-Type": "application/json",
+        "Upstash-Cron": f"CRON_TZ={timezone_name} {cron}" if timezone_name else cron,
+        "Upstash-Method": method,
+    }
+    if schedule_id:
+        headers["Upstash-Schedule-Id"] = schedule_id
+    if retries is not None:
+        headers["Upstash-Retries"] = str(int(retries))
+    for name, value in (forward_headers or {}).items():
+        headers[f"Upstash-Forward-{name}"] = value
+
+    resp = Http(proxy="").request("POST", url, headers=headers, data=body, timeout=15)
+    if resp.code in (200, 201, 202):
+        data = resp.json()
+        sid = str(data.get("scheduleId", "") or "") if isinstance(data, dict) else ""
+        return True, sid
+    detail = resp.text[:200] if resp.text else ""
+    return False, f"HTTP {resp.code}{': ' + detail if detail else ''}"
+
+
 def schedule_repo_dispatch(event_type: str, delay_seconds: int) -> tuple[bool, str]:
     """通过 QStash 延时 Webhook 触发 GitHub repository_dispatch（跨 run 接力调度）。
 

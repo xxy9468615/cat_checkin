@@ -222,6 +222,9 @@ jobs:
           EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: |
           set -euo pipefail
+          # 归一化空白后再比较：github.event.schedule 对同一表达式的空格渲染
+          # 并不稳定（见下方 report-fallback 的说明），精确比较会静默失配。
+          EVENT_SCHEDULE="$(printf '%s' "${EVENT_SCHEDULE:-}" | tr -s ' ' | sed 's/^ //; s/ $//')"
           PLAN_ARGS=""
           if [ -n "${INPUT_TASKS:-}" ]; then
             CANDIDATES=$(printf '%s' "$INPUT_TASKS" | tr '\n' ' ')
@@ -673,11 +676,26 @@ jobs:
   # ============================================================
   # Job 2 — 每日汇总日报（20:00 BJT 主发；21:30 BJT 失败补发）
   # 幂等：Redis sent marker + QStash 投递核查，已成功发送则秒退
+  #
+  # 定时主力 = QStash Cron（scripts/setup_report_schedule.py 注册，精确到分，
+  # 经 repository_dispatch(daily_report) 派发）；GitHub cron 仅作兜底。
+  #
+  # 原因（2026-09-15 排查）：GitHub schedule 在本仓库严重不准时。实测本应
+  # 20:00 BJT 送达的 "0 12 * * *" 日报 cron 屡次延迟约 5~6.7 小时，直到次日
+  # 凌晨 00:59 / 01:16 / 02:44 BJT 才落地（分别晚 5h16m / 4h59m / 5h14m）。
+  # unified_report 在运行时才计算 TODAY，于是这封「昨天的日报」取到的是新一天
+  # 几乎无任务的数据，发出「成功 4、待执行 25」的空报告——用户看到的就是
+  # 「每天凌晨推邮件」。注意：job 条件本身能正确识别日报 cron（故确实执行了），
+  # 它纠正不了「执行得太晚」；时序正确性只能靠下面两层。
+  #
+  # 双闸门：
+  #   1) job 前置解析真实 cron，放行日报时段与 daily_report 派发（其余秒退）；
+  #   2) unified_report 侧 19:00~23:59 BJT 时间窗守卫：晚到的日报只归档，
+  #      不发信也不写 sent marker（否则既发错日期的空数据，又压制次日 20:00 主发）。
   # ============================================================
   report-fallback:
     if: >-
-      ${{ github.event_name == 'schedule' && (github.event.schedule == '0 12 * * *' || github.event.schedule == '30 13 * * *')
-          || github.event.action == 'daily_report' }}
+      ${{ github.event_name == 'schedule' || github.event.action == 'daily_report' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     concurrency:
@@ -687,20 +705,84 @@ jobs:
       contents: read
       actions: write
     steps:
+      # 归一化真实 cron 并分类。放在最前且不依赖任何 action / 仓库内容，
+      # 非日报时段（晨间批次、漂移落地的心跳）在此秒退，不消耗 checkout 时间。
+      - name: Resolve schedule cron
+        id: sched
+        env:
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          set -euo pipefail
+          CRON="$(printf '%s' "$EVENT_SCHEDULE" | tr -s ' ' | sed 's/^ //; s/ $//')"
+          case "$CRON" in
+            "0 12 * * *"|"30 13 * * *") KIND="report" ;;
+            "0 23 * * *")               KIND="morning" ;;
+            "*/30 * * * *")             KIND="heartbeat" ;;
+            *)                          KIND="other" ;;
+          esac
+          echo "cron=[${CRON}] kind=${KIND}"
+          {
+            echo "cron=${CRON}"
+            echo "kind=${KIND}"
+          } >> "$GITHUB_OUTPUT"
+
+      # 日报主发/补发只认「真实 cron 属于日报时段」或 QStash 精确派发。
+      # 注意：此处无法纠正「日报 cron 执行得太晚」——那由 unified_report 的
+      # 19:00~23:59 BJT 时间窗守卫兜住（晚到只归档、不发信、不写 marker）。
+      - name: Gate to report slots only
+        id: gate
+        env:
+          KIND: ${{ steps.sched.outputs.kind }}
+          ACTION: ${{ github.event.action }}
+        run: |
+          set -euo pipefail
+          if [ "$ACTION" = "daily_report" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "✅ QStash 精确定时派发（daily_report），放行日报主发"
+          elif [ "$KIND" = "report" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "✅ 命中日报 cron 时段，放行"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "⏭️ 非日报时段（kind=${KIND:-<empty>}；cron 漂移落地的 ${KIND} 不参与发信），"
+            echo "   本 job 秒退；日报由 QStash 每日 20:00 BJT 精确派发主发。"
+          fi
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1（SHA 固定，node24）
+        if: steps.gate.outputs.run == 'true'
+
+      # 自愈式排程注册：QStash 排程是日报的定时主力，一旦被误删或首次部署
+      # 缺失，本次 cron 命中即原地重建（固定 scheduleId => 幂等 update）。
+      # 刻意放在 setup-python 之前：common.py 此处只用到标准库（可用 runner
+      # 自带 python3），即使 Python 安装步骤失败也能把排程补上——这是今晚
+      # 20:00 能否精准发信的开关。失败不影响本次发信，仅告警。
+      - name: Ensure QStash report schedule
+        if: steps.gate.outputs.run == 'true'
+        env:
+          QSTASH_URL: ${{ secrets.QSTASH_URL }}
+          QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_REPO: ${{ github.repository }}
+        run: |
+          python3 scripts/setup_report_schedule.py || \
+            echo "⚠️ QStash 日报排程注册失败（不影响本次发信；日报仍可由 GitHub cron 兜底）"
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0（SHA 固定，node24）
+        if: steps.gate.outputs.run == 'true'
         with:
           python-version: "3.12"
 
       - name: Syntax check
+        if: steps.gate.outputs.run == 'true'
         run: python3 -m py_compile scripts/*.py
 
       - name: Set TODAY
+        if: steps.gate.outputs.run == 'true'
         run: echo "TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_ENV"
 
       - name: Check if report sent today (Redis marker)
         id: check_sent
+        if: steps.gate.outputs.run == 'true'
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
@@ -739,6 +821,7 @@ jobs:
 
       - name: Verify QStash email delivery
         id: delivery
+        if: steps.gate.outputs.run == 'true'
         env:
           QSTASH_URL: ${{ secrets.QSTASH_URL }}
           QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
@@ -747,6 +830,7 @@ jobs:
 
       - name: Determine if execution is needed
         id: should_run
+        if: steps.gate.outputs.run == 'true'
         env:
           TODAY: ${{ env.TODAY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -766,7 +850,7 @@ jobs:
 
       - name: Send unified report
         id: send_report
-        if: steps.should_run.outputs.skip != 'true'
+        if: steps.gate.outputs.run == 'true' && steps.should_run.outputs.skip != 'true'
         env:
           TZ: Asia/Shanghai
           DAILY_PUSH: "true"
@@ -790,7 +874,7 @@ jobs:
         run: python3 scripts/unified_report.py
 
       - name: Auto-retry failed sites
-        if: always() && steps.should_run.outputs.skip != 'true' && steps.send_report.outputs.failed_matrix != ''
+        if: always() && steps.gate.outputs.run == 'true' && steps.should_run.outputs.skip != 'true' && steps.send_report.outputs.failed_matrix != ''
         env:
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           FAILED_MATRIX: ${{ steps.send_report.outputs.failed_matrix }}

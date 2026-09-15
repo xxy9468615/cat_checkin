@@ -7,7 +7,11 @@
   不发邮件；
 - report-fallback job：每日 20:00 BJT（cron 0 12 * * *）主发汇总日报，
   21:30 BJT（cron 30 13 * * *）失败补发，manual 经 daily_report dispatch；
-  幂等由 Redis sent marker + QStash 投递核查保障。
+  幂等由 Redis sent marker + QStash 投递核查保障；
+  定时主力改由 QStash Cron（scripts/setup_report_schedule.py）精确派发，
+  GitHub cron 仅兜底——其 schedule 实测可延迟 5~6.7 小时到次日凌晨；
+  另受 `_daily_report_window_blocks` 时间窗守卫约束（早于 19:00 BJT 拒发），
+  晚到的日报只归档、不发信、不写 marker，既不推错日期数据也不压制当日主发。
 
 优先从 Upstash Redis `cat_checkin:raw:<TODAY>`（HGETALL）汇聚，
 兜底扫描 `.task_results/` 本地 JSON；Latvi 若今日无结果则回退昨日（24h 冷却跨日）。
@@ -37,6 +41,43 @@ from task_registry import TASKS, get_expected_results  # noqa: E402
 
 # Latvi 的结果文件名（24h 间隔约束，18:00 运行，报告取昨日结果）
 LATVI_RESULT_FILE = "latvi.json"
+
+# 日报发信时间窗（北京时间）：20:00 主发 + 21:30 失败补发。
+# 窗口起点，早于此点一律拒发（见 _daily_report_window_blocks）。
+DAILY_REPORT_EARLIEST_HOUR = 19
+
+# 是否允许次日 00:00~05:59 的「迟到兜底」发信。默认 False（严格收敛在
+# 19:00~23:59 BJT）：凌晨抢发正是用户反馈的故障现象，且会写下 sent marker
+# 压制当日 20:00 主发。仅当 20:00 主发被证实会整批丢失、确需兜底时才改 True。
+DAILY_REPORT_ALLOW_LATE = False
+
+
+def _daily_report_window_blocks(now: dt.datetime, report_fallback: bool) -> bool:
+    """判定当前时刻是否禁止发送日报主邮件（北京时间语义，now 须为 BJT aware）。
+
+    背景（2026-09-15 排查）：GitHub Actions 的 schedule 在本仓库严重不准时。
+    本应 20:00 BJT 送达的 "0 12 * * *" 日报 cron 屡次延迟约 5~6.7 小时，直到
+    次日凌晨 00:59 / 01:16 / 02:44 BJT 才落地。而 TODAY 是在运行时才计算的，
+    于是这封「昨天的日报」取到新一天几乎无任务的数据，发出「成功 4、待执行 25」
+    的空报告，并写下**新一天**的 sent marker，把当天真正的 20:00 主发幂等秒退
+    ——用户看到的就是「每天凌晨推邮件」，且当天再无日报。
+
+    规则（仅约束「主发/补发」通道，report_fallback=True）：
+      - 19:00 ~ 23:59 BJT：放行（覆盖 20:00 主发与 21:30 补发）；
+      - 其余时刻（含 00:00~18:59）：禁止，只归档、绝不写 sent marker；
+      - DAILY_REPORT_ALLOW_LATE=True 时额外放行次日 00:00~05:59。
+
+    非 fallback 通道（重跑补充邮件 / 20:00 前大范围 pending 判定）不受时间窗约束。
+    """
+    if not report_fallback:
+        return False
+    hour = now.hour
+    if hour >= DAILY_REPORT_EARLIEST_HOUR:
+        return False
+    if DAILY_REPORT_ALLOW_LATE and hour < 6:
+        return False
+    return True
+
 
 # 期望任务清单：从统一 task_registry 读取
 EXPECTED_RESULTS: Dict[str, str] = get_expected_results()
@@ -365,6 +406,14 @@ def main() -> None:
         archive_daily_summary(collected, today)
         if fail_count:
             sys.exit(1)
+        return
+
+    if push_enabled and _daily_report_window_blocks(now, report_fallback):
+        # 时间窗守卫：绝不写 sent marker（否则会压制当日 20:00 主发），仅归档。
+        print(f"⏰ 当前 {now.strftime('%H:%M')} BJT 不在日报发信窗口"
+              f"（仅 {DAILY_REPORT_EARLIEST_HOUR}:00 之后发信），"
+              "本次仅归档、不写发送标记，等待 20:00 主发 / 21:30 补发。")
+        archive_daily_summary(collected, today)
         return
 
     if push_enabled and not retry_report and not report_fallback and pending_count > 3:
