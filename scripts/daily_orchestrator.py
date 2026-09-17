@@ -485,14 +485,6 @@ def main() -> None:
     parser.add_argument("--due-only", action="store_true", help="plan mode: apply heartbeat DUE_ONLY filtering (rolling cooldown / latvi signed-today)")
     args = parser.parse_args()
 
-    if args.plan:
-        due = plan_due_tasks(args.tasks, due_only=args.due_only)
-        need_report = check_daily_report_needed(due)
-        print(f"DUE_TASKS={','.join(due) if due else 'none'}")
-        print(f"NEED_REPORT={'true' if need_report else 'false'}")
-        sys.exit(0)
-
-    print(f"Daily orchestrator start @ {bjt_now().strftime('%Y-%m-%d %H:%M:%S')} BJT")
     is_explicit = bool(args.tasks.strip())
 
     if args.reset_circuit or args.reset_circuit_tasks:
@@ -509,6 +501,15 @@ def main() -> None:
             else:
                 resume_all_tasks(reason="全局调度恢复上线 (--reset-circuit)")
                 print("🔄 [CIRCUIT_BREAKER] 全部任务熔断状态已重置上线")
+
+    if args.plan:
+        due = plan_due_tasks(args.tasks, due_only=args.due_only)
+        need_report = check_daily_report_needed(due)
+        print(f"DUE_TASKS={','.join(due) if due else 'none'}")
+        print(f"NEED_REPORT={'true' if need_report else 'false'}")
+        sys.exit(0)
+
+    print(f"Daily orchestrator start @ {bjt_now().strftime('%Y-%m-%d %H:%M:%S')} BJT")
 
     orch = Orchestrator()
     if is_explicit:

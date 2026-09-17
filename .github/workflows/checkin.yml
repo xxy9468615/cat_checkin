@@ -218,6 +218,7 @@ jobs:
         env:
           INPUT_TASKS: ${{ inputs.tasks }}
           INPUT_DUE_ONLY: ${{ inputs.due_only }}
+          INPUT_RESET_CIRCUIT: ${{ inputs.reset_circuit }}
           EVENT_ACTION: ${{ github.event.action }}
           EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: |
@@ -254,6 +255,10 @@ jobs:
             if [ "$EVENT_SCHEDULE" = "*/30 * * * *" ] || [ "${INPUT_DUE_ONLY:-false}" = "true" ]; then
               PLAN_ARGS="--due-only"
             fi
+          fi
+
+          if [ "${INPUT_RESET_CIRCUIT:-false}" = "true" ]; then
+            PLAN_ARGS="$PLAN_ARGS --reset-circuit"
           fi
 
           PLAN_OUT=$(python3 scripts/daily_orchestrator.py --plan $PLAN_ARGS)
