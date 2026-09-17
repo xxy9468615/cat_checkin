@@ -359,9 +359,24 @@ class Orchestrator:
 def build_default_timeline(orch: Orchestrator) -> None:
     now = time.time()
     due_ids = plan_due_tasks("")
+    due_set = set(due_ids)
     for tid in due_ids:
         orch.push(now, "task", TASKS[tid])
+
+    # 熔断停用任务同样入队：plan_due_tasks 会把它们过滤掉，若不入队则日报
+    # 因缺少今日结果而误报「⏳ 待执行」，掩盖真实原因（已熔断，等待人工上线）。
+    # 入队后由 run() 的 suspended 分支写入「🛑 已熔断停用」结果记录。
+    successful_today = _get_today_successful_tasks()
+    suspended_ids = [
+        tid for tid in TASKS
+        if tid not in due_set and tid not in successful_today and is_task_suspended(tid)
+    ]
+    for tid in suspended_ids:
+        orch.push(now, "task", TASKS[tid])
+
     print(f"Due tasks ({len(due_ids)}): {', '.join(due_ids)}")
+    if suspended_ids:
+        print(f"Suspended tasks ({len(suspended_ids)}): {', '.join(suspended_ids)}")
 
 
 def build_explicit_timeline(orch: Orchestrator, raw: str) -> None:

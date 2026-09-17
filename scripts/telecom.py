@@ -63,8 +63,14 @@ except ImportError:
 PREFIX = "TELECOM_"
 
 # 自动兑换话费目标配置（默认目标：10元话费直充券，8000金豆达标）
-TELECOM_EXCHANGE_GOAL = os.getenv("TELECOM_EXCHANGE_GOAL", "10元话费直充券")
-TELECOM_EXCHANGE_BEANS = int(os.getenv("TELECOM_EXCHANGE_BEANS", "8000"))
+# 环境变量可能被误配为非数字（Secret 填写错误）——解析失败时回退默认门槛，避免整个任务导入即崩
+TELECOM_EXCHANGE_GOAL = (os.getenv("TELECOM_EXCHANGE_GOAL") or "").strip() or "10元话费直充券"
+try:
+    TELECOM_EXCHANGE_BEANS = int((os.getenv("TELECOM_EXCHANGE_BEANS") or "").strip() or "8000")
+except ValueError:
+    TELECOM_EXCHANGE_BEANS = 8000
+if TELECOM_EXCHANGE_BEANS <= 0:
+    TELECOM_EXCHANGE_BEANS = 8000
 
 # 电信网关登录公钥与 3DES 密钥
 LOGIN_RSA_PUB = (

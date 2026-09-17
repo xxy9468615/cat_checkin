@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -356,6 +357,45 @@ class TestTelecom(unittest.TestCase):
         self.assertEqual(outcome["status"], "成功")
         self.assertIn("距离【10元话费直充券】(8000金豆) 还差 6500 金豆", outcome["goal_res"])
         self.assertIn("18.8%", outcome["goal_res"])
+
+    def _import_constants(self, extra_env):
+        """在独立子进程中导入 telecom，返回 (BADGES, GOAL) 常量，隔离模块级 env 解析。"""
+        code = (
+            "import os, sys\n"
+            f"sys.path.insert(0, {str(BASE)!r})\n"
+            "import telecom\n"
+            "print(telecom.TELECOM_EXCHANGE_BEANS, telecom.TELECOM_EXCHANGE_GOAL)\n"
+        )
+        env = {k: v for k, v in os.environ.items() if not k.startswith("TELECOM_")}
+        env.update(extra_env)
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(BASE.parent),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        beans, _, goal = proc.stdout.strip().partition(" ")
+        return int(beans), goal
+
+    def test_exchange_env_custom_value(self):
+        """自定义兑换目标与门槛应被正确读取。"""
+        beans, goal = self._import_constants(
+            {"TELECOM_EXCHANGE_BEANS": "12000", "TELECOM_EXCHANGE_GOAL": "20元话费券"}
+        )
+        self.assertEqual(beans, 12000)
+        self.assertEqual(goal, "20元话费券")
+
+    def test_exchange_env_fallback_non_numeric(self):
+        """门槛误配为非数字/空串/负数时应回退默认 8000，不得导入即崩。"""
+        for bad in ("abc", "", "   ", "-5", "0"):
+            with self.subTest(value=bad):
+                beans, goal = self._import_constants(
+                    {"TELECOM_EXCHANGE_BEANS": bad, "TELECOM_EXCHANGE_GOAL": "   "}
+                )
+                self.assertEqual(beans, 8000)
+                self.assertEqual(goal, "10元话费直充券")
 
 
 if __name__ == "__main__":

@@ -150,6 +150,14 @@ jobs:
       # 中国电信 App 请求头凭据
       TELECOM_HEADER_1: ${{ secrets.TELECOM_HEADER_1 }}
       TELECOM_HEADER_2: ${{ secrets.TELECOM_HEADER_2 }}
+      # 服务密码自动登录：sign 抓包失效时永久兜底（手机号缺省复用 CLOUD189_USERNAME_*）
+      TELECOM_PASSWORD_1: ${{ secrets.TELECOM_PASSWORD_1 }}
+      TELECOM_PASSWORD_2: ${{ secrets.TELECOM_PASSWORD_2 }}
+      TELECOM_PHONE_1: ${{ secrets.TELECOM_PHONE_1 }}
+      TELECOM_PHONE_2: ${{ secrets.TELECOM_PHONE_2 }}
+      # 金豆兑换目标（缺省即 10 元话费直充券 / 8000 豆）
+      TELECOM_EXCHANGE_GOAL: ${{ secrets.TELECOM_EXCHANGE_GOAL || '10元话费直充券' }}
+      TELECOM_EXCHANGE_BEANS: ${{ secrets.TELECOM_EXCHANGE_BEANS || '8000' }}
       TELECOM_PROXY: ${{ secrets.TELECOM_PROXY || secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
       # OPPO 商城打卡与赚积分
       OPPO_COOKIE_1: ${{ secrets.OPPO_COOKIE_1 }}

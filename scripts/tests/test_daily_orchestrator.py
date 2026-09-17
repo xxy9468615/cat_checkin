@@ -14,7 +14,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
@@ -178,6 +178,34 @@ class PlanModeTests(unittest.TestCase):
             due = plan_due_tasks("", due_only=True)
         self.assertNotIn("smzdm", due, "今日已成功的任务应跳过")
         self.assertIn("52pojie", due, "白日心跳模式下未成功的常规任务应触发漏跑自愈")
+
+    def test_default_timeline_enqueues_suspended_task(self):
+        """熔断停用任务须入队以写入「已熔断停用」结果记录，避免日报误报「待执行」。"""
+        orch = MagicMock()
+        with patch.object(orch_mod, "plan_due_tasks", return_value=["juejin"]), \
+             patch.object(orch_mod, "_get_today_successful_tasks", return_value=set()), \
+             patch.object(orch_mod, "is_task_suspended",
+                          side_effect=lambda tid: tid == "aistudio"), \
+             patch("sys.stdout", new_callable=io.StringIO) as buf:
+            orch_mod.build_default_timeline(orch)
+
+        pushed = [c.args[2]["id"] for c in orch.push.call_args_list]
+        self.assertIn("juejin", pushed, "到期任务应入队")
+        self.assertIn("aistudio", pushed, "熔断停用任务应入队以留痕")
+        self.assertIn("Suspended tasks", buf.getvalue())
+
+    def test_default_timeline_skips_suspended_but_succeeded_today(self):
+        """今日已成功、事后才熔断的任务不得被覆盖为熔断记录。"""
+        orch = MagicMock()
+        with patch.object(orch_mod, "plan_due_tasks", return_value=[]), \
+             patch.object(orch_mod, "_get_today_successful_tasks", return_value={"aistudio"}), \
+             patch.object(orch_mod, "is_task_suspended",
+                          side_effect=lambda tid: tid == "aistudio"), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            orch_mod.build_default_timeline(orch)
+
+        pushed = [c.args[2]["id"] for c in orch.push.call_args_list]
+        self.assertNotIn("aistudio", pushed)
 
 
 if __name__ == "__main__":
