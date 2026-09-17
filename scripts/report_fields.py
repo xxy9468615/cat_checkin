@@ -1324,7 +1324,7 @@ def ex_telecom(output: str, res: Dict[str, Any]) -> None:
         mm = re.search(r"• 抽奖:\s*【(.+?)】", ln)
         if mm:
             lottery_txt = mm.group(1)
-            if lottery_txt and lottery_txt != "今日已抽":
+            if lottery_txt and lottery_txt not in ("今日已抽", "无抽奖凭据"):
                 cur.parts.append(f"抽奖: {lottery_txt}")
                 res["badges"].append(("reward", f"抽奖 {lottery_txt}"))
             elif lottery_txt == "今日已抽":
@@ -1332,16 +1332,22 @@ def ex_telecom(output: str, res: Dict[str, Any]) -> None:
             continue
         mm = re.search(r"• 任务:\s*【(.+?)】", ln)
         if mm:
-            cur.parts.append(f"任务: {mm.group(1)}")
+            if not mm.group(1).startswith("跳过"):
+                cur.parts.append(f"任务: {mm.group(1)}")
             continue
         mm = re.search(r"• 乐园:\s*【(.+?)】", ln)
         if mm:
-            cur.parts.append(f"乐园: {mm.group(1)}")
+            if not mm.group(1).startswith("跳过"):
+                cur.parts.append(f"乐园: {mm.group(1)}")
             continue
         mm = re.search(r"• 资产:\s*金豆\s*【(" + NUM + r")】", ln)
         if mm:
             cur.parts.append(f"金豆 {_d(mm.group(1))}")
             res["assets"].append(("金豆", _f(mm.group(1))))
+            continue
+        mm = re.search(r"• 目标:\s*【(.+?)】", ln)
+        if mm:
+            cur.parts.append(f"目标: {mm.group(1)}")
             continue
     if cur:
         cur.flush(res)

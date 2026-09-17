@@ -212,6 +212,88 @@ class TestTelecom(unittest.TestCase):
         self.assertEqual(outcome["food_res"], "喂食1次")
         self.assertEqual(outcome["total_bean"], "2580")
 
+    def test_execute_telecom_task_expired_session(self):
+        """401 未授权访问或会话失效时必须明确报错失败，绝不冒充完成。"""
+        if not telecom.HAS_CRYPTO:
+            self.skipTest("缺少 pycryptodome 库，跳过测试")
+
+        acc = telecom.TelecomAccount(
+            index=1,
+            phone="18912345678",
+            sign="expired_sign_token_123456789012345",
+        )
+        mock_http = MagicMock()
+        client = telecom.TelecomClient(acc, mock_http)
+        client._req = MagicMock(return_value={"code": "401", "msg": "未授权访问"})
+
+        with patch.object(client, "restore_cached_session", return_value=True), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            outcome = telecom.execute_telecom_task(client)
+
+        self.assertEqual(outcome["status"], "失败")
+        self.assertIn("会话已失效", outcome["error"])
+        self.assertIn("未授权访问", outcome["error"])
+
+    def test_execute_telecom_task_network_http_error(self):
+        """网络异常或 WAF 412 时必须判定失败，触发代理重试或报错。"""
+        if not telecom.HAS_CRYPTO:
+            self.skipTest("缺少 pycryptodome 库，跳过测试")
+
+        acc = telecom.TelecomAccount(
+            index=1,
+            phone="18912345678",
+            sign="mock_sign_token_1234567890123456",
+        )
+        mock_http = MagicMock()
+        client = telecom.TelecomClient(acc, mock_http)
+        client._req = MagicMock(return_value={"code": 412, "msg": "HTTP 412", "_http_error": True})
+
+        with patch.object(client, "restore_cached_session", return_value=True), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            outcome = telecom.execute_telecom_task(client)
+
+        self.assertEqual(outcome["status"], "失败")
+        self.assertIn("网络请求异常", outcome["error"])
+
+    def test_run_account_proxy_rotation(self):
+        """主代理网络失败时应轮换到下一个候选代理并成功。"""
+        acc = telecom.TelecomAccount(
+            index=1,
+            phone="18912345678",
+            sign="mock_sign_token_1234567890123456",
+        )
+        ep1 = MagicMock()
+        ep1.display_name = "主出口"
+        ep1.url = "socks5://1.1.1.1:1080"
+        ep2 = MagicMock()
+        ep2.display_name = "备用出口"
+        ep2.url = "socks5://2.2.2.2:1080"
+
+        calls = []
+        def fake_exec(client):
+            calls.append(client.http)
+            if len(calls) == 1:
+                return {"status": "失败", "error": "网络请求异常（HTTP -1）"}
+            return {
+                "status": "成功",
+                "gain_bean": 10,
+                "streak_days": 1,
+                "lottery_res": "",
+                "task_res": "",
+                "food_res": "",
+                "total_bean": "100",
+                "error": "",
+            }
+
+        with patch.object(telecom, "_get_candidate_proxies", return_value=[ep1, ep2]), \
+             patch.object(telecom, "execute_telecom_task", side_effect=fake_exec), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok, outcome = telecom._run_account(acc)
+
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(outcome["status"], "成功")
+
     def test_report_fields_extractor(self):
         """报告字段解析器提取验证。"""
         sample_output = """
@@ -224,6 +306,7 @@ class TestTelecom(unittest.TestCase):
 • 任务: 【完成1项】
 • 乐园: 【喂食1次】
 • 资产: 金豆 【2,580】
+• 目标: 【距离【10元话费直充券】(8000金豆) 还差 5420 金豆 (进度: 32.2%)】
 
 总结：成功 1/1
 """
@@ -234,6 +317,7 @@ class TestTelecom(unittest.TestCase):
         self.assertIn("+10金豆", res["lines"][0])
         self.assertIn("连签 7 天", res["lines"][0])
         self.assertIn("金豆 2,580", res["lines"][0])
+        self.assertIn("10元话费直充券", res["lines"][0])
 
         self.assertEqual(res["streak"], 7)
         self.assertIn(("金豆", 10.0), res["gains"])
@@ -241,6 +325,37 @@ class TestTelecom(unittest.TestCase):
         self.assertIn(("reward", "+10 金豆"), res["badges"])
         self.assertIn(("streak", "连签 7 天"), res["badges"])
         self.assertIn(("reward", "抽奖 100M全国流量日包"), res["badges"])
+
+    def test_exchange_goal_progress(self):
+        """金豆兑换目标进度计算与达标兑换。"""
+        if not telecom.HAS_CRYPTO:
+            self.skipTest("缺少 pycryptodome 库，跳过测试")
+
+        acc = telecom.TelecomAccount(
+            index=1,
+            phone="18912345678",
+            sign="mock_sign_token_1234567890123456",
+        )
+        mock_http = MagicMock()
+        client = telecom.TelecomClient(acc, mock_http)
+
+        def fake_req(method, url, headers=None, json_data=None, data=None, timeout=15):
+            if "webSign/sign" in url:
+                return {"resoultCode": "0", "data": {"code": 0}, "resoultMsg": "成功"}
+            if "userCoinInfo" in url:
+                return {"resoultCode": "0", "totalCoin": 1500}
+            return {"resoultCode": "0", "resoultMsg": "成功"}
+
+        client._req = MagicMock(side_effect=fake_req)
+        with patch.object(client, "restore_cached_session", return_value=True), \
+             patch.object(client, "save_session", return_value=None), \
+             patch.dict(os.environ, {"TELECOM_EXCHANGE_GOAL": "10元话费直充券", "TELECOM_EXCHANGE_BEANS": "8000"}), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            outcome = telecom.execute_telecom_task(client)
+
+        self.assertEqual(outcome["status"], "成功")
+        self.assertIn("距离【10元话费直充券】(8000金豆) 还差 6500 金豆", outcome["goal_res"])
+        self.assertIn("18.8%", outcome["goal_res"])
 
 
 if __name__ == "__main__":

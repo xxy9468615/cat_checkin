@@ -49,6 +49,7 @@ AUTO_RENEW_SCRIPTS = {
     "smzdm.py",                # Set-Cookie 滚动保活
     "modelscope.py",           # Set-Cookie 滑动续期（国内/国际共用脚本）
     "workbuddy.py",            # 插件 OAuth refresh_token 滚动续期（60/90 天，每日刷新）
+    "oppo.py",                 # HeyTap PKCE acIdAuthSession SSO 根凭据静默换票
 }
 
 # 续期失败信号（按行匹配；任务整体 ok=True 时命中 → 黄色「续期失败请检查」。
@@ -77,6 +78,10 @@ _RENEWAL_FAIL_PATTERNS: Dict[str, tuple] = {
     "workbuddy.py": (
         r"refresh_token 续期失败",
     ),
+    "oppo.py": (
+        r"换票续期失败",
+        r"提前换票暂未成功",
+    ),
 }
 
 # 续期失败提示语（提示读者该做什么，而不是只抛日志原文）
@@ -87,6 +92,7 @@ _RENEWAL_HINTS: Dict[str, str] = {
     "sophnet.py": "refresh_token 续期失败，请检查凭据",
     "latvi.py": "服务器自动延长失败，请检查站点",
     "workbuddy.py": "refresh_token 滚动续期失败（可能闲置被清理），本次用 Cookie 兜底签到，请重跑 scripts/workbuddy_device_login.py",
+    "oppo.py": "HeyTap SSO 换票续期失败，本次使用现有令牌打卡，请检查 acIdAuthSession 是否有效",
 }
 
 # 无法续期任务：凭据剩余有效期提前 1 天提示（用户指定阈值）

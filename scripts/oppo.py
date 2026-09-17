@@ -84,7 +84,7 @@ from common import (
 
 PREFIX = "OPPO_"
 BASE_HOST = "https://hd.opposhop.cn"
-BIZ_APP_KEY = "D5y74udFkSmoA3XS1TSMfi"
+BIZ_APP_KEY = "WJ9mxZSYJBYQL91FFowN6X"
 SIGN_IN_ACTIVITY_ID = "2094340289534894080"
 CREDITS_ADD_ACTION_ID = "1788913e6d9e4683b8b9ab0088733560"
 TASK_ACTIVITY_ID = "1919591795180969984"
@@ -210,7 +210,7 @@ def _try_refresh_oppo_token(http: Http, cookie_items: Dict[str, str]) -> Tuple[b
 
     auth_code = ""
     try:
-        resp_auth = http.request("GET", auth_url, headers=sso_headers, follow_redirects=False)
+        resp_auth = http.request("GET", auth_url, headers=sso_headers)
         if resp_auth and resp_auth.code in (301, 302, 303, 307, 308):
             loc = resp_auth.headers.get("location") or resp_auth.headers.get("Location") or ""
             if loc:
@@ -345,10 +345,10 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
                     print(f"  ✅ 换票续期成功！新令牌到期时间: {datetime.fromtimestamp(exp_ts, tz=BJT).strftime('%Y-%m-%d %H:%M:%S') if exp_ts else '未知'}")
                 else:
                     print(f"  ❌ 换票续期失败: {ref_msg}")
-        elif rem_sec < 1800:
+        elif rem_sec < 300:
             print(f"  ⏳ 凭证即将过期: 剩余 {rem_sec // 60} 分钟（到期时间: {exp_dt}）")
             if has_sso:
-                print("  🔄 剩余寿命不足 30 分钟，执行提前静默换票保活...")
+                print("  🔄 剩余寿命不足 5 分钟，执行提前静默换票保活...")
                 ok_ref, new_items, ref_msg = _try_refresh_oppo_token(http, cookie_items)
                 if ok_ref:
                     cookie_items = new_items
