@@ -543,6 +543,9 @@ class TelecomClient:
             self.uid = str(state.get("uid"))
         if not self.target_id and state.get("target_id"):
             self.target_id = str(state.get("target_id"))
+        # 注意：password 有意不持久化（2026-09-19 起）——服务密码路线被 3006 设备级
+        # 风控阻断后仅存兜底意义，落盘/入 Redis 只增加泄露面与误触发登录的风险；
+        # 服务密码仅经 TELECOM_PASSWORD_* 环境变量在内存中直读
 
         if self.sign or self.authorization or self.ticket or (self.phone and self.password) \
                 or (self.app_token and self.uid):
@@ -551,10 +554,9 @@ class TelecomClient:
         return False
 
     def save_session(self) -> None:
-        """持久化当前可用会话凭据。"""
+        """持久化当前可用会话凭据（不含密码：敏感值永不落盘，见 restore_cached_session 注释）。"""
         state = {
             "phone": self.phone,
-            "password": self.password,
             "sign": self.sign,
             "authorization": self.authorization,
             "ticket": self.ticket,
