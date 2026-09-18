@@ -1144,7 +1144,9 @@ def _run_account(acc: TelecomAccount) -> Tuple[bool, Dict[str, Any]]:
         else:
             print(f"  🌐 正在通过 [直连出网] 建立连接...", flush=True)
 
-        http = Http(task_name="TELECOM", proxy=p_url, follow_redirects=True)
+        # Chrome TLS 指纹模拟：wappark 的 WAF 对数据中心/被标记 IP 上的 urllib 裸指纹
+        # 返回 412（2026-09-19 CI 实测），与 smzdm 同款解法；本地家宽直连不受影响
+        http = Http(task_name="TELECOM", proxy=p_url, follow_redirects=True, impersonate="chrome124")
         client = TelecomClient(acc, http)
         outcome = execute_telecom_task(client)
         last_outcome = outcome
