@@ -4,13 +4,16 @@
 """中国电信（营业厅 / 天翼生活 / 10000）App 抓包纯授权签到、免费抽奖与资产统计。
 
 模式说明：
-- 纯 App 抓包整串鉴权模式：无需账密，彻底规避风控锁定与验证码。
-- 提取移动端 App 或电信活动 H5 页（wappark.189.cn / wapact.189.cn）的抓包整串凭证。
-- 单次抓包提取凭证有效期通常为 30 天左右，支持多账号序列按月轮转。
+- 服务密码自动登录（推荐）：TELECOM_PASSWORD_* 配置后，sign 过期时经
+  appgologin 网关（userLoginNormal，loginType=4）RSA+3DES 换取免密 Ticket
+  并缓存 Redis，之后每日由 ticket 自动续换 sign，长期免维护。
+  密码类硬错误（错输/锁定）触发当日立即熔断，防止重试梯子连续错输锁死密码。
+- 纯 App 抓包整串鉴权模式（兜底）：无需账密，抓包整串 sign 有效期约 1 天。
 - 会话凭据经 Upstash Redis 与本地 KV 缓存跨 run 持久化，平滑保活。
 
 环境变量：
 - TELECOM_HEADER_1...: 抓包整串（支持含 sign / phone / Authorization 的 Header 串、query 串或 JSON）
+- TELECOM_PASSWORD_1...: 服务密码（手机号缺省回退 CLOUD189_USERNAME_*，或显式 TELECOM_PHONE_*）
 """
 from __future__ import annotations
 
@@ -49,6 +52,7 @@ from common import (
     parse_proxies_text,
     save_kv_state,
 )
+from circuit_breaker import trip_circuit_breaker
 
 # 加密库：金豆中心接口依赖 RSA-1024 与 AES-ECB / 3DES
 try:
@@ -116,6 +120,17 @@ def _get_candidate_proxies() -> List[ProxyEndpoint]:
 
 
 # ---------- 业务接口加解密逻辑 ----------
+
+
+_CREDENTIAL_ERR_PATTS = (
+    "密码错误", "密码不正确", "弱密码", "忘记密码",
+    "密码已被锁定", "账号已锁定", "用户不存在", "账号不存在",
+)
+
+
+def _is_credential_desc(desc: str) -> bool:
+    """登录网关返回的密码类硬错误判定：重试只会加重锁定，须当日停手。"""
+    return any(p in (desc or "") for p in _CREDENTIAL_ERR_PATTS)
 
 
 def _encrypt_aes(data: Union[str, Dict[str, Any], List[Any]], key: bytes = AES_SIGN_KEY) -> str:
@@ -396,6 +411,8 @@ class TelecomClient:
         self.extra_headers = dict(account.extra_headers)
         self.state_file = f".telecom_state_{account.index}.json"
         self.redis_key = f"cat_checkin:state:telecom_{account.index}"
+        # 服务密码登录返回的密码类硬错误描述（非空 = 当日须停止重试登录）
+        self.credential_error = ""
 
     def _req(
         self,
@@ -539,10 +556,14 @@ class TelecomClient:
             timeout=15,
         )
         data = resp.json({}) if isinstance(resp.json({}), dict) else {}
-        l_res = data.get("responseData", {}).get("data", {}).get("loginSuccessResult")
+        rd = data.get("responseData") or {}
+        l_res = (rd.get("data") or {}).get("loginSuccessResult") or {}
         if not l_res:
-            desc = data.get("responseData", {}).get("resultDesc") or data.get("headerInfos", {}).get("reason") or "登录未成功"
+            desc = rd.get("resultDesc") or data.get("headerInfos", {}).get("reason") or "登录未成功"
             print(f"    [login] 服务密码登录网关响应: {desc}", flush=True)
+            if _is_credential_desc(desc):
+                self.credential_error = desc
+                print("    [login] ⛔ 密码类硬错误：当日不再重试登录（防止服务密码连续错输被锁定）", flush=True)
             return False
 
         user_id = str(l_res.get("userId", ""))
@@ -692,6 +713,12 @@ def execute_telecom_task(client: TelecomClient) -> Dict[str, Any]:
         res["error"] = "缺少 App 抓包凭据（请在 TELECOM_HEADER_1 配置抓包整串）"
         return res
 
+    if client.credential_error:
+        res["status"] = "失败"
+        res["error"] = (f"服务密码凭证错误（{client.credential_error}）"
+                        f"——已停止当日重试以防密码锁定，请核对密码后次日自动复跑")
+        return res
+
     # 1. 执行每日签到
     if client.sign and HAS_CRYPTO:
         payload_data: Dict[str, Any] = {"date": int(time.time() * 1000), "sysType": "20002"}
@@ -723,6 +750,11 @@ def execute_telecom_task(client: TelecomClient) -> Dict[str, Any]:
             if (client.phone and client.password) and client.login_with_password():
                 print("    [login] 检测到旧 sign 失效，已通过服务密码自动登录换取新会话，正在重试打卡...", flush=True)
                 return execute_telecom_task(client)
+            if client.credential_error:
+                res["status"] = "失败"
+                res["error"] = (f"服务密码凭证错误（{client.credential_error}）"
+                                f"——已停止当日重试以防密码锁定")
+                return res
             res["status"] = "失败"
             res["error"] = f"App 会话已失效（{msg or '401 未授权访问'}），请更新 TELECOM_HEADER_1 或配置 TELECOM_PASSWORD_1"
             return res
@@ -997,6 +1029,15 @@ def _run_account(acc: TelecomAccount) -> Tuple[bool, Dict[str, Any]]:
         last_outcome = outcome
 
         err = outcome.get("error", "")
+        # 服务密码类硬错误：立即熔断当日重试（密码连错约 5 次会被锁定 24h，
+        # 次数/退避驱动的重试梯子对此无感知，必须在此显式熔断；跨日自动归零复跑）
+        if "服务密码凭证错误" in err:
+            trip_circuit_breaker(
+                "telecom",
+                reason=f"服务密码凭证错误，停止当日重试以防密码锁定（{client.credential_error}）",
+                output=err,
+            )
+            return False, outcome
         # 若凭据失效（401未授权等）或缺少凭据，无需轮换代理，直接返回失败
         if "会话已失效" in err or "缺少" in err or "pycryptodome" in err:
             return False, outcome

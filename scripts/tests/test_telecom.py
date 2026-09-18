@@ -295,6 +295,70 @@ class TestTelecom(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(outcome["status"], "成功")
 
+    def test_is_credential_desc_patterns(self):
+        """密码类硬错误关键词判定（正向/负向）。"""
+        self.assertTrue(telecom._is_credential_desc("用户密码错误，请重新输入"))
+        self.assertTrue(telecom._is_credential_desc("弱密码，请点击“忘记密码”重置您的密码后登录"))
+        self.assertTrue(telecom._is_credential_desc("密码已被锁定，请24小时后再试"))
+        self.assertTrue(telecom._is_credential_desc("账号不存在"))
+        self.assertFalse(telecom._is_credential_desc("登录未成功"))
+        self.assertFalse(telecom._is_credential_desc("网络超时，请稍后重试"))
+        self.assertFalse(telecom._is_credential_desc(""))
+        self.assertFalse(telecom._is_credential_desc(None))
+
+    def test_login_credential_error_flagged(self):
+        """userLoginNormal 返回密码类硬错误时必须打上 credential_error 标记。"""
+        if not telecom.HAS_CRYPTO:
+            self.skipTest("缺少 pycryptodome 库，跳过测试")
+
+        from common import Response
+        acc = telecom.TelecomAccount(index=1, phone="18912345678", password="000000")
+        mock_http = MagicMock()
+        body = json.dumps({
+            "responseData": {
+                "resultCode": "8105",
+                "resultDesc": "弱密码，请点击“忘记密码”重置您的密码后登录",
+                "data": None,
+            }
+        }).encode("utf-8")
+        mock_http.request = MagicMock(return_value=Response(200, None, body, "url"))
+        client = telecom.TelecomClient(acc, mock_http)
+        with patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.login_with_password()
+        self.assertFalse(ok)
+        self.assertIn("弱密码", client.credential_error)
+
+    def test_execute_blocks_retry_after_credential_error(self):
+        """credential_error 置位后 execute_telecom_task 必须直接失败且不再触发登录。"""
+        acc = telecom.TelecomAccount(
+            index=1, phone="18912345678", sign="mock_sign_token_1234567890123456", password="000000",
+        )
+        client = telecom.TelecomClient(acc, MagicMock())
+        client.credential_error = "用户密码错误"
+        with patch.object(client, "prepare_auth", return_value=True), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            outcome = telecom.execute_telecom_task(client)
+        self.assertEqual(outcome["status"], "失败")
+        self.assertIn("服务密码凭证错误", outcome["error"])
+        self.assertIn("用户密码错误", outcome["error"])
+
+    def test_run_account_trips_breaker_on_credential_error(self):
+        """密码类硬错误必须立即熔断当日重试（防服务密码连错锁定 24h）。"""
+        acc = telecom.TelecomAccount(
+            index=1, phone="18912345678", sign="mock_sign_token_1234567890123456", password="000000",
+        )
+        with patch.object(telecom, "_get_candidate_proxies", return_value=[]), \
+             patch.object(telecom, "execute_telecom_task",
+                          return_value={"status": "失败",
+                                        "error": "服务密码凭证错误（用户密码错误）——已停止当日重试"}), \
+             patch.object(telecom, "trip_circuit_breaker") as mock_trip, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok, _ = telecom._run_account(acc)
+        self.assertFalse(ok)
+        mock_trip.assert_called_once()
+        self.assertEqual(mock_trip.call_args.args[0], "telecom")
+        self.assertIn("服务密码凭证错误", mock_trip.call_args.kwargs.get("reason", ""))
+
     def test_report_fields_extractor(self):
         """报告字段解析器提取验证。"""
         sample_output = """
