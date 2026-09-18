@@ -9,10 +9,18 @@
 3. 积分与连签天数查询（GET /point/user/info）
 4. 算力卡总余额查询（POST /studio/resource/user/summary，单位：点）
 5. 大模型 Token 余额查询（GET /studio/trade/token/my/balance）
-6. 百度 Passport 凭证（BDUSS/STOKEN）多账号支持与智能脱敏
+6. 百度 Passport 凭证（BDUSS）多账号支持与智能脱敏、免维护归一化
+
+换票机制（2026-09-19 实测逆向）：
+- BDUSS 是唯一长效凭据（Passport 身份），单独即可完成全部签到/积分/Token 流程。
+- ai-studio-ticket / BDUSS_BFESS 等均为服务端按需自动铸造的短命会话票：
+  请求不带时服务端随响应 Set-Cookie 下发新值，携带过期值也无害（服务端忽略）。
+- /studio/resource/* 受保护端点额外要求 x-studio-token 请求头，
+  取值来自 /overview 页面内嵌的 bdToken（本脚本已自动提取）。
+- 故 Secret 只需 BDUSS：粘贴完整 Cookie 亦可，脚本自动提取 BDUSS 并剥离其余字段。
 
 环境变量：
-- AISTUDIO_COOKIE_1, AISTUDIO_COOKIE_2... (多账号序列，推荐)
+- AISTUDIO_COOKIE_1, AISTUDIO_COOKIE_2... (多账号序列，推荐；只需含 BDUSS)
 - AISTUDIO_COOKIE / AISTUDIO_cookie (单账号兼容)
 """
 
@@ -44,6 +52,36 @@ def _check_passport_cookie(cookie_str: str) -> bool:
     return "BDUSS" in cookie_str or "BDUSS_BFESS" in cookie_str
 
 
+def _extract_bduss(cookie_str: str) -> Tuple[str, int]:
+    """从任意形态的 Cookie 串中提取 BDUSS 值（免维护归一化核心）。
+
+    实测（2026-09-19）：BDUSS 单独即可认证全部所需端点；其余字段要么是
+    服务端自动铸造的短命票（ai-studio-ticket，携带过期值无害但无益），
+    要么是统计/埋点字段。归一化为 BDUSS-only 可让 Secret 与浏览器端
+    ticket 滚动完全解耦，免去周期性重新导出整套 Cookie。
+
+    返回 (bduss, 剥离字段数)。找不到 BDUSS 时返回 ("", 0)。
+    """
+    stripped = 0
+    bduss = ""
+    for pair in cookie_str.split(';'):
+        pair = pair.strip()
+        if '=' not in pair:
+            continue
+        k, v = pair.split('=', 1)
+        if k.strip() == 'BDUSS' and not bduss:
+            bduss = v.strip()
+        else:
+            stripped += 1
+    if bduss:
+        return bduss, stripped
+    # 兼容只粘贴 BDUSS 值本身（百度 BDUSS 为 192 位 base64 变体，含 -/_）
+    s = cookie_str.strip()
+    if re.fullmatch(r'[A-Za-z0-9_\-]{32,}', s):
+        return s, 0
+    return "", 0
+
+
 def _format_token_num(num: int) -> str:
     """格式化 Token 数量（如 2000000 -> 2,000,000 (2.00M)）。"""
     if num >= 1_000_000:
@@ -66,8 +104,15 @@ def _run_account(cookie: str, idx: int, total: int) -> Tuple[bool, str]:
     if not cookie.strip():
         raise RuntimeError("Cookie 为空")
 
-    has_passport = _check_passport_cookie(cookie)
-    cert_status = "🔑 百度 Passport 凭证有效" if has_passport else "🔑 自定义 Cookie"
+    # 免维护归一化：BDUSS 是唯一长效凭据，剥离短命票与埋点字段
+    bduss, stripped = _extract_bduss(cookie)
+    if bduss:
+        if stripped:
+            print(f"🧹 Cookie 归一化: 仅保留 BDUSS（已剥离 {stripped} 个短命票/冗余字段，"
+                  f"ai-studio-ticket 等由服务端按需自动铸造）")
+        cookie = f"BDUSS={bduss}"
+    has_passport = bool(bduss) or _check_passport_cookie(cookie)
+    cert_status = "🔑 百度 Passport 凭证 (BDUSS)" if has_passport else "🔑 自定义 Cookie"
 
     h = Http(follow_redirects=True)
     base_headers = {
@@ -75,6 +120,16 @@ def _run_account(cookie: str, idx: int, total: int) -> Tuple[bool, str]:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Cookie": cookie.strip(),
     }
+
+    # 0. 登录态预检（禁止跟随重定向）：BDUSS 被服务端作废时 /point/* 返回 302
+    #    跳内网登录网关（studiopoint.*.aistudio.internal，公网不可解析），
+    #    提前拦截以给出可行动的报错，而非跟随重定向后的通用 DNS 失败
+    r_probe = Http(follow_redirects=False).request(
+        "GET", "https://aistudio.baidu.com/point/user/info", headers=base_headers, timeout=30)
+    if r_probe.code in (301, 302, 303, 307):
+        raise RuntimeError(
+            "百度登录态已被服务端作废（BDUSS 失效，多为浏览器端退出登录/风控下线所致）"
+            "——重新登录 aistudio.baidu.com 后，把新 BDUSS 更新到对应 Secret 即可")
 
     # 1. 访问 /overview 初始化会话并提取用户基础信息与 bdToken
     username = ""
