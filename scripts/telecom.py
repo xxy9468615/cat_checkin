@@ -133,6 +133,28 @@ def _is_credential_desc(desc: str) -> bool:
     return any(p in (desc or "") for p in _CREDENTIAL_ERR_PATTS)
 
 
+# App 同款 getSingle 现签端点与请求模板（2026-09-19 HAR 逆向，appgologinsz 为抓包实测可用节点）
+APP_GETSINGLE_URL = "https://appgologinsz.189.cn/map/clientXML"
+_GETSINGLE_CLIENT_TYPE = "#13.3.0#channel29#OPPO PJJ110#"
+_GETSINGLE_PROVINCE_CODE = "600202"  # 随账号归属省固定（抓包值）
+
+
+def _build_getsingle_xml(token: str, uid: str, target_id: str, ts: str) -> str:
+    """构造 App 同款 clientXML getSingle 请求体（UserLoginName 需带尾部分号，与抓包一致）。"""
+    return (
+        f'<Request><HeaderInfos><Code>getSingle</Code><Timestamp>{ts}</Timestamp>'
+        f'<BroadAccount></BroadAccount><BroadToken></BroadToken>'
+        f'<ClientType>{_GETSINGLE_CLIENT_TYPE}</ClientType>'
+        f'<FixedLineAccount></FixedLineAccount><FixedLineToken></FixedLineToken>'
+        f'<ProvinceCode>{_GETSINGLE_PROVINCE_CODE}</ProvinceCode>'
+        f'<ShopId>20002</ShopId><Source>110003</Source><SourcePassword>Sid98s</SourcePassword>'
+        f'<Token>{token}</Token>'
+        f'<UserLoginName>{uid};</UserLoginName></HeaderInfos>'
+        f'<Content><Attach>test</Attach><FieldData><TargetId>{target_id}</TargetId>'
+        f'<Url>4a6862274835b451</Url></FieldData></Content></Request>'
+    )
+
+
 def _encrypt_aes(data: Union[str, Dict[str, Any], List[Any]], key: bytes = AES_SIGN_KEY) -> str:
     """AES-128-ECB 加密，PKCS7 填充，Hex 格式输出。"""
     if not HAS_CRYPTO:
@@ -177,6 +199,9 @@ class TelecomAccount:
         user_agent: str = "",
         ticket: str = "",
         password: str = "",
+        app_token: str = "",
+        uid: str = "",
+        target_id: str = "",
         extra_headers: Optional[Dict[str, str]] = None,
     ):
         self.index = index
@@ -187,6 +212,10 @@ class TelecomAccount:
         self.user_agent = user_agent.strip()
         self.ticket = ticket.strip()
         self.password = password.strip()
+        # App 长效登录 Token 三件套（clientXML getSingle 现签 Ticket 用，见 mint_ticket_with_token）
+        self.app_token = app_token.strip()
+        self.uid = uid.strip()
+        self.target_id = target_id.strip()
         self.extra_headers = extra_headers or {}
 
     @property
@@ -211,6 +240,9 @@ def _parse_account_config(raw: str, index: int, password: str = "") -> TelecomAc
     sign = ""
     auth = ""
     ticket = ""
+    app_token = ""
+    uid = ""
+    target_id = ""
     cookies: List[str] = []
     user_agent = ""
     extra_headers: Dict[str, str] = {}
@@ -236,6 +268,12 @@ def _parse_account_config(raw: str, index: int, password: str = "") -> TelecomAc
             extra_headers[k.strip()] = v_val
         elif k_low == "ticket":
             ticket = v_val
+        elif k_low == "token" and v_val.startswith("V1."):
+            app_token = v_val
+        elif k_low in ("uid", "userid"):
+            uid = v_val
+        elif k_low in ("targetid", "target"):
+            target_id = v_val
 
     # 2. 检查内嵌 JSON
     m_json = re.search(r"(\{[\s\S]*\})", raw)
@@ -309,6 +347,21 @@ def _parse_account_config(raw: str, index: int, password: str = "") -> TelecomAc
         if m_phone:
             phone = m_phone.group(1)
 
+    # 5.5 App 长效 Token 三件套（token/uid/targetId，App 同款 getSingle 换票凭据）。
+    #     token 为 V1.0 前缀 base64（含 +/=），避免被下方 auth 的 [A-Za-z0-9_-] 正则误吞
+    if not app_token:
+        m_tok = re.search(r"['\"]?token['\"]?\s*[:=]\s*['\"]?(V1\.0[A-Za-z0-9+/=]{64,512})['\"]?", raw)
+        if m_tok:
+            app_token = m_tok.group(1)
+    if not uid:
+        m_uid = re.search(r"['\"]?uid['\"]?\s*[:=]\s*['\"]?(\d{6,20})['\"]?", raw, re.I)
+        if m_uid:
+            uid = m_uid.group(1)
+    if not target_id:
+        m_tgt = re.search(r"['\"]?target(?:_?id)?['\"]?\s*[:=]\s*['\"]?([0-9a-fA-F]{32,128})['\"]?", raw, re.I)
+        if m_tgt:
+            target_id = m_tgt.group(1)
+
     # 6. 从 cookies / distinct_id 逆向解析手机号（神策/统计 SDK distinct_id base64 编码的手机号）
     if not phone and (cookies or "distinct_id" in raw):
         unq = urllib.parse.unquote(raw)
@@ -362,6 +415,9 @@ def _parse_account_config(raw: str, index: int, password: str = "") -> TelecomAc
         user_agent=user_agent,
         ticket=ticket,
         password=password,
+        app_token=app_token,
+        uid=uid,
+        target_id=target_id,
         extra_headers=extra_headers,
     )
 
@@ -408,6 +464,9 @@ class TelecomClient:
         self.ticket = account.ticket
         self.cookie = account.cookie
         self.user_agent = account.user_agent
+        self.app_token = account.app_token
+        self.uid = account.uid
+        self.target_id = account.target_id
         self.extra_headers = dict(account.extra_headers)
         self.state_file = f".telecom_state_{account.index}.json"
         self.redis_key = f"cat_checkin:state:telecom_{account.index}"
@@ -474,8 +533,15 @@ class TelecomClient:
             self.cookie = str(state.get("cookie"))
         if not self.user_agent and state.get("user_agent"):
             self.user_agent = str(state.get("user_agent"))
+        if not self.app_token and state.get("app_token"):
+            self.app_token = str(state.get("app_token"))
+        if not self.uid and state.get("uid"):
+            self.uid = str(state.get("uid"))
+        if not self.target_id and state.get("target_id"):
+            self.target_id = str(state.get("target_id"))
 
-        if self.sign or self.authorization or self.ticket or (self.phone and self.password):
+        if self.sign or self.authorization or self.ticket or (self.phone and self.password) \
+                or (self.app_token and self.uid):
             print(f"    [keepalive] 成功加载账号缓存会话 (更新于: {state.get('updated_at', '未知')})", flush=True)
             return True
         return False
@@ -490,6 +556,9 @@ class TelecomClient:
             "ticket": self.ticket,
             "cookie": self.cookie,
             "user_agent": self.user_agent,
+            "app_token": self.app_token,
+            "uid": self.uid,
+            "target_id": self.target_id,
             "updated_at": datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S"),
         }
         save_kv_state(self.redis_key, self.state_file, state)
@@ -627,6 +696,45 @@ class TelecomClient:
             return True
         return False
 
+    def mint_ticket_with_token(self) -> bool:
+        """App 同款免密换票：长效 Token 经 clientXML getSingle 现签 Ticket 并换取 sign。
+
+        逆向结论（2026-09-19 HAR 抓包）：App 每次打开金豆 H5 均以自身登录 Token 调
+        getSingle 现签一张 Ticket（3DES 加密下发），H5 经 ssoHomLogin 换 sign。
+        该路径不需要账密、不触发 3006 设备验证，Token 寿命远长于 ticket/sign。
+        """
+        if not (self.app_token and self.uid and self.target_id and HAS_CRYPTO):
+            return False
+        ts = datetime.now(BJT).strftime("%Y%m%d%H%M%S")
+        xml = _build_getsingle_xml(self.app_token, self.uid, self.target_id, ts)
+        resp = self.http.request(
+            "POST",
+            APP_GETSINGLE_URL,
+            data=xml,
+            headers={"Content-Type": "application/xml", "User-Agent": "CtClient;10.4.1;Android;13"},
+            timeout=20,
+        )
+        text = resp.text or ""
+        result_code = re.search(r"<ResultCode>(.*?)</ResultCode>", text)
+        if resp.code != 200 or (result_code and result_code.group(1) != "0000"):
+            reason = re.search(r"<Reason>(.*?)</Reason>", text)
+            print(f"    [token] getSingle 现签失败: code={resp.code} "
+                  f"result={result_code.group(1) if result_code else '?'} "
+                  f"reason={reason.group(1) if reason else text[:80]}", flush=True)
+            return False
+        tk_match = re.findall(r"<Ticket>(.*?)</Ticket>", text)
+        if not tk_match:
+            print("    [token] getSingle 响应中无 Ticket", flush=True)
+            return False
+        try:
+            des_dec = DES3.new(KEY_3DES, DES3.MODE_CBC, IV_3DES)
+            self.ticket = unpad(des_dec.decrypt(bytes.fromhex(tk_match[0])), DES3.block_size).decode()
+        except Exception as e:
+            print(f"    [token] Ticket 3DES 解密失败: {e}", flush=True)
+            return False
+        print(f"    [token] App 长效 Token 现签 Ticket 成功，正在换取 sign...", flush=True)
+        return self.exchange_ticket()
+
     def try_exchange_phone_bill(self, goal: str, target_beans: int) -> str:
         """金豆达标时尝试调用金豆商城/权益接口自动兑换话费。"""
         payload = {
@@ -665,6 +773,10 @@ class TelecomClient:
             if re.match(r"^1\d{10}$", cloud189_user):
                 self.phone = cloud189_user
                 self.acc.phone = cloud189_user
+
+        # 若 sign 仍然缺失且无可用 ticket：优先用 App 长效 Token 现签（免密、免设备验证）
+        if not self.sign and (self.app_token and self.uid):
+            self.mint_ticket_with_token()
 
         # 若 sign 仍然缺失但配置了服务密码，执行服务密码登录换票
         if not self.sign and (self.phone and self.password):
@@ -746,6 +858,9 @@ def execute_telecom_task(client: TelecomClient) -> Dict[str, Any]:
         elif code in ("401", "403") or "未授权" in msg or "未登录" in msg or "失效" in msg or "过期" in msg:
             if client.ticket and client.exchange_ticket():
                 print("    [ticket] 检测到旧 sign 失效，已通过 ticket 自动换取新会话，正在重试打卡...", flush=True)
+                return execute_telecom_task(client)
+            if (client.app_token and client.uid) and client.mint_ticket_with_token():
+                print("    [token] 检测到旧 sign 失效，已用 App 长效 Token 现签换得新会话，正在重试打卡...", flush=True)
                 return execute_telecom_task(client)
             if (client.phone and client.password) and client.login_with_password():
                 print("    [login] 检测到旧 sign 失效，已通过服务密码自动登录换取新会话，正在重试打卡...", flush=True)

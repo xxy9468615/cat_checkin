@@ -359,6 +359,64 @@ class TestTelecom(unittest.TestCase):
         self.assertEqual(mock_trip.call_args.args[0], "telecom")
         self.assertIn("服务密码凭证错误", mock_trip.call_args.kwargs.get("reason", ""))
 
+    def test_parse_token_triple(self):
+        """App 长效 Token 三件套（token/uid/target）解析。"""
+        acc = telecom._parse_account_config(
+            "phone=17762551109; "
+            "token=V1.0KonaH//Utf5WqBO3dyQTy0r9KIhQrXAAZq5cSpJGz6q3tIVYtEJ8ArF7TUOqAsfFjZHpk=; "
+            "uid=3998477332; "
+            "target=598d26069a564aeb4e5c6a25c25d77d9641cc4800bcc5886",
+            1,
+        )
+        self.assertEqual(acc.phone, "17762551109")
+        self.assertTrue(acc.app_token.startswith("V1.0"))
+        self.assertEqual(acc.uid, "3998477332")
+        self.assertEqual(acc.target_id, "598d26069a564aeb4e5c6a25c25d77d9641cc4800bcc5886")
+        # token 不得被误吞为 authorization
+        self.assertEqual(acc.authorization, "")
+
+    def test_build_getsingle_xml(self):
+        """getSingle XML 模板必须与 App 抓包结构一致（UserLoginName 带尾分号）。"""
+        xml = telecom._build_getsingle_xml("V1.0ABC", "3998477332", "598d2606", "20260919020000")
+        self.assertIn("<Code>getSingle</Code>", xml)
+        self.assertIn("<Timestamp>20260919020000</Timestamp>", xml)
+        self.assertIn("<Token>V1.0ABC</Token>", xml)
+        self.assertIn("<UserLoginName>3998477332;</UserLoginName>", xml)
+        self.assertIn("<TargetId>598d2606</TargetId>", xml)
+        self.assertIn("<SourcePassword>Sid98s</SourcePassword>", xml)
+
+    def test_mint_ticket_with_token(self):
+        """Token 现签：解析 Ticket（3DES）并经 ssoHomLogin 换 sign 的完整链路。"""
+        if not telecom.HAS_CRYPTO:
+            self.skipTest("缺少 pycryptodome 库，跳过测试")
+
+        from Crypto.Cipher import DES3
+        from Crypto.Util.Padding import pad
+        from common import Response
+
+        plain_ticket = "48cb5b01testticketplaintext0123456789abcdef"
+        des = DES3.new(telecom.KEY_3DES, DES3.MODE_CBC, telecom.IV_3DES)
+        ticket_hex = des.encrypt(pad(plain_ticket.encode(), DES3.block_size)).hex()
+        xml_resp = (
+            '<Response><HeaderInfos><Code>0000</Code><Reason>成功</Reason></HeaderInfos>'
+            f'<ResponseData><ResultCode>0000</ResultCode><Data><Ticket>{ticket_hex}</Ticket>'
+            '</Data></ResponseData></Response>'
+        )
+
+        acc = telecom.TelecomAccount(
+            index=1, phone="17762551109",
+            app_token="V1.0ABC", uid="3998477332", target_id="598d2606",
+        )
+        mock_http = MagicMock()
+        mock_http.request = MagicMock(return_value=Response(200, None, xml_resp.encode(), "url"))
+        client = telecom.TelecomClient(acc, mock_http)
+        client._req = MagicMock(return_value={"resoultCode": "0", "sign": "f" * 32})
+        with patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.mint_ticket_with_token()
+        self.assertTrue(ok)
+        self.assertEqual(client.ticket, plain_ticket)
+        self.assertEqual(client.sign, "f" * 32)
+
     def test_report_fields_extractor(self):
         """报告字段解析器提取验证。"""
         sample_output = """
