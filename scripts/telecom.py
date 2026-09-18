@@ -227,7 +227,11 @@ class TelecomAccount:
         return f"账号#{self.index}"
 
     def has_credentials(self) -> bool:
-        return bool(self.sign or self.authorization or self.ticket or (self.phone and self.password))
+        return bool(
+            self.sign or self.authorization or self.ticket
+            or (self.app_token and self.uid and self.target_id)
+            or (self.phone and self.password)
+        )
 
 
 def _parse_account_config(raw: str, index: int, password: str = "") -> TelecomAccount:
@@ -781,7 +785,9 @@ class TelecomClient:
         # 若 sign 仍然缺失但配置了服务密码，执行服务密码登录换票
         if not self.sign and (self.phone and self.password):
             self.login_with_password()
-        if not (self.sign or self.authorization or self.ticket or (self.phone and self.password)):
+        if not (self.sign or self.authorization or self.ticket
+                or (self.app_token and self.uid and self.target_id)
+                or (self.phone and self.password)):
             return False
 
         # 若仍未指定手机号，尝试从金豆个人中心反查

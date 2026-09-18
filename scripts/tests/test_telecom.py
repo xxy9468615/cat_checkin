@@ -359,6 +359,16 @@ class TestTelecom(unittest.TestCase):
         self.assertEqual(mock_trip.call_args.args[0], "telecom")
         self.assertIn("服务密码凭证错误", mock_trip.call_args.kwargs.get("reason", ""))
 
+    def test_token_only_account_passes_credential_filter(self):
+        """仅持 token 三件套的账号必须被 load_all_accounts/has_credentials 认可（CI 回归）。"""
+        acc = telecom._parse_account_config(
+            "phone=17762551109; "
+            "token=V1.0KonaH//Utf5WqBO3dyQTy0r9KIhQrXAAZq5cSpJGz6q3tIVYtEJ8ArF7TUOqAsfFjZHpk=; "
+            "uid=3998477332; target=598d26069a564aeb4e5c6a25c25d77d9641cc4800bcc5886",
+            1,
+        )
+        self.assertTrue(acc.has_credentials())
+
     def test_parse_token_triple(self):
         """App 长效 Token 三件套（token/uid/target）解析。"""
         acc = telecom._parse_account_config(
