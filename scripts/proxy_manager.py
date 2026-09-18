@@ -349,7 +349,10 @@ def get_all_proxy_endpoints(task_prefix: str = "") -> List[ProxyEndpoint]:
         elif task_prefix == "CLOUD189":
             task_specific_keys.extend(["52POJIE_PROXY", "WUAI_PROXY", "POJIE_PROXY", "SMZDM_PROXY", "SMZDM_BACKUP_PROXIES", "TELECOM_PROXY"])
         elif task_prefix == "TELECOM":
-            task_specific_keys.extend(["WUAI_PROXY", "POJIE_PROXY", "52POJIE_PROXY", "SMZDM_PROXY", "SMZDM_BACKUP_PROXIES"])
+            # 不引入 SMZDM_BACKUP_PROXIES：wappark.189.cn 的 WAF 按出口 IP 信誉拦截，
+            # 备用住宅池 IP 全部 412（2026-09-19 CI 实测），引入只会白白烧掉重试梯子
+            # 的尝试次数；电信仅信任 TELECOM_PROXY 的家宽出口 + 直连兜底
+            task_specific_keys.extend(["WUAI_PROXY", "POJIE_PROXY", "52POJIE_PROXY", "SMZDM_PROXY"])
         elif task_prefix == "OPPO":
             task_specific_keys.extend(["52POJIE_PROXY", "WUAI_PROXY", "POJIE_PROXY", "SMZDM_PROXY", "SMZDM_BACKUP_PROXIES", "TELECOM_PROXY"])
         _collect(

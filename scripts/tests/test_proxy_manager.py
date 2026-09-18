@@ -122,6 +122,21 @@ class TestProxyManager(unittest.TestCase):
             self.assertEqual(endpoints[0].name, "吾爱国内CN出口")
             self.assertEqual(endpoints[0].url, "http://114.1.2.3:8080")
 
+    def test_telecom_excludes_smzdm_backup_pool(self):
+        # wappark WAF 按出口 IP 信誉拦截备用住宅池（412），TELECOM 不得继承 SMZDM_BACKUP_PROXIES，
+        # 否则每次重试梯子都会在死代理上空烧尝试次数（2026-09-19 CI 实测回归）
+        env = {
+            "TELECOM_PROXY": "http://113.9.9.9:8080#电信家宽",
+            "SMZDM_BACKUP_PROXIES": "http://123.1.1.1:8888#CN-可用-97-52\u2713\nhttp://124.2.2.2:8888#CN-可用-56.2",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            endpoints = get_all_proxy_endpoints(task_prefix="TELECOM")
+            urls = [ep.url for ep in endpoints]
+            self.assertEqual(urls, ["http://113.9.9.9:8080"])
+            # smzdm 自己仍能复用该备用池 + TELECOM_PROXY 别名（池对其他站点的 WAF 可能仍有效）
+            smzdm_eps = get_all_proxy_endpoints(task_prefix="SMZDM")
+            self.assertEqual(len(smzdm_eps), 3)
+
     def test_dead_proxy_alert_format(self):
         ep = ProxyEndpoint(
             name="自建-测试节点",
