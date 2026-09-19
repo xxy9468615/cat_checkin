@@ -487,6 +487,9 @@ class TelecomClient:
         self.extra_headers = dict(account.extra_headers)
         self.state_file = f".telecom_state_{account.index}.json"
         self.redis_key = f"cat_checkin:state:telecom_{account.index}"
+        # cookie 来源标记：restore_cached_session 从缓存/Redis 恢复时置 True，
+        # 用于与用户 HEADER 抓包提供的 cookie 区分（见 prepare_auth 的清理逻辑）
+        self._cookie_from_cache = False
         # 服务密码登录返回的密码类硬错误描述（非空 = 当日须停止重试登录）
         self.credential_error = ""
 
@@ -548,6 +551,7 @@ class TelecomClient:
             self.ticket = str(state.get("ticket"))
         if not self.cookie and state.get("cookie"):
             self.cookie = str(state.get("cookie"))
+            self._cookie_from_cache = True
         if not self.user_agent and state.get("user_agent"):
             self.user_agent = str(state.get("user_agent"))
         if not self.app_token and state.get("app_token"):
@@ -790,15 +794,18 @@ class TelecomClient:
                 self.phone = cloud189_user
                 self.acc.phone = cloud189_user
 
-        # 2026-09-19 CI 全天失败根因：恢复的陈旧缓存 sign 先行请求 wappark 会被 WAF
-        # 以 412 短路（不返回应用层「会话失效」），导致所有代理候选被误判为死代理，
-        # 且失败不落盘使陈旧状态自我延续。App 每次打开金豆页都现签新 Ticket，故持有
-        # 长效 Token 时永远先现签；仅现签失败时才退回缓存 sign/ticket 老路。
+        # 2026-09-19 CI 全天失败根因（两段式）：恢复的陈旧缓存会话先于现签打接口，
+        # ① 旧 sign 抢跑使 mint 被跳过，死会话请求被 WAF 412 短路；
+        # ② 缓存 cookie 与出口 IP 绑定（WAF 通行状态），随 mint 内部 ssoHomLogin
+        #    重放照样 412，现签成功也无法落地（本地无缓存 cookie 故全绿）。
+        # 故：来自缓存的 cookie 一律先行丢弃（cookieless 请求已验证畅通），且持有
+        # 长效 Token 时永远先现签（App 同款），仅现签失败时回退缓存 sign/ticket 老路。
+        if self._cookie_from_cache:
+            self.cookie = ""
+            self._cookie_from_cache = False
         minted = False
         if self.app_token and self.uid and HAS_CRYPTO:
             minted = self.mint_ticket_with_token()
-            if minted:
-                self.cookie = ""  # 丢弃陈旧 cookie，避免跨出口的 WAF 通行状态残留
         if not minted and not self.sign and self.ticket:
             self.exchange_ticket()
 

@@ -436,6 +436,7 @@ class TestTelecom(unittest.TestCase):
         client = telecom.TelecomClient(acc, MagicMock())
         client.sign = "stale_sign_from_2_days_ago_12345678"
         client.cookie = "acw_sc__v2=stale_clearance"
+        client._cookie_from_cache = True
         with patch.object(client, "restore_cached_session", return_value=True), \
              patch.object(client, "mint_ticket_with_token", return_value=True) as m_mint, \
              patch.object(client, "exchange_ticket", return_value=True) as m_exchange, \
@@ -447,6 +448,22 @@ class TestTelecom(unittest.TestCase):
         m_exchange.assert_not_called()
         m_pwd.assert_not_called()
         self.assertEqual(client.cookie, "")
+
+    def test_prepare_auth_preserves_header_provided_cookie(self):
+        """用户 HEADER 抓包提供的 cookie（非缓存来源）不得被清理。"""
+        acc = telecom.TelecomAccount(
+            index=1, phone="17762551109",
+            app_token="V1.0ABC", uid="3998477332", target_id="598d2606",
+        )
+        client = telecom.TelecomClient(acc, MagicMock())
+        client.cookie = "cookie_from_header_capture=1"
+        with patch.object(client, "restore_cached_session", return_value=True), \
+             patch.object(client, "mint_ticket_with_token", return_value=True), \
+             patch.object(client, "exchange_ticket", return_value=True), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.prepare_auth()
+        self.assertTrue(ok)
+        self.assertEqual(client.cookie, "cookie_from_header_capture=1")
 
     def test_prepare_auth_falls_back_to_cached_sign_when_mint_fails(self):
         """现签失败（如 Token 过期）时回退缓存 sign，不再重复换票。"""
