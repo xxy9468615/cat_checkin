@@ -492,6 +492,9 @@ class TelecomClient:
         self._cookie_from_cache = False
         # 服务密码登录返回的密码类硬错误描述（非空 = 当日须停止重试登录）
         self.credential_error = ""
+        # 现签 mint 遭遇网络类失败（连接超时/-1/WAF 412）标记：用于把「缺 sign」
+        # 归因为出口网络问题以触发代理轮换，而非当成凭据缺失直接放弃
+        self.mint_network_failure = False
 
     def _req(
         self,
@@ -738,6 +741,9 @@ class TelecomClient:
             timeout=20,
         )
         text = resp.text or ""
+        # 网络类失败（连接超时/-1/WAF 412/5xx）：与出口相关，应触发代理轮换而非放弃
+        if resp.code == -1 or resp.code == 412 or 500 <= resp.code < 600:
+            self.mint_network_failure = True
         result_code = re.search(r"<ResultCode>(.*?)</ResultCode>", text)
         if resp.code != 200 or (result_code and result_code.group(1) != "0000"):
             reason = re.search(r"<Reason>(.*?)</Reason>", text)
@@ -916,7 +922,12 @@ def execute_telecom_task(client: TelecomClient) -> Dict[str, Any]:
             return res
     elif not client.sign:
         res["status"] = "失败"
-        res["error"] = "缺少 sign 凭据，无法完成签到"
+        if client.mint_network_failure:
+            # 现签因出口连接失败/被 WAF 拦截而未取得 sign：网络类错误，交给
+            # _run_account 轮换下一代理候选（凭据本身没有问题）
+            res["error"] = "网络请求异常（现签未取得 sign：出口连接失败或被 WAF 拦截）"
+        else:
+            res["error"] = "缺少 sign 凭据，无法完成签到"
         return res
     elif not HAS_CRYPTO:
         res["status"] = "失败"
@@ -1188,8 +1199,9 @@ def _run_account(acc: TelecomAccount) -> Tuple[bool, Dict[str, Any]]:
                 output=err,
             )
             return False, outcome
-        # 若凭据失效（401未授权等）或缺少凭据，无需轮换代理，直接返回失败
-        if "会话已失效" in err or "缺少" in err or "pycryptodome" in err:
+        # 若凭据失效（401未授权等）或完全没有凭据，无需轮换代理，直接返回失败；
+        # 「现签未取得 sign」的网络类失败已归因为网络请求异常，走下方轮换分支
+        if "会话已失效" in err or "缺少 App 抓包凭据" in err or "pycryptodome" in err:
             return False, outcome
 
         # 若执行成功或今日已签，直接返回

@@ -295,6 +295,74 @@ class TestTelecom(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(outcome["status"], "成功")
 
+    def test_run_account_rotates_on_mint_network_failure(self):
+        """现签因出口网络失败未取得 sign 时，必须轮换下一代理而非放弃。"""
+        acc = telecom.TelecomAccount(index=1, phone="18912345678")
+        ep1 = MagicMock()
+        ep1.display_name = "主出口"
+        ep1.url = "socks5://1.1.1.1:1080"
+        ep2 = MagicMock()
+        ep2.display_name = "备用出口"
+        ep2.url = "socks5://2.2.2.2:1080"
+
+        calls = []
+        def fake_exec(client):
+            calls.append(client.http)
+            if len(calls) == 1:
+                return {"status": "失败",
+                        "error": "网络请求异常（现签未取得 sign：出口连接失败或被 WAF 拦截）"}
+            return {"status": "成功", "gain_bean": 10, "streak_days": 1,
+                    "lottery_res": "", "task_res": "", "food_res": "",
+                    "total_bean": "100", "error": ""}
+
+        with patch.object(telecom, "_get_candidate_proxies", return_value=[ep1, ep2]), \
+             patch.object(telecom, "execute_telecom_task", side_effect=fake_exec), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok, outcome = telecom._run_account(acc)
+
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(outcome["status"], "成功")
+
+    def test_run_account_no_rotation_on_real_missing_credentials(self):
+        """真正缺少凭据（prepare_auth 失败）仍应直接放弃，不轮换烧尝试次数。"""
+        acc = telecom.TelecomAccount(index=1, phone="18912345678")
+        ep1 = MagicMock()
+        ep1.display_name = "主出口"
+        ep1.url = "socks5://1.1.1.1:1080"
+
+        calls = []
+        def fake_exec(client):
+            calls.append(client.http)
+            return {"status": "失败", "error": "缺少 App 抓包凭据（请在 TELECOM_HEADER_1 配置抓包整串）"}
+
+        with patch.object(telecom, "_get_candidate_proxies", return_value=[ep1]), \
+             patch.object(telecom, "execute_telecom_task", side_effect=fake_exec), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok, outcome = telecom._run_account(acc)
+
+        self.assertFalse(ok)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("缺少 App 抓包凭据", outcome["error"])
+
+    def test_mint_network_failure_flag_on_timeout(self):
+        """mint 遇到连接超时/-1 响应时必须置 mint_network_failure 标记。"""
+        if not telecom.HAS_CRYPTO:
+            self.skipTest("缺少 pycryptodome 库，跳过测试")
+        from common import Response
+
+        acc = telecom.TelecomAccount(
+            index=1, phone="17762551109",
+            app_token="V1.0ABC", uid="3998477332", target_id="598d2606",
+        )
+        mock_http = MagicMock()
+        mock_http.request = MagicMock(return_value=Response(-1, None, b"", "url"))
+        client = telecom.TelecomClient(acc, mock_http)
+        with patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.mint_ticket_with_token()
+        self.assertFalse(ok)
+        self.assertTrue(client.mint_network_failure)
+
     def test_is_credential_desc_patterns(self):
         """密码类硬错误关键词判定（正向/负向）。"""
         self.assertTrue(telecom._is_credential_desc("用户密码错误，请重新输入"))
