@@ -556,7 +556,13 @@ class TelecomClient:
             self.cookie = str(state.get("cookie"))
             self._cookie_from_cache = True
         if not self.user_agent and state.get("user_agent"):
-            self.user_agent = str(state.get("user_agent"))
+            ua = str(state.get("user_agent")).strip()
+            # 状态恢复的 UA 必须通过完整性校验：截断 Mozilla / 裸 App UA 会被
+            # wappark WAF 一律 412（2026-09-19 CI 全天失败的第二根因，探针实测
+            # UA 敏感：完整 Mozilla+App 后缀 200，其余全 412）。不合规则弃用，
+            # 回退 UA_MOBILE 默认值
+            if ua.startswith("Mozilla/5.0") and "AppleWebKit" in ua and "Safari" in ua:
+                self.user_agent = ua
         if not self.app_token and state.get("app_token"):
             self.app_token = str(state.get("app_token"))
         if not self.uid and state.get("uid"):

@@ -579,6 +579,38 @@ class TestTelecom(unittest.TestCase):
         self.assertTrue(ok)
         m_exchange.assert_called_once()
 
+    def test_restore_cached_session_rejects_truncated_ua(self):
+        """状态恢复的截断 UA 必须弃用（wappark WAF 对非完整浏览器 UA 一律 412）。"""
+        acc = telecom.TelecomAccount(index=1, phone="17762551109")
+        client = telecom.TelecomClient(acc, MagicMock())
+        state = {
+            "sign": "s" * 32,
+            "user_agent": "Mozilla/5.0 (Linux; Android 12; zh-cn)",
+            "updated_at": "2026-09-17 07:07:53",
+        }
+        with patch("telecom.load_kv_state", return_value=state), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.restore_cached_session()
+        self.assertTrue(ok)
+        self.assertEqual(client.user_agent, "")
+
+    def test_restore_cached_session_accepts_full_ua(self):
+        """完整浏览器 UA（Mozilla+AppleWebKit+Safari）应正常恢复采用。"""
+        acc = telecom.TelecomAccount(index=1, phone="17762551109")
+        client = telecom.TelecomClient(acc, MagicMock())
+        ua = ("Mozilla/5.0 (Linux; U; Android 12; zh-cn) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Version/4.0 Mobile Safari/537.36 CtClient;10.4.1")
+        state = {
+            "sign": "s" * 32,
+            "user_agent": ua,
+            "updated_at": "2026-09-17 07:07:53",
+        }
+        with patch("telecom.load_kv_state", return_value=state), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.restore_cached_session()
+        self.assertTrue(ok)
+        self.assertEqual(client.user_agent, ua)
+
     def test_candidate_proxies_include_singbox_fallback(self):
         """sing-box 统一出站应作为电信候选兜底（排在 CN 家宽之后）。"""
         env = {
