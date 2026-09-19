@@ -427,6 +427,73 @@ class TestTelecom(unittest.TestCase):
         self.assertEqual(client.ticket, plain_ticket)
         self.assertEqual(client.sign, "f" * 32)
 
+    def test_prepare_auth_mints_fresh_session_over_stale_cache(self):
+        """持有 Token 三件套时必须先现签：陈旧缓存 sign 不得抢跑（wappark 对死会话 412 短路）。"""
+        acc = telecom.TelecomAccount(
+            index=1, phone="17762551109",
+            app_token="V1.0ABC", uid="3998477332", target_id="598d2606",
+        )
+        client = telecom.TelecomClient(acc, MagicMock())
+        client.sign = "stale_sign_from_2_days_ago_12345678"
+        client.cookie = "acw_sc__v2=stale_clearance"
+        with patch.object(client, "restore_cached_session", return_value=True), \
+             patch.object(client, "mint_ticket_with_token", return_value=True) as m_mint, \
+             patch.object(client, "exchange_ticket", return_value=True) as m_exchange, \
+             patch.object(client, "login_with_password", return_value=False) as m_pwd, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.prepare_auth()
+        self.assertTrue(ok)
+        m_mint.assert_called_once()
+        m_exchange.assert_not_called()
+        m_pwd.assert_not_called()
+        self.assertEqual(client.cookie, "")
+
+    def test_prepare_auth_falls_back_to_cached_sign_when_mint_fails(self):
+        """现签失败（如 Token 过期）时回退缓存 sign，不再重复换票。"""
+        acc = telecom.TelecomAccount(
+            index=1, phone="17762551109",
+            app_token="V1.0ABC", uid="3998477332", target_id="598d2606",
+        )
+        client = telecom.TelecomClient(acc, MagicMock())
+        client.sign = "cached_sign_still_valid_1234567890"
+        with patch.object(client, "restore_cached_session", return_value=True), \
+             patch.object(client, "mint_ticket_with_token", return_value=False) as m_mint, \
+             patch.object(client, "exchange_ticket", return_value=True) as m_exchange, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.prepare_auth()
+        self.assertTrue(ok)
+        m_mint.assert_called_once()
+        m_exchange.assert_not_called()
+        self.assertEqual(client.sign, "cached_sign_still_valid_1234567890")
+
+    def test_prepare_auth_uses_cached_ticket_when_mint_fails_without_sign(self):
+        """现签失败且无缓存 sign 时，回退缓存 ticket 换票老路。"""
+        acc = telecom.TelecomAccount(
+            index=1, phone="17762551109",
+            app_token="V1.0ABC", uid="3998477332", target_id="598d2606",
+        )
+        client = telecom.TelecomClient(acc, MagicMock())
+        client.ticket = "c" * 256
+        with patch.object(client, "restore_cached_session", return_value=True), \
+             patch.object(client, "mint_ticket_with_token", return_value=False), \
+             patch.object(client, "exchange_ticket", return_value=True) as m_exchange, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.prepare_auth()
+        self.assertTrue(ok)
+        m_exchange.assert_called_once()
+
+    def test_prepare_auth_without_token_keeps_legacy_order(self):
+        """无 Token 三件套的老配置（ticket 路线）不受影响：缓存 ticket 照常换票。"""
+        acc = telecom.TelecomAccount(index=1, phone="17762551109")
+        client = telecom.TelecomClient(acc, MagicMock())
+        client.ticket = "c" * 256
+        with patch.object(client, "restore_cached_session", return_value=True), \
+             patch.object(client, "exchange_ticket", return_value=True) as m_exchange, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.prepare_auth()
+        self.assertTrue(ok)
+        m_exchange.assert_called_once()
+
     def test_candidate_proxies_include_singbox_fallback(self):
         """sing-box 统一出站应作为电信候选兜底（排在 CN 家宽之后）。"""
         env = {

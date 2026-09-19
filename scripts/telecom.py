@@ -775,11 +775,8 @@ class TelecomClient:
         return f"🎯 已达标！自动兑换响应: {msg or '已提交'}（请在电信 App 金豆商城核查到账）"
 
     def prepare_auth(self) -> bool:
-        """准备可用鉴权票据：优先从环境变量加载，次选本地/Redis缓存。"""
+        """准备可用鉴权票据：Token 现签优先（App 同款），缓存会话仅作回退。"""
         self.restore_cached_session()
-        # 若持有 ticket 且 sign 缺失，尝试用 ticket 换票
-        if not self.sign and self.ticket:
-            self.exchange_ticket()
 
         # 若未指定手机号，优先尝试复用同账号序号的 CLOUD189 手机号配置
         if not self.phone:
@@ -793,9 +790,17 @@ class TelecomClient:
                 self.phone = cloud189_user
                 self.acc.phone = cloud189_user
 
-        # 若 sign 仍然缺失且无可用 ticket：优先用 App 长效 Token 现签（免密、免设备验证）
-        if not self.sign and (self.app_token and self.uid):
-            self.mint_ticket_with_token()
+        # 2026-09-19 CI 全天失败根因：恢复的陈旧缓存 sign 先行请求 wappark 会被 WAF
+        # 以 412 短路（不返回应用层「会话失效」），导致所有代理候选被误判为死代理，
+        # 且失败不落盘使陈旧状态自我延续。App 每次打开金豆页都现签新 Ticket，故持有
+        # 长效 Token 时永远先现签；仅现签失败时才退回缓存 sign/ticket 老路。
+        minted = False
+        if self.app_token and self.uid and HAS_CRYPTO:
+            minted = self.mint_ticket_with_token()
+            if minted:
+                self.cookie = ""  # 丢弃陈旧 cookie，避免跨出口的 WAF 通行状态残留
+        if not minted and not self.sign and self.ticket:
+            self.exchange_ticket()
 
         # 若 sign 仍然缺失但配置了服务密码，执行服务密码登录换票
         if not self.sign and (self.phone and self.password):
