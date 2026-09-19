@@ -104,19 +104,32 @@ UA_MOBILE = (
 
 
 def _get_candidate_proxies() -> List[ProxyEndpoint]:
-    """获取中国电信任务可用的 CN 代理出口列表。"""
+    """获取中国电信任务可用的代理出口列表（CN 家宽优先，sing-box 国际家宽兜底）。"""
     endpoints = get_all_proxy_endpoints(task_prefix="TELECOM")
-    if endpoints:
-        return endpoints[:3]
-    raw = (
-        os.getenv("TELECOM_PROXY")
-        or os.getenv("CLOUD189_PROXY")
-        or os.getenv("SMZDM_PROXY")
-        or os.getenv("52POJIE_PROXY")
-        or os.getenv("WUAI_PROXY")
-        or ""
-    )
-    return parse_proxies_text(raw, default_name_prefix="电信CN代理")[:3]
+    if not endpoints:
+        raw = (
+            os.getenv("TELECOM_PROXY")
+            or os.getenv("CLOUD189_PROXY")
+            or os.getenv("SMZDM_PROXY")
+            or os.getenv("52POJIE_PROXY")
+            or os.getenv("WUAI_PROXY")
+            or ""
+        )
+        endpoints = parse_proxies_text(raw, default_name_prefix="电信CN代理")
+    endpoints = endpoints[:3]
+
+    # 兜底出口：CI 的 sing-box 统一出站（socks5://127.0.0.1:1080，「国际家宽」组）。
+    # wappark 的 WAF 拒数据中心/海外 IP（直连 412/-1），但家宽属性出口可能放行；
+    # 排在 CN 家宽代理之后、直连之前。本地无 sing-box 时该候选会快速失败被跳过。
+    sb_url = (os.getenv("SINGBOX_SOCKS_URL") or "socks5://127.0.0.1:1080").strip()
+    try:
+        from proxy_manager import parse_proxy_line
+        sb_ep = parse_proxy_line(f"{sb_url}#singbox-国际家宽兜底")
+        if sb_ep and all(ep.url != sb_ep.url for ep in endpoints):
+            endpoints.append(sb_ep)
+    except Exception:
+        pass
+    return endpoints
 
 
 # ---------- 业务接口加解密逻辑 ----------

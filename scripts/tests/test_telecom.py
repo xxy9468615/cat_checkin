@@ -427,6 +427,28 @@ class TestTelecom(unittest.TestCase):
         self.assertEqual(client.ticket, plain_ticket)
         self.assertEqual(client.sign, "f" * 32)
 
+    def test_candidate_proxies_include_singbox_fallback(self):
+        """sing-box 统一出站应作为电信候选兜底（排在 CN 家宽之后）。"""
+        env = {
+            "TELECOM_PROXY": "http://113.9.9.9:8080#电信家宽",
+            "SINGBOX_SOCKS_URL": "socks5://127.0.0.1:1080",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            eps = telecom._get_candidate_proxies()
+        urls = [ep.url for ep in eps]
+        self.assertEqual(urls[0], "http://113.9.9.9:8080")
+        self.assertIn("socks5://127.0.0.1:1080", urls)
+
+    def test_candidate_proxies_dedup_singbox(self):
+        """sing-box 出口若与既有候选重复则不重复加入。"""
+        env = {
+            "TELECOM_PROXY": "socks5://127.0.0.1:1080#同址出口",
+            "SINGBOX_SOCKS_URL": "socks5://127.0.0.1:1080",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            eps = telecom._get_candidate_proxies()
+        self.assertEqual([ep.url for ep in eps].count("socks5://127.0.0.1:1080"), 1)
+
     def test_report_fields_extractor(self):
         """报告字段解析器提取验证。"""
         sample_output = """
