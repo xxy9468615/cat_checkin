@@ -569,7 +569,12 @@ class TelecomClient:
 
         if self.sign or self.authorization or self.ticket or (self.phone and self.password) \
                 or (self.app_token and self.uid):
-            print(f"    [keepalive] 成功加载账号缓存会话 (更新于: {state.get('updated_at', '未知')})", flush=True)
+            # 脱敏打印恢复状态的字段长度，便于定位「陈旧缓存抢跑」类问题（2026-09-19）
+            print(f"    [keepalive] 成功加载账号缓存会话 (更新于: {state.get('updated_at', '未知')}) "
+                  f"[sign={len(str(state.get('sign') or ''))} ticket={len(str(state.get('ticket') or ''))} "
+                  f"cookie={len(str(state.get('cookie') or ''))} ua={len(str(state.get('user_agent') or ''))} "
+                  f"auth={len(str(state.get('authorization') or ''))} token={'Y' if state.get('app_token') else 'N'}]",
+                  flush=True)
             return True
         return False
 
@@ -720,6 +725,10 @@ class TelecomClient:
                     pass
             print(f"    [ticket] 成功利用 ticket 换取电信会话 sign: {mask_str(self.sign, 4, 4)}", flush=True)
             return True
+        # 失败不得静默：打印响应要点（脱敏）定位 WAF/会话层问题（2026-09-19 CI 排障）
+        print(f"    [ticket] 换取 sign 失败: http_code={res.get('code')} "
+              f"resoultCode={res.get('resoultCode')} "
+              f"msg={str(res.get('resoultMsg') or res.get('msg') or '')[:80]}", flush=True)
         return False
 
     def mint_ticket_with_token(self) -> bool:
