@@ -501,8 +501,10 @@ def ex_tencent_cloudstudio(output: str, res: Dict[str, Any]) -> None:
             continue
         if "🔑 SSO 主动续票成功" in ln or "🔑 SSO 换票成功" in ln or "🔑 SSO 续期成功" in ln:
             res["badges"].append(("info", "SSO 已续票"))
-        elif "🆕 检测到环境变量 Cookie 已更新" in ln:
-            res["badges"].append(("info", "Cookie已更新"))
+        elif "🔑 qcloud 授权换票成功" in ln:
+            res["badges"].append(("info", "qcloud 已换票"))
+        elif "🆕 检测到环境变量" in ln:
+            res["badges"].append(("info", "凭据已更新"))
         if any(kw in ln for kw in _ERROR_KW) and not ln.startswith(("✅", "🔔")):
             res["error_lines"].append(ln)
     _add_summary(res, output)

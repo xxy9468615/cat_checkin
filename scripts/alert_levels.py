@@ -60,6 +60,8 @@ _RENEWAL_FAIL_PATTERNS: Dict[str, tuple] = {
         r"KEYCLOAK 长期票据",
         r"AUTH_EXPIRED",
         r"自动续票失败",
+        r"qcloud 换票",
+        r"qcloud 授权链",
     ),
     "2libra.py": (
         r"token 换新失败",
@@ -86,7 +88,7 @@ _RENEWAL_FAIL_PATTERNS: Dict[str, tuple] = {
 
 # 续期失败提示语（提示读者该做什么，而不是只抛日志原文）
 _RENEWAL_HINTS: Dict[str, str] = {
-    "tencent_cloudstudio.py": "SSO 静默换票失败（KEYCLOAK 长期票据可能被吊销或要求交互登录），本次用旧票签成，请检查/准备更新 Cookie",
+    "tencent_cloudstudio.py": "自动换票失败（qcloud skey 失效 / KEYCLOAK 长期票据被吊销或要求交互登录），本次用旧票签成；请更新 Secrets 中的 skey+uin 或完整 Cookie",
     "2libra.py": "refresh_token 换新失败，当前 access_token 到期前仍可签到，请尽快重新登录更新 Cookie",
     "alipan.py": "refresh_token 轮换异常，请检查凭据",
     "sophnet.py": "refresh_token 续期失败，请检查凭据",

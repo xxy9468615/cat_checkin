@@ -56,6 +56,11 @@ CASES = [
     ("cloudstudio AUTH_EXPIRED 回退后签成", "tencent_cloudstudio.py", True,
      "🔄 session 失效（AUTH_EXPIRED_401），回退使用环境变量中的 session...\n✅ 签到成功",
      "warn", "AUTH_EXPIRED"),
+    ("cloudstudio qcloud 铸票失败但旧票签成", "tencent_cloudstudio.py", True,
+     "🔐 使用 qcloud 登录态（skey+uin）铸造 CloudStudio 会话...\n"
+     "    [diag] qcloud 换票第 4 步失败：grant HTTP 200 code=NOT-LOGINED——skey/uin 可能已失效\n"
+     "✅ 签到成功",
+     "warn", "换票失败"),
     ("2libra token 换新失败但旧 token 仍可签到", "2libra.py", True,
      "[keepalive] ⚠️ token 换新失败（HTTP 400）——当前 access_token 到期前仍可签到\n签到成功 +300金币",
      "warn", "refresh_token 换新失败"),
