@@ -82,10 +82,33 @@ def _daily_report_window_blocks(now: dt.datetime, report_fallback: bool) -> bool
 # 期望任务清单：从统一 task_registry 读取
 EXPECTED_RESULTS: Dict[str, str] = get_expected_results()
 
+# 结果文件名 → orchestrator 任务 ID（熔断状态以 task_id 为键存放）
+RESULT_TO_TASK_ID: Dict[str, str] = {
+    (cfg.get("result") or f"{tid}.json"): tid for tid, cfg in TASKS.items()
+}
+
 # 重跑候选脚本列表（单 run 模式下放宽为全部 daily 任务，均幂等安全）
 CHECKIN_MATRIX_SCRIPTS = sorted(
     {t["script"] for t in TASKS.values() if "daily" in t.get("tags", [])}
 )
+
+
+def _task_is_suspended(task_id: str) -> bool:
+    """查询任务是否处于熔断停用状态（Redis 权威态 + 本地 state 文件兜底）。
+
+    熔断停用的任务不会被执行、也不会写入当日 raw（run() 的 suspended 分支仅在
+    orchestrator 真正启动时才落记录；空转 run 会在 precheck 提前秒退），因此
+    日报在「期望任务缺席」时必须回查熔断状态——否则会把 🛑 已熔断误标为
+    ⏳ 待执行（掩盖真实原因，且会撑高 pending 计数抑制当日邮件发送）。
+    """
+    if not task_id:
+        return False
+    try:
+        from circuit_breaker import is_task_suspended
+        return bool(is_task_suspended(task_id))
+    except Exception as exc:  # 熔断状态查询失败不得阻塞报告链路
+        print(f"⚠️ 熔断状态查询失败（{task_id}）: {exc}", file=sys.stderr)
+        return False
 
 
 def _load_single_result(path: Path, accepted_dates: Set[str]) -> Optional[dict]:
@@ -171,8 +194,27 @@ def collect_all_results(today: str, yesterday: str) -> Tuple[List[Tuple[bool, Pa
                 if res:
                     collected[json_file.name] = res
 
-    # === 3. 期望清单比对：缺席任务标记为待执行（pending），避免误判为失败红卡 ===
+    # === 3. 期望清单比对：缺席任务区分「🛑 已熔断停用」与「⏳ 待执行」 ===
+    # 熔断停用任务今日必然缺席 raw（被 run() 跳过 / 空转 run 未落记录），
+    # 必须回查熔断状态，否则误报为待执行（掩盖真实原因、撑高 pending 抑制发信）。
     for missing in sorted(set(EXPECTED_RESULTS) - set(collected)):
+        tid = RESULT_TO_TASK_ID.get(
+            missing, missing[:-5] if missing.endswith(".json") else missing
+        )
+        if _task_is_suspended(tid):
+            print(f"🛑 期望任务已熔断停用（等待人工上线，非待执行）: {missing}")
+            collected[missing] = {
+                "ok": False,
+                "status": "suspended",
+                "circuit_broken": True,
+                "script": EXPECTED_RESULTS[missing],
+                "output": (
+                    "🛑 任务已达单日失败上限，触发熔断停用，暂停自动重试，"
+                    "等待人工修复后上线。"
+                ),
+                "elapsed": 0.0,
+            }
+            continue
         print(f"ℹ️ 期望任务尚未收集 (待执行或独立调度中): {missing}")
         collected[missing] = {
             "ok": False,
