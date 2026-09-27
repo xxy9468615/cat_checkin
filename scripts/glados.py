@@ -4,15 +4,18 @@
 """GLaDOS standalone task: multi-account, multi-cookie, multi-domain check-in and auto exchange.
 
 Environment compatibility:
-  GLADOS_ACCOUNTS         Accounts format "email:password", split by newline or "&&". Preferred.
-  GLADOS_email            Single account email.
-  GLADOS_password         Single account password.
+  GLADOS_COOKIE_1, _2...  Multi-account cookie sequence variables (cookie auth ONLY).
   GLADOS_COOKIES          Cookies split by "&", newline, or "&&".
   GLADOS_EXCHANGE_PLAN    plan100 / plan200 / plan500, default: plan500.
   GLADOS_AUTO_EXCHANGE    true/false, default: true.
   GLADOS_VERBOSE          true/false, default: false.
-  GLADOS_DOMAINS          Comma-separated domains, default: glados.cloud,railgun.info.
+  GLADOS_DOMAINS          Comma-separated domains, default: glados.cloud.
   PUSHDEER_SENDKEY        Optional PushDeer key, sends summary without extra dependency.
+
+Auth note: the upstream has no password-login API. POST /api/authorization is a
+dead endpoint that always answers {"code":1} regardless of payload, so only the
+cookie (koa:sess + koa:sess.sig) flow is supported. Cookies must be pasted from
+a real browser session and refreshed manually once the server-side session dies.
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from common import Http, env, env_seq, main_guard, mask_str
+from common import Http, env_seq, main_guard, mask_str
 
 
 class Emoji:
@@ -48,7 +51,10 @@ CHECKIN_FAILURE = -2
 COOKIE_INVALID = -3
 
 # Cookie 失效时响应中常见的登录关键词（命中即判定登录态过期）
-AUTH_FAILURE_KEYWORDS = ("login", "unauthorized", "请登录", "重新登录")
+# 注意 "没有权限"/"No permission"（code=-2）是 koa:sess 签名校验失败时服务端的
+# 固定返回——不带 Cookie 请求也会得到同一结果，与越权/封号无关，必须归入
+# 失效判定，否则会被当成普通签到失败白白烧掉熔断次数。
+AUTH_FAILURE_KEYWORDS = ("login", "unauthorized", "请登录", "重新登录", "没有权限", "no permission")
 
 
 class CookieExpiredError(RuntimeError):
@@ -97,32 +103,11 @@ class Result:
 class Config:
     def __init__(self) -> None:
         self.push_key = os.getenv("PUSHDEER_SENDKEY", "").strip()
-        self.accounts = self._load_accounts()
         self.cookies = self._load_cookies()
         self.domains = self._load_domains()
         self.exchange_plan = self._load_exchange_plan()
         self.auto_exchange = self._bool_env("GLADOS_AUTO_EXCHANGE", True)
         self.verbose = self._bool_env("GLADOS_VERBOSE", False)
-
-    def _load_accounts(self) -> List[Tuple[str, str]]:
-        accounts: List[Tuple[str, str]] = []
-        # 1. 优先扫描序号配对的 EMAIL_1 / PASSWORD_1 序列
-        emails = env_seq("GLADOS_", "email", required=False)
-        passwords = env_seq("GLADOS_", "password", required=False)
-        for u, p in zip(emails, passwords):
-            if u.strip() and p.strip() and (u.strip(), p.strip()) not in accounts:
-                accounts.append((u.strip(), p.strip()))
-
-        # 2. 扫描 ACCOUNT_1 / ACCOUNTS_1 或旧单变量 email:password 列表
-        raw_accounts = env_seq("GLADOS_", "accounts", required=False) or env_seq("GLADOS_", "account", required=False)
-        for chunk in raw_accounts:
-            chunk = chunk.strip()
-            if ":" in chunk:
-                u, _, p = chunk.partition(":")
-                if u.strip() and p.strip() and (u.strip(), p.strip()) not in accounts:
-                    accounts.append((u.strip(), p.strip()))
-
-        return accounts
 
     def _load_cookies(self) -> List[str]:
         # 优先扫描 COOKIE_1, COOKIE_2 序列，回退至 COOKIES / cookie (含 && 切分)
@@ -157,25 +142,6 @@ class GladosAPI:
         self.verbose = verbose
         self.http = Http()
         self.base = f"https://{domain}"
-
-    def login(self, email: str, passwd: str) -> str:
-        resp = self.http.request(
-            "POST",
-            self.base + "/api/authorization",
-            headers={"Origin": self.base, "Referer": f"{self.base}/console/login"},
-            json_data={"email": email, "passwd": passwd},
-        )
-        data = self._safe_json(resp)
-        code = data.get("code")
-        if code != 0:
-            msg = data.get("message") or f"code={code}"
-            # 异常文本会进 CI 日志/邮件，邮箱必须脱敏
-            raise RuntimeError(f"GLaDOS 登录失败 ({mask_str(email)}): {msg}")
-
-        cookies = [f"{c.name}={c.value}" for c in self.http.jar]
-        if not cookies:
-            raise RuntimeError("GLaDOS 登录成功但未返回 Cookie")
-        return "; ".join(cookies)
 
     def _headers(self, cookie: str) -> Dict[str, str]:
         return {
@@ -306,36 +272,20 @@ class Checker:
 
     def run(self) -> None:
         print("【GLaDOS 签到兑换】")
-        if self.config.accounts:
-            total = len(self.config.accounts) * len(self.config.domains)
-            for acc_idx, (email, pwd) in enumerate(self.config.accounts, 1):
-                for domain in self.config.domains:
-                    api = GladosAPI(domain, acc_idx, self.config.verbose)
-                    try:
-                        cookie = api.login(email, pwd)
-                        res = self._run_one(api, cookie, acc_idx, domain)
-                        res.account_name = email
-                        self.results.append(res)
-                    except CookieExpiredError as e:
-                        self.results.append(self._cookie_invalid_result(acc_idx, domain, email, str(e)))
-                    except Exception as e:
-                        print(f"❌ 账号 {mask_str(email)} on {domain} 执行失败: {e}")
-                        res = Result(cookie_index=acc_idx, domain=domain, account_name=email, status=f"失败: {e}")
-                        self.results.append(res)
-        elif self.config.cookies:
-            for cookie_index, cookie in enumerate(self.config.cookies, 1):
-                for domain in self.config.domains:
-                    api = GladosAPI(domain, cookie_index, self.config.verbose)
-                    try:
-                        res = self._run_one(api, cookie, cookie_index, domain)
-                    except CookieExpiredError as e:
-                        res = self._cookie_invalid_result(cookie_index, domain, "", str(e))
-                    except Exception as e:
-                        # 与账号分支对齐：单个 cookie 的解析等异常不能中断其余 cookie
-                        print(f"❌ 账号 {cookie_index} on {domain} 执行失败: {e}")
-                        res = Result(cookie_index=cookie_index, domain=domain, account_name="",
-                                     status=f"失败: {e}")
-                    self.results.append(res)
+        # 上游无密码登录接口，仅支持 Cookie 认证
+        for cookie_index, cookie in enumerate(self.config.cookies, 1):
+            for domain in self.config.domains:
+                api = GladosAPI(domain, cookie_index, self.config.verbose)
+                try:
+                    res = self._run_one(api, cookie, cookie_index, domain)
+                except CookieExpiredError as e:
+                    res = self._cookie_invalid_result(cookie_index, domain, "", str(e))
+                except Exception as e:
+                    # 单个 cookie 的解析等异常不能中断其余 cookie
+                    print(f"❌ 账号 {cookie_index} on {domain} 执行失败: {e}")
+                    res = Result(cookie_index=cookie_index, domain=domain, account_name="",
+                                 status=f"失败: {e}")
+                self.results.append(res)
 
     def _cookie_invalid_result(self, cookie_index: int, domain: str, account_name: str, detail: str) -> Result:
         """生成 Cookie 失效结果并打印明确的修复指引，跳过该账号后续流程。"""
@@ -426,8 +376,8 @@ def pushdeer_send(push_key: str, title: str, content: str) -> None:
 
 def main() -> None:
     config = Config()
-    if not config.accounts and not config.cookies:
-        raise RuntimeError("未找到 GLADOS_ACCOUNTS (或 GLADOS_email/GLADOS_password) 或 GLADOS_COOKIES")
+    if not config.cookies:
+        raise RuntimeError("未找到 GLADOS_COOKIE_1/2/3 或 GLADOS_COOKIES（上游无密码登录，仅支持 Cookie）")
 
     checker = Checker(config)
     checker.run()
