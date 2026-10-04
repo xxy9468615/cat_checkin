@@ -959,20 +959,33 @@ def ex_smzdm(output: str, res: Dict[str, Any]) -> None:
 
 
 def ex_52pojie(output: str, res: Dict[str, Any]) -> None:
-    """吾爱破解：👤 用户: 【xx】 (UID: xx) + • 签到 / 资产 行。"""
+    """吾爱破解：👤 用户: 【xx】 (UID: xx) + • 签到 / 资产 行；有效期随卡片行尾展示。"""
     cur: Any = None
+    pending_exp = ""
+
+    def _flush_cur() -> None:
+        nonlocal pending_exp
+        if cur is not None:
+            if pending_exp:
+                cur.parts.append(pending_exp)
+            cur.flush(res)
+        pending_exp = ""
+
     for raw in output.splitlines():
         ln = raw.strip()
         m = re.search(r"👤 用户:\s*【(.+?)】(?:\s*\(UID:\s*([^)]+)\))?", ln)
         if m:
-            if cur:
-                cur.flush(res)
+            _flush_cur()
             cur = _Block(m.group(1))
+            m_exp = re.search(r"Cookie 剩余 (\d+) 天(?:（(\d{4}-\d{2}-\d{2}) 到期)?", ln)
+            if m_exp:
+                pending_exp = f"Cookie剩{m_exp.group(1)}天" + (f"（{m_exp.group(2)} 到期）" if m_exp.group(2) else "")
+            elif "Cookie 有效期未知" in ln:
+                pending_exp = "Cookie有效期未知"
             continue
         if "签到失败" in ln or "❌" in ln:
-            if cur:
-                cur.flush(res)
-                cur = None
+            _flush_cur()
+            cur = None
             res["fail_lines"].append(_clean(ln))
             res["error_lines"].append(ln)
             continue
@@ -1009,8 +1022,7 @@ def ex_52pojie(output: str, res: Dict[str, Any]) -> None:
             if m_lv:
                 cur.parts.append(m_lv.group(1))
             continue
-    if cur:
-        cur.flush(res)
+    _flush_cur()
     _add_summary(res, output)
 
 

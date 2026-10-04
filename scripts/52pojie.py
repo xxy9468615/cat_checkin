@@ -10,6 +10,9 @@
 4. 支持固定 CN 出口代理与候选代理容灾轮换（52POJIE_PROXY / WUAI_PROXY / SMZDM_PROXY / PROXY）
 5. Upstash Redis + 本地 State 双层跨 CI 持久化（cat_checkin:state:52pojie_{idx}）与 Cookie 滚动保活
 6. 多账号独立隔离运行与用户名/UID 智能脱敏
+7. 自动识别 Cookie 有效期：优先采用真实到期证据（响应 Set-Cookie 的 Expires/Max-Age
+   学习、Netscape/JSON 粘贴格式自带的到期字段），无真实证据时才按 30 天窗口估算；
+   估算耗尽但签到仍成功时如实报「有效期未知」，杜绝假 0 天告警
 
 环境变量：
 - 52POJIE_COOKIE_1, 52POJIE_COOKIE_2... (多账号序列，推荐)
@@ -145,13 +148,144 @@ def _merge_cookie_str(base_cookie: str, set_cookies: List[str]) -> str:
     return "; ".join(f"{k}={v}" for k, v in c_dict.items())
 
 
-def _calc_cookie_expiry(cookie_str: str, state: Dict[str, Any]) -> Optional[int]:
-    """推算 Discuz Cookie 剩余有效天数（默认 30 天会话周期）。"""
+# 登录凭据 cookie（Discuz 前缀 4 位站点哈希 + _2132_ + auth）：其 Expires 即登录有效期
+LOGIN_COOKIE_RE = re.compile(r"^[A-Za-z0-9]+_2132_auth$", re.IGNORECASE)
+# 无任何真实到期证据时的估算窗口（Discuz 默认会话周期）
+COOKIE_FALLBACK_LIFETIME_DAYS = 30
+
+
+def _parse_cookie_date(text: str) -> Optional[int]:
+    """Set-Cookie 日期串（RFC 7231 / Netscape 连字符格式）→ epoch 秒。"""
+    if not text:
+        return None
+    try:
+        from http.cookiejar import http2time
+
+        ts = http2time(text.strip())
+        return int(ts) if ts else None
+    except Exception:
+        return None
+
+
+def _parse_set_cookie_expiry(set_cookie: str) -> Optional[int]:
+    """解析单条 Set-Cookie 标头的 Expires / Max-Age 属性 → epoch 秒（无则 None）。"""
+    m = re.search(r";\s*expires\s*=\s*([^;]+)", set_cookie, re.IGNORECASE)
+    if m:
+        return _parse_cookie_date(m.group(1))
+    m = re.search(r";\s*max-age\s*=\s*(-?\d+)", set_cookie, re.IGNORECASE)
+    if m:
+        max_age = int(m.group(1))
+        return int(time.time()) + max_age if max_age > 0 else None
+    return None
+
+
+def _collect_cookie_expiries(resp: Any) -> Dict[str, int]:
+    """从响应中提取登录凭据 cookie（*_2132_auth）的真实到期时间（epoch 秒）。
+
+    双引擎：curl_cffi 走 CookieJar（自带 expires），urllib 走 Set-Cookie 标头
+    Expires/Max-Age 属性；saltkey/sid/WAF 等其余 cookie 的时效不代表登录有效期，
+    一律忽略。任何异常静默返回 {}，绝不影响主流程。
+    """
+    out: Dict[str, int] = {}
+    try:
+        jar = getattr(getattr(resp, "_raw_cookies", None), "jar", None)
+        if jar is not None:
+            for c in jar:
+                name = getattr(c, "name", "") or ""
+                exp = getattr(c, "expires", None)
+                if LOGIN_COOKIE_RE.match(name) and isinstance(exp, (int, float)) and exp > 0:
+                    out[name] = int(exp)
+    except Exception:
+        pass
+    try:
+        for sc in _collect_resp_cookies(resp):
+            name = sc.split("=", 1)[0].strip()
+            if LOGIN_COOKIE_RE.match(name):
+                ts = _parse_set_cookie_expiry(sc)
+                if ts:
+                    out[name] = ts
+    except Exception:
+        pass
+    return out
+
+
+def _pick_expiry(expiries: Dict[str, int]) -> Optional[int]:
+    """从 {cookie 名: 到期 epoch} 中取登录凭据（*_auth）的到期时间。"""
+    for name, ts in expiries.items():
+        if name.endswith("_auth") and isinstance(ts, (int, float)) and ts > 0:
+            return int(ts)
+    return None
+
+
+def _parse_explicit_cookie_expiry(cookie_str: str) -> Optional[int]:
+    """识别粘贴 Cookie 自带的到期字段（Netscape 文件 / 浏览器 JSON 导出）。
+
+    普通「k=v; k=v」标头格式不含到期信息 → None；多条证据优先取 auth cookie
+    （登录态本体），不存在时回退站点域内最大值。
+    """
+    s = (cookie_str or "").strip()
+    if not s:
+        return None
+    cands: List[Tuple[str, float]] = []  # (cookie 名, 到期 epoch)
+    if s.startswith("[") or s.startswith("{"):
+        try:
+            data = json.loads(s)
+        except Exception:
+            return None
+        for it in (data if isinstance(data, list) else [data]):
+            if not isinstance(it, dict):
+                continue
+            dom = str(it.get("domain") or "").lower()
+            if dom and "52pojie" not in dom:
+                continue
+            ts = it.get("expirationDate") or it.get("expires") or it.get("expiry")
+            if isinstance(ts, (int, float)) and ts > 0:
+                cands.append((str(it.get("name") or ""), float(ts)))
+    else:
+        for line in s.splitlines():
+            cols = line.split("\t")
+            if len(cols) < 7:
+                continue
+            try:
+                ts = float(cols[4])
+            except ValueError:
+                continue
+            if ts <= 0 or "52pojie" not in cols[0].lower():
+                continue
+            cands.append((cols[5].strip(), ts))
+    auth = [ts for name, ts in cands if name.endswith("_auth")]
+    pool = auth or [ts for _, ts in cands]
+    return int(max(pool)) if pool else None
+
+
+def _build_expiry_tag(cookie_str: str, state: Dict[str, Any], learned: Optional[Dict[str, int]] = None) -> str:
+    """自动识别 Cookie 有效期并渲染输出标签（签到流程此刻已验证登录态存活）。
+
+    证据优先级：本轮 Set-Cookie 真实到期 > state 历史学习值（cookie_expire_ts）
+    > 粘贴格式自带到期字段 > saved_ts+30 天估算。估算耗尽（≤0）但登录态存活，
+    说明 30 天硬上限假设已被推翻 → 如实报「有效期未知」，不产出假 0 天告警。
+    """
+    now = time.time()
+    ts: Optional[float] = None
+    for cand in (_pick_expiry(learned or {}), state.get("cookie_expire_ts"), _parse_explicit_cookie_expiry(cookie_str)):
+        if isinstance(cand, (int, float)) and cand > 0:
+            ts = float(cand)
+            break
+    if ts:
+        remaining = max(0, int((ts - now) / 86400))
+        date_txt = datetime.fromtimestamp(ts, BJT).strftime("%Y-%m-%d")
+        if remaining < 7:
+            return f" | ⚠️ Cookie 剩余 {remaining} 天（{date_txt} 到期，请尽快更新）"
+        return f" | 🔑 Cookie 剩余 {remaining} 天（{date_txt} 到期）"
     saved_ts = state.get("saved_ts")
-    if saved_ts and isinstance(saved_ts, (int, float)):
-        expire_ts = int(saved_ts) + 30 * 86400
-        return max(0, int((expire_ts - time.time()) / 86400))
-    return 30
+    if isinstance(saved_ts, (int, float)) and saved_ts > 0:
+        remaining = max(0, min(int((saved_ts + COOKIE_FALLBACK_LIFETIME_DAYS * 86400 - now) / 86400), COOKIE_FALLBACK_LIFETIME_DAYS))
+        if remaining > 0:
+            if remaining < 7:
+                return f" | ⚠️ Cookie 剩余 {remaining} 天（请尽快更新）"
+            return f" | 🔑 Cookie 剩余 {remaining} 天"
+        return f" | 🔑 Cookie 有效期未知（超出 {COOKIE_FALLBACK_LIFETIME_DAYS} 天估算窗口仍有效）"
+    return ""
 
 
 def _load_accounts() -> List[str]:
@@ -421,11 +555,15 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
     state_file = f".52pojie_state_{idx}.json"
 
     state = load_kv_state(redis_key, state_file) or {}
+    env_changed = state.get("env_hash") != env_hash
     cur_cookie = raw_cookie
 
     # 若环境变量未变更且状态中有滚动保存的有效 cookie，则使用滚动 cookie
-    if state.get("env_hash") == env_hash and state.get("cookie"):
+    if not env_changed and state.get("cookie"):
         cur_cookie = str(state["cookie"]).strip()
+    if env_changed:
+        # 换新凭据：旧 cookie 的到期学习成果作废（寿命起点随本次成功保存重置）
+        state.pop("cookie_expire_ts", None)
 
     candidate_proxies = _get_candidate_proxies()
     if not candidate_proxies:
@@ -454,13 +592,8 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
     masked_name = mask_str(nickname, 1, 1) if nickname else f"账号 #{idx}"
     masked_uid = mask_str(uid, 2, 2) if uid != "未知" else "未知"
 
-    remaining_days = _calc_cookie_expiry(cur_cookie, state)
-    expiry_tag = ""
-    if remaining_days is not None:
-        if remaining_days < 7:
-            expiry_tag = f" | ⚠️ Cookie 剩余 {remaining_days} 天（请尽快更新）"
-        else:
-            expiry_tag = f" | 🔑 Cookie 剩余 {remaining_days} 天"
+    learned_now = _collect_cookie_expiries(r_credit)
+    expiry_tag = _build_expiry_tag(cur_cookie, state, learned_now)
 
     # 2. 任务申请：GET /home.php?do=apply&id=2&mod=task (多重 WAF 绕过模板)
     apply_url_variants = [
@@ -553,7 +686,7 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
 
     print(f"• 资产: {' · '.join(asset_parts)}")
 
-    # 6. 滚动保存状态（若有新 Set-Cookie 或首次记录）
+    # 6. 滚动保存状态（若有新 Set-Cookie 或首次记录），并持久化学习到的真实到期时间
     try:
         all_sc: List[str] = []
         all_sc.extend(_collect_resp_cookies(r_credit))
@@ -561,19 +694,27 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
         all_sc.extend(_collect_resp_cookies(r_draw))
         merged_cookie = _merge_cookie_str(cur_cookie, all_sc) if all_sc else cur_cookie
 
-        save_kv_state(
-            redis_key,
-            state_file,
-            {
-                "cookie": merged_cookie,
-                "env_hash": env_hash,
-                "nickname": nickname,
-                "uid": uid,
-                "is_qq": is_qq_bind,
-                "saved_ts": int(state.get("saved_ts") or time.time()),
-                "updated_at": datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S"),
-            },
-        )
+        learned: Dict[str, int] = dict(learned_now)
+        for r in (r_apply, r_draw):
+            learned.update(_collect_cookie_expiries(r))
+        new_expire = _pick_expiry(learned) or _parse_explicit_cookie_expiry(cur_cookie)
+        prev_expire = state.get("cookie_expire_ts") if not env_changed else None
+        candidates = [float(t) for t in (prev_expire, new_expire) if isinstance(t, (int, float)) and t > 0]
+
+        new_state = {
+            "cookie": merged_cookie,
+            "env_hash": env_hash,
+            "nickname": nickname,
+            "uid": uid,
+            "is_qq": is_qq_bind,
+            # saved_ts = 凭据寿命起点（≈ 用户登录并粘贴的时刻），换新凭据才重置；
+            # 每次运行都刷新会让估算窗口变成假滑动，重新制造假 0 天告警
+            "saved_ts": int(time.time()) if env_changed else int(state.get("saved_ts") or time.time()),
+            "updated_at": datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if candidates:
+            new_state["cookie_expire_ts"] = int(max(candidates))
+        save_kv_state(redis_key, state_file, new_state)
     except Exception:
         pass
 

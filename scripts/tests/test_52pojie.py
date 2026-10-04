@@ -8,12 +8,16 @@
 4. 多源代理出口与候选池解析
 5. 多前缀与多账号序列加载兼容性
 6. 签到状态（成功、今日已签、Cookie 失效、WAF 拦截）判定逻辑
+7. Cookie 有效期自动识别（Set-Cookie Expires/Max-Age 学习、Netscape/JSON
+   粘贴格式到期字段、估算窗口耗尽后如实报「未知」不产出假 0 天告警）
 """
 from __future__ import annotations
 
 import os
 import io
+import re
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -24,6 +28,7 @@ sys.path.insert(0, str(BASE))
 import importlib
 
 pojie = importlib.import_module("52pojie")
+from alert_levels import _COOKIE_DAYS_RE  # noqa: E402  与黄色预警引擎的输出契约
 
 
 class Test52Pojie(unittest.TestCase):
@@ -170,6 +175,181 @@ class Test52Pojie(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 pojie._run_account("htVD_2132_auth=expired", 1, 1)
         self.assertIn("Cookie 已失效", str(ctx.exception))
+
+    # ------------------------------------------------------------------
+    # 7. Cookie 有效期自动识别
+    # ------------------------------------------------------------------
+    def test_parse_set_cookie_expiry(self):
+        # Expires（PHP 常用连字符 Netscape 格式）
+        ts = pojie._parse_set_cookie_expiry("htVD_2132_auth=abc; path=/; expires=Fri, 04-Dec-2026 08:00:00 GMT; HttpOnly")
+        self.assertIsNotNone(ts)
+        # 空格格式同样兼容
+        self.assertEqual(ts, pojie._parse_set_cookie_expiry("a=b; Expires=Fri, 04 Dec 2026 08:00:00 GMT"))
+        # Max-Age → now + 秒数
+        now = time.time()
+        ts2 = pojie._parse_set_cookie_expiry("htVD_2132_auth=abc; Max-Age=86400")
+        self.assertIsNotNone(ts2)
+        self.assertTrue(now + 86000 <= ts2 <= time.time() + 86800)
+        # 负 Max-Age（删除 cookie）/ 无属性 → None
+        self.assertIsNone(pojie._parse_set_cookie_expiry("a=b; Max-Age=0"))
+        self.assertIsNone(pojie._parse_set_cookie_expiry("htVD_2132_lastact=123"))
+
+    def test_collect_cookie_expiries(self):
+        # urllib 路径：headers dict 内的 Set-Cookie 标头；只认 *_2132_auth，
+        # saltkey / WAF 短时效 cookie 一律忽略
+        resp = MagicMock()
+        resp._raw_cookies = None
+        resp.headers = {"Set-Cookie": [
+            "htVD_2132_auth=abc; expires=Fri, 04-Dec-2026 08:00:00 GMT; path=/",
+            "htVD_2132_saltkey=s; expires=Fri, 04-Dec-2026 08:00:00 GMT",
+            "acw_tc=short; expires=Sat, 05-Dec-2026 08:00:00 GMT",
+        ]}
+        out = pojie._collect_cookie_expiries(resp)
+        self.assertIn("htVD_2132_auth", out)
+        self.assertNotIn("htVD_2132_saltkey", out)
+        self.assertNotIn("acw_tc", out)
+
+        # curl_cffi 路径：CookieJar 内 Cookie 自带 expires
+        class _JarCookie:
+            def __init__(self, name, expires):
+                self.name = name
+                self.value = "v"
+                self.expires = expires
+
+        resp2 = MagicMock()
+        resp2.headers = {}
+        resp2._raw_cookies = type(
+            "FakeCookies", (), {"jar": [_JarCookie("htVD_2132_auth", 1800000000), _JarCookie("wzws_cid", 1900000000)]}
+        )()
+        out2 = pojie._collect_cookie_expiries(resp2)
+        self.assertEqual(out2, {"htVD_2132_auth": 1800000000})
+
+    def test_pick_expiry(self):
+        # 只认 auth cookie：lastcheckfeed 时间更晚也不取
+        pairs = {"htVD_2132_saltkey": 100, "htVD_2132_lastcheckfeed": 300, "htVD_2132_auth": 200}
+        self.assertEqual(pojie._pick_expiry(pairs), 200)
+        self.assertIsNone(pojie._pick_expiry({"htVD_2132_saltkey": 100}))
+        self.assertIsNone(pojie._pick_expiry({}))
+
+    def test_parse_explicit_cookie_expiry(self):
+        # 普通标头格式无到期字段 → None
+        self.assertIsNone(pojie._parse_explicit_cookie_expiry("htVD_2132_auth=abc; htVD_2132_saltkey=s"))
+
+        # Netscape 文件格式：7 列制表符，域名过滤 + auth 优先
+        netscape = (
+            "# Netscape HTTP Cookie File\n"
+            ".52pojie.cn\tTRUE\t/\tTRUE\t1900000000\thtVD_2132_auth\txxx\n"
+            ".52pojie.cn\tTRUE\t/\tTRUE\t1899999000\thtVD_2132_saltkey\tyyy\n"
+            ".example.com\tTRUE\t/\tTRUE\t1999999999\tother\tzzz\n"
+        )
+        self.assertEqual(pojie._parse_explicit_cookie_expiry(netscape), 1900000000)
+        # 无 auth cookie 时回退站点域内最大值
+        netscape_no_auth = (
+            "# Netscape HTTP Cookie File\n"
+            ".52pojie.cn\tTRUE\t/\tTRUE\t1900000000\thtVD_2132_saltkey\tyyy\n"
+            ".example.com\tTRUE\t/\tTRUE\t1999999999\tother\tzzz\n"
+        )
+        self.assertEqual(pojie._parse_explicit_cookie_expiry(netscape_no_auth), 1900000000)
+
+        # 浏览器 JSON 导出格式（EditThisCookie / DevTools），域名过滤
+        json_export = (
+            '[{"name": "htVD_2132_saltkey", "value": "s", "domain": ".52pojie.cn", "expirationDate": 1899999000},'
+            '{"name": "htVD_2132_auth", "value": "a", "domain": ".52pojie.cn", "expirationDate": 1900000000},'
+            '{"name": "other", "value": "o", "domain": ".example.com", "expirationDate": 1999999999}]'
+        )
+        self.assertEqual(pojie._parse_explicit_cookie_expiry(json_export), 1900000000)
+
+    def test_build_expiry_tag(self):
+        now = time.time()
+        # 真实到期时间（state 学习值）→ 优先采用并带日期
+        tag = pojie._build_expiry_tag("k=v", {"cookie_expire_ts": int(now + 23.4 * 86400)})
+        self.assertIn("🔑 Cookie 剩余 23 天", tag)
+        self.assertIn("到期", tag)
+        # 真实到期且 < 7 天 → ⚠️（必须仍命中 alert_levels 的「剩余 N 天」正则，保住黄色预警链路）
+        tag_warn = pojie._build_expiry_tag("k=v", {"cookie_expire_ts": int(now + 0.5 * 86400)})
+        self.assertIn("⚠️ Cookie 剩余 0 天", tag_warn)
+        m_alert = _COOKIE_DAYS_RE.search(tag_warn)
+        self.assertIsNotNone(m_alert)
+        self.assertLessEqual(int(m_alert.group(1)), 1)
+        # 真实到期时间优先于已耗尽的估算窗口
+        tag_real = pojie._build_expiry_tag("k=v", {"cookie_expire_ts": int(now + 40 * 86400), "saved_ts": int(now - 90 * 86400)})
+        self.assertIn("Cookie 剩余", tag_real)
+        self.assertNotIn("有效期未知", tag_real)
+
+        # 估算分支：近期粘贴（saved_ts 不足 3 天，留 2 小时余量防 floor 抖动）→ 30 天窗口内估算
+        tag_est = pojie._build_expiry_tag("k=v", {"saved_ts": int(now - 3 * 86400 + 7200)})
+        self.assertIn("🔑 Cookie 剩余 27 天", tag_est)
+        # 估算耗尽但登录态存活 → 如实报「未知」，不再产出假 0 天告警
+        tag_dead = pojie._build_expiry_tag("k=v", {"saved_ts": int(now - 60 * 86400)})
+        self.assertIn("Cookie 有效期未知", tag_dead)
+        self.assertNotIn("剩余 0 天", tag_dead)
+        # 无任何证据 → 无标签
+        self.assertEqual(pojie._build_expiry_tag("k=v", {}), "")
+
+    @patch.object(pojie, "save_kv_state")
+    @patch.object(pojie, "load_kv_state", return_value={})
+    @patch.object(pojie, "_http_request_with_failover")
+    def test_run_account_learns_expiry(self, mock_http, mock_load, mock_save):
+        # credit 响应下发带 Expires 的 auth Set-Cookie → 学习到期时间并持久化
+        sc = "htVD_2132_auth=abc; path=/; expires=Fri, 04-Dec-2026 08:00:00 GMT"
+        resp_credit = MagicMock(
+            code=200,
+            headers={"Set-Cookie": [sc]},
+            text='<div class="vwmy"><a href="home.php?mod=space&amp;uid=888">测试员</a></div>'
+            "<li><em>吾爱币:</em> 1 CB</li><li><em>积分:</em> 2</li>",
+        )
+        resp_apply = MagicMock(code=200, text="<![CDATA[任务已申请]]>", headers={})
+        resp_draw = MagicMock(code=200, text="<![CDATA[恭喜您，任务已成功完成]]>", headers={})
+        mock_http.side_effect = [(resp_credit, "", None), (resp_apply, "", None), (resp_draw, "", None)]
+
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            ok, _ = pojie._run_account("htVD_2132_auth=abc", 1, 1)
+            output = mock_stdout.getvalue()
+
+        self.assertTrue(ok)
+        self.assertTrue(re.search(r"Cookie 剩余 \d+ 天（2026-12-04 到期）", output))
+        from http.cookiejar import http2time
+
+        args = mock_save.call_args.args
+        saved = args[2] if args else mock_save.call_args.kwargs["state"]
+        self.assertEqual(saved.get("cookie_expire_ts"), http2time("Fri, 04 Dec 2026 08:00:00 GMT"))
+
+    @patch.object(pojie, "save_kv_state")
+    @patch.object(pojie, "load_kv_state")
+    @patch.object(pojie, "_http_request_with_failover")
+    def test_run_account_env_change_resets_expiry(self, mock_http, mock_load, mock_save):
+        # 旧状态（env_hash 失配）：90 天前保存 + 陈旧学习值 → 换新凭据后全部作废
+        stale_ts = int(time.time() - 90 * 86400)
+        mock_load.return_value = {
+            "env_hash": "old_hash",
+            "cookie": "htVD_2132_auth=rolled",
+            "cookie_expire_ts": stale_ts,
+            "saved_ts": stale_ts,
+        }
+        resp_credit = MagicMock(
+            code=200,
+            headers={},
+            text='<div class="vwmy"><a href="home.php?mod=space&amp;uid=888">测试员</a></div>'
+            "<li><em>吾爱币:</em> 1 CB</li><li><em>积分:</em> 2</li>",
+        )
+        resp_apply = MagicMock(code=200, text="<![CDATA[恭喜您，任务已成功完成]]>", headers={})
+        resp_draw = MagicMock(code=200, text="<![CDATA[恭喜您，任务已成功完成]]>", headers={})
+        mock_http.side_effect = [(resp_credit, "", None), (resp_apply, "", None), (resp_draw, "", None)]
+
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            ok, _ = pojie._run_account("htVD_2132_auth=fresh", 1, 1)
+            output = mock_stdout.getvalue()
+
+        self.assertTrue(ok)
+        # 登录态存活但估算窗口已耗尽 → 「未知」而非假 0 天
+        self.assertIn("Cookie 有效期未知", output)
+        self.assertNotIn("剩余 0 天", output)
+        args = mock_save.call_args.args
+        saved = args[2] if args else mock_save.call_args.kwargs["state"]
+        # 寿命起点重置为本次运行；陈旧学习值作废；滚动 cookie 弃用（使用新粘贴值）
+        self.assertGreater(saved.get("saved_ts", 0), time.time() - 120)
+        self.assertNotIn("cookie_expire_ts", saved)
+        self.assertEqual(saved.get("cookie"), "htVD_2132_auth=fresh")
 
 
 if __name__ == "__main__":
