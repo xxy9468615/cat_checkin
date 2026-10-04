@@ -1351,6 +1351,20 @@ def ex_telecom(output: str, res: Dict[str, Any]) -> None:
         if mm:
             cur.parts.append(f"目标: {mm.group(1)}")
             continue
+        mm = re.search(r"• 赢花费:\s*【(.+?)】", ln)
+        if mm:
+            txt = mm.group(1)
+            if txt.startswith("跳过"):
+                continue
+            cur.parts.append(f"赢花费: {txt}")
+            m_gain = re.search(r"点数\+(\d+)", txt)
+            if m_gain:
+                res["badges"].append(("reward", f"AI视频赢花费 +{m_gain.group(1)} 点数"))
+                res["gains"].append(("点数", _f(m_gain.group(1))))
+            m_bill = re.search(r"已兑(10元话费)", txt)
+            if m_bill:
+                res["badges"].append(("reward", f"赢花费兑换{m_bill.group(1)}"))
+            continue
     if cur:
         cur.flush(res)
     _add_summary(res, output)

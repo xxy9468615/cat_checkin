@@ -391,7 +391,7 @@ def _parse_account_config(raw: str, index: int, password: str = "") -> TelecomAc
             except Exception:
                 pass
 
-    # 7. 从 CtClient User-Agent 逆向解析手机号 (如 NTUxMTA5!#!MTc3NjI -> 17762 + 551109)
+    # 7. 从 CtClient User-Agent 逆向解析手机号（b64 前缀!#!b64 尾6位，两端去 padding 拼接）
     if not phone and user_agent:
         m_uaph = re.search(r"([A-Za-z0-9+/=]+)!#!([A-Za-z0-9+/=]+)", user_agent)
         if m_uaph:
@@ -871,6 +871,7 @@ def execute_telecom_task(client: TelecomClient) -> Dict[str, Any]:
         "food_res": "",
         "total_bean": "",
         "goal_res": "",
+        "imusic_res": "",
         "error": "",
     }
 
@@ -1172,6 +1173,38 @@ def execute_telecom_task(client: TelecomClient) -> Dict[str, Any]:
                 res["goal_res"] = f"距离【{TELECOM_EXCHANGE_GOAL}】({TELECOM_EXCHANGE_BEANS}金豆) 还差 {diff} 金豆 (进度 {pct}%)"
                 print(f"    [目标] {res['goal_res']}", flush=True)
 
+        # 8. 天翼爱音乐「AI视频创作赢话费」（ai.imusic.cn ai119）：getSingle 现签
+        # ticket 同源直接登录，月度免费生成次数用满，每次提交 +20 积分兑奖券开奖。
+        # 独立子活动：任何异常只记录到 imusic_res，绝不影响主签到结果与退出码。
+        if os.getenv("TELECOM_IMUSIC_DISABLE", "").strip() not in ("1", "true", "True"):
+            if client.ticket and HAS_CRYPTO:
+                try:
+                    from imusic import run_imusic_luck
+
+                    im = run_imusic_luck(client.http, client.ticket, client.phone)
+                    parts_im = []
+                    if im.get("videos"):
+                        parts_im.append(f"提交{im['videos']}次生成")
+                    if im.get("gain"):
+                        parts_im.append(f"点数+{im['gain']}")
+                    if im.get("redeemed"):
+                        parts_im.append(f"已兑{im['redeemed']}")
+                    if im.get("draws"):
+                        parts_im.append(f"抽奖{im['draws']}次")
+                    if im.get("score"):
+                        parts_im.append(f"总点数{im['score']}")
+                    if im.get("issue"):
+                        parts_im.append(str(im["issue"]))
+                    detail = "，".join(parts_im) or str(im.get("msg") or "")
+                    res["imusic_res"] = f"{im.get('status')}({detail})" if detail else str(im.get("status"))
+                    print(f"    [imusic] 赢花费活动: {res['imusic_res']}", flush=True)
+                except Exception as im_exc:
+                    res["imusic_res"] = f"跳过(异常: {type(im_exc).__name__})"
+                    print(f"    [imusic] 赢花费活动异常: {im_exc}", flush=True)
+            else:
+                res["imusic_res"] = "跳过(无现签ticket)"
+                print("    [imusic] 无现签 ticket，跳过赢花费活动", flush=True)
+
         # 签到成功后持久化有效会话
         client.save_session()
 
@@ -1277,6 +1310,8 @@ def main() -> None:
             print(f"• 资产: 金豆 【{outcome['total_bean']}】")
         if outcome.get("goal_res"):
             print(f"• 目标: 【{outcome['goal_res']}】")
+        if outcome.get("imusic_res"):
+            print(f"• 赢花费: 【{outcome['imusic_res']}】")
 
         if outcome["status"] in ("成功", "今日已签"):
             success_cnt += 1
