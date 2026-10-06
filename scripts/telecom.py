@@ -748,12 +748,15 @@ class TelecomClient:
             return False
         ts = datetime.now(BJT).strftime("%Y%m%d%H%M%S")
         xml = _build_getsingle_xml(self.app_token, self.uid, self.target_id, ts)
+        # 连接超时 10s（原 20s）：死节点（如 TELECOM_PROXY 首位的 HK09，每次
+        # curl(28) TCP 连接超时）会吃满整个 timeout 才触发轮换，直接侵蚀 300s 任务预算；
+        # 健康节点（HK03）实测现签仅 1~3s，10s 留足余量又不误伤慢节点（2026-10-06 CI 复盘）。
         resp = self.http.request(
             "POST",
             APP_GETSINGLE_URL,
             data=xml,
             headers={"Content-Type": "application/xml", "User-Agent": "CtClient;10.4.1;Android;13"},
-            timeout=20,
+            timeout=10,
         )
         text = resp.text or ""
         # 网络类失败（连接超时/-1/WAF 412/5xx）：与出口相关，应触发代理轮换而非放弃

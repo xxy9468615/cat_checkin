@@ -250,7 +250,10 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "script": "telecom.py",
         "name": "中国电信 签到",
         "result": "telecom.json",
-        "timeout": 300,
+        # 540s：wappark 现签链路 + 30 项任务扫描 + 乐园/资产 + imusic 子活动，
+        # 实测正常耗时已达 264~300s，旧 300s 上限正压在悬崖上（2026-10-06 CI 复盘）。
+        # 另：首个死节点 HK09 每次空耗一次 getSingle 连接超时，也需在预算内消化。
+        "timeout": 540,
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
