@@ -3,7 +3,7 @@
 # new Env("统一任务注册表与调度队列")
 """统一任务注册表与调度队列管理器。
 
-定义项目中全部 16 个签到任务的元数据（脚本、结果文件、超时、账号、调度标签），
+定义项目中全部 27 个签到任务的元数据（脚本、结果文件、超时、账号、调度标签），
 作为统一执行引擎（checkin.yml）与统一报告（unified_report.py）
 的唯一事实来源（Single Source of Truth）。
 """
@@ -100,18 +100,8 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
-    "tencent_cloudstudio": {
-        "id": "tencent_cloudstudio",
-        "script": "tencent_cloudstudio.py",
-        "name": "Tencent CloudStudio 签到",
-        "result": "tencent_cloudstudio.json",
-        "timeout": 300,
-        "account": "",
-        # 12h 滚动冷却（2026-09-06）：SSO 会话保活每天两次即可；此前无冷却元数据
-        # 导致每次心跳必跑、心跳永不空转
-        "sched": {"type": "rolling", "period_h": 12},
-        "tags": ["00:50", "matrix", "daily"],
-    },
+    # --- Tencent CloudStudio（2026-10-11 退役：上游凭据 7 天短命、更新成本高，
+    #     2026-09-22 熔断后停用至今；脚本 tencent_cloudstudio.py 保留，恢复时加回本表即可）---
     "ugnas_club": {
         "id": "ugnas_club",
         "script": "ugnas_club.py",
@@ -160,16 +150,8 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
-    # --- OPPO商城（HeyTap 每日签到打卡、连签里程碑与日常任务积分）---
-    "oppo": {
-        "id": "oppo",
-        "script": "oppo.py",
-        "name": "OPPO商城 签到与赚积分",
-        "result": "oppo.json",
-        "timeout": 300,
-        "account": "",
-        "tags": ["00:50", "matrix", "daily"],
-    },
+    # --- OPPO商城（2026-10-11 退役：HeyTap acIdAuthSession 为 7 天短命凭据、
+    #     更新成本高，2026-10-05 熔断后停用；脚本 oppo.py 保留，恢复时加回本表即可）---
     # --- NodeSeek（nodeseek.com 每日随机/固定鸡腿签到，支持代理出口）---
     "nodeseek": {
         "id": "nodeseek",

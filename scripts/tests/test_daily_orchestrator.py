@@ -82,23 +82,23 @@ class PlanModeTests(unittest.TestCase):
 
     def test_due_only_filters_cooldown_and_signed_latvi(self):
         env = {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:test:"}
+        # 冷却样例用真实 rolling 任务 modelscope（25h 未到期）；modelscope_ai 无冷却视为到期。
         with patch.dict(os.environ, env, clear=False), \
              patch.object(orch_mod, "is_task_suspended", return_value=False), \
              patch.object(orch_mod, "_cooldown_due_at",
                           side_effect=lambda cfg: time.time() + 3600 if cfg["id"] == "modelscope" else None), \
              patch.object(orch_mod, "_latvi_signed_today", return_value=True):
-            due = plan_due_tasks("modelscope,tencent_cloudstudio,latvi", due_only=True)
+            due = plan_due_tasks("modelscope,modelscope_ai,latvi", due_only=True)
         self.assertNotIn("modelscope", due, "冷却未到期的 rolling 任务不应到期")
-        self.assertIn("tencent_cloudstudio", due)
+        self.assertIn("modelscope_ai", due)
         self.assertNotIn("latvi", due, "今日已签的 latvi 不应到期")
 
     def test_due_only_includes_due_tasks(self):
         with patch.object(orch_mod, "is_task_suspended", return_value=False), \
              patch.object(orch_mod, "_cooldown_due_at", return_value=None), \
              patch.object(orch_mod, "_latvi_signed_today", return_value=False):
-            due = plan_due_tasks("modelscope,tencent_cloudstudio,latvi", due_only=True)
-        # resolve_execution_queue 对 "modelscope" 按双站配对展开出 modelscope_ai
-        self.assertEqual(due, ["modelscope", "modelscope_ai", "tencent_cloudstudio", "latvi"])
+            due = plan_due_tasks("modelscope,modelscope_ai,latvi", due_only=True)
+        self.assertEqual(due, ["modelscope", "modelscope_ai", "latvi"])
 
     def test_explicit_mode_ignores_cooldown(self):
         """非 due_only（显式列表/主 cron）口径：候选内全部到期（重试列表已预过滤）。"""
