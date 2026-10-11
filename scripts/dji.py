@@ -22,6 +22,7 @@ from common import (
     mask_str,
     save_kv_state,
 )
+import cookie_validity as cv
 
 PREFIX = "DJI_"
 BASE_URL = "https://bbs.dji.com"
@@ -189,12 +190,16 @@ def _run_one(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
     final = h.request("GET", f"{BASE_URL}/api/v2/users/login-info?device=desktop&t={nowms()}", headers=headers, timeout=30).text
     final_credits = find(r'"credits":\s*(\d+)', final, "?")
 
-    # 6. 持久化最新 Cookie 与会话状态至 Redis / Local State
+    # 6. 持久化最新 Cookie 与会话状态至 Redis / Local State；
+    #    凭据有效期经共享引擎跟踪（SSO 长效票续发时自动转精确倒计时）
+    learned = cv.learn_from_jar(h.jar)
+    tracked = cv.update_state(dict(state), cur_cookie, learned)
     try:
         save_kv_state(
             redis_key,
             state_file,
             {
+                **tracked,
                 "cookie": cur_cookie,
                 "env_hash": env_hash,
                 "uid": uid,
@@ -211,6 +216,11 @@ def _run_one(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
     masked_uid = mask_str(uid)
     prefix_label = f"[{idx}/{total}] " if total > 1 else ""
     sso_tag = " | 🔑 DJI SSO 1年长效凭据 (已启用自动换票保活)" if has_sso else " | ⚠️ 纯论坛 Cookie (14天寿命，建议补充 _meta_key)"
+    # 动态有效期标签：SSO 票无已知窗口 → 如实报「已使用 N 天」；纯论坛 Cookie 按 14 天窗口估算
+    sso_tag += cv.tag_for(
+        cur_cookie, tracked, learned,
+        fallback_lifetime_days=None if has_sso else 14,
+    )
 
     lines = [
         f"{prefix_label}【个人信息】用户：【{masked_user}】 UID：【{masked_uid}】{sso_tag}",

@@ -43,6 +43,7 @@ from common import (
     parse_proxy_line,
     save_kv_state,
 )
+import cookie_validity as cv
 
 PREFIX = "SMZDM_"
 WEB_UA = (
@@ -140,11 +141,17 @@ def _merge_cookie_str(base_cookie: str, set_cookies: List[str]) -> str:
 
 
 def _calc_cookie_expiry(cookie_str: str, state: Dict[str, Any]) -> Optional[int]:
-    """推算 sess Cookie 的剩余有效天数（默认 45 天会话周期）。"""
-    saved_ts = state.get("saved_ts")
-    if saved_ts and isinstance(saved_ts, (int, float)):
-        expire_ts = int(saved_ts) + 45 * 86400
-        return max(0, int((expire_ts - time.time()) / 86400))
+    """推算 sess Cookie 的剩余有效天数（45 天会话窗口；证据解析委托共享引擎）。
+
+    优先真实到期证据（历史学习值 / 粘贴内嵌字段），无证据时退回
+    saved_ts + 45 天窗口；完全无 state 视为刚启用（45 天满窗）。
+    """
+    ts = cv.resolve_expire_ts(state, cookie_str)
+    if ts:
+        return cv.remaining_days(ts)
+    first_seen = state.get("first_seen_ts") or state.get("saved_ts")
+    if isinstance(first_seen, (int, float)) and first_seen > 0:
+        return cv.remaining_days(first_seen + 45 * 86400)
     return 45
 
 
@@ -354,12 +361,22 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
     masked_id = mask_str(smzdm_id, 2, 2) if smzdm_id else "未知"
 
     remaining_days = _calc_cookie_expiry(cur_cookie, state)
-    expiry_tag = ""
-    if remaining_days is not None:
-        if remaining_days < 7:
+    learned = cv.learn_from_set_cookies(collected_set_cookies)
+    expiry_tag = cv.build_tag(
+        state, cookie_str=cur_cookie, learned=learned, fallback_lifetime_days=45
+    )
+    if not expiry_tag:
+        # 首轮运行（state 尚未落盘）：以本次启用时刻为窗口锚点，避免首日无提示
+        expiry_tag = cv.build_tag(
+            {"saved_ts": int(time.time())},
+            cookie_str=cur_cookie,
+            learned=learned,
+            fallback_lifetime_days=45,
+        )
+    if remaining_days is not None and remaining_days < 7:
+        # 保留「7 天内黄字」提示口径（build_tag 的 ⚠️ 分支通常已覆盖）
+        if "⚠️" not in expiry_tag and remaining_days >= 0:
             expiry_tag = f" | ⚠️ Cookie 剩余 {remaining_days} 天（请尽快更新）"
-        else:
-            expiry_tag = f" | 🔑 Cookie 剩余 {remaining_days} 天"
 
     proxy_tag = f" | 🌐 代理出口: {used_proxy}" if used_proxy else ""
     print(f"[{idx}/{total}] 👤 用户: 【{masked_name}】 (UID: {masked_id}){expiry_tag}{proxy_tag}")
@@ -397,9 +414,11 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
         print(f"• 签到: 【{status_label}】 连签天数: 【{checkin_num}】天 ({gain_part}) | 经验: 【{exp:,}】")
         print(f"• 资产: 积分 【{point:,}】 · 金币 【{gold:,}】 · 等级 【V{rank}】")
 
-        # 5. 滚动保存状态（若有新 Set-Cookie 或更新保存时间）
+        # 5. 滚动保存状态（若有新 Set-Cookie 或更新保存时间）；同时持久化
+        #    共享引擎的凭据跟踪键（真实到期证据跨运行积累）
         try:
             merged_cookie = _merge_cookie_str(cur_cookie, collected_set_cookies) if collected_set_cookies else cur_cookie
+            tracked = cv.update_state(dict(state), merged_cookie, learned)
             save_kv_state(
                 redis_key,
                 state_file,
@@ -409,6 +428,9 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
                     "nickname": nickname,
                     "smzdm_id": smzdm_id,
                     "saved_ts": int(state.get("saved_ts") or time.time()),
+                    "cookie_md5": tracked.get("cookie_md5", ""),
+                    "first_seen_ts": tracked.get("first_seen_ts") or int(state.get("saved_ts") or time.time()),
+                    "cookie_expire_ts": tracked.get("cookie_expire_ts", ""),
                     "updated_at": datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S"),
                 },
             )

@@ -41,6 +41,7 @@ from common import (
     mask_str,
     parse_proxy_line,
 )
+import cookie_validity as cv
 
 PREFIX = "NODESEEK_"
 DEFAULT_API = "https://www.nodeseek.com"
@@ -59,24 +60,14 @@ def _parse_cookie_info(cookie_str: str) -> Tuple[str, str, Optional[int]]:
     m = re.search(r"pjwt=([^;]+)", cookie_str)
     if m:
         raw_jwt = m.group(1).strip()
-        parts = raw_jwt.split(".")
-        if parts:
-            try:
-                b64_payload = parts[0]
-                # 补全 base64 padding
-                b64_payload += "=" * ((4 - len(b64_payload) % 4) % 4)
-                decoded = base64.b64decode(b64_payload).decode("utf-8")
-                payload = json.loads(decoded)
-                if isinstance(payload, dict):
-                    username = str(payload.get("name", ""))
-                    uid = str(payload.get("id", ""))
-                    ts = payload.get("ts")
-                    if ts and isinstance(ts, (int, float)):
-                        # NodeSeek Session 默认有效期 30 天 (2592000s)
-                        expire_ts = int(ts) + 30 * 86400
-                        remaining_days = max(0, int((expire_ts - time.time()) / 86400))
-            except Exception:
-                pass
+        payload = cv.parse_jwt_payload(raw_jwt)
+        if payload:
+            username = str(payload.get("name", ""))
+            uid = str(payload.get("id", ""))
+            # NodeSeek Session 默认有效期 30 天（签发 ts + 窗口，共享引擎统一口径）
+            ts = cv.parse_jwt_issued_ts(raw_jwt)
+            if ts:
+                remaining_days = cv.remaining_days(ts + 30 * 86400)
 
     return username, uid, remaining_days
 

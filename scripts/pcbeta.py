@@ -4,11 +4,25 @@
 import os
 import re
 import sys
+import time
 from typing import Dict, List, Optional, Tuple
 
-from common import Http, env_seq, find, must_match, strip_tags, main_guard, mask_str
+from common import (
+    Http,
+    env_seq,
+    find,
+    load_kv_state,
+    main_guard,
+    mask_str,
+    must_match,
+    save_kv_state,
+    strip_tags,
+)
+import cookie_validity as cv
 
 PREFIX = "PCBETA_"
+# Discuz 登录凭据 cookie（站点哈希前缀 + _auth），其到期即登录有效期
+AUTH_COOKIE_RE = re.compile(r"^[A-Za-z0-9]+_auth$", re.IGNORECASE)
 BASE_URL = "https://i.pcbeta.com"
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -169,8 +183,25 @@ def _run_one(acc: Dict[str, Optional[str]], idx: int, total: int) -> Tuple[bool,
             pb = "，".join(f"{k}: {v}" for k, v in credits_list)
 
     task_summary = f"任务响应：{'；'.join(msgs)}" if msgs else "任务已申请/领取"
+
+    # 凭据有效期跟踪（共享引擎）：*_auth 为登录态本体。粘贴 Cookie 无到期字段时
+    # 如实报「已使用 N 天」；服务端续发 auth（勾选自动登录）时自动转为精确倒计时
+    redis_key = f"cat_checkin:state:pcbeta_{idx}"
+    state_file = f".pcbeta_state_{idx}.json"
+    learned = cv.learn_from_jar(h.jar, credential_match=AUTH_COOKIE_RE.match)
+    tracked = cv.update_state(
+        load_kv_state(redis_key, state_file) or {}, cookie or "", learned
+    )
+    validity_tag = cv.tag_for(
+        cookie or "", tracked, learned, credential_match=AUTH_COOKIE_RE.match
+    )
+    try:
+        save_kv_state(redis_key, state_file, {**tracked, "updated_at": int(time.time())})
+    except Exception:
+        pass
+
     prefix_label = f"[{idx}/{total}] " if total > 1 else ""
-    return True, f"{prefix_label}用户：{mask_str(nick)} | {pb or '积分获取成功'}\n{task_summary}"
+    return True, f"{prefix_label}用户：{mask_str(nick)} | {pb or '积分获取成功'}{validity_tag}\n{task_summary}"
 
 
 def main():

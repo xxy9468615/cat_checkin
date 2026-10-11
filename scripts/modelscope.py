@@ -49,8 +49,12 @@ from common import (
     mask_str,
     save_kv_state,
 )
+import cookie_validity as cv
 
 PREFIX = "MODELSCOPE_"
+
+# 登录会话凭据 cookie（WAF/统计类短命 cookie 不作为有效期证据）
+CREDENTIAL_COOKIES = ("m_session_id",)
 
 
 DEFAULT_UA = (
@@ -933,7 +937,9 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
 
     # 登录态健康（签到成功 / 24h 冷却 / daily_active 未到账）且使用 Cookie 时，
     # 都持久化并滚动更新 Cookie——确保服务端在触碰过程中下发的新 Cookie 得以积累，
-    # 避免「daily_active 未到账的账号永远卡在最初的 env Cookie」而无法自愈
+    # 避免「daily_active 未到账的账号永远卡在最初的 env Cookie」而无法自愈；
+    # 同时经共享引擎跟踪凭据有效期（换新 Cookie 指纹变更自动重置计时）
+    validity_tag = ""
     if user and active_cookie and not token:
         updated_cookie = _merge_cookies(active_cookie, h.jar)
         if updated_cookie:
@@ -944,10 +950,20 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
                 if env_cookie
                 else ""
             )
+            learned = cv.learn_from_jar(
+                h.jar, credential_match=lambda n: n in CREDENTIAL_COOKIES
+            )
+            tracked = cv.update_state(
+                load_kv_state(redis_key, state_file) or {}, updated_cookie, learned
+            )
+            validity_tag = cv.tag_for(
+                updated_cookie, tracked, learned, credential_match=lambda n: n in CREDENTIAL_COOKIES
+            )
             save_kv_state(
                 redis_key,
                 state_file,
                 {
+                    **tracked,
                     "cookie": updated_cookie,
                     "env_hash": env_hash,
                     "updated_at": int(time.time()),
@@ -978,9 +994,10 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
 
     if credited:
         # 「过期」主体是本次到账的魔粒奖励（流水自带 expire_at，非 Cookie 有效期）——
-        # 必须写明「魔粒」，否则读者会误读成 Cookie/凭据即将过期
+        # 必须写明「魔粒」，否则读者会误读成 Cookie/凭据即将过期；
+        # 日报解析器按「过期$」行尾锚定提取，有效期标签须置于 exp_desc 之前
         exp_desc = f"，魔粒 {expire_at} 过期" if expire_at else ""
-        status = f"签到成功，今日已领取 {amount} 魔粒{like_msg}{exp_desc}"
+        status = f"签到成功，今日已领取 {amount} 魔粒{like_msg}{validity_tag}{exp_desc}"
         return True, f"{user_tag} {status}", credit_ts
 
     # 24h 冷却期：今日流水正常（点赞/触碰均已生效），仅奖励未到账，报绿卡避免误报
@@ -994,7 +1011,7 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
             f"今日 daily_active 未到账：24h 冷却中（上次到账 {record.get('last_created', '?')}），"
             f"Cookie 登录态正常，{eta_desc}{like_msg}"
         )
-        return True, f"{user_tag} {status}", credit_ts
+        return True, f"{user_tag} {status}{validity_tag}", credit_ts
 
     if token and not cookie:
         # 2026-08-25 实测：Bearer Token 能通过 OpenAPI 鉴权，但 OpenAPI 调用不计入
@@ -1013,7 +1030,7 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
             f"请在浏览器实际登录使用该账号触发日活，连续多日未发放再更新 Cookie）{like_msg}"
         )
 
-    return credited, f"{user_tag} {status}", credit_ts
+    return credited, f"{user_tag} {status}{validity_tag}", credit_ts
 
 
 def _run_site(

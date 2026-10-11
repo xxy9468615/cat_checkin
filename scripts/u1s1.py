@@ -12,7 +12,8 @@ import sys
 import tempfile
 import time
 import zlib
-from common import Http, ensure, env_seq, is_already_signed, main_guard, mask_str
+from common import Http, ensure, env_seq, is_already_signed, load_kv_state, main_guard, mask_str, save_kv_state
+import cookie_validity as cv
 
 PREFIX = "U1S1_"
 CAPCAT_SITE_KEY = "f8ad0853ed20b00d"
@@ -347,7 +348,19 @@ def run_account(idx: int, total_accounts: int, token: str, h: Http) -> tuple[boo
     else:
         print(f"⚠️ 用户资产查询失败 (HTTP {me_resp.code})，跳过")
 
-    return True, "成功"
+    # 凭据有效期跟踪（共享引擎）：u1s1_session 为登录凭据，JWT 形状时直接出倒计时
+    redis_key = f"cat_checkin:state:u1s1_{idx}"
+    state_file = f".u1s1_state_{idx}.json"
+    cred_match = lambda n: n == "u1s1_session"  # noqa: E731
+    learned = cv.learn_from_jar(h.jar, credential_match=cred_match)
+    tracked = cv.update_state(load_kv_state(redis_key, state_file) or {}, token, learned)
+    validity_tag = cv.tag_for(token, tracked, learned, credential_match=cred_match)
+    try:
+        save_kv_state(redis_key, state_file, {**tracked, "updated_at": int(time.time())})
+    except Exception:
+        pass
+
+    return True, f"成功{validity_tag}"
 
 
 def main():

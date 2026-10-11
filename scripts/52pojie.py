@@ -45,6 +45,7 @@ from common import (
     save_kv_state,
     strip_tags,
 )
+import cookie_validity as cv
 
 PREFIX = "52POJIE_"
 BASE_URL = "https://www.52pojie.cn"
@@ -155,58 +156,30 @@ COOKIE_FALLBACK_LIFETIME_DAYS = 30
 
 
 def _parse_cookie_date(text: str) -> Optional[int]:
-    """Set-Cookie 日期串（RFC 7231 / Netscape 连字符格式）→ epoch 秒。"""
-    if not text:
-        return None
-    try:
-        from http.cookiejar import http2time
-
-        ts = http2time(text.strip())
-        return int(ts) if ts else None
-    except Exception:
-        return None
+    """Set-Cookie 日期串（RFC 7231 / Netscape 连字符格式）→ epoch 秒（共享引擎）。"""
+    return cv.parse_cookie_date(text)
 
 
 def _parse_set_cookie_expiry(set_cookie: str) -> Optional[int]:
-    """解析单条 Set-Cookie 标头的 Expires / Max-Age 属性 → epoch 秒（无则 None）。"""
-    m = re.search(r";\s*expires\s*=\s*([^;]+)", set_cookie, re.IGNORECASE)
-    if m:
-        return _parse_cookie_date(m.group(1))
-    m = re.search(r";\s*max-age\s*=\s*(-?\d+)", set_cookie, re.IGNORECASE)
-    if m:
-        max_age = int(m.group(1))
-        return int(time.time()) + max_age if max_age > 0 else None
-    return None
+    """解析单条 Set-Cookie 标头的 Expires / Max-Age 属性 → epoch 秒（共享引擎）。"""
+    return cv.parse_set_cookie_expiry(set_cookie)
 
 
 def _collect_cookie_expiries(resp: Any) -> Dict[str, int]:
     """从响应中提取登录凭据 cookie（*_2132_auth）的真实到期时间（epoch 秒）。
 
-    双引擎：curl_cffi 走 CookieJar（自带 expires），urllib 走 Set-Cookie 标头
-    Expires/Max-Age 属性；saltkey/sid/WAF 等其余 cookie 的时效不代表登录有效期，
-    一律忽略。任何异常静默返回 {}，绝不影响主流程。
+    双引擎统一走共享模块：curl_cffi 走 CookieJar（自带 expires），urllib 走
+    Set-Cookie 标头 Expires/Max-Age 属性；saltkey/sid/WAF 等其余 cookie 的
+    时效不代表登录有效期，一律忽略。任何异常静默返回 {}，绝不影响主流程。
     """
-    out: Dict[str, int] = {}
     try:
         jar = getattr(getattr(resp, "_raw_cookies", None), "jar", None)
-        if jar is not None:
-            for c in jar:
-                name = getattr(c, "name", "") or ""
-                exp = getattr(c, "expires", None)
-                if LOGIN_COOKIE_RE.match(name) and isinstance(exp, (int, float)) and exp > 0:
-                    out[name] = int(exp)
     except Exception:
-        pass
-    try:
-        for sc in _collect_resp_cookies(resp):
-            name = sc.split("=", 1)[0].strip()
-            if LOGIN_COOKIE_RE.match(name):
-                ts = _parse_set_cookie_expiry(sc)
-                if ts:
-                    out[name] = ts
-    except Exception:
-        pass
-    return out
+        jar = None
+    return cv.merge_learned(
+        cv.learn_from_response(resp, credential_match=LOGIN_COOKIE_RE.match),
+        cv.learn_from_jar(jar, credential_match=LOGIN_COOKIE_RE.match),
+    )
 
 
 def _pick_expiry(expiries: Dict[str, int]) -> Optional[int]:
@@ -221,41 +194,18 @@ def _parse_explicit_cookie_expiry(cookie_str: str) -> Optional[int]:
     """识别粘贴 Cookie 自带的到期字段（Netscape 文件 / 浏览器 JSON 导出）。
 
     普通「k=v; k=v」标头格式不含到期信息 → None；多条证据优先取 auth cookie
-    （登录态本体），不存在时回退站点域内最大值。
+    （登录态本体），不存在时回退站点域内最大值。解析统一走共享引擎。
     """
     s = (cookie_str or "").strip()
     if not s:
         return None
-    cands: List[Tuple[str, float]] = []  # (cookie 名, 到期 epoch)
-    if s.startswith("[") or s.startswith("{"):
-        try:
-            data = json.loads(s)
-        except Exception:
-            return None
-        for it in (data if isinstance(data, list) else [data]):
-            if not isinstance(it, dict):
-                continue
-            dom = str(it.get("domain") or "").lower()
-            if dom and "52pojie" not in dom:
-                continue
-            ts = it.get("expirationDate") or it.get("expires") or it.get("expiry")
-            if isinstance(ts, (int, float)) and ts > 0:
-                cands.append((str(it.get("name") or ""), float(ts)))
-    else:
-        for line in s.splitlines():
-            cols = line.split("\t")
-            if len(cols) < 7:
-                continue
-            try:
-                ts = float(cols[4])
-            except ValueError:
-                continue
-            if ts <= 0 or "52pojie" not in cols[0].lower():
-                continue
-            cands.append((cols[5].strip(), ts))
-    auth = [ts for name, ts in cands if name.endswith("_auth")]
-    pool = auth or [ts for _, ts in cands]
-    return int(max(pool)) if pool else None
+    # 先只认 *_2132_auth（登录态本体）；无 auth 凭据时回退站点域内最大值
+    return (
+        cv.expire_from_cookie_str(
+            s, credential_match=LOGIN_COOKIE_RE.match, domain_hint="52pojie"
+        )
+        or cv.expire_from_cookie_str(s, domain_hint="52pojie")
+    )
 
 
 def _build_expiry_tag(cookie_str: str, state: Dict[str, Any], learned: Optional[Dict[str, int]] = None) -> str:
@@ -264,28 +214,15 @@ def _build_expiry_tag(cookie_str: str, state: Dict[str, Any], learned: Optional[
     证据优先级：本轮 Set-Cookie 真实到期 > state 历史学习值（cookie_expire_ts）
     > 粘贴格式自带到期字段 > saved_ts+30 天估算。估算耗尽（≤0）但登录态存活，
     说明 30 天硬上限假设已被推翻 → 如实报「有效期未知」，不产出假 0 天告警。
+    渲染统一走共享引擎 cookie_validity（口径与 alert_levels / report_fields 兼容）。
     """
-    now = time.time()
-    ts: Optional[float] = None
-    for cand in (_pick_expiry(learned or {}), state.get("cookie_expire_ts"), _parse_explicit_cookie_expiry(cookie_str)):
-        if isinstance(cand, (int, float)) and cand > 0:
-            ts = float(cand)
-            break
-    if ts:
-        remaining = max(0, int((ts - now) / 86400))
-        date_txt = datetime.fromtimestamp(ts, BJT).strftime("%Y-%m-%d")
-        if remaining < 7:
-            return f" | ⚠️ Cookie 剩余 {remaining} 天（{date_txt} 到期，请尽快更新）"
-        return f" | 🔑 Cookie 剩余 {remaining} 天（{date_txt} 到期）"
-    saved_ts = state.get("saved_ts")
-    if isinstance(saved_ts, (int, float)) and saved_ts > 0:
-        remaining = max(0, min(int((saved_ts + COOKIE_FALLBACK_LIFETIME_DAYS * 86400 - now) / 86400), COOKIE_FALLBACK_LIFETIME_DAYS))
-        if remaining > 0:
-            if remaining < 7:
-                return f" | ⚠️ Cookie 剩余 {remaining} 天（请尽快更新）"
-            return f" | 🔑 Cookie 剩余 {remaining} 天"
-        return f" | 🔑 Cookie 有效期未知（超出 {COOKIE_FALLBACK_LIFETIME_DAYS} 天估算窗口仍有效）"
-    return ""
+    return cv.build_tag(
+        state,
+        cookie_str=cookie_str,
+        learned=learned,
+        credential_match=LOGIN_COOKIE_RE.match,
+        fallback_lifetime_days=COOKIE_FALLBACK_LIFETIME_DAYS,
+    )
 
 
 def _load_accounts() -> List[str]:

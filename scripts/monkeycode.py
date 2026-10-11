@@ -11,7 +11,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from common import Http, ensure, env, env_seq, main_guard, mask_str
+from common import Http, ensure, env, env_seq, load_kv_state, main_guard, mask_str, save_kv_state
+import cookie_validity as cv
 
 PREFIX = "MONKEYCODE_"
 BASE = "https://monkeycode-ai.com"
@@ -412,6 +413,26 @@ def _run_one(acc: Dict[str, Optional[str]], idx: int, total: int) -> Tuple[bool,
 
     wallet_lines = get_wallet_info_lines(h, headers)
     lines.extend(wallet_lines)
+
+    # 凭据有效期跟踪（共享引擎）：登录铸造/粘贴的 session 到期证据来自
+    # Set-Cookie；无证据时如实报「已使用 N 天」。多条证据取最长（WAF 短命
+    # cookie 不会压过真会话）。
+    try:
+        sess = jar_cookie(h)
+        redis_key = f"cat_checkin:state:monkeycode_{idx}"
+        state_file = f".monkeycode_state_{idx}.json"
+        learned = cv.learn_from_jar(h.jar)
+        tracked = cv.update_state(load_kv_state(redis_key, state_file) or {}, sess, learned)
+        validity_tag = cv.tag_for(sess, tracked, learned)
+        try:
+            save_kv_state(redis_key, state_file, {**tracked, "updated_at": int(time.time())})
+        except Exception:
+            pass
+        if validity_tag:
+            lines.append(validity_tag.lstrip(" |"))
+    except Exception:
+        pass
+
     return True, "\n".join(lines)
 
 

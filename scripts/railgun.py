@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from common import Http, env_seq, main_guard, mask_str
+import cookie_validity as cv
 
 
 class Emoji:
@@ -69,22 +70,14 @@ EXCHANGE_PLANS = {
 
 
 def _parse_cookie_expiry(cookie_str: str) -> Tuple[Optional[int], Optional[int]]:
-    """解析 Koa Session Cookie (koa:sess) 中的 _expire 时间戳，返回 (expire_ts, remaining_days)。"""
-    m = re.search(r"koa:sess=([^;]+)", cookie_str)
-    if not m:
+    """解析 Koa Session Cookie (koa:sess) 中的 _expire 时间戳，返回 (expire_ts, remaining_days)。
+
+    解析委托共享引擎 cookie_validity（全任务唯一实现，2026-10 收敛）。
+    """
+    expire_ts = cv.expire_from_cookie_str(cookie_str)
+    if not expire_ts:
         return None, None
-    try:
-        raw_b64 = urllib.parse.unquote(m.group(1).strip())
-        decoded = base64.b64decode(raw_b64 + "==").decode("utf-8")
-        data = json.loads(decoded)
-        expire_ms = data.get("_expire")
-        if expire_ms:
-            expire_ts = int(expire_ms / 1000)
-            remaining_days = max(0, int((expire_ts - time.time()) / 86400))
-            return expire_ts, remaining_days
-    except Exception:
-        pass
-    return None, None
+    return expire_ts, cv.remaining_days(expire_ts)
 
 
 @dataclass

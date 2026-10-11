@@ -37,6 +37,7 @@ from common import (
     mask_str,
     save_kv_state,
 )
+import cookie_validity as cv
 
 SITE = "https://2libra.com"
 
@@ -145,25 +146,23 @@ def _cookie_get(cookie_str: str, name: str) -> str:
 
 
 def _jwt_exp(token: str):
-    """解析 JWT payload 的 exp（epoch 秒）；非 JWT 或解析失败返回 None。"""
-    try:
-        payload = token.split(".")[1]
-        payload += "=" * (-len(payload) % 4)
-        return int(json.loads(base64.urlsafe_b64decode(payload)).get("exp") or 0) or None
-    except Exception:
-        return None
+    """解析 JWT payload 的 exp（epoch 秒）；非 JWT 或解析失败返回 None（共享引擎）。"""
+    return cv.parse_jwt_exp(token)
 
 
-def _save_state(redis_key: str, state_file: str, cookie: str, env_hash: str) -> None:
-    save_kv_state(
-        redis_key,
-        state_file,
-        {
-            "cookie": cookie,
-            "env_hash": env_hash,
-            "updated_at": datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S"),
-        },
-    )
+def _save_state(
+    redis_key: str, state_file: str, cookie: str, env_hash: str, tracked: Optional[Dict[str, Any]] = None
+) -> None:
+    payload = {
+        "cookie": cookie,
+        "env_hash": env_hash,
+        "updated_at": datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if tracked:
+        payload.update(
+            {k: tracked[k] for k in ("cookie_md5", "first_seen_ts", "cookie_expire_ts") if tracked.get(k)}
+        )
+    save_kv_state(redis_key, state_file, payload)
 
 
 def _keepalive_refresh(base: str, redis_key: str, state_file: str, env_hash: str, label: str) -> str:
@@ -265,12 +264,16 @@ def _run_one(raw_cookie: str, auth: str, idx: int = 1, total: int = 1) -> str:
     line += first
     line += f"\n当前金币总数为 {bal} 个，已累计签到 {streak} 天\n当前用户等级为 {lvl} 级，经验值为 {cur} 点，距离升级还差 {nxt} 点"
 
-    # 签到成功：合并本次链路 Set-Cookie 持久化，供下次运行保活与复用
+    # 签到成功：合并本次链路 Set-Cookie 持久化，供下次运行保活与复用；
+    # 凭据有效期经共享引擎跟踪并随 state 持久化，主行追加 🔑/⚠️ 标签
     merged = _merge_cookies(base, h.jar)
+    learned = cv.learn_from_jar(h.jar)
+    tracked = cv.update_state(dict(saved), merged, learned)
     try:
-        _save_state(redis_key, state_file, merged, env_hash)
+        _save_state(redis_key, state_file, merged, env_hash, tracked)
     except Exception as exc:
         print(f"  ⚠️ 状态持久化失败: {exc}")
+    line += cv.tag_for(merged, tracked, learned, label="Token")
     return line
 
 

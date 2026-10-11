@@ -19,6 +19,7 @@ from common import (
     mask_str,
     save_kv_state,
 )
+import cookie_validity as cv
 
 PREFIX = "JUEJIN_"
 BASE_URL = "https://api.juejin.cn"
@@ -73,19 +74,14 @@ def _parse_cookie_tokens(cookie_str: str) -> Tuple[str, str]:
 
 
 def _parse_cookie_expiry(cookie_str: str) -> Tuple[Optional[int], Optional[int]]:
-    """解析 sid_guard 中的签发时间戳与 TTL，返回 (expire_ts, remaining_days)。"""
-    unquoted = urllib.parse.unquote(cookie_str)
-    m = re.search(r"sid_guard=[^|;]+\|(\d+)\|(\d+)", unquoted)
-    if m:
-        try:
-            issue_ts = int(m.group(1))
-            ttl_sec = int(m.group(2))
-            expire_ts = issue_ts + ttl_sec
-            remaining_days = max(0, int((expire_ts - time.time()) / 86400))
-            return expire_ts, remaining_days
-        except Exception:
-            pass
-    return None, None
+    """解析 sid_guard 中的签发时间戳与 TTL，返回 (expire_ts, remaining_days)。
+
+    解析委托共享引擎 cookie_validity（全任务唯一实现，2026-10 收敛）。
+    """
+    expire_ts = cv.parse_sid_guard_expire(urllib.parse.unquote(cookie_str or ""))
+    if not expire_ts:
+        return None, None
+    return expire_ts, cv.remaining_days(expire_ts)
 
 
 def _run_one(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:

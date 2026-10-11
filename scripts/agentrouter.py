@@ -47,6 +47,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from common import Http, env, env_seq, load_kv_state, main_guard, mask_str, sanitize_snippet, save_kv_state
+import cookie_validity as cv
 
 PREFIX = "AGENTROUTER_"
 DEFAULT_API_URL = "https://ps.air-outer.com"
@@ -449,7 +450,27 @@ def _run_one(idx: int, total: int, account: dict, base: str) -> str:
             print(f"ℹ️ 余额展示跳过: {e}")
 
     user_tag = mask_str(uid) if uid else mask_str(username)
-    line = f"[{idx}/{total}] 账号：{user_tag} | {sign_msg}{quota_desc}"
+
+    # 凭据有效期跟踪（共享引擎）：登录铸造的 session（30 天）为凭据本体，
+    # 真实到期证据来自 Set-Cookie 的 Max-Age；换新 session 指纹变更自动重置计时
+    validity_tag = ""
+    if session:
+        cred_match = lambda n: n == "session"  # noqa: E731
+        state = _load_state()
+        cv_key = f"cv:{user_tag}"
+        learned = cv.learn_from_jar(h.jar, credential_match=cred_match)
+        tracked = cv.update_state(state.get(cv_key) or {}, session, learned)
+        state[cv_key] = tracked
+        try:
+            _save_state(state)
+        except Exception:
+            pass
+        validity_tag = cv.tag_for(
+            session, tracked, learned,
+            credential_match=cred_match, fallback_lifetime_days=30,
+        )
+
+    line = f"[{idx}/{total}] 账号：{user_tag} | {sign_msg}{quota_desc}{validity_tag}"
     print(line)
     return line
 

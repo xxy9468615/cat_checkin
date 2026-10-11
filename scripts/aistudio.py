@@ -35,9 +35,12 @@ from common import (
     Http,
     env_seq,
     is_already_signed,
+    load_kv_state,
     main_guard,
     mask_str,
+    save_kv_state,
 )
+import cookie_validity as cv
 
 PREFIX = "AISTUDIO_"
 UA = (
@@ -167,7 +170,26 @@ def _run_account(cookie: str, idx: int, total: int) -> Tuple[bool, str]:
     user_label = mask_str(username) if username else (f"UID: {mask_str(uid)}" if uid else f"账号 #{idx}")
     uid_label = f" (UID: {mask_str(uid)})" if uid and username else ""
 
-    print(f"[{idx}/{total}] 👤 用户: 【{user_label}】{uid_label} | {cert_status}")
+    # 凭据有效期跟踪（共享引擎）：BDUSS 为唯一长效凭据。百度通常不再对本会话
+    # 下发 BDUSS 的 Set-Cookie 到期证据 → 如实报「已使用 N 天」；一旦响应带出
+    # BDUSS 的 Expires/Max-Age 则自动转为精确倒计时。换新 Cookie 指纹变更自动重置。
+    redis_key = f"cat_checkin:state:aistudio_{idx}"
+    state_file = f".aistudio_state_{idx}.json"
+    learned = cv.learn_from_jar(h.jar, credential_match=lambda n: n.startswith("BDUSS"))
+    tracked = cv.update_state(load_kv_state(redis_key, state_file) or {}, cookie, learned)
+    validity_tag = cv.tag_for(
+        cookie, tracked, learned, credential_match=lambda n: n.startswith("BDUSS")
+    )
+    try:
+        save_kv_state(
+            redis_key,
+            state_file,
+            {**tracked, "updated_at": int(datetime.now().timestamp())},
+        )
+    except Exception:
+        pass
+
+    print(f"[{idx}/{total}] 👤 用户: 【{user_label}】{uid_label} | {cert_status}{validity_tag}")
 
     api_headers = {
         "User-Agent": UA,
