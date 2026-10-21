@@ -1155,6 +1155,41 @@ def ex_modelscope(output: str, res: Dict[str, Any]) -> None:
             mm2 = re.search(r"点赞已达上限 (\d+)/(\d+)", body)
             if mm2:
                 parts.append(f"点赞 {mm2.group(1)}/{mm2.group(2)}")
+        mm = re.search(r"完成AIGC发布 (\d+)/(\d+) 次 \(\+(\d+) 魔粒\)", body)
+        if mm:
+            parts.append(f"AIGC发布 {mm.group(1)}/{mm.group(2)}(+{mm.group(3)})")
+            res["gains"].append(("魔粒", _f(mm.group(3))))
+        else:
+            mm_pending = re.search(r"完成AIGC发布 (\d+) 次\(待结算\)", body)
+            if mm_pending:
+                parts.append(f"AIGC已发{mm_pending.group(1)}篇(待结算)")
+            else:
+                mm2 = re.search(r"AIGC发布已达上限 (\d+)/(\d+)", body)
+                if mm2:
+                    parts.append(f"AIGC发布 {mm2.group(1)}/{mm2.group(2)}")
+        mm_banner = re.search(r"主页置顶\(\+(\d+)\)", body)
+        if mm_banner:
+            parts.append(f"主页置顶(+{mm_banner.group(1)})")
+            res["gains"].append(("魔粒", _f(mm_banner.group(1))))
+        mm_exp = re.search(r"完善个人介绍\(\+(\d+)\)", body)
+        if mm_exp:
+            parts.append(f"完善个人介绍(+{mm_exp.group(1)})")
+            res["gains"].append(("魔粒", _f(mm_exp.group(1))))
+        mm_email = re.search(r"验证邮箱\(\+(\d+)\)", body)
+        if mm_email:
+            parts.append(f"验证邮箱(+{mm_email.group(1)})")
+            res["gains"].append(("魔粒", _f(mm_email.group(1))))
+        mm_ali = re.search(r"阿里云绑定\(\+(\d+)\)", body)
+        if mm_ali:
+            parts.append(f"阿里云绑定(+{mm_ali.group(1)})")
+            res["gains"].append(("魔粒", _f(mm_ali.group(1))))
+        mm_badge = re.search(r"勋章激励\(\+(\d+)\)", body)
+        if mm_badge:
+            parts.append(f"勋章激励(+{mm_badge.group(1)})")
+            res["gains"].append(("魔粒", _f(mm_badge.group(1))))
+        mm_bal = re.search(r"可用余额 (\d+) 魔粒", body)
+        if mm_bal:
+            parts.append(f"余{mm_bal.group(1)}")
         mm = re.search(r"24h 冷却中（上次到账 ([^）]+)）", body)
         if mm:
             em = re.search(r"预计 (\d+) 小时 (\d+) 分钟后可领", body)

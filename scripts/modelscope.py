@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import random
 import sys
@@ -37,6 +38,12 @@ import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    import dotenv
+    dotenv.load_dotenv(override=False)
+except ImportError:
+    pass
 
 from common import (
     BJT,
@@ -140,7 +147,13 @@ def _touch_user(
         print(f"  [diag] 触碰响应下发 Cookie 字段[{host}]: {sorted({c.name for c in h.jar})}")
         # 2026-08-29 HAR 抓包确认：前端每次页面加载都会调 /api/v1/users/login/info
         # （daily_active 规则即「注册并登陆，每日登录即可获取」）——补齐这一登录事件触碰
-        for api_path in ("/api/v1/users/login/info", "/api/v1/users/authorized/check"):
+        for api_path in (
+            "/api/v1/users/login/info",
+            "/api/v1/users/authorized/check",
+            "/api/v1/users/binding/check",
+            "/api/v1/medal/user/check",
+            "/api/v1/medal/user/info",
+        ):
             try:
                 h.request("GET", f"https://{host}{api_path}", headers=web_headers, timeout=15)
             except Exception:
@@ -579,6 +592,367 @@ def _do_daily_likes(
     return success_cnt, success_cnt * amount_per_like
 
 
+def _fetch_all_earn_rules(
+    h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None
+) -> Dict[str, Dict[str, Any]]:
+    """获取所有魔粒任务规则与当前状态字典。"""
+    hdrs = _headers(host, token=token, cookie=cookie)
+    rules_map: Dict[str, Dict[str, Any]] = {}
+    try:
+        resp = h.request(
+            "GET",
+            f"https://{host}/openapi/v1/magicubes/earn/rules",
+            headers=hdrs,
+            timeout=15,
+        )
+        if resp.code == 200:
+            data = resp.json({})
+            if data and data.get("success"):
+                for r in data.get("data") or []:
+                    rk = str(r.get("rule_key") or "").strip()
+                    if rk:
+                        rules_map[rk] = r
+    except Exception:
+        pass
+    return rules_map
+
+
+def _fetch_magicubes_balance(
+    h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None
+) -> Dict[str, int]:
+    """获取用户魔粒账户余额。"""
+    hdrs = _headers(host, token=token, cookie=cookie)
+    try:
+        resp = h.request(
+            "GET",
+            f"https://{host}/openapi/v1/magicubes/balance",
+            headers=hdrs,
+            timeout=15,
+        )
+        if resp.code == 200:
+            data = resp.json({})
+            if data and data.get("success"):
+                bdata = data.get("data") or {}
+                return {
+                    "total_balance": int(bdata.get("total_balance") or 0),
+                    "available_balance": int(bdata.get("available_balance") or 0),
+                    "frozen_amount": int(bdata.get("frozen_amount") or 0),
+                }
+    except Exception:
+        pass
+    return {"total_balance": 0, "available_balance": 0, "frozen_amount": 0}
+
+
+def _do_profile_complement_tasks(
+    h: Http,
+    host: str,
+    token: Optional[str] = None,
+    cookie: Optional[str] = None,
+    user_info: Optional[Dict[str, Any]] = None,
+    rules_map: Optional[Dict[str, Dict[str, Any]]] = None,
+    preferred_target_id: Optional[str] = None,
+) -> Tuple[int, List[str]]:
+    """执行一次性信息完善任务（主页置顶、个人介绍）。
+
+    返回 (获得魔粒数, 描述信息列表)。
+    """
+    if not cookie:
+        return 0, []
+
+    if rules_map is None:
+        rules_map = _fetch_all_earn_rules(h, host, token=token, cookie=cookie)
+
+    earned = 0
+    msgs = []
+    hdrs = _headers(host, token=token, cookie=cookie)
+    hdrs["Content-Type"] = "application/json"
+    uname = (user_info or {}).get("username") or (user_info or {}).get("user_name") or ""
+
+    # 1. 配置个人主页置顶 (infocomplement_profile_banner, +50 长期魔粒)
+    banner_rule = rules_map.get("infocomplement_profile_banner")
+    if banner_rule and int(banner_rule.get("total_earned") or 0) == 0:
+        target_id = preferred_target_id
+        hl_type = 9 if target_id else 3
+        # 若外部未传入自建资产，查询用户当前 highlights 或公开资产
+        if not target_id and uname:
+            try:
+                r_hl = h.request(
+                    "GET",
+                    f"https://{host}/api/v1/users/homepage/highlights/{uname}",
+                    headers=hdrs,
+                    timeout=15,
+                )
+                if r_hl.code == 200:
+                    hls = (r_hl.json({}).get("Data") or {}).get("Highlights") or []
+                    if hls:
+                        # 已经有置顶项，任务可能处于未刷新状态
+                        target_id = str(hls[0].get("TargetID") or "")
+                        hl_type = int(hls[0].get("HighlightType") or 9)
+            except Exception:
+                pass
+
+        if target_id:
+            try:
+                resp = h.request(
+                    "POST",
+                    f"https://{host}/api/v1/users/homepage/highlights",
+                    headers=hdrs,
+                    json_data={
+                        "highlights": [
+                            {
+                                "HighlightType": hl_type,
+                                "TargetID": str(target_id),
+                            }
+                        ]
+                    },
+                    timeout=15,
+                )
+                if resp.code == 200:
+                    res_data = resp.json({})
+                    if res_data.get("Success") or res_data.get("Code") == 200:
+                        earned += int(banner_rule.get("amount") or 50)
+                        msgs.append("主页置顶(+50)")
+            except Exception:
+                pass
+
+    # 2. 编辑个人介绍 (infocomplement_profile_experience, +50 长期魔粒)
+    exp_rule = rules_map.get("infocomplement_profile_experience")
+    if exp_rule and int(exp_rule.get("total_earned") or 0) == 0:
+        try:
+            resp_info = h.request(
+                "GET",
+                f"https://{host}/api/v1/users/info",
+                headers=hdrs,
+                timeout=15,
+            )
+            curr_info = {}
+            if resp_info.code == 200:
+                curr_info = resp_info.json({}).get("Data") or {}
+
+            curr_desc = str(curr_info.get("description") or "").strip()
+            if not curr_desc or curr_desc in ("{}", '""'):
+                default_desc = json.dumps(
+                    {
+                        "blocks": [
+                            {
+                                "key": "b1",
+                                "text": "AI & Open Source Developer | ModelScope Community",
+                                "type": "unstyled",
+                                "depth": 0,
+                                "inlineStyleRanges": [],
+                                "entityRanges": [],
+                                "data": {},
+                            }
+                        ],
+                        "entityMap": {},
+                    }
+                )
+                post_data = {
+                    "description": default_desc,
+                    "UserNickName": curr_info.get("user_nickname") or uname,
+                    "ProfileTemplate": int(curr_info.get("profile_template") or 0),
+                    "Experiences": "[]",
+                    "SocialLinks": "[]",
+                }
+                resp_save = h.request(
+                    "POST",
+                    f"https://{host}/api/v1/users/info",
+                    headers=hdrs,
+                    json_data=post_data,
+                    timeout=15,
+                )
+                if resp_save.code == 200:
+                    res_data = resp_save.json({})
+                    if res_data.get("Success") or res_data.get("Code") == 200:
+                        earned += int(exp_rule.get("amount") or 50)
+                        msgs.append("完善个人介绍(+50)")
+        except Exception:
+            pass
+
+    return earned, msgs
+
+
+def _do_daily_aigc_publish(
+    h: Http,
+    host: str,
+    token: Optional[str] = None,
+    cookie: Optional[str] = None,
+    count: int = 10,
+    amount_per_publish: int = 10,
+    username: Optional[str] = None,
+) -> Tuple[int, int, Optional[str]]:
+    """执行每日发布 AIGC 作品并触发有效浏览量（≥1）任务。
+
+    返回 (成功发布次数, 获得魔粒数, 最后一个发布的作品ID)。
+    """
+    if count <= 0 or not cookie:
+        return 0, 0, None
+
+    hdrs = _headers(host, token=token, cookie=cookie)
+    hdrs["Content-Type"] = "application/json"
+    success_cnt = 0
+    last_pic_id: Optional[str] = None
+
+    # 合规优质示例素材图（社区公用加速资源）
+    sample_img_url = (
+        "https://img.alicdn.com/imgextra/i1/O1CN01yhHrHg1Pdl3UKPhGc_!!6000000001864-2-tps-88-88.png"
+    )
+
+    for i in range(count):
+        try:
+            # 1. 登记素材资源（后端真实路由 /api/v1/muse/image/create）
+            create_resp = h.request(
+                "POST",
+                f"https://{host}/api/v1/muse/image/create",
+                headers=hdrs,
+                json_data=[
+                    {
+                        "height": 1024,
+                        "width": 1024,
+                        "index": 0,
+                        "sourceType": "MUSE_UPLOAD",
+                        "url": sample_img_url,
+                        "mediaType": "IMAGE",
+                    }
+                ],
+                timeout=15,
+            )
+            if create_resp.code != 200:
+                continue
+            create_data = create_resp.json({})
+            res_items = (create_data.get("Data") or {}).get("data") or create_data.get("data") or []
+            if not res_items or not isinstance(res_items, list):
+                continue
+            item = res_items[0] or {}
+            img_id = item.get("id")
+            if not img_id:
+                continue
+
+            # 2. 补齐生成与模型参数
+            rand_code = random.randint(1000, 9999)
+            h.request(
+                "POST",
+                f"https://{host}/api/v1/muse/image/updateImageGenerateInfo",
+                headers=hdrs,
+                json_data=[
+                    {
+                        "imageId": img_id,
+                        "imageUrl": sample_img_url,
+                        "prompt": (
+                            f"Cute cyber cat in neon sci-fi wonderland #{rand_code}, "
+                            "8k resolution, highly detailed"
+                        ),
+                        "negativePrompt": "blurry, low quality, distorted",
+                        "numInferenceSteps": 20,
+                        "sampler": "Euler",
+                        "guidanceScale": 7.5,
+                        "checkpointModelVersionId": 469191,
+                    }
+                ],
+                timeout=15,
+            )
+
+            # 3. 发布到创意广场
+            upload_resp = h.request(
+                "POST",
+                f"https://{host}/api/v1/aigc/picture/upload",
+                headers=hdrs,
+                json_data={
+                    "Title": f"Cyber Cat #{rand_code}",
+                    "MuseImages": [
+                        {
+                            "MuseImageID": img_id,
+                            "IsCoverImage": 1,
+                        }
+                    ],
+                    "Labels": ["photography", "dimension"],
+                },
+                timeout=15,
+            )
+            if upload_resp.code != 200:
+                continue
+            upload_data = upload_resp.json({})
+            if not (
+                upload_data.get("Success")
+                or upload_data.get("Code") == 200
+                or upload_data.get("Message") == "success"
+            ):
+                continue
+
+            pic_id = (upload_data.get("Data") or {}).get("id") or (upload_data.get("Data") or {}).get("PictureId")
+            if pic_id:
+                last_pic_id = str(pic_id)
+
+            # 4. 产生有效浏览量记录（触发「浏览量≥1」规则）：
+            # 完整模拟个人主页作品列表卡片点击与分享页访问链路
+            if pic_id:
+                uname = username or ""
+                # A. 个人主页作品卡片点击跳转作品分享页 HTML
+                hdrs_share = dict(hdrs)
+                if uname:
+                    hdrs_share["Referer"] = f"https://{host}/profile/{uname}"
+                try:
+                    h.request(
+                        "GET",
+                        f"https://{host}/aigc/gallery/share/{pic_id}?source=InnovateSquare",
+                        headers=hdrs_share,
+                        timeout=10,
+                    )
+                except Exception:
+                    pass
+
+                # B. 作品业务详情 API 请求（带作品分享页 Referer）
+                hdrs_pic = dict(hdrs)
+                hdrs_pic["Referer"] = f"https://{host}/aigc/gallery/share/{pic_id}?source=InnovateSquare"
+                try:
+                    h.request(
+                        "GET",
+                        f"https://{host}/api/v1/aigc/picture/{pic_id}",
+                        headers=hdrs_pic,
+                        timeout=10,
+                    )
+                except Exception:
+                    pass
+
+                # C. 关联 Muse 图像元数据请求
+                try:
+                    h.request(
+                        "GET",
+                        f"https://{host}/api/v1/muse/image/get?id={img_id}",
+                        headers=hdrs_pic,
+                        timeout=10,
+                    )
+                except Exception:
+                    pass
+
+                # D. 个人主页作品聚合刷新触碰（触发个人主页作品卡片更新）
+                if uname:
+                    try:
+                        h.request(
+                            "PUT",
+                            f"https://{host}/api/v1/dolphin/agg",
+                            headers=hdrs,
+                            json_data={
+                                "Query": "",
+                                "Target": "",
+                                "Path": uname,
+                                "IncludePrePublish": True,
+                                "IncludeAllStatus": True,
+                                "SortBy": "gmt_modified",
+                            },
+                            timeout=10,
+                        )
+                    except Exception:
+                        pass
+
+            success_cnt += 1
+            time.sleep(random.uniform(0.3, 0.6))
+        except Exception:
+            pass
+
+    return success_cnt, success_cnt * amount_per_publish, last_pic_id
+
+
 def _resolve_cookie(env_cookie: str, idx: int, site: str) -> Tuple[str, str, Optional[str]]:
     """解析某账号的 Cookie 配置。
 
@@ -971,15 +1345,18 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
                 },
             )
 
-    # 每日点击喜欢 20 次任务（单次 +2 魔粒，每日上限 20 次共 40 魔粒）
-    like_msg = ""
+    # 查询全量魔粒规则与当前配额状态
+    rules_map = _fetch_all_earn_rules(h, host, token=token, cookie=active_cookie) if user and active_cookie else {}
+
+    # 1. 每日点击喜欢任务（单次 +2 魔粒，每日上限 10 次共 20 魔粒）
     if user and active_cookie:
-        used_likes, max_likes, amt_per_like = _get_daily_like_status(
-            h, host, token=token, cookie=active_cookie
-        )
+        like_rule = rules_map.get("interaction_like", {})
+        max_likes = int(like_rule.get("daily_cap") or 10)
+        used_likes = int(like_rule.get("today_used") or 0)
+        amt_per_like = int(like_rule.get("amount") or 2)
         remaining_likes = max(0, max_likes - used_likes)
         if remaining_likes > 0:
-            done_likes, earned_magicubes = _do_daily_likes(
+            _do_daily_likes(
                 h,
                 host,
                 token=token,
@@ -987,17 +1364,112 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
                 count=remaining_likes,
                 amount_per_like=amt_per_like,
             )
-            total_done = used_likes + done_likes
-            like_msg = f"，完成点赞 {total_done}/{max_likes} 次 (+{total_done * amt_per_like} 魔粒)"
-        else:
-            like_msg = f"，点赞已达上限 {used_likes}/{max_likes} 次"
+
+    # 2. 每日发布 AIGC 作品并触发有效浏览任务（单次 +10 魔粒，每日上限 10 次共 100 魔粒）
+    done_aigc_cnt = 0
+    last_published_id = None
+    if user and active_cookie:
+        aigc_rule = rules_map.get("opensource_aigcworks_publish", {})
+        max_aigc = int(aigc_rule.get("daily_cap") or 10)
+        used_aigc = int(aigc_rule.get("today_used") or 0)
+        amt_per_aigc = int(aigc_rule.get("amount") or 10)
+        remaining_aigc = max(0, max_aigc - used_aigc)
+        if remaining_aigc > 0:
+            uname_val = (user or {}).get("username") or (user or {}).get("user_name") or ""
+            done_aigc_cnt, _, last_published_id = _do_daily_aigc_publish(
+                h,
+                host,
+                token=token,
+                cookie=active_cookie,
+                count=remaining_aigc,
+                amount_per_publish=amt_per_aigc,
+                username=uname_val,
+            )
+
+    # 3. 信息完善任务（主页置顶 +50 长期魔粒，完善个人介绍 +50 长期魔粒）
+    if user and active_cookie:
+        _do_profile_complement_tasks(
+            h,
+            host,
+            token=token,
+            cookie=active_cookie,
+            user_info=user,
+            rules_map=rules_map,
+            preferred_target_id=last_published_id,
+        )
+
+    # 任务动作执行完毕后，重新拉取服务端最新真实账本（确保所有魔粒到账数据与余额绝对吻合）
+    latest_rules = _fetch_all_earn_rules(h, host, token=token, cookie=active_cookie) if user and active_cookie else {}
+
+    # 1. 真实点赞状态与收益
+    like_msg = ""
+    if user and active_cookie:
+        lr = latest_rules.get("interaction_like", {})
+        l_cap = int(lr.get("daily_cap") or 10)
+        l_used = int(lr.get("today_used") or 0)
+        l_earned = int(lr.get("today_earned_amount") or 0)
+        if l_earned > 0:
+            like_msg = f"，完成点赞 {l_used}/{l_cap} 次 (+{l_earned} 魔粒)"
+        elif l_used >= l_cap:
+            like_msg = f"，点赞已达上限 {l_used}/{l_cap} 次"
+        elif l_used > 0:
+            like_msg = f"，已点赞 {l_used}/{l_cap} 次"
+
+    # 2. 真实 AIGC 发布状态与收益（区分实时到账 vs 批处理待结算）
+    aigc_msg = ""
+    if user and active_cookie:
+        ar = latest_rules.get("opensource_aigcworks_publish", {})
+        a_cap = int(ar.get("daily_cap") or 10)
+        a_used = int(ar.get("today_used") or 0)
+        a_earned = int(ar.get("today_earned_amount") or 0)
+        if a_earned > 0:
+            aigc_msg = f"，完成AIGC发布 {a_used}/{a_cap} 次 (+{a_earned} 魔粒)"
+        elif a_used >= a_cap:
+            aigc_msg = f"，AIGC发布已达上限 {a_used}/{a_cap} 次"
+        elif done_aigc_cnt > 0:
+            aigc_msg = f"，完成AIGC发布 {done_aigc_cnt} 次(待结算)"
+
+    # 3. 真实信息完善收益（主页置顶 +50、个人介绍 +50）
+    profile_msg = ""
+    if user and active_cookie:
+        p_items = []
+        br = latest_rules.get("infocomplement_profile_banner", {})
+        if int(br.get("today_earned_amount") or 0) > 0:
+            p_items.append(f"主页置顶(+{br.get('today_earned_amount')})")
+        er = latest_rules.get("infocomplement_profile_experience", {})
+        if int(er.get("today_earned_amount") or 0) > 0:
+            p_items.append(f"完善个人介绍(+{er.get('today_earned_amount')})")
+        vr = latest_rules.get("infocomplement_email_verification", {})
+        if int(vr.get("today_earned_amount") or 0) > 0:
+            p_items.append(f"验证邮箱(+{vr.get('today_earned_amount')})")
+        if p_items:
+            profile_msg = "，" + "，".join(p_items)
+
+    # 4. 账号加成实际收益（阿里云绑定 +50、勋章 +20 等）
+    extra_msgs = []
+    ali_r = latest_rules.get("aliyun_bindlogin", {})
+    if int(ali_r.get("today_earned_amount") or 0) > 0:
+        extra_msgs.append(f"阿里云绑定(+{ali_r.get('today_earned_amount')})")
+    badge_r = latest_rules.get("badge_magicube_shortterm", {})
+    if int(badge_r.get("today_earned_amount") or 0) > 0:
+        extra_msgs.append(f"勋章激励(+{badge_r.get('today_earned_amount')})")
+    extra_msg = ("，" + "，".join(extra_msgs)) if extra_msgs else ""
+
+    # 5. 魔粒可用余额（以服务端当前 balance 接口为准）
+    bal_msg = ""
+    if user and active_cookie:
+        bal = _fetch_magicubes_balance(h, host, token=token, cookie=active_cookie)
+        if bal.get("available_balance") is not None:
+            bal_msg = f"，可用余额 {bal['available_balance']} 魔粒"
+
+    task_details = f"{extra_msg}{like_msg}{aigc_msg}{profile_msg}{bal_msg}"
 
     if credited:
         # 「过期」主体是本次到账的魔粒奖励（流水自带 expire_at，非 Cookie 有效期）——
         # 必须写明「魔粒」，否则读者会误读成 Cookie/凭据即将过期；
         # 日报解析器按「过期$」行尾锚定提取，有效期标签须置于 exp_desc 之前
         exp_desc = f"，魔粒 {expire_at} 过期" if expire_at else ""
-        status = f"签到成功，今日已领取 {amount} 魔粒{like_msg}{validity_tag}{exp_desc}"
+        status = f"签到成功，今日已领取 {amount} 魔粒{task_details}{validity_tag}{exp_desc}"
         return True, f"{user_tag} {status}", credit_ts
 
     # 24h 冷却期：今日流水正常（点赞/触碰均已生效），仅奖励未到账，报绿卡避免误报
@@ -1009,7 +1481,7 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
         )
         status = (
             f"今日 daily_active 未到账：24h 冷却中（上次到账 {record.get('last_created', '?')}），"
-            f"Cookie 登录态正常，{eta_desc}{like_msg}"
+            f"Cookie 登录态正常，{eta_desc}{task_details}"
         )
         return True, f"{user_tag} {status}{validity_tag}", credit_ts
 
@@ -1027,7 +1499,7 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
         # 多为该账号当天缺乏被服务端认可的「日活」行为或奖励规则变化
         status = (
             f"交易记录无今日 daily_active（登录态正常、Cookie 未失效；"
-            f"请在浏览器实际登录使用该账号触发日活，连续多日未发放再更新 Cookie）{like_msg}"
+            f"请在浏览器实际登录使用该账号触发日活，连续多日未发放再更新 Cookie）{task_details}"
         )
 
     return credited, f"{user_tag} {status}{validity_tag}", credit_ts
