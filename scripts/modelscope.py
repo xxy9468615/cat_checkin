@@ -857,8 +857,20 @@ def _do_daily_aigc_publish(
                 continue
             print(
                 f"  [aigc:{i+1}] create OK id={img_id!r}({type(img_id).__name__}) "
-                f"字段: {sorted(item.keys())}"
+                f"完整值: { {k: str(v)[:60] for k, v in item.items()} }"
             )
+            # 立即反查该素材是否可查（upload 报「Image information query is empty」
+            # 说明其内部查询查不到这条记录——区分「记录不存在」与「查询条件不同」）
+            try:
+                chk = h.request(
+                    "GET",
+                    f"https://{host}/api/v1/muse/image/get?id={img_id}",
+                    headers=hdrs,
+                    timeout=10,
+                )
+                print(f"  [aigc:{i+1}] muse/image/get 反查: HTTP {chk.code} {chk.text[:200]}")
+            except Exception as exc:
+                print(f"  [aigc:{i+1}] muse/image/get 反查异常: {exc}")
 
             # 2. 补齐生成与模型参数
             rand_code = random.randint(1000, 9999)
