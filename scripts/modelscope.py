@@ -6,9 +6,10 @@
 
 机制：
 1. 登录奖励（每日 200 魔粒）在用户产生活跃会话后被动发放。
-2. ⚠️ 2026-10-27：国内站出现账号封禁，点赞 / AIGC 发布 / 信息完善等互动任务
-   已全部暂停（独立开关，默认 False），仅保留每日登录签到；点赞任务频率行为
-   已优化（随机目标抽样 + 4~12s 拟人间隔），后期经开关开放。
+2. ⚠️ 2026-10-27：国内站出现账号封禁，点赞 / AIGC 发布等互动任务已全部暂停
+   （独立开关，默认 False），仅保留每日登录签到；点赞任务频率行为已优化
+   （随机目标抽样 + 4~12s 拟人间隔），后期经开关开放。信息完善（主页置顶/
+   个人介绍）为一次性账号设置动作，已从脚本移除，不应进入每日任务。
    反风控加固同步落地：每账号固定 UA（state 持久化 + 合法性校验）、请求拟人
    随机间隔、触碰端点收敛、发奖缓冲期轻量触碰、启动抖动 0~120s、多账号
    强制间隔、每账号独立代理（MODELSCOPE_PROXY_{idx}）、暂停名单机制。
@@ -71,12 +72,12 @@ PREFIX = "MODELSCOPE_"
 # （日活触碰 + daily_active 查询 + Cookie 滚动续期）。三类动作独立开关，默认全停：
 #   MODELSCOPE_ENABLE_LIKE_TASKS=1      每日点赞（频率行为已优化，后期开放）
 #   MODELSCOPE_ENABLE_AIGC_PUBLISH=1    AIGC 作品发布（AI 站链路未通，暂停 indefinitely）
-#   MODELSCOPE_ENABLE_PROFILE_TASKS=1   信息完善（一次性任务）
-# MODELSCOPE_ENABLE_BONUS_TASKS=1 可一键打开全部（单次手动运行用，日常调度不带）。
+# 信息完善（主页置顶/个人介绍）属一次性账号设置动作，2026-10-28 已从任务脚本移除——
+# 一次性动作手工在浏览器里做一次即可，不应占用每日任务的请求足迹与开关心智。
+# MODELSCOPE_ENABLE_BONUS_TASKS=1 可一键打开全部互动任务（单次手动运行用，日常调度不带）。
 _ENABLE_ALL = (os.getenv("MODELSCOPE_ENABLE_BONUS_TASKS") or "").strip() == "1"
 ENABLE_LIKE_TASKS = _ENABLE_ALL or (os.getenv("MODELSCOPE_ENABLE_LIKE_TASKS") or "").strip() == "1"
 ENABLE_AIGC_PUBLISH = _ENABLE_ALL or (os.getenv("MODELSCOPE_ENABLE_AIGC_PUBLISH") or "").strip() == "1"
-ENABLE_PROFILE_TASKS = _ENABLE_ALL or (os.getenv("MODELSCOPE_ENABLE_PROFILE_TASKS") or "").strip() == "1"
 
 # 2026-10-27：国内站账号 2 已被平台封禁，暂停其全部任务行为——不加载、不触碰、
 # 不滚动 Cookie，避免封禁账号继续产生自动化流量加深风控标记。
@@ -695,136 +696,6 @@ def _fetch_magicubes_balance(
     except Exception:
         pass
     return {"total_balance": 0, "available_balance": 0, "frozen_amount": 0}
-
-
-def _do_profile_complement_tasks(
-    h: Http,
-    host: str,
-    token: Optional[str] = None,
-    cookie: Optional[str] = None,
-    user_info: Optional[Dict[str, Any]] = None,
-    rules_map: Optional[Dict[str, Dict[str, Any]]] = None,
-    preferred_target_id: Optional[str] = None,
-    ua: Optional[str] = None,
-) -> Tuple[int, List[str]]:
-    """执行一次性信息完善任务（主页置顶、个人介绍）。
-
-    返回 (获得魔粒数, 描述信息列表)。
-    """
-    if not cookie:
-        return 0, []
-
-    if rules_map is None:
-        rules_map = _fetch_all_earn_rules(h, host, token=token, cookie=cookie)
-
-    earned = 0
-    msgs = []
-    hdrs = _headers(host, token=token, cookie=cookie, ua=ua)
-    hdrs["Content-Type"] = "application/json"
-    uname = (user_info or {}).get("username") or (user_info or {}).get("user_name") or ""
-
-    # 1. 配置个人主页置顶 (infocomplement_profile_banner, +50 长期魔粒)
-    banner_rule = rules_map.get("infocomplement_profile_banner")
-    if banner_rule and int(banner_rule.get("total_earned") or 0) == 0:
-        target_id = preferred_target_id
-        hl_type = 9 if target_id else 3
-        # 若外部未传入自建资产，查询用户当前 highlights 或公开资产
-        if not target_id and uname:
-            try:
-                r_hl = h.request(
-                    "GET",
-                    f"https://{host}/api/v1/users/homepage/highlights/{uname}",
-                    headers=hdrs,
-                    timeout=15,
-                )
-                if r_hl.code == 200:
-                    hls = (r_hl.json({}).get("Data") or {}).get("Highlights") or []
-                    if hls:
-                        # 已经有置顶项，任务可能处于未刷新状态
-                        target_id = str(hls[0].get("TargetID") or "")
-                        hl_type = int(hls[0].get("HighlightType") or 9)
-            except Exception:
-                pass
-
-        if target_id:
-            try:
-                resp = h.request(
-                    "POST",
-                    f"https://{host}/api/v1/users/homepage/highlights",
-                    headers=hdrs,
-                    json_data={
-                        "highlights": [
-                            {
-                                "HighlightType": hl_type,
-                                "TargetID": str(target_id),
-                            }
-                        ]
-                    },
-                    timeout=15,
-                )
-                if resp.code == 200:
-                    res_data = resp.json({})
-                    if res_data.get("Success") or res_data.get("Code") == 200:
-                        earned += int(banner_rule.get("amount") or 50)
-                        msgs.append("主页置顶(+50)")
-            except Exception:
-                pass
-
-    # 2. 编辑个人介绍 (infocomplement_profile_experience, +50 长期魔粒)
-    exp_rule = rules_map.get("infocomplement_profile_experience")
-    if exp_rule and int(exp_rule.get("total_earned") or 0) == 0:
-        try:
-            resp_info = h.request(
-                "GET",
-                f"https://{host}/api/v1/users/info",
-                headers=hdrs,
-                timeout=15,
-            )
-            curr_info = {}
-            if resp_info.code == 200:
-                curr_info = resp_info.json({}).get("Data") or {}
-
-            curr_desc = str(curr_info.get("description") or "").strip()
-            if not curr_desc or curr_desc in ("{}", '""'):
-                default_desc = json.dumps(
-                    {
-                        "blocks": [
-                            {
-                                "key": "b1",
-                                "text": "AI & Open Source Developer | ModelScope Community",
-                                "type": "unstyled",
-                                "depth": 0,
-                                "inlineStyleRanges": [],
-                                "entityRanges": [],
-                                "data": {},
-                            }
-                        ],
-                        "entityMap": {},
-                    }
-                )
-                post_data = {
-                    "description": default_desc,
-                    "UserNickName": curr_info.get("user_nickname") or uname,
-                    "ProfileTemplate": int(curr_info.get("profile_template") or 0),
-                    "Experiences": "[]",
-                    "SocialLinks": "[]",
-                }
-                resp_save = h.request(
-                    "POST",
-                    f"https://{host}/api/v1/users/info",
-                    headers=hdrs,
-                    json_data=post_data,
-                    timeout=15,
-                )
-                if resp_save.code == 200:
-                    res_data = resp_save.json({})
-                    if res_data.get("Success") or res_data.get("Code") == 200:
-                        earned += int(exp_rule.get("amount") or 50)
-                        msgs.append("完善个人介绍(+50)")
-        except Exception:
-            pass
-
-    return earned, msgs
 
 
 def _do_daily_aigc_publish(
@@ -1541,7 +1412,7 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
 
     # 查询全量魔粒规则与当前配额状态——纯登录签到模式（互动开关全关）下
     # 服务端账本/余额查询对结果无影响，一并裁剪以压低请求足迹
-    _enable_any = ENABLE_LIKE_TASKS or ENABLE_AIGC_PUBLISH or ENABLE_PROFILE_TASKS
+    _enable_any = ENABLE_LIKE_TASKS or ENABLE_AIGC_PUBLISH
     rules_map = (
         _fetch_all_earn_rules(h, host, token=token, cookie=active_cookie, ua=ua)
         if user and active_cookie and _enable_any
@@ -1588,19 +1459,6 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
                 ua=ua,
             )
 
-    # 3. 信息完善任务（主页置顶 +50 长期魔粒，完善个人介绍 +50 长期魔粒）——默认停
-    if user and active_cookie and ENABLE_PROFILE_TASKS:
-        _do_profile_complement_tasks(
-            h,
-            host,
-            token=token,
-            cookie=active_cookie,
-            user_info=user,
-            rules_map=rules_map,
-            preferred_target_id=last_published_id,
-            ua=ua,
-        )
-
     # 任务动作执行完毕后，重新拉取服务端最新真实账本（确保所有魔粒到账数据与余额绝对吻合）
     latest_rules = (
         _fetch_all_earn_rules(h, host, token=token, cookie=active_cookie, ua=ua)
@@ -1636,22 +1494,6 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
         elif done_aigc_cnt > 0:
             aigc_msg = f"，完成AIGC发布 {done_aigc_cnt} 次(待结算)"
 
-    # 3. 真实信息完善收益（主页置顶 +50、个人介绍 +50）
-    profile_msg = ""
-    if user and active_cookie:
-        p_items = []
-        br = latest_rules.get("infocomplement_profile_banner", {})
-        if int(br.get("today_earned_amount") or 0) > 0:
-            p_items.append(f"主页置顶(+{br.get('today_earned_amount')})")
-        er = latest_rules.get("infocomplement_profile_experience", {})
-        if int(er.get("today_earned_amount") or 0) > 0:
-            p_items.append(f"完善个人介绍(+{er.get('today_earned_amount')})")
-        vr = latest_rules.get("infocomplement_email_verification", {})
-        if int(vr.get("today_earned_amount") or 0) > 0:
-            p_items.append(f"验证邮箱(+{vr.get('today_earned_amount')})")
-        if p_items:
-            profile_msg = "，" + "，".join(p_items)
-
     # 4. 账号加成实际收益（阿里云绑定 +50、勋章 +20 等）
     extra_msgs = []
     ali_r = latest_rules.get("aliyun_bindlogin", {})
@@ -1669,7 +1511,7 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
         if bal.get("available_balance") is not None:
             bal_msg = f"，可用余额 {bal['available_balance']} 魔粒"
 
-    task_details = f"{extra_msg}{like_msg}{aigc_msg}{profile_msg}{bal_msg}"
+    task_details = f"{extra_msg}{like_msg}{aigc_msg}{bal_msg}"
 
     if credited:
         # 「过期」主体是本次到账的魔粒奖励（流水自带 expire_at，非 Cookie 有效期）——

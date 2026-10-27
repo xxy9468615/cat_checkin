@@ -5,8 +5,7 @@
 1. 魔粒规则获取与余额解析
 2. 点赞喜欢任务执行与封顶
 3. AIGC 作品自动化发布流水线
-4. 一次性主页置顶与个人介绍完善
-5. 统一日报字段解析器（ex_modelscope）
+4. 统一日报字段解析器（ex_modelscope）
 """
 import os
 import sys
@@ -139,50 +138,6 @@ class TestModelScopeTasks(unittest.TestCase):
         self.assertEqual(done, 1)
         self.assertEqual(earned, 10)
         self.assertEqual(last_id, "88801")
-
-    def test_do_profile_complement_tasks_already_completed(self):
-        rules_map = {
-            "infocomplement_profile_banner": {"total_earned": 1, "amount": 50},
-            "infocomplement_profile_experience": {"total_earned": 1, "amount": 50},
-        }
-        earned, msgs = ms._do_profile_complement_tasks(
-            self.mock_http, self.host, cookie=self.cookie, rules_map=rules_map
-        )
-        self.assertEqual(earned, 0)
-        self.assertEqual(msgs, [])
-        self.mock_http.request.assert_not_called()
-
-    def test_do_profile_complement_tasks_uncompleted(self):
-        rules_map = {
-            "infocomplement_profile_banner": {"total_earned": 0, "amount": 50},
-            "infocomplement_profile_experience": {"total_earned": 0, "amount": 50},
-        }
-        resp_banner = MagicMock(code=200)
-        resp_banner.json.return_value = {"Success": True, "Code": 200}
-
-        resp_info_get = MagicMock(code=200)
-        resp_info_get.json.return_value = {"Data": {"description": "", "user_nickname": "dev"}}
-
-        resp_info_post = MagicMock(code=200)
-        resp_info_post.json.return_value = {"Success": True, "Code": 200}
-
-        self.mock_http.request.side_effect = [
-            resp_banner,
-            resp_info_get,
-            resp_info_post,
-        ]
-
-        earned, msgs = ms._do_profile_complement_tasks(
-            self.mock_http,
-            self.host,
-            cookie=self.cookie,
-            user_info={"username": "dev"},
-            rules_map=rules_map,
-            preferred_target_id="88801",
-        )
-        self.assertEqual(earned, 100)
-        self.assertIn("主页置顶(+50)", msgs)
-        self.assertIn("完善个人介绍(+50)", msgs)
 
     def test_paused_account_skipped(self):
         """暂停名单内的账号序号不加载（封禁账号零触碰）。"""
