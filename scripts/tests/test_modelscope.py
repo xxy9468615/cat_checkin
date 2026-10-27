@@ -8,6 +8,7 @@
 4. 一次性主页置顶与个人介绍完善
 5. 统一日报字段解析器（ex_modelscope）
 """
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -179,6 +180,42 @@ class TestModelScopeTasks(unittest.TestCase):
         self.assertEqual(earned, 100)
         self.assertIn("主页置顶(+50)", msgs)
         self.assertIn("完善个人介绍(+50)", msgs)
+
+    def test_paused_account_skipped(self):
+        """暂停名单内的账号序号不加载（封禁账号零触碰）。"""
+        env = {
+            "MODELSCOPE_COOKIE_1": "m_session_id=synthetic_a",
+            "MODELSCOPE_COOKIE_2": "m_session_id=synthetic_b",
+        }
+        with patch.dict(os.environ, env), patch.object(
+            ms, "load_kv_state", return_value={}
+        ), patch.object(ms, "PAUSED_CN_ACCOUNTS", {2}):
+            accounts = ms._load_accounts("cn")
+        self.assertEqual([a["index"] for a in accounts], [1])
+
+    def test_paused_accounts_env_override(self):
+        """MODELSCOPE_PAUSED_CN_ACCOUNTS 环境变量整体覆盖硬编码默认名单。"""
+        env = {
+            "MODELSCOPE_COOKIE_1": "m_session_id=synthetic_a",
+            "MODELSCOPE_COOKIE_2": "m_session_id=synthetic_b",
+            "MODELSCOPE_PAUSED_CN_ACCOUNTS": "1,2",
+        }
+        with patch.dict(os.environ, env), patch.object(
+            ms, "load_kv_state", return_value={}
+        ):
+            self.assertEqual(ms._load_accounts("cn"), [])
+
+    def test_valid_ua_rejects_truncated(self):
+        """telecom 先例：截断/非法 UA 必须判无效，触发重新选定。"""
+        self.assertTrue(ms._valid_ua(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+        ))
+        self.assertFalse(ms._valid_ua("Mozilla/5.0 (Windows NT 10.0; Win64; x64)"))
+        self.assertFalse(ms._valid_ua(""))
+        self.assertFalse(ms._valid_ua(None))
+        for ua in ms.UA_POOL:
+            self.assertTrue(ms._valid_ua(ua), f"UA 池成员必须自身合法: {ua}")
 
     def test_report_fields_ex_modelscope(self):
         sample_output = (

@@ -6,7 +6,11 @@
 
 机制：
 1. 登录奖励（每日 200 魔粒）在用户产生活跃会话后被动发放。
-2. 每日点击喜欢 20 次任务（单次 +2 魔粒，每日上限 20 次共 40 魔粒）。
+2. ⚠️ 2026-10-27：国内站出现账号封禁，点赞 / AIGC 发布 / 信息完善等互动任务
+   已全部暂停（ENABLE_BONUS_TASKS = False），仅保留每日登录签到。
+   反风控加固同步落地：每账号固定 UA（state 持久化 + 合法性校验）、请求拟人
+   随机间隔、触碰端点收敛、发奖缓冲期轻量触碰、启动抖动 0~120s、多账号
+   强制间隔、每账号独立代理（MODELSCOPE_PROXY_{idx}）、暂停名单机制。
 3. 接口路径已变更：magic_cube → magicubes（2026-08 前后迁移）。
 4. 判断方式：直查交易记录接口，`rule_key == "daily_active"` 且 `gmt_created == 今日`
    即视为已领取，无需余额增长推算或退避轮询。
@@ -26,6 +30,8 @@
   MODELSCOPE_AI_TOKEN / MODELSCOPE_AI_COOKIE：国际站专用 Token / Cookie
   MODELSCOPE_HOST：国内站主机（默认 www.modelscope.cn）
   MODELSCOPE_AI_HOST：国际站主机（默认 www.modelscope.ai）
+  MODELSCOPE_PAUSED_CN_ACCOUNTS / MODELSCOPE_PAUSED_AI_ACCOUNTS：
+    暂停名单（逗号分隔账号序号，如 "2,3"），命中序号不加载、不触碰、不滚动 Cookie
 """
 from __future__ import annotations
 
@@ -60,6 +66,18 @@ import cookie_validity as cv
 
 PREFIX = "MODELSCOPE_"
 
+# 2026-10-27：国内站出现账号封禁，互动类任务（每日点赞、AIGC 作品发布、信息完善）
+# 全部暂停，仅保留每日登录签到（日活触碰 + daily_active 查询 + Cookie 滚动续期）。
+# 默认 False；单次手动运行可用 MODELSCOPE_ENABLE_BONUS_TASKS=1 临时打开
+# （配合 scripts/modelscope_publish_once.py 一次性发布工具），日常调度不带该变量。
+ENABLE_BONUS_TASKS = (os.getenv("MODELSCOPE_ENABLE_BONUS_TASKS") or "").strip() == "1"
+
+# 2026-10-27：国内站账号 2 已被平台封禁，暂停其全部任务行为——不加载、不触碰、
+# 不滚动 Cookie，避免封禁账号继续产生自动化流量加深风控标记。
+# 环境变量 MODELSCOPE_PAUSED_CN_ACCOUNTS / MODELSCOPE_PAUSED_AI_ACCOUNTS
+# （逗号分隔序号，如 "2,3"）可整体覆盖此默认值；解封或换号后清空即可。
+PAUSED_CN_ACCOUNTS = {2}
+
 # 登录会话凭据 cookie（WAF/统计类短命 cookie 不作为有效期证据）
 CREDENTIAL_COOKIES = ("m_session_id",)
 
@@ -68,6 +86,32 @@ DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
+
+# 反风控：UA 池（2026-10-27 封禁复盘）。此前所有账号/所有天共用一个写死的 Chrome 131
+# UA，是最易聚类识别的指纹。现改为每账号从池中随机选定一个真实形态的完整 UA，
+# 随 state 持久化后长期保持稳定（真实浏览器 UA 不会天天变）。
+UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+]
+
+
+def _valid_ua(ua: Optional[str]) -> bool:
+    """恢复的 UA 必须是完整形态（telecom 2026-09-19 先例：截断 UA 会全面 412）。"""
+    return bool(ua) and all(s in ua for s in ("Mozilla/5.0", "AppleWebKit", "Safari"))
+
+
+def _human_pause(lo: float, hi: float) -> None:
+    """请求间拟人随机间隔，消除秒级 burst 的机器时序特征。"""
+    time.sleep(random.uniform(lo, hi))
 
 
 def _default_host() -> str:
@@ -94,13 +138,16 @@ def _merge_cookies(existing_cookie: Optional[str], jar: Any) -> str:
 
 
 def _headers(
-    host: str, token: Optional[str] = None, cookie: Optional[str] = None
+    host: str,
+    token: Optional[str] = None,
+    cookie: Optional[str] = None,
+    ua: Optional[str] = None,
 ) -> Dict[str, str]:
     """构造带浏览器上下文或 Token 鉴权的请求头，避免被风控/埋点中间件忽略。"""
     headers = {
         "Origin": f"https://{host}",
         "Referer": f"https://{host}/my/overview",
-        "User-Agent": DEFAULT_UA,
+        "User-Agent": ua if _valid_ua(ua) else DEFAULT_UA,
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     }
@@ -117,25 +164,30 @@ def _headers(
 
 
 def _touch_user(
-    h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None
+    h: Http,
+    host: str,
+    token: Optional[str] = None,
+    cookie: Optional[str] = None,
+    ua: Optional[str] = None,
 ) -> Dict[str, Any]:
     """全链路触碰会话并验证登录态。
 
-    1. 若有 Cookie，访问个人中心 Web 页面与首页，触发 Web 端活跃埋点中间件。
+    1. 若有 Cookie，访问个人中心 Web 页面触发 Web 端活跃埋点中间件（页面收敛为
+       最小集 + 拟人间隔，2026-10-27 封禁复盘：此前 6 页面 + 5 API 秒级连发）。
     2. 访问 magicubes 任务规则与余额端点，激活每日签到奖励系统。
-    3. 访问 OpenAPI 模型与数据集轻量端点，激活用户活动。
-    4. GET /openapi/v1/users/me 验证登录态并提取用户信息。
+    3. GET /openapi/v1/users/me 验证登录态并提取用户信息。
     """
     if cookie:
         web_headers = {
-            "User-Agent": DEFAULT_UA,
+            "User-Agent": ua if _valid_ua(ua) else DEFAULT_UA,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
             "Referer": f"https://{host}/",
             "Cookie": cookie,
         }
         page_status = []
-        for path in ("/my/overview", "/", "/home", "/models", "/datasets", "/my/tasks"):
+        for path in ("/my/overview", "/"):
+            _human_pause(0.8, 2.0)
             try:
                 r = h.request("GET", f"https://{host}{path}", headers=web_headers, timeout=15)
                 page_status.append(f"{path}={r.code}")
@@ -146,58 +198,21 @@ def _touch_user(
         print(f"  [diag] web 触碰[{host}]: {' '.join(page_status)}")
         print(f"  [diag] 触碰响应下发 Cookie 字段[{host}]: {sorted({c.name for c in h.jar})}")
         # 2026-08-29 HAR 抓包确认：前端每次页面加载都会调 /api/v1/users/login/info
-        # （daily_active 规则即「注册并登陆，每日登录即可获取」）——补齐这一登录事件触碰
-        for api_path in (
-            "/api/v1/users/login/info",
-            "/api/v1/users/authorized/check",
-            "/api/v1/users/binding/check",
-            "/api/v1/medal/user/check",
-            "/api/v1/medal/user/info",
-        ):
+        # （daily_active 规则即「注册并登陆，每日登录即可获取」）——补齐这一登录事件触碰；
+        # 其余 binding/medal 探针已裁剪（非日活必需，只增加风控暴露面）
+        for api_path in ("/api/v1/users/login/info", "/api/v1/users/authorized/check"):
+            _human_pause(0.5, 1.5)
             try:
                 h.request("GET", f"https://{host}{api_path}", headers=web_headers, timeout=15)
             except Exception:
                 pass
 
-    hdrs = _headers(host, token=token, cookie=cookie)
+    hdrs = _headers(host, token=token, cookie=cookie, ua=ua)
     try:
-        # 激活魔粒日常任务与余额系统
-        h.request(
-            "GET",
-            f"https://{host}/openapi/v1/magicubes/earn/rules",
-            headers=hdrs,
-            timeout=15,
-        )
-        h.request(
-            "GET",
-            f"https://{host}/openapi/v1/magicubes/balance",
-            headers=hdrs,
-            timeout=15,
-        )
-        h.request(
-            "GET",
-            f"https://{host}/openapi/v1/models?page_number=1&page_size=10",
-            headers=hdrs,
-            timeout=15,
-        )
-        h.request(
-            "GET",
-            f"https://{host}/openapi/v1/datasets?page_number=1&page_size=10",
-            headers=hdrs,
-            timeout=15,
-        )
-        h.request(
-            "GET",
-            f"https://{host}/openapi/v1/studios?page_number=1&page_size=10",
-            headers=hdrs,
-            timeout=15,
-        )
-        h.request(
-            "GET",
-            f"https://{host}/openapi/v1/community/posts?page_number=1&page_size=10",
-            headers=hdrs,
-            timeout=15,
-        )
+        # 激活魔粒日常任务与余额系统（models/datasets/studios/posts 等铺量触碰已裁剪）
+        for api_path in ("/openapi/v1/magicubes/earn/rules", "/openapi/v1/magicubes/balance"):
+            _human_pause(0.4, 1.2)
+            h.request("GET", f"https://{host}{api_path}", headers=hdrs, timeout=15)
     except Exception:
         pass
 
@@ -257,7 +272,8 @@ def _parse_created(s: str) -> Optional[datetime]:
 
 
 def _get_today_daily_active(
-    h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None
+    h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None,
+    ua: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """查询每日签到（daily_active）奖励交易记录或任务完成状态。
 
@@ -268,7 +284,7 @@ def _get_today_daily_active(
     """
     today = datetime.now(BJT)
     today_str = today.strftime("%Y-%m-%d")
-    hdrs = _headers(host, token=token, cookie=cookie)
+    hdrs = _headers(host, token=token, cookie=cookie, ua=ua)
 
     # 判据 1：交易记录直查（分页扫描至越过今日）
     seen_rule_keys = set()
@@ -279,6 +295,8 @@ def _get_today_daily_active(
     resp = None
     try:
         for page in (1, 2, 3):
+            if page > 1:
+                _human_pause(0.5, 1.2)
             resp = h.request(
                 "GET",
                 f"https://{host}/openapi/v1/magicubes/transactions"
@@ -429,13 +447,14 @@ DEFAULT_MCP_TARGETS = [
 
 
 def _get_daily_like_status(
-    h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None
+    h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None,
+    ua: Optional[str] = None,
 ) -> Tuple[int, int, int]:
     """查询每日点赞/喜欢任务规则与进度。
 
     返回 (today_used, max_count, amount_per_like)。
     """
-    hdrs = _headers(host, token=token, cookie=cookie)
+    hdrs = _headers(host, token=token, cookie=cookie, ua=ua)
     try:
         resp = h.request(
             "GET",
@@ -473,6 +492,7 @@ def _fetch_mcp_like_targets(
     token: Optional[str] = None,
     cookie: Optional[str] = None,
     needed: int = 20,
+    ua: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """发现可点赞的 MCP Server 目标列表。
 
@@ -480,7 +500,7 @@ def _fetch_mcp_like_targets(
     """
     targets: List[Dict[str, str]] = []
     seen = set()
-    hdrs = _headers(host, token=token, cookie=cookie)
+    hdrs = _headers(host, token=token, cookie=cookie, ua=ua)
     hdrs["Content-Type"] = "application/json"
 
     for page in range(1, 3):
@@ -548,6 +568,7 @@ def _do_daily_likes(
     cookie: Optional[str] = None,
     count: int = 20,
     amount_per_like: int = 2,
+    ua: Optional[str] = None,
 ) -> Tuple[int, int]:
     """执行每日点击喜欢 20 次任务。
 
@@ -563,7 +584,7 @@ def _do_daily_likes(
         return 0, 0
 
     success_cnt = 0
-    hdrs = _headers(host, token=token, cookie=cookie)
+    hdrs = _headers(host, token=token, cookie=cookie, ua=ua)
     hdrs["Content-Type"] = "application/json"
 
     for t in targets:
@@ -593,10 +614,11 @@ def _do_daily_likes(
 
 
 def _fetch_all_earn_rules(
-    h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None
+    h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None,
+    ua: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """获取所有魔粒任务规则与当前状态字典。"""
-    hdrs = _headers(host, token=token, cookie=cookie)
+    hdrs = _headers(host, token=token, cookie=cookie, ua=ua)
     rules_map: Dict[str, Dict[str, Any]] = {}
     try:
         resp = h.request(
@@ -618,10 +640,11 @@ def _fetch_all_earn_rules(
 
 
 def _fetch_magicubes_balance(
-    h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None
+    h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None,
+    ua: Optional[str] = None,
 ) -> Dict[str, int]:
     """获取用户魔粒账户余额。"""
-    hdrs = _headers(host, token=token, cookie=cookie)
+    hdrs = _headers(host, token=token, cookie=cookie, ua=ua)
     try:
         resp = h.request(
             "GET",
@@ -651,6 +674,7 @@ def _do_profile_complement_tasks(
     user_info: Optional[Dict[str, Any]] = None,
     rules_map: Optional[Dict[str, Dict[str, Any]]] = None,
     preferred_target_id: Optional[str] = None,
+    ua: Optional[str] = None,
 ) -> Tuple[int, List[str]]:
     """执行一次性信息完善任务（主页置顶、个人介绍）。
 
@@ -664,7 +688,7 @@ def _do_profile_complement_tasks(
 
     earned = 0
     msgs = []
-    hdrs = _headers(host, token=token, cookie=cookie)
+    hdrs = _headers(host, token=token, cookie=cookie, ua=ua)
     hdrs["Content-Type"] = "application/json"
     uname = (user_info or {}).get("username") or (user_info or {}).get("user_name") or ""
 
@@ -780,6 +804,7 @@ def _do_daily_aigc_publish(
     count: int = 10,
     amount_per_publish: int = 10,
     username: Optional[str] = None,
+    ua: Optional[str] = None,
 ) -> Tuple[int, int, Optional[str]]:
     """执行每日发布 AIGC 作品并触发有效浏览量（≥1）任务。
 
@@ -788,7 +813,7 @@ def _do_daily_aigc_publish(
     if count <= 0 or not cookie:
         return 0, 0, None
 
-    hdrs = _headers(host, token=token, cookie=cookie)
+    hdrs = _headers(host, token=token, cookie=cookie, ua=ua)
     hdrs["Content-Type"] = "application/json"
     success_cnt = 0
     last_pic_id: Optional[str] = None
@@ -992,6 +1017,17 @@ def _resolve_cookie(env_cookie: str, idx: int, site: str) -> Tuple[str, str, Opt
     return "", "", None
 
 
+def _paused_accounts(site: str) -> set:
+    """返回指定站点需要暂停的账号序号集合（环境变量优先，硬编码为默认值）。"""
+    override = (os.getenv(f"{PREFIX}PAUSED_{site.upper()}_ACCOUNTS") or "").strip()
+    if override:
+        try:
+            return {int(x) for x in override.replace("，", ",").split(",") if x.strip()}
+        except ValueError:
+            print(f"  ⚠️ {PREFIX}PAUSED_{site.upper()}_ACCOUNTS 格式非法（{override}），忽略")
+    return set(PAUSED_CN_ACCOUNTS) if site == "cn" else set()
+
+
 def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
     """加载指定站点（cn / ai）的所有账号凭证，支持 Token 与 Cookie 混合、多账号索引扫描及 Redis 滚动状态。
 
@@ -1017,8 +1053,13 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
         token_keys = ["TOKEN", "API_TOKEN", "ACCESS_TOKEN", "SDK_TOKEN"]
         cookie_keys = ["COOKIE", "COOKIES"]
 
+    paused = _paused_accounts(site)
+
     # 1. 扫描 1..20 显式序号
     for idx in range(1, 21):
+        if idx in paused:
+            print(f"  [pause] {site} 站账号 {idx} 处于暂停名单（封禁/风控），跳过加载")
+            continue
         token_val = ""
         env_cookie_val = ""
 
@@ -1110,6 +1151,9 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
                 if x.strip()
             ]
             for sub_idx, c_item in enumerate(raw_cookies, 1):
+                if sub_idx in paused:
+                    print(f"  [pause] {site} 站账号 {sub_idx} 处于暂停名单（封禁/风控），跳过加载")
+                    continue
                 accounts.append(
                     {
                         "token": None,
@@ -1127,6 +1171,9 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
                 if x.strip()
             ]
             for sub_idx, t_item in enumerate(raw_tokens, 1):
+                if sub_idx in paused:
+                    print(f"  [pause] {site} 站账号 {sub_idx} 处于暂停名单（封禁/风控），跳过加载")
+                    continue
                 accounts.append(
                     {
                         "token": t_item,
@@ -1139,44 +1186,74 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
                 )
         elif token_val or cookie_val:
             # Cookie 优先（同序号分支注释）；Token 仅作为无 Cookie 时的回退
-            accounts.append(
-                {
-                    "token": None if cookie_val else token_val,
-                    "cookie": cookie_val or None,
-                    "fallback_cookie": fallback_cookie,
-                    "env_cookie": env_cookie_val or None,
-                    "index": 1,
-                    "site": site,
-                }
-            )
+            if 1 in paused:
+                print(f"  [pause] {site} 站账号 1 处于暂停名单（封禁/风控），跳过加载")
+            else:
+                accounts.append(
+                    {
+                        "token": None if cookie_val else token_val,
+                        "cookie": cookie_val or None,
+                        "fallback_cookie": fallback_cookie,
+                        "env_cookie": env_cookie_val or None,
+                        "index": 1,
+                        "site": site,
+                    }
+                )
 
     return accounts
 
 
+def _light_touch(
+    h: Http, host: str, ua: Optional[str] = None, cookie: Optional[str] = None
+) -> None:
+    """轻量日活触碰：仅 login/info 登录事件（HAR 证据显示 daily_active 由它触发）。
+
+    用于发奖异步缓冲期的重试——不重放整轮 web 页面触碰，避免每轮 17+ 请求的
+    秒级 burst 指纹。
+    """
+    if not cookie:
+        return
+    web_headers = {
+        "User-Agent": ua if _valid_ua(ua) else DEFAULT_UA,
+        "Accept": "application/json, text/plain, */*",
+        "Referer": f"https://{host}/my/overview",
+        "Cookie": cookie,
+    }
+    try:
+        h.request("GET", f"https://{host}/api/v1/users/login/info", headers=web_headers, timeout=15)
+    except Exception:
+        pass
+
+
 def _touch_and_check(
-    h: Http, host: str, token: Optional[str] = None, cookie: Optional[str] = None
+    h: Http,
+    host: str,
+    token: Optional[str] = None,
+    cookie: Optional[str] = None,
+    ua: Optional[str] = None,
 ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Dict[str, Any]], str]:
     """触碰会话、验证登录态并查询今日 daily_active 交易记录。
 
     返回 (credited, user_info, transaction_record, error_msg)。
     """
     try:
-        user = _touch_user(h, host, token=token, cookie=cookie)
+        user = _touch_user(h, host, token=token, cookie=cookie, ua=ua)
     except Exception as e:
         return False, None, None, f"登录态验证失败：{e}"
 
     try:
-        record = _get_today_daily_active(h, host, token=token, cookie=cookie)
+        record = _get_today_daily_active(h, host, token=token, cookie=cookie, ua=ua)
     except Exception as e:
         return False, user, None, f"交易记录查询失败：{e}"
 
-    # 若尚未查到今日到账，给予服务端异步发奖队列短暂缓冲（5s / 10s / 15s）并重触碰
+    # 若尚未查到今日到账，给予服务端异步发奖队列缓冲（等待抖动 ±20%），
+    # 缓冲期间只做轻量触碰（login/info），不再重放整轮页面触碰
     if record is None and cookie and not token:
-        for wait in (5, 10, 15):
-            time.sleep(wait)
+        for wait in (8, 16, 28):
+            time.sleep(wait * random.uniform(0.85, 1.2))
             try:
-                _touch_user(h, host, token=token, cookie=cookie)
-                record = _get_today_daily_active(h, host, token=token, cookie=cookie)
+                _light_touch(h, host, ua=ua, cookie=cookie)
+                record = _get_today_daily_active(h, host, token=token, cookie=cookie, ua=ua)
                 if record is not None:
                     break
             except Exception:
@@ -1217,8 +1294,25 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
     idx = account.get("index", 1)
     site = account.get("site", "cn")
 
+    # 每账号固定 UA：从 state 恢复（telecom 先例：截断/非法 UA 一律弃用），
+    # 无有效 UA 则从池中随机选定一个并在本次运行结束时随 state 持久化，
+    # 此后该账号长期保持同一 UA（真实浏览器的 UA 不会每天变）
+    state_file = f".modelscope_{site}_state_{idx}.json"
+    redis_key = f"cat_checkin:state:modelscope_{site}_{idx}"
+    acc_state = load_kv_state(redis_key, state_file) or {}
+    ua = str(acc_state.get("ua") or "").strip()
+    if not _valid_ua(ua):
+        ua = random.choice(UA_POOL)
+        # 立即固化：即使本次登录失败（后续 save 不触发），UA 也不至于每次运行都换
+        acc_state["ua"] = ua
+        save_kv_state(redis_key, state_file, acc_state)
+        print(f"  [{idx}] [ua] 账号 UA 未初始化或非法，已选定新 UA（持久化后保持稳定）")
+
+    # 每账号独立代理（MODELSCOPE_PROXY_{idx}）优先：多账号共机共 IP 是最直接的
+    # 聚类特征，可为不同账号配置不同代理；未配置则回退任务级/全局代理
     proxy = (
-        os.getenv("MODELSCOPE_PROXY", "").strip()
+        os.getenv(f"{PREFIX}PROXY_{idx}", "").strip()
+        or os.getenv("MODELSCOPE_PROXY", "").strip()
         or os.getenv("HTTPS_PROXY", "").strip()
         or os.getenv("https_proxy", "").strip()
     )
@@ -1226,7 +1320,7 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
 
     active_cookie = cookie
     credited, user, record, err = _touch_and_check(
-        h, host, token=token, cookie=active_cookie
+        h, host, token=token, cookie=active_cookie, ua=ua
     )
 
     # 缓存 Cookie 失效或未到账时，自动回退尝试环境变量/Secrets 中的最新 Cookie
@@ -1235,7 +1329,7 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
         print(f"  [{idx}] 🔄 缓存 Cookie 登录态失效或未到账，尝试回退使用环境变量最新配置的 Cookie...")
         h_fallback = Http(proxy=proxy)
         fb_credited, fb_user, fb_record, fb_err = _touch_and_check(
-            h_fallback, host, token=token, cookie=fallback_cookie
+            h_fallback, host, token=token, cookie=fallback_cookie, ua=ua
         )
         if fb_credited or (fb_user and not user):
             active_cookie = fallback_cookie
@@ -1250,7 +1344,7 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
         cn_h = Http(proxy=proxy)
         cn_ok = True
         try:
-            _touch_user(cn_h, cn_host, token=token, cookie=active_cookie)
+            _touch_user(cn_h, cn_host, token=token, cookie=active_cookie, ua=ua)
         except Exception as exc:
             cn_ok = False
             print(f"  [{idx}] [diag] CN 站触碰/登录态校验失败：{exc}")
@@ -1258,7 +1352,7 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
             for check_host, check_h in ((cn_host, cn_h), (host, h)):
                 try:
                     rec = _get_today_daily_active(
-                        check_h, check_host, token=token, cookie=active_cookie
+                        check_h, check_host, token=token, cookie=active_cookie, ua=ua
                     )
                 except Exception:
                     rec = None
@@ -1317,8 +1411,6 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
     if user and active_cookie and not token:
         updated_cookie = _merge_cookies(active_cookie, h.jar)
         if updated_cookie:
-            state_file = f".modelscope_{site}_state_{idx}.json"
-            redis_key = f"cat_checkin:state:modelscope_{site}_{idx}"
             env_hash = (
                 hashlib.md5(env_cookie.encode("utf-8")).hexdigest()
                 if env_cookie
@@ -1342,14 +1434,19 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
                     "env_hash": env_hash,
                     "updated_at": int(time.time()),
                     "user_tag": user_tag,
+                    "ua": ua,
                 },
             )
 
     # 查询全量魔粒规则与当前配额状态
-    rules_map = _fetch_all_earn_rules(h, host, token=token, cookie=active_cookie) if user and active_cookie else {}
+    rules_map = (
+        _fetch_all_earn_rules(h, host, token=token, cookie=active_cookie, ua=ua)
+        if user and active_cookie
+        else {}
+    )
 
-    # 1. 每日点击喜欢任务（单次 +2 魔粒，每日上限 10 次共 20 魔粒）
-    if user and active_cookie:
+    # 1. 每日点击喜欢任务（单次 +2 魔粒，每日上限 10 次共 20 魔粒）——已暂停，见 ENABLE_BONUS_TASKS
+    if user and active_cookie and ENABLE_BONUS_TASKS:
         like_rule = rules_map.get("interaction_like", {})
         max_likes = int(like_rule.get("daily_cap") or 10)
         used_likes = int(like_rule.get("today_used") or 0)
@@ -1363,12 +1460,13 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
                 cookie=active_cookie,
                 count=remaining_likes,
                 amount_per_like=amt_per_like,
+                ua=ua,
             )
 
-    # 2. 每日发布 AIGC 作品并触发有效浏览任务（单次 +10 魔粒，每日上限 10 次共 100 魔粒）
+    # 2. 每日发布 AIGC 作品并触发有效浏览任务（单次 +10 魔粒，每日上限 10 次共 100 魔粒）——已暂停
     done_aigc_cnt = 0
     last_published_id = None
-    if user and active_cookie:
+    if user and active_cookie and ENABLE_BONUS_TASKS:
         aigc_rule = rules_map.get("opensource_aigcworks_publish", {})
         max_aigc = int(aigc_rule.get("daily_cap") or 10)
         used_aigc = int(aigc_rule.get("today_used") or 0)
@@ -1384,10 +1482,11 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
                 count=remaining_aigc,
                 amount_per_publish=amt_per_aigc,
                 username=uname_val,
+                ua=ua,
             )
 
-    # 3. 信息完善任务（主页置顶 +50 长期魔粒，完善个人介绍 +50 长期魔粒）
-    if user and active_cookie:
+    # 3. 信息完善任务（主页置顶 +50 长期魔粒，完善个人介绍 +50 长期魔粒）——已暂停
+    if user and active_cookie and ENABLE_BONUS_TASKS:
         _do_profile_complement_tasks(
             h,
             host,
@@ -1396,10 +1495,15 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
             user_info=user,
             rules_map=rules_map,
             preferred_target_id=last_published_id,
+            ua=ua,
         )
 
     # 任务动作执行完毕后，重新拉取服务端最新真实账本（确保所有魔粒到账数据与余额绝对吻合）
-    latest_rules = _fetch_all_earn_rules(h, host, token=token, cookie=active_cookie) if user and active_cookie else {}
+    latest_rules = (
+        _fetch_all_earn_rules(h, host, token=token, cookie=active_cookie, ua=ua)
+        if user and active_cookie
+        else {}
+    )
 
     # 1. 真实点赞状态与收益
     like_msg = ""
@@ -1458,7 +1562,7 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
     # 5. 魔粒可用余额（以服务端当前 balance 接口为准）
     bal_msg = ""
     if user and active_cookie:
-        bal = _fetch_magicubes_balance(h, host, token=token, cookie=active_cookie)
+        bal = _fetch_magicubes_balance(h, host, token=token, cookie=active_cookie, ua=ua)
         if bal.get("available_balance") is not None:
             bal_msg = f"，可用余额 {bal['available_balance']} 魔粒"
 
@@ -1518,6 +1622,12 @@ def _run_site(
     results = []
     latest_ts: Optional[float] = None
     for idx, acc in enumerate(accounts, 1):
+        # 多账号共 run 时强制间隔：消除「同 IP、同 UA、请求序列一致、背靠背执行」
+        # 的多账号聚类特征（2026-10-27 封禁复盘：单 IP 秒级连续切换账号）
+        if idx > 1:
+            gap = random.uniform(20, 60)
+            print(f"  ⏳ 账号间隔 {gap:.0f}s（反多账号时序聚类）")
+            time.sleep(gap)
         try:
             ok, msg, credit_ts = _run_one(acc, host)
             if credit_ts and (latest_ts is None or credit_ts > latest_ts):
@@ -1599,6 +1709,13 @@ def _run_both_sites() -> None:
 
 
 def main():
+    # 启动抖动：rolling 调度本身按 24h 状态散点，这里再加 0~120s 随机延迟，
+    # 打破「误差 <1 分钟的准点周期」规律（MODELSCOPE_START_JITTER=0 可关闭，本地调试用）
+    if (os.getenv("MODELSCOPE_START_JITTER") or "").strip() != "0":
+        delay = random.uniform(0, 120)
+        print(f"[jitter] 启动抖动 {delay:.0f}s（反准点周期规律）")
+        time.sleep(delay)
+
     # MODELSCOPE_SITE=cn/ai：单站点独立任务模式（独立调度/失败卡/通知状态）；
     # 未设置：双站顺序执行（青龙/本地手动兼容）
     site = (os.getenv("MODELSCOPE_SITE") or "").strip().lower()
