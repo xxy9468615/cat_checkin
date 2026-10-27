@@ -843,10 +843,12 @@ def _do_daily_aigc_publish(
                 timeout=15,
             )
             if create_resp.code != 200:
+                print(f"  [aigc:{i+1}] create 失败 HTTP {create_resp.code}: {create_resp.text[:150]}")
                 continue
             create_data = create_resp.json({})
             res_items = (create_data.get("Data") or {}).get("data") or create_data.get("data") or []
             if not res_items or not isinstance(res_items, list):
+                print(f"  [aigc:{i+1}] create 响应无素材项: {str(create_data)[:200]}")
                 continue
             item = res_items[0] or {}
             img_id = item.get("id")
@@ -895,6 +897,7 @@ def _do_daily_aigc_publish(
                 timeout=15,
             )
             if upload_resp.code != 200:
+                print(f"  [aigc:{i+1}] upload 失败 HTTP {upload_resp.code}: {upload_resp.text[:150]}")
                 continue
             upload_data = upload_resp.json({})
             if not (
@@ -902,6 +905,7 @@ def _do_daily_aigc_publish(
                 or upload_data.get("Code") == 200
                 or upload_data.get("Message") == "success"
             ):
+                print(f"  [aigc:{i+1}] upload 业务失败: {str(upload_data)[:200]}")
                 continue
 
             pic_id = (upload_data.get("Data") or {}).get("id") or (upload_data.get("Data") or {}).get("PictureId")
@@ -972,8 +976,8 @@ def _do_daily_aigc_publish(
 
             success_cnt += 1
             time.sleep(random.uniform(0.3, 0.6))
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"  [aigc:{i+1}] 发布链路异常: {type(exc).__name__}: {exc}")
 
     return success_cnt, success_cnt * amount_per_publish, last_pic_id
 
