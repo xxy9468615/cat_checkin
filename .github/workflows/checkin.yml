@@ -251,7 +251,8 @@ jobs:
             case "$EVENT_ACTION" in
               latvi_next_sign|checkin_latvi) CANDIDATES="latvi" ;;
               workbuddy_travel_claim)        CANDIDATES="workbuddy" ;;
-              checkin_modelscope)            CANDIDATES="modelscope,modelscope_ai" ;;
+              # ModelScope 双实例已于 2026-10-28 退役（风控簇风险）——遗留 dispatch 入口指向空队列
+              checkin_modelscope)            CANDIDATES="none" ;;
               checkin_morning)               CANDIDATES="all" ;;
               *)                             CANDIDATES="" ;;
             esac
