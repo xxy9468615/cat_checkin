@@ -853,11 +853,16 @@ def _do_daily_aigc_publish(
             item = res_items[0] or {}
             img_id = item.get("id")
             if not img_id:
+                print(f"  [aigc:{i+1}] create 素材项无 id，字段: {sorted(item.keys())}")
                 continue
+            print(
+                f"  [aigc:{i+1}] create OK id={img_id!r}({type(img_id).__name__}) "
+                f"字段: {sorted(item.keys())}"
+            )
 
             # 2. 补齐生成与模型参数
             rand_code = random.randint(1000, 9999)
-            h.request(
+            upd_resp = h.request(
                 "POST",
                 f"https://{host}/api/v1/muse/image/updateImageGenerateInfo",
                 headers=hdrs,
@@ -878,8 +883,15 @@ def _do_daily_aigc_publish(
                 ],
                 timeout=15,
             )
+            if upd_resp.code != 200:
+                print(
+                    f"  [aigc:{i+1}] updateInfo 失败 HTTP {upd_resp.code}: {upd_resp.text[:150]}"
+                )
 
             # 3. 发布到创意广场
+            muse_id = img_id
+            if isinstance(muse_id, str) and muse_id.isdigit():
+                muse_id = int(muse_id)
             upload_resp = h.request(
                 "POST",
                 f"https://{host}/api/v1/aigc/picture/upload",
@@ -888,7 +900,7 @@ def _do_daily_aigc_publish(
                     "Title": f"Cyber Cat #{rand_code}",
                     "MuseImages": [
                         {
-                            "MuseImageID": img_id,
+                            "MuseImageID": muse_id,
                             "IsCoverImage": 1,
                         }
                     ],
