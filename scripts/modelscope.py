@@ -197,7 +197,9 @@ def _touch_user(
             "Cookie": cookie,
         }
         page_status = []
-        for path in ("/my/overview", "/"):
+        # 2026-10-27 二次收敛：单账号最小请求集——web 页面只留 /my/overview，
+        # 登录事件只留 login/info（daily_active 的 HAR 证据触发点）
+        for path in ("/my/overview",):
             _human_pause(0.8, 2.0)
             try:
                 r = h.request("GET", f"https://{host}{path}", headers=web_headers, timeout=15)
@@ -211,21 +213,19 @@ def _touch_user(
         # 2026-08-29 HAR 抓包确认：前端每次页面加载都会调 /api/v1/users/login/info
         # （daily_active 规则即「注册并登陆，每日登录即可获取」）——补齐这一登录事件触碰；
         # 其余 binding/medal 探针已裁剪（非日活必需，只增加风控暴露面）
-        for api_path in ("/api/v1/users/login/info", "/api/v1/users/authorized/check"):
-            _human_pause(0.5, 1.5)
-            try:
-                h.request("GET", f"https://{host}{api_path}", headers=web_headers, timeout=15)
-            except Exception:
-                pass
+        # binding/medal/authorized 等探针全部裁剪（非日活必需，只增加风控暴露面）
+        _human_pause(0.5, 1.5)
+        try:
+            h.request(
+                "GET",
+                f"https://{host}/api/v1/users/login/info",
+                headers=web_headers,
+                timeout=15,
+            )
+        except Exception:
+            pass
 
     hdrs = _headers(host, token=token, cookie=cookie, ua=ua)
-    try:
-        # 激活魔粒日常任务与余额系统（models/datasets/studios/posts 等铺量触碰已裁剪）
-        for api_path in ("/openapi/v1/magicubes/earn/rules", "/openapi/v1/magicubes/balance"):
-            _human_pause(0.4, 1.2)
-            h.request("GET", f"https://{host}{api_path}", headers=hdrs, timeout=15)
-    except Exception:
-        pass
 
     resp = h.request(
         "GET",
@@ -312,7 +312,7 @@ def _get_today_daily_active(
     recent_samples: list = []
     resp = None
     try:
-        for page in (1, 2, 3):
+        for page in (1, 2):
             if page > 1:
                 _human_pause(0.5, 1.2)
             resp = h.request(
@@ -1539,10 +1539,12 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
                 },
             )
 
-    # 查询全量魔粒规则与当前配额状态
+    # 查询全量魔粒规则与当前配额状态——纯登录签到模式（互动开关全关）下
+    # 服务端账本/余额查询对结果无影响，一并裁剪以压低请求足迹
+    _enable_any = ENABLE_LIKE_TASKS or ENABLE_AIGC_PUBLISH or ENABLE_PROFILE_TASKS
     rules_map = (
         _fetch_all_earn_rules(h, host, token=token, cookie=active_cookie, ua=ua)
-        if user and active_cookie
+        if user and active_cookie and _enable_any
         else {}
     )
 
@@ -1602,7 +1604,7 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
     # 任务动作执行完毕后，重新拉取服务端最新真实账本（确保所有魔粒到账数据与余额绝对吻合）
     latest_rules = (
         _fetch_all_earn_rules(h, host, token=token, cookie=active_cookie, ua=ua)
-        if user and active_cookie
+        if user and active_cookie and _enable_any
         else {}
     )
 
@@ -1660,9 +1662,9 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
         extra_msgs.append(f"勋章激励(+{badge_r.get('today_earned_amount')})")
     extra_msg = ("，" + "，".join(extra_msgs)) if extra_msgs else ""
 
-    # 5. 魔粒可用余额（以服务端当前 balance 接口为准）
+    # 5. 魔粒可用余额（以服务端当前 balance 接口为准）——互动模式才查询
     bal_msg = ""
-    if user and active_cookie:
+    if user and active_cookie and _enable_any:
         bal = _fetch_magicubes_balance(h, host, token=token, cookie=active_cookie, ua=ua)
         if bal.get("available_balance") is not None:
             bal_msg = f"，可用余额 {bal['available_balance']} 魔粒"
