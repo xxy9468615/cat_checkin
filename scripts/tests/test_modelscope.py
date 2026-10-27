@@ -220,6 +220,42 @@ class TestModelScopeTasks(unittest.TestCase):
         for ua in ms.UA_POOL:
             self.assertTrue(ms._valid_ua(ua), f"UA 池成员必须自身合法: {ua}")
 
+    def test_touch_user_blacklist_detection(self):
+        """403 + 黑名单文案必须识别为风控拉黑（而非普通凭证失效）。"""
+        blacklist_body = (
+            '{"detail":"错误代码:403 - {\'error\':{\'message\':'
+            '\'您的账户因可疑活动被列入黑名单，欢迎通过 contact@modelscope.cn 联系我们\'}}"}'
+        )
+        resp = MagicMock(code=403)
+        resp.json.return_value = {}
+        resp.text = blacklist_body
+        h = MagicMock()
+        h.request.return_value = resp
+        with self.assertRaises(RuntimeError) as ctx:
+            ms._touch_user(h, self.host, cookie=self.cookie)
+        self.assertIn("黑名单", str(ctx.exception))
+        self.assertIn("contact@modelscope.cn", str(ctx.exception))
+
+    def test_touch_user_expired_vs_blacklist(self):
+        """403 无黑名单文案 → 仍走「凭证失效」分支，提示重取 Cookie。"""
+        resp = MagicMock(code=403)
+        resp.json.return_value = {}
+        resp.text = '{"message":"unauthorized"}'
+        h = MagicMock()
+        h.request.return_value = resp
+        with self.assertRaises(RuntimeError) as ctx:
+            ms._touch_user(h, self.host, cookie=self.cookie)
+        self.assertIn("已失效/未登录", str(ctx.exception))
+        self.assertNotIn("黑名单", str(ctx.exception))
+
+    def test_blacklisted_account_skipped(self):
+        """state 中 blacklisted=true 的账号零触碰跳过（自动停用闭环）。"""
+        env = {"MODELSCOPE_COOKIE_1": "m_session_id=synthetic_a"}
+        with patch.dict(os.environ, env), patch.object(
+            ms, "load_kv_state", return_value={"blacklisted": True}
+        ):
+            self.assertEqual(ms._load_accounts("cn"), [])
+
     def test_report_fields_ex_modelscope(self):
         sample_output = (
             "【ModelScope 国内站 签到】\n"

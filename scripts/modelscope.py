@@ -93,6 +93,11 @@ DEFAULT_UA = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
+# 平台风控黑名单响应特征（2026-10-27：403 "您的账户因可疑活动被列入黑名单"）。
+# 命中即视为账号已被风控处置：自动写入 blacklisted 状态，后续运行零触碰跳过，
+# 申诉解封后删除对应 state（或 Redis key cat_checkin:state:modelscope_<site>_<idx>）即可恢复。
+BLACKLIST_MARKERS = ("黑名单", "可疑活动", "拉黑", "blacklist")
+
 # 反风控：UA 池（2026-10-27 封禁复盘）。此前所有账号/所有天共用一个写死的 Chrome 131
 # UA，是最易聚类识别的指纹。现改为每账号从池中随机选定一个真实形态的完整 UA，
 # 随 state 持久化后长期保持稳定（真实浏览器 UA 不会天天变）。
@@ -230,6 +235,13 @@ def _touch_user(
     )
     data = resp.json({})
     if resp.code in (401, 403) or (isinstance(data, dict) and data.get("code") in (401, 403)):
+        body = resp.text or ""
+        if any(m in body for m in BLACKLIST_MARKERS):
+            # 风控黑名单与凭证失效是两回事：前者需要申诉/停用，重取 Cookie 无意义
+            raise RuntimeError(
+                f"账号已被平台列入黑名单（风控判定可疑活动，HTTP {resp.code}），"
+                f"请通过 contact@modelscope.cn 申诉；自动停用该账号前请勿重试"
+            )
         auth_type = (
             "Token"
             if token and not cookie
@@ -1102,10 +1114,20 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
 
     paused = _paused_accounts(site)
 
+    def _blacklisted(i: int) -> bool:
+        st = load_kv_state(
+            f"cat_checkin:state:modelscope_{site}_{i}",
+            f".modelscope_{site}_state_{i}.json",
+        ) or {}
+        return bool(st.get("blacklisted"))
+
     # 1. 扫描 1..20 显式序号
     for idx in range(1, 21):
         if idx in paused:
             print(f"  [pause] {site} 站账号 {idx} 处于暂停名单（封禁/风控），跳过加载")
+            continue
+        if _blacklisted(idx):
+            print(f"  [blacklist] {site} 站账号 {idx} 已被平台拉黑（自动停用），零触碰跳过")
             continue
         token_val = ""
         env_cookie_val = ""
@@ -1201,6 +1223,9 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
                 if sub_idx in paused:
                     print(f"  [pause] {site} 站账号 {sub_idx} 处于暂停名单（封禁/风控），跳过加载")
                     continue
+                if _blacklisted(sub_idx):
+                    print(f"  [blacklist] {site} 站账号 {sub_idx} 已被平台拉黑（自动停用），零触碰跳过")
+                    continue
                 accounts.append(
                     {
                         "token": None,
@@ -1221,6 +1246,9 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
                 if sub_idx in paused:
                     print(f"  [pause] {site} 站账号 {sub_idx} 处于暂停名单（封禁/风控），跳过加载")
                     continue
+                if _blacklisted(sub_idx):
+                    print(f"  [blacklist] {site} 站账号 {sub_idx} 已被平台拉黑（自动停用），零触碰跳过")
+                    continue
                 accounts.append(
                     {
                         "token": t_item,
@@ -1235,6 +1263,8 @@ def _load_accounts(site: str = "cn") -> List[Dict[str, Any]]:
             # Cookie 优先（同序号分支注释）；Token 仅作为无 Cookie 时的回退
             if 1 in paused:
                 print(f"  [pause] {site} 站账号 1 处于暂停名单（封禁/风控），跳过加载")
+            elif _blacklisted(1):
+                print(f"  [blacklist] {site} 站账号 1 已被平台拉黑（自动停用），零触碰跳过")
             else:
                 accounts.append(
                     {
@@ -1330,6 +1360,28 @@ def _persist_last_credit_ts(task_id: str, ts: Optional[float]) -> None:
             print(f"  [sched] last_credit_ts → {datetime.fromtimestamp(ts, timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')} BJT")
     except Exception as exc:
         print(f"  ⚠️ last_credit_ts 持久化失败: {exc}")
+
+
+def _mark_blacklisted(site: str, idx: int, user_tag: str = "") -> None:
+    """账号被风控拉黑后写入 blacklisted 标记，后续运行由 _load_accounts 零触碰跳过。
+
+    state 同时保留 cookie/env_hash 等字段不覆盖（申诉解封后删掉 blacklisted 键即可恢复）。
+    """
+    state_file = f".modelscope_{site}_state_{idx}.json"
+    redis_key = f"cat_checkin:state:modelscope_{site}_{idx}"
+    try:
+        state = load_kv_state(redis_key, state_file) or {}
+        state["blacklisted"] = True
+        state["blacklisted_at"] = int(time.time())
+        if user_tag:
+            state["user_tag"] = user_tag
+        save_kv_state(redis_key, state_file, state)
+        print(
+            f"  [{idx}] 🚫 已将 {site} 站账号 {idx} 标记为黑名单停用"
+            f"（后续运行零触碰；申诉解封后删除 state 中 blacklisted 键恢复）"
+        )
+    except Exception as exc:
+        print(f"  [{idx}] ⚠️ 黑名单标记写入失败: {exc}")
 
 
 def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[float]]:
@@ -1428,6 +1480,8 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
             credit_ts = time.time()
 
     if not user:
+        if any(m in (err or "") for m in BLACKLIST_MARKERS):
+            _mark_blacklisted(site, idx)
         return False, err or "登录态验证失败", None
 
     name = user.get("nickname") or user.get("username") or ""
