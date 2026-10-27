@@ -7,7 +7,8 @@
 机制：
 1. 登录奖励（每日 200 魔粒）在用户产生活跃会话后被动发放。
 2. ⚠️ 2026-10-27：国内站出现账号封禁，点赞 / AIGC 发布 / 信息完善等互动任务
-   已全部暂停（ENABLE_BONUS_TASKS = False），仅保留每日登录签到。
+   已全部暂停（独立开关，默认 False），仅保留每日登录签到；点赞任务频率行为
+   已优化（随机目标抽样 + 4~12s 拟人间隔），后期经开关开放。
    反风控加固同步落地：每账号固定 UA（state 持久化 + 合法性校验）、请求拟人
    随机间隔、触碰端点收敛、发奖缓冲期轻量触碰、启动抖动 0~120s、多账号
    强制间隔、每账号独立代理（MODELSCOPE_PROXY_{idx}）、暂停名单机制。
@@ -66,11 +67,16 @@ import cookie_validity as cv
 
 PREFIX = "MODELSCOPE_"
 
-# 2026-10-27：国内站出现账号封禁，互动类任务（每日点赞、AIGC 作品发布、信息完善）
-# 全部暂停，仅保留每日登录签到（日活触碰 + daily_active 查询 + Cookie 滚动续期）。
-# 默认 False；单次手动运行可用 MODELSCOPE_ENABLE_BONUS_TASKS=1 临时打开
-# （配合 scripts/modelscope_publish_once.py 一次性发布工具），日常调度不带该变量。
-ENABLE_BONUS_TASKS = (os.getenv("MODELSCOPE_ENABLE_BONUS_TASKS") or "").strip() == "1"
+# 2026-10-27：国内站出现账号封禁，互动类任务全部暂停，仅保留每日登录签到
+# （日活触碰 + daily_active 查询 + Cookie 滚动续期）。三类动作独立开关，默认全停：
+#   MODELSCOPE_ENABLE_LIKE_TASKS=1      每日点赞（频率行为已优化，后期开放）
+#   MODELSCOPE_ENABLE_AIGC_PUBLISH=1    AIGC 作品发布（AI 站链路未通，暂停 indefinitely）
+#   MODELSCOPE_ENABLE_PROFILE_TASKS=1   信息完善（一次性任务）
+# MODELSCOPE_ENABLE_BONUS_TASKS=1 可一键打开全部（单次手动运行用，日常调度不带）。
+_ENABLE_ALL = (os.getenv("MODELSCOPE_ENABLE_BONUS_TASKS") or "").strip() == "1"
+ENABLE_LIKE_TASKS = _ENABLE_ALL or (os.getenv("MODELSCOPE_ENABLE_LIKE_TASKS") or "").strip() == "1"
+ENABLE_AIGC_PUBLISH = _ENABLE_ALL or (os.getenv("MODELSCOPE_ENABLE_AIGC_PUBLISH") or "").strip() == "1"
+ENABLE_PROFILE_TASKS = _ENABLE_ALL or (os.getenv("MODELSCOPE_ENABLE_PROFILE_TASKS") or "").strip() == "1"
 
 # 2026-10-27：国内站账号 2 已被平台封禁，暂停其全部任务行为——不加载、不触碰、
 # 不滚动 Cookie，避免封禁账号继续产生自动化流量加深风控标记。
@@ -503,9 +509,11 @@ def _fetch_mcp_like_targets(
     hdrs = _headers(host, token=token, cookie=cookie, ua=ua)
     hdrs["Content-Type"] = "application/json"
 
-    for page in range(1, 3):
+    for page in range(1, 4):
         if len(targets) >= needed:
             break
+        if page > 1:
+            _human_pause(0.8, 2.0)
         try:
             resp = h.request(
                 "PUT",
@@ -557,8 +565,9 @@ def _fetch_mcp_like_targets(
                 }
             )
 
-    targets.sort(key=lambda x: x.get("already_star", False))
-    return [{"path": t["path"], "name": t["name"]} for t in targets]
+    # 返回完整池（含 already_star 标记），由调用方随机抽样——不再按固定顺序消费，
+    # 避免所有账号每天点同一批目标形成协同指纹
+    return targets
 
 
 def _do_daily_likes(
@@ -570,24 +579,33 @@ def _do_daily_likes(
     amount_per_like: int = 2,
     ua: Optional[str] = None,
 ) -> Tuple[int, int]:
-    """执行每日点击喜欢 20 次任务。
+    """执行每日点击喜欢任务。
 
-    返回 (成功次数, 获得魔粒数)。
+    2026-10-27 频率行为优化（封禁复盘）：不再以 0.2~0.4s 固定节奏连点固定顺序的
+    目标列表——目标池随机抽样、未点赞目标优先、每次点赞间隔 4~12s 拟人随机，
+    打散时序与目标指纹。返回 (成功次数, 获得魔粒数)。
     """
     if count <= 0:
         return 0, 0
 
     targets = _fetch_mcp_like_targets(
-        h, host, token=token, cookie=cookie, needed=count + 10
+        h, host, token=token, cookie=cookie, needed=count * 2 + 20
     )
     if not targets:
         return 0, 0
+
+    # 未点赞目标优先（避免对已收藏目标再 PUT 造成取消收藏），同组内随机打散
+    fresh = [t for t in targets if not t.get("already_star")]
+    starred = [t for t in targets if t.get("already_star")]
+    random.shuffle(fresh)
+    random.shuffle(starred)
+    pool = fresh + starred
 
     success_cnt = 0
     hdrs = _headers(host, token=token, cookie=cookie, ua=ua)
     hdrs["Content-Type"] = "application/json"
 
-    for t in targets:
+    for t in pool:
         if success_cnt >= count:
             break
         path = t["path"]
@@ -608,7 +626,8 @@ def _do_daily_likes(
                     success_cnt += 1
         except Exception:
             pass
-        time.sleep(random.uniform(0.2, 0.4))
+        if success_cnt < count:
+            _human_pause(4, 12)
 
     return success_cnt, success_cnt * amount_per_like
 
@@ -1473,8 +1492,8 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
         else {}
     )
 
-    # 1. 每日点击喜欢任务（单次 +2 魔粒，每日上限 10 次共 20 魔粒）——已暂停，见 ENABLE_BONUS_TASKS
-    if user and active_cookie and ENABLE_BONUS_TASKS:
+    # 1. 每日点击喜欢任务（单次 +2 魔粒，每日上限 10 次共 20 魔粒）——默认停，见 ENABLE_LIKE_TASKS
+    if user and active_cookie and ENABLE_LIKE_TASKS:
         like_rule = rules_map.get("interaction_like", {})
         max_likes = int(like_rule.get("daily_cap") or 10)
         used_likes = int(like_rule.get("today_used") or 0)
@@ -1494,7 +1513,7 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
     # 2. 每日发布 AIGC 作品并触发有效浏览任务（单次 +10 魔粒，每日上限 10 次共 100 魔粒）——已暂停
     done_aigc_cnt = 0
     last_published_id = None
-    if user and active_cookie and ENABLE_BONUS_TASKS:
+    if user and active_cookie and ENABLE_AIGC_PUBLISH:
         aigc_rule = rules_map.get("opensource_aigcworks_publish", {})
         max_aigc = int(aigc_rule.get("daily_cap") or 10)
         used_aigc = int(aigc_rule.get("today_used") or 0)
@@ -1513,8 +1532,8 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
                 ua=ua,
             )
 
-    # 3. 信息完善任务（主页置顶 +50 长期魔粒，完善个人介绍 +50 长期魔粒）——已暂停
-    if user and active_cookie and ENABLE_BONUS_TASKS:
+    # 3. 信息完善任务（主页置顶 +50 长期魔粒，完善个人介绍 +50 长期魔粒）——默认停
+    if user and active_cookie and ENABLE_PROFILE_TASKS:
         _do_profile_complement_tasks(
             h,
             host,

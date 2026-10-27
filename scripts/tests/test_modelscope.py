@@ -81,8 +81,9 @@ class TestModelScopeTasks(unittest.TestCase):
         self.assertEqual(bal["available_balance"], 450)
         self.assertEqual(bal["frozen_amount"], 50)
 
+    @patch("modelscope._human_pause")
     @patch("modelscope._fetch_mcp_like_targets")
-    def test_do_daily_likes(self, mock_targets):
+    def test_do_daily_likes(self, mock_targets, mock_pause):
         mock_targets.return_value = [
             {"path": "Alipay", "name": "alipay-subscription"},
             {"path": "TianYanCha", "name": "tyc-mcp"},
@@ -100,7 +101,8 @@ class TestModelScopeTasks(unittest.TestCase):
         self.assertEqual(self.mock_http.request.call_count, 2)
 
     def test_do_daily_aigc_publish_success(self):
-        # 模拟：1. image/create -> 2. image/updateImageGenerateInfo -> 3. aigc/picture/upload -> 4. play/track
+        # 模拟：1. image/create -> 1.5 create后 muse/image/get 反查诊断
+        #       -> 2. image/updateImageGenerateInfo -> 3. aigc/picture/upload -> 4. 后续触碰
         resp_create = MagicMock(code=200)
         resp_create.json.return_value = {
             "data": [{"id": 99901, "url": "https://img.example.com/test.png"}]
@@ -124,6 +126,7 @@ class TestModelScopeTasks(unittest.TestCase):
 
         self.mock_http.request.side_effect = [
             resp_create,
+            resp_get,
             resp_update,
             resp_upload,
             resp_track,
