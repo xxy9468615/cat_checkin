@@ -285,7 +285,9 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "timeout": 600,
         "account": "",
         "tags": ["09:10", "modelscope", "modelscope_ai", "daily"],
-        "env": {"MODELSCOPE_SITE": "ai"},
+        # TEMP(2026-10-27)：单次开启账号1 AIGC 发布（抓包删除接口准备），跑完即撤
+        "env": {"MODELSCOPE_SITE": "ai", "MODELSCOPE_ENABLE_BONUS_TASKS": "1",
+                "MODELSCOPE_PAUSED_AI_ACCOUNTS": "2,3"},
         "sched": {"type": "rolling", "period_h": 24},
     },
 
