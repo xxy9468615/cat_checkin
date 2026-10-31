@@ -294,8 +294,10 @@ class ImusicLuckClient:
         return res
 
     def get_ai_video_left(self) -> int:
-        """当前剩余免费 AI 视频生成次数（privilegeVrbtAIVideoLeftNum）。
+        """权益包侧剩余 AI 视频生成次数（queryAiMakePkgInfo.privilegeVrbtAIVideoLeftNum）。
 
+        ⚠️ 该计数不是提交闸门：与 diy/AiAgentChatApi/queryAiMakeCount 的闸门计数
+        不同步（2026-10-31 实测闸门「本月剩余0次」时本接口仍报 1），仅作展示/兜底。
         计数口径（官方规则）：每 3 天获赠 3 次，新赠时旧机会清零不叠加；
         抽奖获得的「AI制作体验券」到账会增加该计数。"""
         res = self._en_api(
@@ -307,6 +309,18 @@ class ImusicLuckClient:
             return int(data.get("privilegeVrbtAIVideoLeftNum") or 0)
         except (TypeError, ValueError):
             return 0
+
+    def get_make_count(self) -> Dict[str, Any]:
+        """服务端制作闸门计数（diy/AiAgentChatApi/queryAiMakeCount）。
+
+        提交 template_make_add_v2 前服务端以此为准：月度免费次数（monthFreeNum /
+        privilegeVrbtAIVideoLeftNum，提示语如「本月剩余0次，本次制作消耗1次」）。
+        闸门=0 时提交一律被拒，返回通用 10013「网络异常，请稍后重试」——
+        这是 2026-10 月第8期「提交从未成功」的根因（此前误读 pkgInfo 计数=1）。"""
+        return self._en_api(
+            {"mobile": self.phone, "aid": ACTIVITY_ID, "channelId": CHANNEL_ID, "portal": PORTAL},
+            "diy/AiAgentChatApi/queryAiMakeCount",
+        )
 
     def get_scores(self) -> Dict[str, Any]:
         """总点数/剩余可用点数（totalScore 含已消耗；remainingScore 可用于抽奖/兑换）。"""
@@ -419,8 +433,9 @@ def run_imusic_luck(http: Any, ticket: str, phone: str = "") -> Dict[str, Any]:
     """执行一次「AI视频创作赢话费」日常流程。
 
     策略（2026-10-03 按用户实测反馈定稿）：
-      1. 制作次数完全以服务端剩余计数为准（自动检测，不依赖放量周期假设），
-         有就提交用光——提交成功即 +20 点到账，无需等待生成完成。
+      1. 制作次数以服务端制作闸门计数为准（queryAiMakeCount，自动检测；权益包计数
+         queryAiMakePkgInfo 与闸门不同步仅作兜底），有就提交用光——提交成功即 +20 点
+         到账，无需等待生成完成；闸门=0（如「本月剩余0次」）如实上报，不再空转提交。
       2. 点数优先兑换 10 元话费（1000 点，每日限量先到先得，code=10003=当日抢完；
          前端兑换链路无验证码）。任务每次运行到达 1000 点即发起兑换。
       3. 兑换失败（售罄/风控）才退回抽奖，且默认保留 1000 点兑换储备只抽超出部分
@@ -464,10 +479,21 @@ def run_imusic_luck(http: Any, ticket: str, phone: str = "") -> Dict[str, Any]:
 
         score_before = str(_read_scores().get("totalScore") or "")
         left = client.get_ai_video_left()
+        # 制作闸门计数（2026-10-31 根因修复）：提交前以 queryAiMakeCount 为准。
+        # 权益包计数（上面 pkgInfo 的 left）与闸门不同步，闸门=0 时提交必被
+        # 10013「网络异常」拒绝——此前误读 pkgInfo=1 反复空转整个第8期。
+        cnt_data = client.get_make_count().get("data") or {}
+        try:
+            gate_left = int(cnt_data.get("privilegeVrbtAIVideoLeftNum"))
+        except (TypeError, ValueError):
+            gate_left = None
+        if gate_left is None:
+            gate_left = left  # 闸门响应异常时退回权益包计数（旧行为）
+        left = gate_left
         out["left"] = left
 
-        # 1. 用光免费制作次数：完全以服务端剩余计数为准（privilegeVrbtAIVideoLeftNum），
-        #    不依赖任何放量周期假设；提交成功即 +20 点到账，无需等待生成完成
+        # 1. 用光免费制作次数：以服务端制作闸门计数为准（见上 gate_left）；
+        #    提交成功即 +20 点到账，无需等待生成完成
         submitted = 0
         submit_err = ""
         if left > 0:
@@ -482,7 +508,7 @@ def run_imusic_luck(http: Any, ticket: str, phone: str = "") -> Dict[str, Any]:
                 d = res.get("data") or {}
                 ok = res.get("code") == "0000" and (d.get("success") or d.get("makeId"))
                 err = "" if ok else str(d.get("message") or res.get("desc") or "提交被拒绝")
-                return ok, d, err
+                return ok, res, err
 
             def _is_transient(err: str) -> bool:
                 # 服务端瞬态拒绝（网络抖动/风控滑窗）：「网络异常，请稍后重试」等
@@ -493,20 +519,33 @@ def run_imusic_luck(http: Any, ticket: str, phone: str = "") -> Dict[str, Any]:
                     template = templates[i % len(templates)]
                 else:
                     break
-                ok, data, err = _submit_once(template)
-                if not ok and _is_transient(err):
-                    # 「网络异常」类瞬态拒绝退避重试一次（2026-10-30 用户日志：
-                    # 800/1000 点卡在提交被拒，服务端消息为网络异常，非次数用尽）
+                ok, res_full, err = _submit_once(template)
+                # 10013「网络异常，请稍后重试」实为服务端制作闸门拒绝（2026-10-31 实测：
+                # 闸门月度配额=0 时单发必现、报文与真实 H5 一致也照样被拒）——终局化，
+                # 不做瞬态重试，避免每轮空转 + 误报
+                is_gate_reject = str(res_full.get("code")) == "10013"
+                if not ok and not is_gate_reject and _is_transient(err):
                     time.sleep(random.uniform(3.0, 5.0))
-                    ok, data, err = _submit_once(template)
+                    ok, res_full, err = _submit_once(template)
                 if ok:
                     submitted += 1
-                    print(f"    [imusic] 提交生成#{submitted}: {data.get('makeId')} ({template.get('videoName')})", flush=True)
+                    print(f"    [imusic] 提交生成#{submitted}: "
+                          f"{(res_full.get('data') or {}).get('makeId')} ({template.get('videoName')})", flush=True)
                 else:
-                    submit_err = err
-                    print(f"    [imusic] 提交失败: {submit_err[:60]}", flush=True)
+                    if is_gate_reject:
+                        tip = str(cnt_data.get("balanceMakeTimesTip") or "")
+                        submit_err = f"制作闸门拒绝(10013){('：' + tip) if tip else '（月度免费次数耗尽/风控）'}"
+                        print(f"    [imusic] 提交被拒(10013)：{tip or '服务端制作闸门拒绝'}——非网络问题，本次不再重试", flush=True)
+                    else:
+                        submit_err = err
+                        print(f"    [imusic] 提交失败: {submit_err[:60]}", flush=True)
                     break
                 time.sleep(1.5)
+        elif cnt_data:
+            # 闸门明确报 0：如实记录，不再发起注定被拒的提交
+            tip = str(cnt_data.get("balanceMakeTimesTip") or "本月免费制作次数已用完")
+            submit_err = f"制作闸门=0（{tip}）"
+            print(f"    [imusic] 制作闸门=0，跳过提交（{tip}）——权益包计数此前误报可用", flush=True)
         out["videos"] = submitted
 
         # 2. 点数优先兑换 10 元话费（每日限量、先到先得；code=10003 即当日份额已抢完）。
@@ -560,9 +599,21 @@ def run_imusic_luck(http: Any, ticket: str, phone: str = "") -> Dict[str, Any]:
             out["gain"] = int(out["score"]) - int(score_before)
         except (TypeError, ValueError):
             out["gain"] = 0
-        out["left"] = client.get_ai_video_left()
+        if cnt_data and submitted > 0:
+            # 有提交才重读闸门计数（真实消耗）；闸门=0 时权益包计数无参考价值
+            try:
+                out["left"] = int(client.get_make_count().get("data", {}).get(
+                    "privilegeVrbtAIVideoLeftNum"))
+            except (TypeError, ValueError):
+                pass
+        elif not cnt_data:
+            # 闸门接口不可用，退回权益包计数（旧行为）
+            out["left"] = client.get_ai_video_left()
+        gate_exhausted = bool(cnt_data) and left <= 0 and submitted == 0
         if submitted > 0 or out["draws"] > 0 or out["redeemed"]:
             out["status"] = "成功"
+        elif gate_exhausted:
+            out["status"] = "无剩余次数"
         elif submit_err:
             out["status"] = "失败"
         else:
@@ -578,7 +629,9 @@ def run_imusic_luck(http: Any, ticket: str, phone: str = "") -> Dict[str, Any]:
             if out["draws"]:
                 parts.append(f"抽奖{out['draws']}次")
             if left <= 0 and not submitted:
-                parts.append("免费次数已用完")
+                # 闸门计数可用时优先其官方提示语（如「本月剩余0次，本次制作消耗1次」）
+                gate_tip = str(cnt_data.get("balanceMakeTimesTip") or "") if cnt_data else ""
+                parts.append(gate_tip or "免费次数已用完")
             out["msg"] = "；".join(parts) or (submit_err or "无可用动作")
         return out
     except Exception as e:

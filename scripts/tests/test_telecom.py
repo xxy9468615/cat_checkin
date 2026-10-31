@@ -743,6 +743,61 @@ class TestJindouExchange(unittest.TestCase):
         acc = telecom.TelecomAccount(index=1, phone="18912345678")
         return telecom.TelecomClient(acc, MagicMock())
 
+    def test_ensure_bearer_from_existing_ticket(self):
+        """authorization 为空 + 现有 ticket 可用：统一登录一次即得 Bearer，不现签。"""
+        client = self._client()
+        client.ticket = "t" * 256
+        with patch.object(client, "jindou_unified_login", return_value="tok" * 40) as m_login, \
+             patch.object(client, "mint_ticket_with_token", return_value=True) as m_mint, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            bearer = client.ensure_jindou_bearer()
+        self.assertEqual(bearer, "tok" * 40)
+        self.assertEqual(client.authorization, "tok" * 40)
+        m_login.assert_called_once()
+        m_mint.assert_not_called()
+
+    def test_ensure_bearer_mints_when_ticket_stale(self):
+        """ticket 过期（统一登录 502）+ 持有 Token 三件套：现签新 ticket 后重试换取。"""
+        acc = telecom.TelecomAccount(index=1, phone="18912345678",
+                                     app_token="V1.0ABC", uid="1000000001",
+                                     target_id="fake0000")
+        client = telecom.TelecomClient(acc, MagicMock())
+        client.ticket = "stale" * 64
+        with patch.object(client, "jindou_unified_login",
+                          side_effect=["", "fresh_bearer"]) as m_login, \
+             patch.object(client, "mint_ticket_with_token", return_value=True) as m_mint, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            bearer = client.ensure_jindou_bearer()
+        self.assertEqual(bearer, "fresh_bearer")
+        self.assertEqual(client.authorization, "fresh_bearer")
+        self.assertEqual(m_login.call_count, 2)
+        m_mint.assert_called_once()
+
+    def test_ensure_bearer_failure_stays_empty(self):
+        """统一登录与现签均失败：返回空串且不误写 authorization。"""
+        acc = telecom.TelecomAccount(index=1, phone="18912345678",
+                                     app_token="V1.0ABC", uid="1000000001",
+                                     target_id="fake0000")
+        client = telecom.TelecomClient(acc, MagicMock())
+        client.ticket = "t" * 256
+        with patch.object(client, "jindou_unified_login", return_value=""), \
+             patch.object(client, "mint_ticket_with_token", return_value=False), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            bearer = client.ensure_jindou_bearer()
+        self.assertEqual(bearer, "")
+        self.assertEqual(client.authorization, "")
+
+    def test_ensure_bearer_reuses_existing_authorization(self):
+        """已持有 authorization：直接复用，不发任何换取请求。"""
+        client = self._client()
+        client.authorization = "already_have_bearer"
+        with patch.object(client, "jindou_unified_login") as m_login, \
+             patch.object(client, "mint_ticket_with_token") as m_mint:
+            bearer = client.ensure_jindou_bearer()
+        self.assertEqual(bearer, "already_have_bearer")
+        m_login.assert_not_called()
+        m_mint.assert_not_called()
+
     def _goods(self):
         return [
             {"id": "g20", "title": "20元话费券", "amount": "16000"},

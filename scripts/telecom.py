@@ -831,6 +831,27 @@ class TelecomClient:
 
     # ---------- 金豆商城（wapact.189.cn:9001）抢兑 ----------
 
+    def ensure_jindou_bearer(self) -> str:
+        """确保持有 wapact 商城 Bearer：authorization 为空时现场换取。
+
+        转盘/抢兑链路（wapact 网关）与 jt-sign sign 无关，抓包串通常只含
+        App 长效 token/sign，authorization 为空——此前转盘直接放弃报
+        「无抽奖凭据」，抽奖从未执行过（2026-10-31 修复）。
+        链路（实测打通）：ticket → /unified/user/login 换 Bearer；
+        ticket 一次性/过期（统一登录 code=502「登录失败」）则先用 App
+        长效 token 现签新 ticket 再换。成功时写入 self.authorization。"""
+        if self.authorization:
+            return self.authorization
+        bearer = ""
+        if self.ticket:
+            bearer = self.jindou_unified_login()
+        if not bearer and self.app_token and self.uid and self.target_id:
+            if self.mint_ticket_with_token():
+                bearer = self.jindou_unified_login()
+        if bearer:
+            self.authorization = bearer
+        return bearer
+
     def _jindou_headers(self, token: str = "") -> Dict[str, str]:
         h = {"User-Agent": JINDOU_UA, "Referer": JINDOU_REFERER}
         if token:
@@ -1126,8 +1147,8 @@ def execute_telecom_task(client: TelecomClient) -> Dict[str, Any]:
                 ex_msg = ex_res.get("msg") or ex_res.get("resoultMsg") or ""
                 print(f"    [奖励] 领取累签{cont_days}天奖励: {ex_msg}", flush=True)
 
-        # 3. 免费金豆大转盘抽奖
-        if client.authorization:
+        # 3. 免费金豆大转盘抽奖（Bearer 现场换取见 ensure_jindou_bearer，2026-10-31 修复）
+        if client.ensure_jindou_bearer():
             auth_hdr = client.authorization if client.authorization.startswith("Bearer ") else f"Bearer {client.authorization}"
             tab_res = client._req(
                 "GET",
@@ -1173,7 +1194,8 @@ def execute_telecom_task(client: TelecomClient) -> Dict[str, Any]:
                 res["lottery_res"] = f"今日已抽({msg})" if "已" in msg else msg
                 print(f"    [抽奖] 转盘响应: {msg}", flush=True)
         else:
-            res["lottery_res"] = "无抽奖凭据"
+            res["lottery_res"] = "无抽奖凭据（统一登录换取 Bearer 失败）"
+            print(f"    [抽奖] {res['lottery_res']}", flush=True)
 
         # 4. 金豆日常浏览与聚合任务
         if client.sign and HAS_CRYPTO:
