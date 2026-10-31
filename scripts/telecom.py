@@ -1520,11 +1520,14 @@ def run_exchange_mode() -> int:
         print(f"\n👤 用户: 【{acc.display_name}】")
         terminal = False
         # 与 _run_account 同款出口候选：CN 家宽 → sing-box 兜底 → 直连（wapact 网关
-        # 对数据中心 IP 未实测拦截，直连保底必须入队，本地无代理时唯一可用出口）
+        # 对数据中心 IP 未实测拦截，直连保底必须入队，本地无代理时唯一可用出口）。
+        # 全队列迭代（与 _run_account 一致）——2026-10-31 10:00 场次首战复盘：三个
+        # CN 代理同时网络死亡时，[:3] 截断把直连兜底挡在门外，全场次白白错过；
+        # 死节点在各候选上的消耗仅为超时（统一登录 15s），全量迭代代价可接受。
         proxy_queue: List[Optional[ProxyEndpoint]] = list(_get_candidate_proxies())
         if None not in proxy_queue:
             proxy_queue.append(None)
-        for candidate in proxy_queue[:3]:
+        for candidate in proxy_queue:
             p_url = candidate.url if candidate else ""
             label = candidate.display_name if candidate else "直连出网"
             print(f"  🌐 正在通过 [{label}] 执行抢兑...", flush=True)
