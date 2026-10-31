@@ -168,15 +168,18 @@ class TestImusicCrypto(unittest.TestCase):
 
 def _make_server(*, token_ok=True, left_num=4, templates=2, submit_ok=True,
                  total=720, remaining=20, draw_awards=None, redeem_ok=True,
-                 transient_fails=0):
+                 transient_fails=0, gate_left=None, make_code=None):
     """构造可编排的 mock 网关与点数状态机。
 
     total/remaining 为活动点数（total 含已消耗）；每次成功制作 +20 点；
     抽奖扣 20 点并按 draw_awards 脚本循环发奖（{"awardIndex","name","points"}）；
     兑换在 remaining>=1000 且 redeem_ok 时成功扣 1000；
-    transient_fails>0 时制作提交先返回「网络异常」瞬态拒绝若干次（验证重试）。"""
-    state = {"submits": 0, "total": total, "remaining": remaining, "draws": 0, "redeems": 0,
-             "transient_left": transient_fails}
+    transient_fails>0 时制作提交先返回「网络异常」瞬态拒绝若干次（验证重试）；
+    gate_left=None 时 queryAiMakeCount 返回未知接口（驱动兜底路径），
+    否则返回该闸门计数（模拟与权益包计数不同步的真实形态）；
+    make_code 非 None 时制作提交固定返回该 code（如 10013 闸门拒绝）。"""
+    state = {"submits": 0, "make_calls": 0, "total": total, "remaining": remaining,
+             "draws": 0, "redeems": 0, "transient_left": transient_fails}
     draw_awards = draw_awards or [{"awardIndex": "16320106", "name": ""}]
 
     def login_page(query, headers):
@@ -199,6 +202,16 @@ def _make_server(*, token_ok=True, left_num=4, templates=2, submit_ok=True,
             obj = {"code": "0000", "desc": "成功",
                    "data": {"privilegeVrbtAIVideoLeftNum": left,
                             "balanceMakeTimesTip": f"当前剩余{left}次"}}
+        elif api.endswith("queryAiMakeCount"):
+            if gate_left is None:
+                # 驱动兜底路径：闸门接口不可用 → 回退权益包计数
+                obj = {"code": "1002", "desc": f"未知接口 {api}"}
+            else:
+                g = max(0, gate_left - state["submits"])
+                obj = {"code": "0000", "desc": "成功",
+                       "data": {"privilegeVrbtAIVideoLeftNum": g,
+                                "balanceMakeTimesTip": f"本月剩余{g}次，本次制作消耗1次",
+                                "monthFreeNum": g, "makeLimitState": 0}}
         elif api.endswith("getOperationCurrentIssueInfo"):
             obj = {"code": "0000", "desc": "查询成功",
                    "data": {"issueName": "第6期", "issueNumber": "ai119_6", "activityId": "ai119"}}
@@ -227,12 +240,17 @@ def _make_server(*, token_ok=True, left_num=4, templates=2, submit_ok=True,
 
     def make_api(query, headers):
         """template_make_add_v2：与 en/api 同款加解密，但 payload 无 apiName（与抓包一致）。"""
+        state["make_calls"] += 1
         params = _server_decrypt_form(query, headers)
         if state["transient_left"] > 0:
             # 「网络异常，请稍后重试」瞬态拒绝（2026-10-30 CI 实测形态）
             state["transient_left"] -= 1
             obj = {"code": "1001", "desc": "失败",
                    "data": {"success": False, "message": "网络异常，请稍后重试"}}
+            return 200, _server_encrypt_resp(headers, obj)
+        if make_code is not None:
+            # 服务端闸门拒绝（10013「网络异常，请稍后重试」为实测形态）
+            obj = {"code": make_code, "desc": "网络异常，请稍后重试"}
             return 200, _server_encrypt_resp(headers, obj)
         if submit_ok:
             state["submits"] += 1
@@ -331,6 +349,62 @@ class TestImusicFlow(unittest.TestCase):
         self.assertEqual(out["status"], "失败")
         self.assertEqual(out["videos"], 0)
         self.assertEqual(state["submits"], 0)
+
+    def test_run_gate_zero_skips_submit(self):
+        """2026-10-31 根因回归：闸门计数=0（权益包计数误报 1）→ 不发起注定被拒的提交。
+
+        第8期实测形态：queryAiMakeCount 本月剩余0次，queryAiMakePkgInfo 仍报 1，
+        旧逻辑读后者反复提交，每次被 10013「网络异常」拒绝。"""
+        server, state = _make_server(left_num=1, gate_left=0, total=800, remaining=140)
+        out = run_imusic_luck(server, "f" * 256, "13800138000")
+        self.assertEqual(state["make_calls"], 0)      # 零提交尝试
+        self.assertEqual(out["videos"], 0)
+        self.assertEqual(out["status"], "无剩余次数")
+        self.assertEqual(out["left"], 0)
+        self.assertIn("本月剩余0次", out["msg"])
+
+    def test_run_gate_reject_10013_terminal(self):
+        """10013「网络异常」= 闸门拒绝：终局化，不瞬态重试，如实上报。"""
+        server, state = _make_server(left_num=2, gate_left=2, make_code="10013",
+                                     total=800, remaining=140)
+        with patch.object(imusic.time, "sleep", lambda *_: None):
+            out = run_imusic_luck(server, "f" * 256, "13800138000")
+        self.assertEqual(state["make_calls"], 1)      # 只打一发，无重试
+        self.assertEqual(out["videos"], 0)
+        self.assertEqual(out["status"], "失败")
+        self.assertIn("10013", out["msg"])
+
+    def test_run_retry_then_gate_reject_relabel(self):
+        """CodeRabbit 评审回归：瞬态重试后返回 10013 须按闸门拒绝归类上报，
+        而非误报为网络错误（重试共 2 发后停止）。"""
+        server, state = _make_server(left_num=2, gate_left=2, transient_fails=1,
+                                     make_code="10013", total=800, remaining=140)
+        with patch.object(imusic.time, "sleep", lambda *_: None):
+            out = run_imusic_luck(server, "f" * 256, "13800138000")
+        self.assertEqual(state["make_calls"], 2)      # 首发 1001 + 退避重试 10013
+        self.assertEqual(out["videos"], 0)
+        self.assertEqual(out["status"], "失败")
+        self.assertIn("10013", out["msg"])
+        self.assertIn("闸门", out["msg"])
+
+    def test_run_gate_overrides_pkg_count(self):
+        """闸门计数优先于权益包计数：gate=2 时提交 2 次（pkgInfo 报 4 不采信）。"""
+        server, state = _make_server(left_num=4, gate_left=2, templates=3,
+                                     total=700, remaining=0)
+        with patch.object(imusic.time, "sleep", lambda *_: None):
+            out = run_imusic_luck(server, "f" * 256, "13800138000")
+        self.assertEqual(out["videos"], 2)
+        self.assertEqual(state["submits"], 2)
+        self.assertEqual(state["make_calls"], 2)
+
+    def test_run_gate_unavailable_falls_back(self):
+        """闸门接口不可用（未知接口）：回退权益包计数，行为与旧版一致。"""
+        server, state = _make_server(left_num=3, gate_left=None, templates=2,
+                                     total=700, remaining=0)
+        with patch.object(imusic.time, "sleep", lambda *_: None):
+            out = run_imusic_luck(server, "f" * 256, "13800138000")
+        self.assertEqual(out["videos"], 3)
+        self.assertEqual(state["submits"], 3)
 
     def test_run_submit_rejected(self):
         """服务端拒绝提交：立即停止并如实汇报。"""

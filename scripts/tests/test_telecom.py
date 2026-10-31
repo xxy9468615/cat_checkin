@@ -743,6 +743,125 @@ class TestJindouExchange(unittest.TestCase):
         acc = telecom.TelecomAccount(index=1, phone="18912345678")
         return telecom.TelecomClient(acc, MagicMock())
 
+    def test_ensure_bearer_from_existing_ticket(self):
+        """authorization 为空 + 现有 ticket 可用：统一登录一次即得 Bearer，不现签。"""
+        client = self._client()
+        client.ticket = "t" * 256
+        with patch.object(client, "jindou_unified_login", return_value="tok" * 40) as m_login, \
+             patch.object(client, "mint_ticket_with_token", return_value=True) as m_mint, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            bearer = client.ensure_jindou_bearer()
+        self.assertEqual(bearer, "tok" * 40)
+        self.assertEqual(client.authorization, "tok" * 40)
+        m_login.assert_called_once()
+        m_mint.assert_not_called()
+
+    def test_ensure_bearer_mints_when_ticket_stale(self):
+        """ticket 过期（统一登录 502）+ 持有 Token 三件套：现签新 ticket 后重试换取。"""
+        acc = telecom.TelecomAccount(index=1, phone="18912345678",
+                                     app_token="V1.0ABC", uid="1000000001",
+                                     target_id="fake0000")
+        client = telecom.TelecomClient(acc, MagicMock())
+        client.ticket = "stale" * 64
+        observed_tickets: list[str] = []
+
+        def login_side_effect() -> str:
+            # 记录每次统一登录时 client 实际持有的 ticket，用于断言重试已换新票
+            observed_tickets.append(client.ticket)
+            return "" if len(observed_tickets) == 1 else "fresh_bearer"
+
+        def mint_side_effect() -> bool:
+            client.ticket = "fresh_ticket"
+            return True
+
+        with patch.object(client, "jindou_unified_login",
+                          side_effect=login_side_effect) as m_login, \
+             patch.object(client, "mint_ticket_with_token",
+                          side_effect=mint_side_effect) as m_mint, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            bearer = client.ensure_jindou_bearer()
+        self.assertEqual(bearer, "fresh_bearer")
+        self.assertEqual(client.authorization, "fresh_bearer")
+        self.assertEqual(m_login.call_count, 2)
+        self.assertEqual(observed_tickets, ["stale" * 64, "fresh_ticket"])
+        m_mint.assert_called_once()
+
+    def test_ensure_bearer_failure_stays_empty(self):
+        """统一登录与现签均失败：返回空串且不误写 authorization。"""
+        acc = telecom.TelecomAccount(index=1, phone="18912345678",
+                                     app_token="V1.0ABC", uid="1000000001",
+                                     target_id="fake0000")
+        client = telecom.TelecomClient(acc, MagicMock())
+        client.ticket = "t" * 256
+        with patch.object(client, "jindou_unified_login", return_value=""), \
+             patch.object(client, "mint_ticket_with_token", return_value=False), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            bearer = client.ensure_jindou_bearer()
+        self.assertEqual(bearer, "")
+        self.assertEqual(client.authorization, "")
+
+    def test_ensure_bearer_reuses_existing_authorization(self):
+        """已持有 authorization：直接复用，不发任何换取请求。"""
+        client = self._client()
+        client.authorization = "already_have_bearer"
+        with patch.object(client, "jindou_unified_login") as m_login, \
+             patch.object(client, "mint_ticket_with_token") as m_mint:
+            bearer = client.ensure_jindou_bearer()
+        self.assertEqual(bearer, "already_have_bearer")
+        m_login.assert_not_called()
+        m_mint.assert_not_called()
+
+    # ---------- 转盘 Bearer 自愈（CodeRabbit 评审指认：状态缓存旧 Bearer 失效） ----------
+
+    def test_turntable_auth_reject_refreshes_and_retries_once(self):
+        """queryTurnTable 鉴权拒绝：清空 authorization 现场重取，重试一次后成功。"""
+        client = self._client()
+        calls = []
+
+        def fake_req(method, url, headers=None, **kw):
+            calls.append(headers.get("Authorization"))
+            if len(calls) == 1:
+                return {"code": 401, "msg": "HTTP 401"}   # 旧 Bearer 失效
+            return {"code": 0, "message": "成功", "biz": {"wzTurntable": {"code": "act1"}}}
+
+        client.authorization = "stale_bearer"
+        with patch.object(client, "ensure_jindou_bearer",
+                          side_effect=["stale_bearer", "fresh_bearer"]), \
+             patch.object(client, "_req", side_effect=fake_req):
+            res = client.jindou_query_turntable()
+        self.assertEqual(res.get("code"), 0)
+        self.assertEqual(client.authorization, "fresh_bearer")
+        self.assertEqual(calls, ["Bearer stale_bearer", "Bearer fresh_bearer"])
+
+    def test_turntable_non_auth_failure_no_retry(self):
+        """非鉴权类失败（业务错误）：不重试，单发原路返回。"""
+        client = self._client()
+        client.authorization = "bearer_ok"
+        with patch.object(client, "ensure_jindou_bearer", return_value="bearer_ok"), \
+             patch.object(client, "_req",
+                          return_value={"code": 5, "msg": "系统错误"}) as m_req:
+            res = client.jindou_query_turntable()
+        self.assertEqual(res.get("code"), 5)
+        m_req.assert_called_once()
+
+    def test_is_auth_reject_detects_transport_status(self):
+        """_req 透出的 _http_status（body 带非空 JSON 时 HTTP 状态不丢）可判定鉴权拒绝。"""
+        self.assertTrue(telecom.TelecomClient._is_auth_reject(
+            {"code": 0, "message": "Unauthorized", "_http_status": 401}))
+        self.assertTrue(telecom.TelecomClient._is_auth_reject({"code": 403}))
+        self.assertFalse(telecom.TelecomClient._is_auth_reject(
+            {"code": 5, "msg": "系统错误", "_http_status": 200}))
+        self.assertFalse(telecom.TelecomClient._is_auth_reject({"code": 999999}))
+
+    def test_turntable_no_bearer_short_circuits(self):
+        """换取 Bearer 失败：短路返回，不打转盘请求。"""
+        client = self._client()
+        with patch.object(client, "ensure_jindou_bearer", return_value=""), \
+             patch.object(client, "_req") as m_req:
+            res = client.jindou_query_turntable()
+        self.assertNotEqual(res.get("code"), 0)
+        m_req.assert_not_called()
+
     def _goods(self):
         return [
             {"id": "g20", "title": "20元话费券", "amount": "16000"},
