@@ -527,6 +527,9 @@ def run_imusic_luck(http: Any, ticket: str, phone: str = "") -> Dict[str, Any]:
                 if not ok and not is_gate_reject and _is_transient(err):
                     time.sleep(random.uniform(3.0, 5.0))
                     ok, res_full, err = _submit_once(template)
+                    # 重试响应同样要按闸门拒绝归类（CodeRabbit 评审：重试 10013
+                    # 曾被误报为网络错误）
+                    is_gate_reject = str(res_full.get("code")) == "10013"
                 if ok:
                     submitted += 1
                     print(f"    [imusic] 提交生成#{submitted}: "
@@ -600,9 +603,11 @@ def run_imusic_luck(http: Any, ticket: str, phone: str = "") -> Dict[str, Any]:
         except (TypeError, ValueError):
             out["gain"] = 0
         if cnt_data and submitted > 0:
-            # 有提交才重读闸门计数（真实消耗）；闸门=0 时权益包计数无参考价值
+            # 有提交才重读闸门计数（真实消耗）；闸门=0 时权益包计数无参考价值。
+            # data 可能为 null：用 `or {}` 归一（.get("data", {}) 在键存在且为
+            # null 时返回 None，链式 .get 抛 AttributeError 会把成功运行标成失败）
             try:
-                out["left"] = int(client.get_make_count().get("data", {}).get(
+                out["left"] = int((client.get_make_count().get("data") or {}).get(
                     "privilegeVrbtAIVideoLeftNum"))
             except (TypeError, ValueError):
                 pass

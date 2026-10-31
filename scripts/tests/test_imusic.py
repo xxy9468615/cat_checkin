@@ -242,15 +242,15 @@ def _make_server(*, token_ok=True, left_num=4, templates=2, submit_ok=True,
         """template_make_add_v2：与 en/api 同款加解密，但 payload 无 apiName（与抓包一致）。"""
         state["make_calls"] += 1
         params = _server_decrypt_form(query, headers)
-        if make_code is not None:
-            # 服务端闸门拒绝（10013「网络异常，请稍后重试」为实测形态）
-            obj = {"code": make_code, "desc": "网络异常，请稍后重试"}
-            return 200, _server_encrypt_resp(headers, obj)
         if state["transient_left"] > 0:
             # 「网络异常，请稍后重试」瞬态拒绝（2026-10-30 CI 实测形态）
             state["transient_left"] -= 1
             obj = {"code": "1001", "desc": "失败",
                    "data": {"success": False, "message": "网络异常，请稍后重试"}}
+            return 200, _server_encrypt_resp(headers, obj)
+        if make_code is not None:
+            # 服务端闸门拒绝（10013「网络异常，请稍后重试」为实测形态）
+            obj = {"code": make_code, "desc": "网络异常，请稍后重试"}
             return 200, _server_encrypt_resp(headers, obj)
         if submit_ok:
             state["submits"] += 1
@@ -373,6 +373,19 @@ class TestImusicFlow(unittest.TestCase):
         self.assertEqual(out["videos"], 0)
         self.assertEqual(out["status"], "失败")
         self.assertIn("10013", out["msg"])
+
+    def test_run_retry_then_gate_reject_relabel(self):
+        """CodeRabbit 评审回归：瞬态重试后返回 10013 须按闸门拒绝归类上报，
+        而非误报为网络错误（重试共 2 发后停止）。"""
+        server, state = _make_server(left_num=2, gate_left=2, transient_fails=1,
+                                     make_code="10013", total=800, remaining=140)
+        with patch.object(imusic.time, "sleep", lambda *_: None):
+            out = run_imusic_luck(server, "f" * 256, "13800138000")
+        self.assertEqual(state["make_calls"], 2)      # 首发 1001 + 退避重试 10013
+        self.assertEqual(out["videos"], 0)
+        self.assertEqual(out["status"], "失败")
+        self.assertIn("10013", out["msg"])
+        self.assertIn("闸门", out["msg"])
 
     def test_run_gate_overrides_pkg_count(self):
         """闸门计数优先于权益包计数：gate=2 时提交 2 次（pkgInfo 报 4 不采信）。"""

@@ -921,6 +921,41 @@ class TelecomClient:
             return [], ""
         return None, str(data.get("message") or f"code={data.get('code')}")
 
+    @staticmethod
+    def _is_auth_reject(res: Dict[str, Any]) -> bool:
+        """网关响应是否为 Bearer 鉴权类拒绝（HTTP 401/403 或登录态文案）。"""
+        if res.get("code") in (401, 403, "401", "403"):
+            return True
+        msg = str(res.get("msg") or res.get("message") or res.get("resoultMsg") or "")
+        return any(k in msg for k in ("登录", "失效", "过期", "未授权", "token", "Token"))
+
+    def jindou_query_turntable(self) -> Dict[str, Any]:
+        """转盘活动查询（ensure_jindou_bearer 取 Bearer；鉴权拒绝自愈一次）。
+
+        状态缓存恢复的 authorization 可能已过期：ensure 会直接复用旧值，导致
+        queryTurnTable 鉴权失败且同一失效 Bearer 被反复持久化（评审指认）。
+        故鉴权类拒绝时清空 authorization 现场重取，再试一次；其余失败走原路。"""
+        if not self.ensure_jindou_bearer():
+            return {"code": -1, "msg": "无可用商城 Bearer"}
+        for attempt in range(2):
+            url = (f"https://wapact.189.cn:9001/gateway/golden/api/queryTurnTable"
+                   f"?userType=1&_={int(time.time() * 1000)}")
+            res = self._req("GET", url, headers={
+                "Authorization": (self.authorization
+                                  if self.authorization.startswith("Bearer ")
+                                  else f"Bearer {self.authorization}"),
+            })
+            if res.get("code") == 0 or not self._is_auth_reject(res):
+                return res
+            if attempt == 0:
+                self.authorization = ""
+                bearer = self.ensure_jindou_bearer()
+                if not bearer:
+                    return res
+                self.authorization = bearer
+                print("    [抽奖] Bearer 鉴权被拒，已现场重取并重试一次", flush=True)
+        return res
+
     def jindou_exchange_once(self, token: str, activity_id: str) -> Dict[str, str]:
         """提交一次兑换，返回归一化 {code, result_code, message}。"""
         res = self.http.request(
@@ -1147,14 +1182,10 @@ def execute_telecom_task(client: TelecomClient) -> Dict[str, Any]:
                 ex_msg = ex_res.get("msg") or ex_res.get("resoultMsg") or ""
                 print(f"    [奖励] 领取累签{cont_days}天奖励: {ex_msg}", flush=True)
 
-        # 3. 免费金豆大转盘抽奖（Bearer 现场换取见 ensure_jindou_bearer，2026-10-31 修复）
-        if client.ensure_jindou_bearer():
+        # 3. 免费金豆大转盘抽奖（Bearer 现场换取 + 鉴权失败自愈见 jindou_query_turntable）
+        tab_res = client.jindou_query_turntable()
+        if client.authorization and tab_res:
             auth_hdr = client.authorization if client.authorization.startswith("Bearer ") else f"Bearer {client.authorization}"
-            tab_res = client._req(
-                "GET",
-                f"https://wapact.189.cn:9001/gateway/golden/api/queryTurnTable?userType=1&_={int(time.time()*1000)}",
-                headers={"Authorization": auth_hdr},
-            )
             if tab_res.get("code") == 0 and tab_res.get("biz", {}).get("wzTurntable", {}).get("code"):
                 act_id = tab_res["biz"]["wzTurntable"]["code"]
                 chk_res = client._req(
@@ -1531,7 +1562,10 @@ def run_exchange_mode() -> int:
             p_url = candidate.url if candidate else ""
             label = candidate.display_name if candidate else "直连出网"
             print(f"  🌐 正在通过 [{label}] 执行抢兑...", flush=True)
-            http = Http(task_name="TELECOM", proxy=p_url, follow_redirects=True, impersonate="chrome124")
+            # 直连候选必须禁用 Http 的任务代理推断，否则「直连出网」会把已失败的
+            # TELECOM_PROXY 首选捡回来（CodeRabbit 评审 + 2026-10-31 场次首战复盘）
+            http = Http(task_name="TELECOM", proxy=p_url, follow_redirects=True,
+                        impersonate="chrome124", infer_proxy=bool(candidate))
             client = TelecomClient(acc, http)
             if not client.prepare_auth():
                 # 现签失败多为出口网络问题（死节点吃满超时），换下一候选而非放弃
@@ -1575,8 +1609,10 @@ def _run_account(acc: TelecomAccount) -> Tuple[bool, Dict[str, Any]]:
             print(f"  🌐 正在通过 [直连出网] 建立连接...", flush=True)
 
         # Chrome TLS 指纹模拟：wappark 的 WAF 对数据中心/被标记 IP 上的 urllib 裸指纹
-        # 返回 412（2026-09-19 CI 实测），与 smzdm 同款解法；本地家宽直连不受影响
-        http = Http(task_name="TELECOM", proxy=p_url, follow_redirects=True, impersonate="chrome124")
+        # 返回 412（2026-09-19 CI 实测），与 smzdm 同款解法；本地家宽直连不受影响。
+        # 直连候选禁用任务代理推断（同 run_exchange_mode，评审指认）
+        http = Http(task_name="TELECOM", proxy=p_url, follow_redirects=True,
+                    impersonate="chrome124", infer_proxy=bool(candidate))
         client = TelecomClient(acc, http)
         outcome = execute_telecom_task(client)
         last_outcome = outcome

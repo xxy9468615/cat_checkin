@@ -106,7 +106,7 @@ class TestCloud189(unittest.TestCase):
         ep2.url = "http://127.0.0.1:8888"
         created = []
 
-        def fake_http(follow_redirects=True, proxy=""):
+        def fake_http(follow_redirects=True, proxy="", infer_proxy=True):
             h = MagicMock()
             h.url = proxy
             created.append((proxy, h))

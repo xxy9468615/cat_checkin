@@ -216,6 +216,7 @@ class Http:
         proxy: Union[str, ProxyEndpoint] = "",
         task_name: str = "",
         impersonate: str = "",
+        infer_proxy: bool = True,
     ):
         # 浏览器 TLS/HTTP2 指纹模拟（如 "chrome124"），走 curl_cffi 发起请求，
         # 绕过 Aliyun WAF 等对 urllib 裸 TLS 指纹的识别。空串 = 保持纯 urllib 链路。
@@ -238,8 +239,10 @@ class Http:
         if not follow_redirects:
             handlers.insert(0, NoRedirectHandler())
 
-        # 原生任务代理能力自适应：若未显式传 proxy，自动探测任务环境配置
-        if not proxy:
+        # 原生任务代理能力自适应：若未显式传 proxy，自动探测任务环境配置。
+        # infer_proxy=False 显式禁用推断——出口轮换的「直连出网」候选必须走真直连，
+        # 否则推断会把已失败的任务代理捡回来（2026-10-31 场次首战复盘 + 评审修正）
+        if not proxy and infer_proxy:
             inferred_task = task_name
             if not inferred_task and sys.argv and sys.argv[0]:
                 stem = Path(sys.argv[0]).stem

@@ -391,7 +391,10 @@ def _run_one(idx: int, total: int, username: str, password: str,
     for candidate in proxy_queue:
         p_name = candidate.display_name if candidate else "直连出网"
         print(f"  🌐 正在通过 CN 出口 [{p_name}] 建立连接...", flush=True)
-        h = Http(follow_redirects=True, proxy=candidate.url if candidate else "")
+        # 直连候选禁用 Http 任务代理推断：否则会按脚本名捡回已失败的 CLOUD189 代理，
+        # 「直连出网」名不副实（telecom 同款问题，评审指认后统一修正）
+        h = Http(follow_redirects=True, proxy=candidate.url if candidate else "",
+                 infer_proxy=bool(candidate))
         try:
             if username and password:
                 sk = _login(h, username, password)
