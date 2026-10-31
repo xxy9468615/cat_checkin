@@ -352,8 +352,8 @@ class TestTelecom(unittest.TestCase):
         from common import Response
 
         acc = telecom.TelecomAccount(
-            index=1, phone="17762551109",
-            app_token="V1.0ABC", uid="3998477332", target_id="598d2606",
+            index=1, phone="13800138000",
+            app_token="V1.0ABC", uid="1000000001", target_id="fake0000",
         )
         mock_http = MagicMock()
         mock_http.request = MagicMock(return_value=Response(-1, None, b"", "url"))
@@ -430,9 +430,9 @@ class TestTelecom(unittest.TestCase):
     def test_token_only_account_passes_credential_filter(self):
         """仅持 token 三件套的账号必须被 load_all_accounts/has_credentials 认可（CI 回归）。"""
         acc = telecom._parse_account_config(
-            "phone=17762551109; "
-            "token=V1.0KonaH//Utf5WqBO3dyQTy0r9KIhQrXAAZq5cSpJGz6q3tIVYtEJ8ArF7TUOqAsfFjZHpk=; "
-            "uid=3998477332; target=598d26069a564aeb4e5c6a25c25d77d9641cc4800bcc5886",
+            "phone=13800138000; "
+            "token=V1.0FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE; "
+            "uid=1000000001; target=deadbeefcafebabe0123456789abcdef00",
             1,
         )
         self.assertTrue(acc.has_credentials())
@@ -440,27 +440,27 @@ class TestTelecom(unittest.TestCase):
     def test_parse_token_triple(self):
         """App 长效 Token 三件套（token/uid/target）解析。"""
         acc = telecom._parse_account_config(
-            "phone=17762551109; "
-            "token=V1.0KonaH//Utf5WqBO3dyQTy0r9KIhQrXAAZq5cSpJGz6q3tIVYtEJ8ArF7TUOqAsfFjZHpk=; "
-            "uid=3998477332; "
-            "target=598d26069a564aeb4e5c6a25c25d77d9641cc4800bcc5886",
+            "phone=13800138000; "
+            "token=V1.0FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE; "
+            "uid=1000000001; "
+            "target=deadbeefcafebabe0123456789abcdef00",
             1,
         )
-        self.assertEqual(acc.phone, "17762551109")
+        self.assertEqual(acc.phone, "13800138000")
         self.assertTrue(acc.app_token.startswith("V1.0"))
-        self.assertEqual(acc.uid, "3998477332")
-        self.assertEqual(acc.target_id, "598d26069a564aeb4e5c6a25c25d77d9641cc4800bcc5886")
+        self.assertEqual(acc.uid, "1000000001")
+        self.assertEqual(acc.target_id, "deadbeefcafebabe0123456789abcdef00")
         # token 不得被误吞为 authorization
         self.assertEqual(acc.authorization, "")
 
     def test_build_getsingle_xml(self):
         """getSingle XML 模板必须与 App 抓包结构一致（UserLoginName 带尾分号）。"""
-        xml = telecom._build_getsingle_xml("V1.0ABC", "3998477332", "598d2606", "20260919020000")
+        xml = telecom._build_getsingle_xml("V1.0ABC", "1000000001", "fake0000", "20260919020000")
         self.assertIn("<Code>getSingle</Code>", xml)
         self.assertIn("<Timestamp>20260919020000</Timestamp>", xml)
         self.assertIn("<Token>V1.0ABC</Token>", xml)
-        self.assertIn("<UserLoginName>3998477332;</UserLoginName>", xml)
-        self.assertIn("<TargetId>598d2606</TargetId>", xml)
+        self.assertIn("<UserLoginName>1000000001;</UserLoginName>", xml)
+        self.assertIn("<TargetId>fake0000</TargetId>", xml)
         self.assertIn("<SourcePassword>Sid98s</SourcePassword>", xml)
 
     def test_mint_ticket_with_token(self):
@@ -482,8 +482,8 @@ class TestTelecom(unittest.TestCase):
         )
 
         acc = telecom.TelecomAccount(
-            index=1, phone="17762551109",
-            app_token="V1.0ABC", uid="3998477332", target_id="598d2606",
+            index=1, phone="13800138000",
+            app_token="V1.0ABC", uid="1000000001", target_id="fake0000",
         )
         mock_http = MagicMock()
         mock_http.request = MagicMock(return_value=Response(200, None, xml_resp.encode(), "url"))
@@ -498,8 +498,8 @@ class TestTelecom(unittest.TestCase):
     def test_prepare_auth_mints_fresh_session_over_stale_cache(self):
         """持有 Token 三件套时必须先现签：陈旧缓存 sign 不得抢跑（wappark 对死会话 412 短路）。"""
         acc = telecom.TelecomAccount(
-            index=1, phone="17762551109",
-            app_token="V1.0ABC", uid="3998477332", target_id="598d2606",
+            index=1, phone="13800138000",
+            app_token="V1.0ABC", uid="1000000001", target_id="fake0000",
         )
         client = telecom.TelecomClient(acc, MagicMock())
         client.sign = "stale_sign_from_2_days_ago_12345678"
@@ -520,8 +520,8 @@ class TestTelecom(unittest.TestCase):
     def test_prepare_auth_preserves_header_provided_cookie(self):
         """用户 HEADER 抓包提供的 cookie（非缓存来源）不得被清理。"""
         acc = telecom.TelecomAccount(
-            index=1, phone="17762551109",
-            app_token="V1.0ABC", uid="3998477332", target_id="598d2606",
+            index=1, phone="13800138000",
+            app_token="V1.0ABC", uid="1000000001", target_id="fake0000",
         )
         client = telecom.TelecomClient(acc, MagicMock())
         client.cookie = "cookie_from_header_capture=1"
@@ -536,8 +536,8 @@ class TestTelecom(unittest.TestCase):
     def test_prepare_auth_falls_back_to_cached_sign_when_mint_fails(self):
         """现签失败（如 Token 过期）时回退缓存 sign，不再重复换票。"""
         acc = telecom.TelecomAccount(
-            index=1, phone="17762551109",
-            app_token="V1.0ABC", uid="3998477332", target_id="598d2606",
+            index=1, phone="13800138000",
+            app_token="V1.0ABC", uid="1000000001", target_id="fake0000",
         )
         client = telecom.TelecomClient(acc, MagicMock())
         client.sign = "cached_sign_still_valid_1234567890"
@@ -554,8 +554,8 @@ class TestTelecom(unittest.TestCase):
     def test_prepare_auth_uses_cached_ticket_when_mint_fails_without_sign(self):
         """现签失败且无缓存 sign 时，回退缓存 ticket 换票老路。"""
         acc = telecom.TelecomAccount(
-            index=1, phone="17762551109",
-            app_token="V1.0ABC", uid="3998477332", target_id="598d2606",
+            index=1, phone="13800138000",
+            app_token="V1.0ABC", uid="1000000001", target_id="fake0000",
         )
         client = telecom.TelecomClient(acc, MagicMock())
         client.ticket = "c" * 256
@@ -569,7 +569,7 @@ class TestTelecom(unittest.TestCase):
 
     def test_prepare_auth_without_token_keeps_legacy_order(self):
         """无 Token 三件套的老配置（ticket 路线）不受影响：缓存 ticket 照常换票。"""
-        acc = telecom.TelecomAccount(index=1, phone="17762551109")
+        acc = telecom.TelecomAccount(index=1, phone="13800138000")
         client = telecom.TelecomClient(acc, MagicMock())
         client.ticket = "c" * 256
         with patch.object(client, "restore_cached_session", return_value=True), \
@@ -581,7 +581,7 @@ class TestTelecom(unittest.TestCase):
 
     def test_restore_cached_session_rejects_truncated_ua(self):
         """状态恢复的截断 UA 必须弃用（wappark WAF 对非完整浏览器 UA 一律 412）。"""
-        acc = telecom.TelecomAccount(index=1, phone="17762551109")
+        acc = telecom.TelecomAccount(index=1, phone="13800138000")
         client = telecom.TelecomClient(acc, MagicMock())
         state = {
             "sign": "s" * 32,
@@ -596,7 +596,7 @@ class TestTelecom(unittest.TestCase):
 
     def test_restore_cached_session_accepts_full_ua(self):
         """完整浏览器 UA（Mozilla+AppleWebKit+Safari）应正常恢复采用。"""
-        acc = telecom.TelecomAccount(index=1, phone="17762551109")
+        acc = telecom.TelecomAccount(index=1, phone="13800138000")
         client = telecom.TelecomClient(acc, MagicMock())
         ua = ("Mozilla/5.0 (Linux; U; Android 12; zh-cn) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Version/4.0 Mobile Safari/537.36 CtClient;10.4.1")
