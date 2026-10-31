@@ -1,0 +1,67 @@
+name: Support Ticket Watch (refs/pull GC)
+
+# GitHub Support 工单跟踪（手机号 PII 历史清理，2026-10-31 提交）：
+# 工单诉求 = 删除 refs/pull/1-5/head + 服务端 GC。办结信号 = 这些 ref 从远端
+# 消失（工单系统无 API，远端 ref 是唯一可编程的办结信号）。
+# 每 6 小时探测一次：
+#   - refs 消失 → Discord 通知「办结」一次（Upstash 去重），此后静默
+#   - 超过 3 天（2026-11-03 15:30 UTC）仍未办结 → 每天一次 Discord 催单提醒
+# 工单闭环后本工作流可手动 disable（Actions 页面操作）。
+
+on:
+  schedule:
+    - cron: "30 */6 * * *" # 00:30/06:30/12:30/18:30 UTC = 08:30/14:30/20:30/02:30 BJT
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe refs/pull/1-5 and notify
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          UPSTASH_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          DEADLINE_UTC: "2026-11-03T15:30:00Z" # 提交时刻 + 3 天
+        run: |
+          set -euo pipefail
+          n=$(git ls-remote https://github.com/xxy9468615/cat_checkin.git \
+              | grep -cE "refs/pull/[1-5]/head" || true)
+          echo "refs/pull/1-5 remaining: $n"
+
+          redis() {
+            curl -sf -X POST "$UPSTASH_URL/$1" \
+              -H "Authorization: Bearer $UPSTASH_TOKEN" ${2:+-d "$2"} \
+              | jq -r '.result // ""'
+          }
+          notify() {
+            [ -n "$DISCORD_WEBHOOK_URL" ] || { echo "[no webhook] $1"; return 0; }
+            jq -n --arg c "$1" '{content: $c}' \
+              | curl -sf -X POST "$DISCORD_WEBHOOK_URL" \
+                  -H "Content-Type: application/json" -d @- > /dev/null
+          }
+
+          if [ "$n" -eq 0 ]; then
+            if [ -z "$(redis get cat_checkin:state:notify:support_gc_done || true)" ]; then
+              notify "✅ **Support 工单办结**：refs/pull/1-5 已被移除，服务端 GC 生效——手机号旧历史不再可按 SHA 获取。可到 Actions 页面 disable 本工作流。"
+              redis set cat_checkin:state:notify:support_gc_done "1" > /dev/null || true
+            fi
+            echo "resolved"
+            exit 0
+          fi
+
+          now=$(date -u +%s)
+          dl=$(date -u -d "$DEADLINE_UTC" +%s)
+          if [ "$now" -ge "$dl" ]; then
+            today=$(date -u +%m%d)
+            ping_key="cat_checkin:state:notify:support_gc_ping_$today"
+            if [ -z "$(redis get "$ping_key" || true)" ]; then
+              notify "⏰ **Support 工单超 3 天未办结**（refs/pull/1-5 仍在，共 $n 个）。建议：回原工单追加一条 status ping（强调手机号 PII 正在造成持续钓鱼骚扰，请求优先处理），或重新提交并引用原工单号。"
+              redis set "$ping_key" "1" > /dev/null || true
+            fi
+          fi
+          echo "pending"
