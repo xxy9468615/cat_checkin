@@ -177,6 +177,7 @@ def _run_account(cookie: str, idx: int, total: int) -> Tuple[bool, str]:
     state_file = f".aistudio_state_{idx}.json"
     learned = cv.learn_from_jar(h.jar, credential_match=lambda n: n.startswith("BDUSS"))
     tracked = cv.update_state(load_kv_state(redis_key, state_file) or {}, cookie, learned)
+    cv.mark_ok(tracked)  # 成功运行日入账（无解析有效期凭据按执行天数反推寿命）
     validity_tag = cv.tag_for(
         cookie, tracked, learned, credential_match=lambda n: n.startswith("BDUSS")
     )

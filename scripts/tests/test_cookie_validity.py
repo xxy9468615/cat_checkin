@@ -222,11 +222,13 @@ class TestBuildTag(unittest.TestCase):
         st2 = {"first_seen_ts": NOW - 50 * DAY}
         tag2 = cv.build_tag(st2, fallback_lifetime_days=45, now=NOW)
         self.assertIn("有效期未知", tag2)
-        self.assertIn("已使用 50 天", tag2)
+        self.assertIn("已成功运行 50 天", tag2)  # 2026-10-31 口径：成功运行天数
+        self.assertIn("超出 45 天估算窗口", tag2)
+        self.assertIn("建议预防性更新", tag2)
 
     def test_unknown_with_usage(self):
         tag = cv.build_tag({"first_seen_ts": NOW - 9 * DAY}, now=NOW)
-        self.assertIn("🔑 Cookie 有效期未知（已使用 9 天", tag)
+        self.assertIn("🔑 Cookie 有效期未知（已成功运行 9 天", tag)  # 有 first_seen 时按天数近似
         self.assertNotIn("剩余", tag)
 
     def test_stale_evidence_ignored(self):

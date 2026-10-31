@@ -160,7 +160,10 @@ def _save_state(
     }
     if tracked:
         payload.update(
-            {k: tracked[k] for k in ("cookie_md5", "first_seen_ts", "cookie_expire_ts") if tracked.get(k)}
+            # ok_* 键：成功运行日跟踪（无解析有效期凭据按执行天数反推寿命，见 cookie_validity.mark_ok）
+            {k: tracked[k] for k in ("cookie_md5", "first_seen_ts", "cookie_expire_ts",
+                                     "ok_days_total", "ok_dates", "ok_first_date", "ok_last_date")
+             if tracked.get(k)}
         )
     save_kv_state(redis_key, state_file, payload)
 
@@ -269,6 +272,7 @@ def _run_one(raw_cookie: str, auth: str, idx: int = 1, total: int = 1) -> str:
     merged = _merge_cookies(base, h.jar)
     learned = cv.learn_from_jar(h.jar)
     tracked = cv.update_state(dict(saved), merged, learned)
+    cv.mark_ok(tracked)  # 成功运行日入账（无解析有效期凭据按执行天数反推寿命）
     try:
         _save_state(redis_key, state_file, merged, env_hash, tracked)
     except Exception as exc:

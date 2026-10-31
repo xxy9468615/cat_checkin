@@ -420,6 +420,7 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
         try:
             merged_cookie = _merge_cookie_str(cur_cookie, collected_set_cookies) if collected_set_cookies else cur_cookie
             tracked = cv.update_state(dict(state), merged_cookie, learned)
+            cv.mark_ok(tracked)  # 成功运行日入账（无解析有效期凭据按执行天数反推寿命）
             save_kv_state(
                 redis_key,
                 state_file,
@@ -434,6 +435,11 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
                     "cookie_md5": tracked.get("cookie_md5", ""),
                     "first_seen_ts": tracked.get("first_seen_ts") or int(state.get("saved_ts") or time.time()),
                     "cookie_expire_ts": tracked.get("cookie_expire_ts", ""),
+                    # ok_* 键：成功运行日跟踪（cookie_validity.mark_ok，反推寿命依据）
+                    "ok_first_date": tracked.get("ok_first_date") or "",
+                    "ok_last_date": tracked.get("ok_last_date") or "",
+                    "ok_days_total": tracked.get("ok_days_total") or 0,
+                    "ok_dates": tracked.get("ok_dates") or [],
                     "updated_at": datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S"),
                 },
             )

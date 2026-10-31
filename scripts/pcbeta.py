@@ -192,6 +192,7 @@ def _run_one(acc: Dict[str, Optional[str]], idx: int, total: int) -> Tuple[bool,
     tracked = cv.update_state(
         load_kv_state(redis_key, state_file) or {}, cookie or "", learned
     )
+    cv.mark_ok(tracked)  # 成功运行日入账（无解析有效期凭据按执行天数反推寿命）
     validity_tag = cv.tag_for(
         cookie or "", tracked, learned, credential_match=AUTH_COOKIE_RE.match
     )

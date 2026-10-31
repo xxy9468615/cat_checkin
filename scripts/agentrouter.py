@@ -460,6 +460,7 @@ def _run_one(idx: int, total: int, account: dict, base: str) -> str:
         cv_key = f"cv:{user_tag}"
         learned = cv.learn_from_jar(h.jar, credential_match=cred_match)
         tracked = cv.update_state(state.get(cv_key) or {}, session, learned)
+        cv.mark_ok(tracked)  # 成功运行日入账（无解析有效期凭据按执行天数反推寿命）
         state[cv_key] = tracked
         try:
             _save_state(state)
