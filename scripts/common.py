@@ -241,7 +241,13 @@ class Http:
 
         # 原生任务代理能力自适应：若未显式传 proxy，自动探测任务环境配置。
         # infer_proxy=False 显式禁用推断——出口轮换的「直连出网」候选必须走真直连，
-        # 否则推断会把已失败的任务代理捡回来（2026-10-31 场次首战复盘 + 评审修正）
+        # 否则推断会把已失败的任务代理捡回来（2026-10-31 场次首战复盘 + 评审修正）。
+        # 直连模式同时屏蔽环境变量代理（HTTPS_PROXY 等）：urllib 默认 ProxyHandler
+        # 读环境、curl_cffi/libcurl 未显式指定代理时同样回退环境变量——「直连」必须
+        # 两端都掐掉环境代理，否则环境代理一死直连兜底跟着死（评审指认）。
+        self.direct_no_env_proxy = bool(not proxy and not infer_proxy)
+        if self.direct_no_env_proxy:
+            handlers.insert(0, urllib.request.ProxyHandler({}))
         if not proxy and infer_proxy:
             inferred_task = task_name
             if not inferred_task and sys.argv and sys.argv[0]:
@@ -406,8 +412,11 @@ class Http:
 
         from curl_cffi import requests as cr
         sess_kwargs = {"impersonate": self.impersonate, "timeout": timeout}
+        # 直连模式：显式空代理串 = libcurl CURLOPT_PROXY ""，掐掉环境变量代理
+        if getattr(self, "direct_no_env_proxy", False):
+            sess_kwargs["proxies"] = {"http": "", "https": ""}
         # 代理出口：优先走具体的 ProxyEndpoint（含 socks5/http），与 urllib 链路一致
-        if getattr(self, "proxy_endpoint", None):
+        elif getattr(self, "proxy_endpoint", None):
             sess_kwargs["proxies"] = {
                 "http": self.proxy_endpoint.url,
                 "https": self.proxy_endpoint.url,

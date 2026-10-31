@@ -831,6 +831,15 @@ class TestJindouExchange(unittest.TestCase):
         self.assertEqual(res.get("code"), 5)
         m_req.assert_called_once()
 
+    def test_is_auth_reject_detects_transport_status(self):
+        """_req 透出的 _http_status（body 带非空 JSON 时 HTTP 状态不丢）可判定鉴权拒绝。"""
+        self.assertTrue(telecom.TelecomClient._is_auth_reject(
+            {"code": 0, "message": "Unauthorized", "_http_status": 401}))
+        self.assertTrue(telecom.TelecomClient._is_auth_reject({"code": 403}))
+        self.assertFalse(telecom.TelecomClient._is_auth_reject(
+            {"code": 5, "msg": "系统错误", "_http_status": 200}))
+        self.assertFalse(telecom.TelecomClient._is_auth_reject({"code": 999999}))
+
     def test_turntable_no_bearer_short_circuits(self):
         """换取 Bearer 失败：短路返回，不打转盘请求。"""
         client = self._client()

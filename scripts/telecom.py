@@ -574,6 +574,10 @@ class TelecomClient:
             data_dict = resp.json({}) if isinstance(resp.json({}), dict) else {}
             if resp.code != 200 and not data_dict:
                 return {"code": resp.code, "msg": f"HTTP {resp.code}", "_http_error": True}
+            if resp.code != 200:
+                # 传输层状态随响应透出（body 非 JSON 形态时 code 字段可能是业务码，
+                # HTTP 401/403 会丢——鉴权判定需要它，见 _is_auth_reject）
+                data_dict["_http_status"] = resp.code
             return data_dict
         except Exception as err:
             if os.getenv("DEBUG"):
@@ -923,8 +927,12 @@ class TelecomClient:
 
     @staticmethod
     def _is_auth_reject(res: Dict[str, Any]) -> bool:
-        """网关响应是否为 Bearer 鉴权类拒绝（HTTP 401/403 或登录态文案）。"""
-        if res.get("code") in (401, 403, "401", "403"):
+        """网关响应是否为 Bearer 鉴权类拒绝（HTTP 401/403 或登录态文案）。
+
+        _req 对非 200 且带 JSON body 的响应会附 _http_status（业务 code 字段
+        可能盖住传输层状态），两处都要查。"""
+        if res.get("code") in (401, 403, "401", "403") or \
+                res.get("_http_status") in (401, 403):
             return True
         msg = str(res.get("msg") or res.get("message") or res.get("resoultMsg") or "")
         return any(k in msg for k in ("登录", "失效", "过期", "未授权", "token", "Token"))

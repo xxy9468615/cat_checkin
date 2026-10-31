@@ -4,10 +4,13 @@
 
 2026-10-31 评审指认：出口轮换的「直连出网」候选（proxy=""）会被 Http 的任务
 代理推断捡回已失败的 TELECOM/CLOUD189 代理——infer_proxy=False 必须走真直连。"""
+import os
+import sys
 import unittest
 from unittest.mock import patch
 
-from common import Http
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from common import Http  # noqa: E402
 
 
 class TestHttpProxyInfer(unittest.TestCase):
@@ -44,6 +47,19 @@ class TestHttpProxyInfer(unittest.TestCase):
                  infer_proxy=False)
         self.assertTrue(h.has_proxy)
         self.assertEqual(h.proxy_endpoint.url, "http://127.0.0.1:7891")
+
+    def test_direct_mode_shields_env_proxies(self):
+        """直连模式标记置位（urllib ProxyHandler({}) + curl 显式空代理的依据），
+        显式代理/默认推断模式不置位。"""
+        with patch("proxy_manager.get_task_proxy_endpoints",
+                   return_value=[self._fake_endpoint()]):
+            h_infer = Http(task_name="TELECOM")
+        h_direct = Http(task_name="TELECOM", infer_proxy=False)
+        h_explicit = Http(task_name="TELECOM", proxy="http://127.0.0.1:7891",
+                          infer_proxy=False)
+        self.assertFalse(getattr(h_infer, "direct_no_env_proxy", False))
+        self.assertTrue(h_direct.direct_no_env_proxy)
+        self.assertFalse(h_explicit.direct_no_env_proxy)
 
 
 if __name__ == "__main__":

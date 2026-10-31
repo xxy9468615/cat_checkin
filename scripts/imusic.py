@@ -610,7 +610,8 @@ def run_imusic_luck(http: Any, ticket: str, phone: str = "") -> Dict[str, Any]:
                 out["left"] = int((client.get_make_count().get("data") or {}).get(
                     "privilegeVrbtAIVideoLeftNum"))
             except (TypeError, ValueError):
-                pass
+                # 刷新失败宁缺毋滥：保留提交前旧值会虚报剩余次数（评审指认）
+                out["left"] = None
         elif not cnt_data:
             # 闸门接口不可用，退回权益包计数（旧行为）
             out["left"] = client.get_ai_video_left()
