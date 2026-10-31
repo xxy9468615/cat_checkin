@@ -40,6 +40,7 @@ from common import (
     load_kv_state,
     main_guard,
     mask_str,
+    mask_nickname,
     parse_proxy_line,
     save_kv_state,
 )
@@ -357,8 +358,8 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
         if not smzdm_id:
             smzdm_id = str(u_data.get("smzdm_id") or "")
 
-    masked_name = mask_str(nickname, 1, 1) if nickname else f"账号 #{idx}"
-    masked_id = mask_str(smzdm_id, 2, 2) if smzdm_id else "未知"
+    masked_name = mask_nickname(nickname) if nickname else f"账号 #{idx}"
+    masked_id = mask_str(smzdm_id) if smzdm_id else "未知"
 
     remaining_days = _calc_cookie_expiry(cur_cookie, state)
     learned = cv.learn_from_set_cookies(collected_set_cookies)
@@ -384,6 +385,39 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
     error_code = res_data.get("error_code")
     error_msg = str(res_data.get("error_msg") or "")
     data = res_data.get("data", {}) if isinstance(res_data.get("data"), dict) else {}
+
+    # 5. 滚动保存状态（若有新 Set-Cookie 或更新保存时间）；同时持久化
+    #    共享引擎的凭据跟踪键（真实到期证据跨运行积累）。成功与幂等已签
+    #    两条路径共用（评审：幂等路径不入账会让成功天数长期停滞）
+    def _persist_tracking() -> None:
+        try:
+            merged_cookie = _merge_cookie_str(cur_cookie, collected_set_cookies) if collected_set_cookies else cur_cookie
+            tracked = cv.update_state(dict(state), merged_cookie, learned)
+            cv.mark_ok(tracked)  # 成功运行日入账（无解析有效期凭据按执行天数反推寿命）
+            save_kv_state(
+                redis_key,
+                state_file,
+                {
+                    "cookie": merged_cookie,
+                    "env_hash": env_hash,
+                    # PII 脱敏后落盘（2026-10-31）：昵称/ID 属个人信息，
+                    # 状态文件+Redis 长期留存不得存明文
+                    "nickname": mask_str(nickname),
+                    "smzdm_id": mask_str(smzdm_id),
+                    "saved_ts": int(state.get("saved_ts") or time.time()),
+                    "cookie_md5": tracked.get("cookie_md5", ""),
+                    "first_seen_ts": tracked.get("first_seen_ts") or int(state.get("saved_ts") or time.time()),
+                    "cookie_expire_ts": tracked.get("cookie_expire_ts", ""),
+                    # ok_* 键：成功运行日跟踪（cookie_validity.mark_ok，反推寿命依据）
+                    "ok_first_date": tracked.get("ok_first_date") or "",
+                    "ok_last_date": tracked.get("ok_last_date") or "",
+                    "ok_days_total": tracked.get("ok_days_total") or 0,
+                    "ok_dates": tracked.get("ok_dates") or [],
+                    "updated_at": datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            )
+        except Exception:
+            pass
 
     # 4. 判定签到成败与幂等
     is_success = str(error_code) == "0"
@@ -414,34 +448,13 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
         print(f"• 签到: 【{status_label}】 连签天数: 【{checkin_num}】天 ({gain_part}) | 经验: 【{exp:,}】")
         print(f"• 资产: 积分 【{point:,}】 · 金币 【{gold:,}】 · 等级 【V{rank}】")
 
-        # 5. 滚动保存状态（若有新 Set-Cookie 或更新保存时间）；同时持久化
-        #    共享引擎的凭据跟踪键（真实到期证据跨运行积累）
-        try:
-            merged_cookie = _merge_cookie_str(cur_cookie, collected_set_cookies) if collected_set_cookies else cur_cookie
-            tracked = cv.update_state(dict(state), merged_cookie, learned)
-            save_kv_state(
-                redis_key,
-                state_file,
-                {
-                    "cookie": merged_cookie,
-                    "env_hash": env_hash,
-                    "nickname": nickname,
-                    "smzdm_id": smzdm_id,
-                    "saved_ts": int(state.get("saved_ts") or time.time()),
-                    "cookie_md5": tracked.get("cookie_md5", ""),
-                    "first_seen_ts": tracked.get("first_seen_ts") or int(state.get("saved_ts") or time.time()),
-                    "cookie_expire_ts": tracked.get("cookie_expire_ts", ""),
-                    "updated_at": datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S"),
-                },
-            )
-        except Exception:
-            pass
-
+        _persist_tracking()
         return True, "成功"
 
-    # error_code != 0 时的幂等判定
+    # error_code != 0 时的幂等判定：今日已签同为有效登录日，跟踪键照常入账
     if is_already_signed(error_msg, ("已签到", "今日已签", "已经签到", "请勿重复")):
         print(f"• 签到: 【今日已签】 ({error_msg})")
+        _persist_tracking()
         return True, "今日已签"
 
     # 真实失败

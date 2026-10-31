@@ -418,11 +418,14 @@ def _run_one(acc: Dict[str, Optional[str]], idx: int, total: int) -> Tuple[bool,
     # Set-Cookie；无证据时如实报「已使用 N 天」。多条证据取最长（WAF 短命
     # cookie 不会压过真会话）。
     try:
-        sess = jar_cookie(h)
+        # jar 为空（服务端未回 Set-Cookie）时回退原 cookie：否则换新凭据后指纹不变，
+        # ok_* 计数不重置，老化预警失真（评审指认）
+        sess = jar_cookie(h) or cookie
         redis_key = f"cat_checkin:state:monkeycode_{idx}"
         state_file = f".monkeycode_state_{idx}.json"
         learned = cv.learn_from_jar(h.jar)
         tracked = cv.update_state(load_kv_state(redis_key, state_file) or {}, sess, learned)
+        cv.mark_ok(tracked)  # 成功运行日入账（无解析有效期凭据按执行天数反推寿命）
         validity_tag = cv.tag_for(sess, tracked, learned)
         try:
             save_kv_state(redis_key, state_file, {**tracked, "updated_at": int(time.time())})

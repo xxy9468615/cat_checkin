@@ -177,19 +177,6 @@ def _run_account(cookie: str, idx: int, total: int) -> Tuple[bool, str]:
     state_file = f".aistudio_state_{idx}.json"
     learned = cv.learn_from_jar(h.jar, credential_match=lambda n: n.startswith("BDUSS"))
     tracked = cv.update_state(load_kv_state(redis_key, state_file) or {}, cookie, learned)
-    validity_tag = cv.tag_for(
-        cookie, tracked, learned, credential_match=lambda n: n.startswith("BDUSS")
-    )
-    try:
-        save_kv_state(
-            redis_key,
-            state_file,
-            {**tracked, "updated_at": int(datetime.now().timestamp())},
-        )
-    except Exception:
-        pass
-
-    print(f"[{idx}/{total}] 👤 用户: 【{user_label}】{uid_label} | {cert_status}{validity_tag}")
 
     api_headers = {
         "User-Agent": UA,
@@ -227,6 +214,24 @@ def _run_account(cookie: str, idx: int, total: int) -> Tuple[bool, str]:
             raise RuntimeError(f"百度登录态已失效或未授权：{err_msg}")
         else:
             raise RuntimeError(f"签到请求异常 [{r_sign.code}]：{err_msg}")
+
+    # 签到成功（含幂等「今日已签」）才入账成功运行日并落库——mark_ok 不得
+    # 先于签到结果（失败运行计入成功天数会让老化预警失真）；有效期标签与
+    # 用户行也随后生成，确保达到老化基线「当天」的输出即带 ⚠️（评审指认：
+    # 先渲染标签会把 45 天当天报成 44 天，alert_levels 漏掉本次黄卡）
+    cv.mark_ok(tracked)
+    validity_tag = cv.tag_for(
+        cookie, tracked, learned, credential_match=lambda n: n.startswith("BDUSS")
+    )
+    try:
+        save_kv_state(
+            redis_key, state_file,
+            {**tracked, "updated_at": int(datetime.now().timestamp())},
+        )
+    except Exception:
+        pass
+
+    print(f"[{idx}/{total}] 👤 用户: 【{user_label}】{uid_label} | {cert_status}{validity_tag}")
 
     # 3. 每日算力卡领取（POST /studio/user/center/resource/receive?isInfoComplete=1）
     card_receive_msg = ""

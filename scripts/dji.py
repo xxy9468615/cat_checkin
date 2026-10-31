@@ -194,6 +194,7 @@ def _run_one(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
     #    凭据有效期经共享引擎跟踪（SSO 长效票续发时自动转精确倒计时）
     learned = cv.learn_from_jar(h.jar)
     tracked = cv.update_state(dict(state), cur_cookie, learned)
+    cv.mark_ok(tracked)  # 成功运行日入账（无解析有效期凭据按执行天数反推寿命）
     try:
         save_kv_state(
             redis_key,

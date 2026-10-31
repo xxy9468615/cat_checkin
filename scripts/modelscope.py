@@ -1394,6 +1394,10 @@ def _run_one(account: Dict[str, Any], host: str) -> Tuple[bool, str, Optional[fl
             tracked = cv.update_state(
                 load_kv_state(redis_key, state_file) or {}, updated_cookie, learned
             )
+            # 仅确认到账（credited）或明确接受冷却结果（record 存在）才入账；
+            # daily_active 未到账的运行不得计入成功天数（评审指认）
+            if credited or record is not None:
+                cv.mark_ok(tracked)
             validity_tag = cv.tag_for(
                 updated_cookie, tracked, learned, credential_match=lambda n: n in CREDENTIAL_COOKIES
             )

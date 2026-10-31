@@ -100,6 +100,12 @@ _RENEWAL_HINTS: Dict[str, str] = {
 # 无法续期任务：凭据剩余有效期提前 1 天提示（用户指定阈值）
 EXPIRY_WARN_DAYS = 1
 _COOKIE_DAYS_RE = re.compile(r"Cookie 剩余 (\d+) 天")
+# 有效期未知但已老化的凭据（cookie_validity 按成功运行天数反推后升级 ⚠️）：
+# 「超出估算窗口」或「达到老化基线」形态一律黄卡（2026-10-31 预警能力补全）。
+# 「已运行」形态覆盖无 mark_ok 计数的历史状态（超出声明估算窗口即视为老化）
+_COOKIE_UNKNOWN_AGING_RE = re.compile(
+    r"(?:Cookie|Token) 有效期未知（(?:已成功运行|已运行) \d+ 天[^）]*建议预防性更新"
+)
 
 # ---------------------------------------------------------------------------
 # 凭据未配置检测（⚪，非故障）：新任务代码先进 main、Secret 还没配的场景。
@@ -171,6 +177,8 @@ def classify(script: str, ok: bool, output: str) -> Dict[str, object]:
             m = _COOKIE_DAYS_RE.search(ln)
             if m and int(m.group(1)) <= EXPIRY_WARN_DAYS:
                 warns.append(f"Cookie 仅剩 {int(m.group(1))} 天，无法自动续期，请尽快更新凭据")
+            elif _COOKIE_UNKNOWN_AGING_RE.search(ln):
+                warns.append("凭据无法解析有效期且已超老化基线，存在突然失效风险，请预防性更新或抓包确认")
     # 去重保序，上限 5 条防刷屏
     seen: set = set()
     warns = [w for w in warns if not (w in seen or seen.add(w))][:5]

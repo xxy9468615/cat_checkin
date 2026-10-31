@@ -164,18 +164,9 @@ def _run_account(raw_token: str, idx: int, total: int) -> Tuple[bool, str]:
         "Referer": "https://www.alipan.com/",
     }
 
-    # 4. 辅助触碰签到列表（触发日活）
-    try:
-        h.request(
-            "POST",
-            "https://member.alipan.com/v1/activity/sign_in_list",
-            headers=api_headers,
-            json_data={"_rx-s": "mobile"},
-        )
-    except Exception:
-        pass
-
-    # 5. 核心签到与月度签到详情查询 (POST /v2/activity/sign_in_info)
+    # 4. 核心签到与月度签到详情查询 (POST /v2/activity/sign_in_info)
+    # （旧「4. 辅助触碰签到列表」sign_in_list 月度日历查询已清理：响应被整体
+    #   丢弃、不解析不输出，月度信息本就由 sign_in_info 提供——残缺功能下线）
     r_info = h.request(
         "POST",
         "https://member.alipan.com/v2/activity/sign_in_info",

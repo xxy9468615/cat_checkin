@@ -829,40 +829,54 @@ def strip_tags(s: Any) -> str:
     s = re.sub(r"<img\b[^>]*\btitle=[\"']([^\"']*)[\"'][^>]*>", r"\1", s, flags=re.I)
     return html.unescape(re.sub(r"<[^>]*>", "", s)).strip()
 
-def _mask_domain(domain: str, mask_char: str = "*") -> str:
-    """邮箱域名脱敏：保留首字符与尾部后缀，其余掩码。
 
-    - aifre.cyou   -> a***.cyou
-    - gmail.com    -> g***.com
-    - mail.foo.co.uk -> m***.co.uk（co/com/net/org/gov/edu/ac + 国家码的二级后缀整段保留）
-    - localhost    -> l***
-    - 极短/异常域  -> ***（掩码兜底，绝不原样返回）
-    """
-    domain = (domain or "").strip().rstrip(".")
-    if not domain:
+def mask_phone(value: Any, mask_char: str = "*") -> str:
+    """手机号脱敏：只保留末 4 位，其余全部掩码（2026-10-31 脱敏增强，用户指令）。
+
+    11 位手机号 13812345678 -> *******5678（7 个掩码符 + 末 4 位）；
+    8~15 位纯数字串同规则；其余形态回退 mask_str 通用规则。"""
+    s = str(value or "").strip()
+    if len(s) == 11 and s.isdigit():
+        return mask_char * (len(s) - 4) + s[-4:]
+    if 8 <= len(s) <= 15 and s.isdigit():
+        return mask_char * (len(s) - 4) + s[-4:]
+    return mask_str(s, mask_char=mask_char)
+
+
+def mask_nickname(value: Any, mask_char: str = "*") -> str:
+    """昵称/用户名脱敏：只保留末 3 位字符，前缀用定长 *** 防长度泄漏。
+
+    「张小三」(3 位) -> ***（≤4 位全脱，防短名反推）；「王小虎要加油」-> ***加油。"""
+    s = str(value or "").strip()
+    if len(s) <= 4:
         return mask_char * 3
-    labels = domain.split(".")
-    if len(labels) == 1:
-        return f"{domain[0]}{mask_char * 3}" if len(domain) > 1 else mask_char * 3
-    second_level = {"co", "com", "net", "org", "gov", "edu", "ac"}
-    keep_labels = 2 if len(labels) >= 3 and labels[-2].lower() in second_level else 1
-    tail = ".".join(labels[-keep_labels:])
-    return f"{domain[0]}{mask_char * 3}.{tail}"
+    return mask_char * 3 + s[-3:]
+
+
+def mask_email(value: Any, mask_char: str = "*") -> str:
+    """邮箱脱敏：前缀只保留末 4 位，域名（尾缀）全额脱敏（用户指令）。
+
+    user123@gmail.com -> ***r123@***。前缀用定长 *** 防长度泄漏，
+    域名不再保留首字符/TLD（欧美信息保护法数据最小化口径）。"""
+    s = str(value or "").strip()
+    if "@" not in s or s.startswith("@") or s.endswith("@"):
+        return mask_str(s, mask_char=mask_char)
+    user_part, _domain = s.split("@", 1)
+    if len(user_part) <= 4:
+        return f"{mask_char * 3}@{mask_char * 3}"
+    return f"{mask_char * 3}{user_part[-4:]}@{mask_char * 3}"
 
 
 def mask_str(value: Any, keep_start: int | None = None, keep_end: int | None = None, mask_char: str = "*") -> str:
     """智能脱敏字符串（用户名、手机号、邮箱、账号 ID 等）。
 
-    脱敏规则：
-    - 邮箱：@ 前缀与域名都脱敏，仅保留域名 TLD（co.uk/com.cn 等二级后缀整段保留），
-      如 user123@gmail.com -> u***3@g***.com，abc@aifre.cyou -> a***b@a***.cyou
-    - 手机号（11位纯数字）：保留前3后4，如 13812345678 -> 138****5678
-    - 自定义 keep_start / keep_end：按指定保留字符数脱敏
-    - 默认智能策略（首尾可见、中间掩码，便于本人识别同时防止公开泄露）：
-      * 长度 <= 1: 返回 "*"
-      * 长度 == 2: 保留首位，如 "张三" -> "张*"
-      * 长度 3~9:  保留首1尾1，如 "hun8461" -> "h***1", "admin" -> "a***n"
-      * 长度 >= 10: 保留首3尾3，如 "yd_219491735" -> "yd_***735"
+    脱敏规则（2026-10-31 增强：手机号只留末4、昵称/通用只留末尾、邮箱域名全脱）：
+    - 邮箱：mask_email（前缀末4 + 域名全额脱敏），user123@gmail.com -> ***r123@***
+    - 手机号/纯数字 ID（8~15位）：mask_phone（只留末4），13812345678 -> *******5678
+    - 自定义 keep_start / keep_end：按指定保留字符数脱敏（调用方显式决策）
+    - 默认通用策略（欧美信息保护法数据最小化：不露头部字符，定长掩码防长度泄漏）：
+      * 长度 <= 4: 全脱 "***"
+      * 长度 >= 5: 定长 "***" + 末 3 位，如 "hun8461" -> "***461", "yd_219491735" -> "***735"
     """
     if value is None:
         return ""
@@ -870,15 +884,13 @@ def mask_str(value: Any, keep_start: int | None = None, keep_end: int | None = N
     if not s:
         return ""
 
-    # 邮箱处理：本地部分常规脱敏；域名保留首字符 + TLD，其余掩码
+    # 邮箱处理：前缀末4 + 域名全额脱敏
     if "@" in s and not (s.startswith("@") or s.endswith("@")):
-        user_part, domain_part = s.split("@", 1)
-        masked_user = mask_str(user_part, keep_start=keep_start, keep_end=keep_end, mask_char=mask_char)
-        return f"{masked_user}@{_mask_domain(domain_part)}"
+        return mask_email(s, mask_char=mask_char)
 
-    # 手机号处理 (11位纯数字)
-    if len(s) == 11 and s.isdigit() and keep_start is None and keep_end is None:
-        return f"{s[:3]}****{s[-4:]}"
+    # 手机号/纯数字 ID 处理（8~15 位，显式 keep 参数优先）
+    if keep_start is None and keep_end is None and 8 <= len(s) <= 15 and s.isdigit():
+        return mask_phone(s, mask_char=mask_char)
 
     n = len(s)
     if n <= 1:
@@ -889,12 +901,11 @@ def mask_str(value: Any, keep_start: int | None = None, keep_end: int | None = N
         if ks == 0 and ke == 0:
             return mask_char * 3
         return f"{s[:ks]}***{s[n - ke:] if ke > 0 else ''}"
-    if n == 2:
-        return f"{s[0]}{mask_char}"
 
-    if n < 10:
-        return f"{s[0]}***{s[-1]}"
-    return f"{s[:3]}***{s[-3:]}"
+    # 默认通用策略：定长掩码 + 只露尾部（防头部重识别 + 防长度泄漏）
+    if n <= 4:
+        return mask_char * 3
+    return f"{mask_char * 3}{s[-3:]}"
 
 def bj_time_from_iso_z(value: str) -> tuple[str,str]:
     if not value:

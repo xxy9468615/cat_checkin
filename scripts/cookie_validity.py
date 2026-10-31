@@ -20,13 +20,17 @@
   🔑 Cookie 剩余 N 天（YYYY-MM-DD 到期）              # 证据充分且剩余 ≥ 7 天
   ⚠️ Cookie 剩余 N 天（YYYY-MM-DD 到期，请尽快更新）   # 剩余 < 7 天
   🔑 Cookie 剩余 N 天                                  # 兜底窗口倒计时（无确切日期）
-  🔑 Cookie 有效期未知（已使用 N 天，未观察到期证据）   # 无任何到期证据
+  🔑 Cookie 有效期未知（已成功运行 N 天，未观察到期证据） # 无证据 + mark_ok 天数 < 老化基线
+  ⚠️ Cookie 有效期未知（已成功运行 N 天，超出 M 天估算窗口，建议预防性更新）
+  ⚠️ Cookie 有效期未知（已成功运行 N 天，达到 M 天老化基线，建议预防性更新）
+                                                       # 按成功执行天数反推已老化（黄卡锚点）
 
 用法示例（任务脚本内）：
     import cookie_validity as cv
     learned = cv.learn_from_response(resp)          # 每次关键响应后
     learned.update(cv.learn_from_jar(h.jar))
     state = cv.update_state(state, cookie_str, learned)
+    cv.mark_ok(state)                               # 签到成功：记录成功运行日（反推寿命依据）
     save_kv_state(redis_key, state_file, state)     # 与任务原有 state 一并保存
     tag = cv.build_tag(state, learned, credential_match=lambda n: n == "BDUSS")
     print(f"👤 用户行{tag}")
@@ -36,12 +40,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
 import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from http.cookiejar import http2time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 try:  # 与任务脚本共用北京时区渲染；common 不可用时静默降级
     from common import BJT
@@ -51,6 +56,26 @@ except Exception:  # pragma: no cover
 # 剩余天数低于该阈值时用 ⚠️（与 alert_levels「剩 ≤1 天才黄卡」互补：提前一周提醒）
 WARN_REMAINING_DAYS = 7
 DAY_SEC = 86400
+
+# 无解析有效期凭据的老化预警基线（天）：成功运行天数达到该值且仍无任何到期
+# 证据 → 升级 ⚠️ 建议预防性更新（2026-10-31 用户指令：按成功执行天数反推有效期
+# 实现预警；COOKIE_UNKNOWN_AGING_WARN_DAYS 可覆盖，非法值回退默认不阻塞导入——
+# 本模块被全部任务共享，配置错误不能让无关任务起不来）
+def _int_env(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        print(f"⚠️ {name}={raw!r} 非整数，回退默认 {default} 天", flush=True)
+        return default
+    return v if v > 0 else default
+
+
+UNKNOWN_AGING_WARN_DAYS = _int_env("COOKIE_UNKNOWN_AGING_WARN_DAYS", 45)
+# ok_dates 明细保留窗口（天）：累计计数另存 ok_days_total，不受窗口裁剪影响
+OK_DATES_KEEP = 120
 
 # 凭据匹配回调类型：lambda name: bool；None 表示不过滤（全量 cookie 皆可为证据）
 CredentialMatch = Optional[Callable[[str], bool]]
@@ -345,7 +370,10 @@ def update_state(
     """滚动跟踪 state（原地更新并返回）。
 
     - cookie 指纹变更（用户更新 Secrets）→ 重置 first_seen_ts 并清除旧到期证据，
-      避免旧 Cookie 的证据污染新 Cookie 的估算；
+      避免旧 Cookie 的证据污染新 Cookie 的估算；成功运行日跟踪（ok_*）同步重置——
+      ok_days 度量的是「当前这枚 Cookie」的服务天数，跨凭据累计会让老化信号失真
+      （滚动保活凭据每次 Set-Cookie 都换指纹，天然不适用老化预警，与本表 update_state
+      重置语义一致）；
     - learned 有真实证据 → 写 cookie_expire_ts（滑动续期只增不减）。
     """
     now = int(time.time())
@@ -354,6 +382,10 @@ def update_state(
         state["cookie_md5"] = fp
         state["first_seen_ts"] = now
         state.pop("cookie_expire_ts", None)
+        state.pop("ok_days_total", None)
+        state.pop("ok_first_date", None)
+        state.pop("ok_last_date", None)
+        state.pop("ok_dates", None)
     if not state.get("first_seen_ts"):
         state["first_seen_ts"] = now
     learned_ts = max((learned or {}).values()) if learned else 0
@@ -402,6 +434,44 @@ def remaining_days(expire_ts: float, now: Optional[float] = None) -> int:
     return max(0, int((float(expire_ts) - now) / DAY_SEC))
 
 
+def mark_ok(state: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
+    """记录一次成功运行日（无解析有效期凭据按成功执行天数反推寿命的依据）。
+
+    写入状态键：
+    - ok_first_date：首次成功运行日（YYYY-MM-DD，BJT）
+    - ok_last_date：最近成功运行日
+    - ok_days_total：累计成功运行天数（同日多次运行只计 1）
+    - ok_dates：近期成功日期明细（保留 OK_DATES_KEEP 条，供排障核对）
+
+    任务在签到成功后、save_kv_state 前调用；持久化走既有 KV 数据库双通道
+    （本地 JSON + Upstash Redis）。与 update_state 一样只改传入 dict。"""
+    now = now if now is not None else time.time()
+    today = datetime.fromtimestamp(now, BJT).strftime("%Y-%m-%d")
+    dates = state.get("ok_dates")
+    dates = [d for d in dates if isinstance(d, str)] if isinstance(dates, list) else []
+    if today not in dates:
+        dates.append(today)
+        try:
+            state["ok_days_total"] = int(state.get("ok_days_total") or 0) + 1
+        except (TypeError, ValueError):
+            state["ok_days_total"] = 1
+    state["ok_dates"] = dates[-OK_DATES_KEEP:]
+    state["ok_first_date"] = state.get("ok_first_date") or today
+    state["ok_last_date"] = today
+    return state
+
+
+def ok_run_days(state: Dict[str, Any], now: Optional[float] = None) -> int:
+    """经 mark_ok 确认的成功运行天数（ok_days_total）。
+
+    只认计数器，不做日历天数近似——first_seen 只说明「凭据已存在 N 天」，
+    不等于「成功运行 N 天」，混用会在首次入账时虚发老化预警（评审指认）。"""
+    try:
+        return max(0, int(state.get("ok_days_total") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def build_tag(
     state: Dict[str, Any],
     cookie_str: str = "",
@@ -433,6 +503,8 @@ def build_tag(
     if not isinstance(first_seen, (int, float)) or first_seen <= 0:
         # 兼容历史任务的自建键名（smzdm/52pojie 的 saved_ts：Cookie 首次启用时刻）
         first_seen = state.get("saved_ts")
+    # 仅计入经 mark_ok 确认的成功运行日；无计数的历史状态沿用「已使用」口径
+    ok_days = ok_run_days(state)
     if isinstance(first_seen, (int, float)) and first_seen > 0:
         used_days = max(0, int((now - first_seen) / DAY_SEC))
         if fallback_lifetime_days:
@@ -443,10 +515,22 @@ def build_tag(
                 if rem < WARN_REMAINING_DAYS:
                     return f" | ⚠️ {label} 剩余 {rem} 天（请尽快更新）"
                 return f" | 🔑 {label} 剩余 {rem} 天"
+            # 超出估算窗口仍存活：寿命下限已破，随时可能失效 → 升级 ⚠️
+            # （「有效期未知」字面为 report_fields 解析锚点，不得改动）
+            days_txt = f"已成功运行 {ok_days} 天" if ok_days > 0 else f"已运行 {used_days} 天"
             return (
-                f" | 🔑 {label} 有效期未知"
-                f"（超出 {fallback_lifetime_days} 天估算窗口仍有效，已使用 {used_days} 天）"
+                f" | ⚠️ {label} 有效期未知"
+                f"（{days_txt}，超出 {fallback_lifetime_days} 天估算窗口，建议预防性更新）"
             )
+        # 无兜底窗口：按成功运行天数反推——达到老化基线 → ⚠️ 建议预防性更新
+        # （alert_levels 以「有效期未知（已成功运行 N 天 … 建议预防性更新」为黄卡锚点）
+        if ok_days >= UNKNOWN_AGING_WARN_DAYS:
+            return (
+                f" | ⚠️ {label} 有效期未知"
+                f"（已成功运行 {ok_days} 天，达到 {UNKNOWN_AGING_WARN_DAYS} 天老化基线，建议预防性更新）"
+            )
+        if ok_days > 0:
+            return f" | 🔑 {label} 有效期未知（已成功运行 {ok_days} 天，未观察到期证据）"
         return f" | 🔑 {label} 有效期未知（已使用 {used_days} 天，未观察到期证据）"
     return ""
 

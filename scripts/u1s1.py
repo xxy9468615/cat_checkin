@@ -354,6 +354,7 @@ def run_account(idx: int, total_accounts: int, token: str, h: Http) -> tuple[boo
     cred_match = lambda n: n == "u1s1_session"  # noqa: E731
     learned = cv.learn_from_jar(h.jar, credential_match=cred_match)
     tracked = cv.update_state(load_kv_state(redis_key, state_file) or {}, token, learned)
+    cv.mark_ok(tracked)  # 成功运行日入账（无解析有效期凭据按执行天数反推寿命）
     validity_tag = cv.tag_for(token, tracked, learned, credential_match=cred_match)
     try:
         save_kv_state(redis_key, state_file, {**tracked, "updated_at": int(time.time())})
