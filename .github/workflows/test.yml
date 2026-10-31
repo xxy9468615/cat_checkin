@@ -1,0 +1,66 @@
+name: Unit Tests & Code Quality
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'scripts/**'
+      - 'requirements.txt'
+      - '.github/workflows/test.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'scripts/**'
+      - 'requirements.txt'
+      - '.github/workflows/test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Run Unit Tests & Syntax Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (SHA 固定，node24)
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0 (SHA 固定，node24)
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Syntax check
+        run: python3 -m py_compile scripts/*.py
+
+      # 机器审核防线（2026-10-31 事件：真实电信 App Token 残片随测试夹具流入公开仓库
+      # 长达 20+ 提交无人察觉；另历史悬空提交泄露过 Telegram Bot Token）。高置信度
+      # 凭据模式 + 已泄露值黑名单；测试夹具一律合成数据（CLAUDE.md 规则3）：合成
+      # token 必须用 V1.0FAKE 前缀。黑名单真实值在文件内做字符串拼接混淆（运行时
+      # 才组装），避免扫描器配置本身成为明文 PII。排除 *.md 与本文件（自匹配）。
+      - name: Secret scan (deny real credentials in tracked files)
+        run: |
+          matches=$(git grep -nE \
+            -e 'V1\.0[A-Za-z0-9+/=]{50,}' \
+            -e 'gh[pous]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}' \
+            -e 'sk-[A-Za-z0-9]{30,}' \
+            -e '[0-9]{8,10}:[A-Za-z0-9_-]{30,}' \
+            -e '1'"7762551109|3""998477332|598d26069a564aeb" \
+            -- . ':!*.md' ':!.github/workflows/test.yml' || true)
+          # 合成夹具白名单：V1.0FAKE 前缀 = 测试专用假 token（约定见 CLAUDE.md 规则10）
+          matches=$(printf '%s\n' "$matches" | grep -v 'V1\.0FAKE' || true)
+          if [ -n "$matches" ]; then
+            echo "::error::检测到疑似真实凭据/PII 入库（测试只允许合成夹具），明细如下"
+            echo "$matches"
+            exit 1
+          fi
+          echo "✅ 密钥扫描通过：未发现真实凭据形态"
+
+      - name: Install dependencies
+        run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Run unit test suite
+        run: python3 -m unittest discover -s scripts/tests/ -p "test_*.py"

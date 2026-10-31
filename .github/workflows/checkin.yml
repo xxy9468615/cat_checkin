@@ -1,0 +1,925 @@
+name: Daily Check-in & Unified Task Queue
+
+run-name: >-
+  checkin: ${{ inputs.retry == true && 'auto-retry(report)' || (github.event_name == 'workflow_dispatch' && (inputs.tasks != '' && inputs.tasks || 'manual') || (github.event_name == 'repository_dispatch' && github.event.action || 'scheduled')) }}
+
+on:
+  schedule:
+    # 晨间主任务批次：北京时间 07:00（UTC 23:00 前一日）
+    - cron: "0 23 * * *"
+    # 30 分钟心跳与容灾自愈轮询（今日已全量完成秒退；有遗漏/未跑/到期重试则自动补跑）
+    - cron: "*/30 * * * *"
+    # 每日汇总日报主发送：北京时间 20:00（UTC 12:00）——唯一日常发信点
+    - cron: "0 12 * * *"
+    # 日报失败补发：北京时间 21:30（UTC 13:30，20:00 已成功发送则秒退）
+    - cron: "30 13 * * *"
+  repository_dispatch:
+    types:
+      - checkin_morning
+      - checkin_modelscope
+      - checkin_latvi
+      - latvi_next_sign
+      - workbuddy_travel_claim
+      - daily_report
+      - checkin_retry
+  workflow_dispatch:
+    inputs:
+      tasks:
+        description: '要执行的任务ID或脚本，逗号分隔（可选: all, matrix, workbuddy, glados, modelscope 等；留空自动按今日未跑任务执行）'
+        required: false
+        default: ''
+        type: string
+      reset_circuit:
+        description: '重置并重新上线处于熔断状态的任务（等待修复后上线时勾选）'
+        required: false
+        default: false
+        type: boolean
+      retry:
+        description: '标记为报告自动重跑（防循环；人工触发保持 false）'
+        required: false
+        default: false
+        type: boolean
+      due_only:
+        description: '心跳模拟：仅滚动冷却任务 + 到期过滤 + 仅归档（不发邮件）'
+        required: false
+        default: false
+        type: boolean
+      direct:
+        description: '诊断：跳过代理出站（sing-box 不启动），任务用 runner 自身 IP 直连（nodeseek 排查用）'
+        required: false
+        default: false
+        type: boolean
+      no_cffi:
+        description: '诊断：nodeseek 强制 urllib/HTTP1.1（禁用 curl_cffi chrome 指纹）'
+        required: false
+        default: false
+        type: boolean
+
+# 最小权限：GITHUB_TOKEN 仅用于 actions 调度与运行状态查询
+permissions:
+  contents: read
+  actions: write
+
+# ============================================================
+# Job 1 — 统一编排主流水线（晨间主 run / 心跳自愈 / 调度接力）
+# ============================================================
+jobs:
+  unified:
+    if: >-
+      ${{ !(github.event_name == 'schedule' && (github.event.schedule == '30 13 * * *' || github.event.schedule == '0 12 * * *'))
+          && github.event.action != 'daily_report' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: unified-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      TZ: Asia/Shanghai
+      TASK_OUTPUT_DIR: .task_results
+      GITHUB_REPO: ${{ github.repository }}
+      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+      QSTASH_URL: ${{ secrets.QSTASH_URL }}
+      QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
+      # 权限最小化：GH_PAT 仅在必要步骤单独注入，避免任务子进程持有写权限令牌
+      GLADOS_COOKIE_1: ${{ secrets.GLADOS_COOKIE_1 }}
+      GLADOS_COOKIE_2: ${{ secrets.GLADOS_COOKIE_2 }}
+      GLADOS_COOKIE_3: ${{ secrets.GLADOS_COOKIE_3 }}
+      GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
+      GLADOS_AUTO_EXCHANGE: "true"
+      GLADOS_DOMAINS: glados.cloud
+      RAILGUN_COOKIE_1: ${{ secrets.RAILGUN_COOKIE_1 }}
+      RAILGUN_COOKIE_2: ${{ secrets.RAILGUN_COOKIE_2 }}
+      RAILGUN_COOKIE_3: ${{ secrets.RAILGUN_COOKIE_3 }}
+      RAILGUN_AUTO_EXCHANGE: "true"
+      RAILGUN_DOMAINS: railgun.info
+      "2LIBRA_COOKIE_1": ${{ secrets.TWO_LIBRA_COOKIE_1 }}
+      BIANJIE_AI_USERNAME_1: ${{ secrets.BIANJIE_AI_USERNAME_1 }}
+      BIANJIE_AI_PASSWORD_1: ${{ secrets.BIANJIE_AI_PASSWORD_1 }}
+      BIANJIE_AI_USERNAME_2: ${{ secrets.BIANJIE_AI_USERNAME_2 }}
+      BIANJIE_AI_PASSWORD_2: ${{ secrets.BIANJIE_AI_PASSWORD_2 }}
+      MOXING_USERNAME_1: ${{ secrets.MOXING_USERNAME }}
+      MOXING_PASSWORD_1: ${{ secrets.MOXING_PASSWORD }}
+      MOXING_DOMAIN: https://moxing.chat
+      MOXING_UA: ${{ secrets.MOXING_UA }}
+      UGNAS_COOKIE_1: ${{ secrets.UGNAS_COOKIE_1 }}
+      CLOUDSTUDIO_COOKIE_1: ${{ secrets.CLOUDSTUDIO_COOKIE_1 }}
+      NAIXI_USERNAME_1: ${{ secrets.NAIXI_USERNAME_1 }}
+      NAIXI_PASSWORD_1: ${{ secrets.NAIXI_PASSWORD_1 }}
+      DJI_COOKIE_1: ${{ secrets.DJI_COOKIE_1 }}
+      PCBETA_COOKIE_1: ${{ secrets.PCBETA_COOKIE_1 }}
+      PCBETA_USERNAME_1: ${{ secrets.PCBETA_USERNAME_1 }}
+      PCBETA_PASSWORD_1: ${{ secrets.PCBETA_PASSWORD_1 }}
+      MONKEYCODE_EMAIL_1: ${{ secrets.MONKEYCODE_EMAIL_1 }}
+      MONKEYCODE_PASSWORD_1: ${{ secrets.MONKEYCODE_PASSWORD_1 }}
+      MONKEYCODE_EMAIL_2: ${{ secrets.MONKEYCODE_EMAIL_2 }}
+      MONKEYCODE_PASSWORD_2: ${{ secrets.MONKEYCODE_PASSWORD_2 }}
+      SOPHNET_TOKEN_1: ${{ secrets.SOPHNET_TOKEN_1 }}
+      SOPHNET_REFRESH_TOKEN_1: ${{ secrets.SOPHNET_REFRESH_TOKEN_1 }}
+      SOPHNET_TOKEN_2: ${{ secrets.SOPHNET_TOKEN_2 }}
+      SOPHNET_REFRESH_TOKEN_2: ${{ secrets.SOPHNET_REFRESH_TOKEN_2 }}
+      AI_ROUTER_REFRESH_TOKEN_1: ${{ secrets.AI_ROUTER_REFRESH_TOKEN_1 }}
+      AGENTROUTER_EMAIL_1: ${{ secrets.AGENTROUTER_EMAIL_1 }}
+      AGENTROUTER_PASSWORD_1: ${{ secrets.AGENTROUTER_PASSWORD_1 }}
+      AGENTROUTER_COOKIE: ${{ secrets.AGENTROUTER_COOKIE }}
+      AGENTROUTER_API_URL: https://ps.air-outer.com
+      AGENTROUTER_STATE_FILE: .agentrouter_state.json
+      # 代理环境变量按需由 sing-box 出站步骤动态注入
+      U1S1_TOKEN_1: ${{ secrets.U1S1_TOKEN_1 }}
+      JUEJIN_COOKIE_1: ${{ secrets.JUEJIN_COOKIE_1 }}
+      JUEJIN_COOKIE_2: ${{ secrets.JUEJIN_COOKIE_2 }}
+      NODESEEK_COOKIE_1: ${{ secrets.NODESEEK_COOKIE_1 }}
+      # 保持置空以强制使用工作流统一出站代理，避免节点不一致触发安全质询
+      NODESEEK_PROXY: ""
+      AISTUDIO_COOKIE_1: ${{ secrets.AISTUDIO_COOKIE_1 }}
+      AISTUDIO_COOKIE_2: ${{ secrets.AISTUDIO_COOKIE_2 }}
+      ALIPAN_REFRESH_TOKEN_1: ${{ secrets.ALIPAN_REFRESH_TOKEN_1 }}
+      SMZDM_COOKIE_1: ${{ secrets.SMZDM_COOKIE_1 }}
+      SMZDM_PROXY: ${{ secrets.SMZDM_PROXY || secrets.WUAI_PROXY }}
+      # CN 代理备用池：主出口（WUAI_PROXY，单点晨间离线）之外的容灾候选，
+      # 被 proxy_manager 的 52POJIE/CLOUD189/TELECOM/OPPO 别名链自动复用
+      SMZDM_BACKUP_PROXIES: ${{ secrets.SMZDM_BACKUP_PROXIES }}
+      52POJIE_COOKIE_1: ${{ secrets.WUAI_COOKIE_1 }}
+      52POJIE_PROXY: ${{ secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
+      # 夸克 App 鉴权签名凭据
+      QUARK_MPARAM_1: ${{ secrets.QUARK_MPARAM_1 }}
+      CLOUD189_USERNAME_1: ${{ secrets.CLOUD189_USERNAME_1 }}
+      CLOUD189_PASSWORD_1: ${{ secrets.CLOUD189_PASSWORD_1 }}
+      CLOUD189_COOKIE_1: ${{ secrets.CLOUD189_COOKIE_1 }}
+      CLOUD189_PROXY: ${{ secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
+      # 中国电信 App 请求头凭据
+      TELECOM_HEADER_1: ${{ secrets.TELECOM_HEADER_1 }}
+      TELECOM_HEADER_2: ${{ secrets.TELECOM_HEADER_2 }}
+      # 服务密码自动登录：sign 抓包失效时永久兜底（手机号缺省复用 CLOUD189_USERNAME_*）
+      TELECOM_PASSWORD_1: ${{ secrets.TELECOM_PASSWORD_1 }}
+      TELECOM_PASSWORD_2: ${{ secrets.TELECOM_PASSWORD_2 }}
+      TELECOM_PHONE_1: ${{ secrets.TELECOM_PHONE_1 }}
+      TELECOM_PHONE_2: ${{ secrets.TELECOM_PHONE_2 }}
+      # 金豆兑换目标（缺省即 10 元话费直充券 / 8000 豆）
+      TELECOM_EXCHANGE_GOAL: ${{ secrets.TELECOM_EXCHANGE_GOAL || '10元话费直充券' }}
+      TELECOM_EXCHANGE_BEANS: ${{ secrets.TELECOM_EXCHANGE_BEANS || '8000' }}
+      TELECOM_PROXY: ${{ secrets.TELECOM_PROXY || secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
+      # OPPO 商城打卡与赚积分
+      OPPO_COOKIE_1: ${{ secrets.OPPO_COOKIE_1 }}
+      OPPO_COOKIE_2: ${{ secrets.OPPO_COOKIE_2 }}
+      OPPO_PROXY: ${{ secrets.OPPO_PROXY || secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
+      # WorkBuddy OAuth 刷新令牌
+      WORKBUDDY_REFRESH_TOKEN_1: ${{ secrets.WORKBUDDY_REFRESH_TOKEN_1 }}
+      WORKBUDDY_REFRESH_TOKEN_2: ${{ secrets.WORKBUDDY_REFRESH_TOKEN_2 }}
+      WORKBUDDY_WAIT_TRAVEL: "true"
+      MODELSCOPE_TOKEN_1: ${{ secrets.MODELSCOPE_TOKEN_1 }}
+      MODELSCOPE_TOKEN_2: ${{ secrets.MODELSCOPE_TOKEN_2 }}
+      MODELSCOPE_COOKIE_1: ${{ secrets.MODELSCOPE_COOKIE_1 }}
+      MODELSCOPE_COOKIE_2: ${{ secrets.MODELSCOPE_COOKIE_2 }}
+      MODELSCOPE_AI_TOKEN_1: ${{ secrets.MODELSCOPE_AI_TOKEN_1 }}
+      MODELSCOPE_AI_TOKEN_2: ${{ secrets.MODELSCOPE_AI_TOKEN_2 }}
+      MODELSCOPE_AI_TOKEN_3: ${{ secrets.MODELSCOPE_AI_TOKEN_3 }}
+      MODELSCOPE_AI_COOKIE_1: ${{ secrets.MODELSCOPE_AI_COOKIE_1 }}
+      MODELSCOPE_AI_COOKIE_2: ${{ secrets.MODELSCOPE_AI_COOKIE_2 }}
+      MODELSCOPE_AI_COOKIE_3: ${{ secrets.MODELSCOPE_AI_COOKIE_3 }}
+      LATVI_EMAIL_1: ${{ secrets.LATVI_EMAIL }}
+      LATVI_PASSWORD_1: ${{ secrets.LATVI_PASSWORD }}
+      LATVI_STATE_FILE: .latvi_state.json
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+      RESEND_FROM: ${{ secrets.RESEND_FROM }}
+      RESEND_TO: ${{ secrets.RESEND_TO }}
+      MAIL_HOST: ${{ secrets.MAIL_HOST }}
+      MAIL_PORT: ${{ secrets.MAIL_PORT }}
+      MAIL_USER: ${{ secrets.MAIL_USER }}
+      MAIL_PASS: ${{ secrets.MAIL_PASS }}
+      MAIL_FROM: ${{ secrets.MAIL_FROM }}
+      MAIL_TO: ${{ secrets.MAIL_TO }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1（SHA 固定，node24）
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0（SHA 固定，node24）
+        with:
+          python-version: "3.12"
+
+      - name: Restore unified states
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0（SHA 固定，node24）
+        with:
+          path: |
+            .ai_router_state.json
+            .latvi_state.json
+            .agentrouter_state.json
+            .cloudstudio_state*.json
+            .2libra_state*.json
+            .modelscope_*.json
+            .juejin_state*.json
+            .alipan_state*.json
+            .smzdm_state*.json
+            .52pojie_state*.json
+            .notify_state_*.json
+          key: unified-states-${{ github.run_id }}
+          restore-keys: |
+            unified-states-
+            ai-router-state-
+            latvi-state-
+            agentrouter-state-
+
+      # ── 到期前置判定与自愈调度 ─────────────────────────
+      - name: Precheck due tasks (idle runs exit here)
+        id: orch_tasks
+        env:
+          INPUT_TASKS: ${{ inputs.tasks }}
+          INPUT_DUE_ONLY: ${{ inputs.due_only }}
+          INPUT_RESET_CIRCUIT: ${{ inputs.reset_circuit }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          set -euo pipefail
+          # 归一化空白后再比较：github.event.schedule 对同一表达式的空格渲染
+          # 并不稳定（见下方 report-fallback 的说明），精确比较会静默失配。
+          EVENT_SCHEDULE="$(printf '%s' "${EVENT_SCHEDULE:-}" | tr -s ' ' | sed 's/^ //; s/ $//')"
+          PLAN_ARGS=""
+          if [ -n "${INPUT_TASKS:-}" ]; then
+            CANDIDATES=$(printf '%s' "$INPUT_TASKS" | tr '\n' ' ')
+            echo "显式指定任务: $CANDIDATES"
+            PLAN_ARGS="--tasks $CANDIDATES"
+          elif [ "${EVENT_ACTION:-}" = "checkin_retry" ]; then
+            RETRY_CANDIDATES=$(python3 scripts/circuit_breaker.py get-due-retries 2>/dev/null || echo "")
+            echo "分时段重试接力: 就绪任务 = ${RETRY_CANDIDATES:-<无>}"
+            if [ -n "$RETRY_CANDIDATES" ]; then
+              PLAN_ARGS="--tasks $RETRY_CANDIDATES"
+            else
+              PLAN_ARGS="--tasks none"
+            fi
+          elif [ -n "${EVENT_ACTION:-}" ]; then
+            case "$EVENT_ACTION" in
+              latvi_next_sign|checkin_latvi) CANDIDATES="latvi" ;;
+              workbuddy_travel_claim)        CANDIDATES="workbuddy" ;;
+              # ModelScope 双实例已于 2026-10-28 退役（风控簇风险）——遗留 dispatch 入口指向空队列
+              checkin_modelscope)            CANDIDATES="none" ;;
+              checkin_morning)               CANDIDATES="all" ;;
+              *)                             CANDIDATES="" ;;
+            esac
+            if [ -n "$CANDIDATES" ]; then
+              PLAN_ARGS="--tasks $CANDIDATES"
+            fi
+          else
+            # 定时调度与心跳轮询：状态驱动全量巡检，自动识别今日未完成/遗漏补跑/冷却就绪任务
+            if [ "$EVENT_SCHEDULE" = "*/30 * * * *" ] || [ "${INPUT_DUE_ONLY:-false}" = "true" ]; then
+              PLAN_ARGS="--due-only"
+            fi
+          fi
+
+          if [ "${INPUT_RESET_CIRCUIT:-false}" = "true" ]; then
+            PLAN_ARGS="$PLAN_ARGS --reset-circuit"
+          fi
+
+          PLAN_OUT=$(python3 scripts/daily_orchestrator.py --plan $PLAN_ARGS)
+          DUE=$(echo "$PLAN_OUT" | sed -n 's/^DUE_TASKS=//p')
+          NEED_REPORT=$(echo "$PLAN_OUT" | sed -n 's/^NEED_REPORT=//p')
+
+          echo "due_tasks=${DUE:-none}" >> "$GITHUB_OUTPUT"
+          echo "need_report=${NEED_REPORT:-false}" >> "$GITHUB_OUTPUT"
+          if [ "${DUE:-none}" = "none" ]; then
+            if [ "${NEED_REPORT:-false}" = "true" ]; then
+              echo "📨 今日全部任务已在早前完成，本 run 仅补发统一日报推送"
+            else
+              echo "🟢 空转 run：今日全部任务已完成或尚在冷却期，且已推送日报（秒退）"
+            fi
+          else
+            echo "✅ 待执行/补跑任务: $DUE"
+          fi
+
+      - name: Direct mode (clear proxy env, runner IP 直连)
+        if: inputs.direct == true
+        run: |
+          echo "NODESEEK_PROXY=" >> "$GITHUB_ENV"
+          echo "AGENTROUTER_PROXY=" >> "$GITHUB_ENV"
+          echo "2LIBRA_PROXY=" >> "$GITHUB_ENV"
+          echo "CLOUDSTUDIO_PROXY=" >> "$GITHUB_ENV"
+          echo "direct 诊断模式：跳过代理，任务用 runner IP 直连"
+      - name: no_cffi mode (nodeseek 强制 urllib)
+        if: inputs.no_cffi == true
+        run: |
+          echo "NODESEEK_NO_CFFI=1" >> "$GITHUB_ENV"
+          echo "no_cffi 诊断模式：nodeseek 强制 urllib/HTTP1.1"
+
+      - name: Install dependencies
+        if: steps.orch_tasks.outputs.due_tasks != 'none'
+        run: |
+          pip install --no-cache-dir -r requirements.txt
+
+      - name: Set TODAY
+        if: steps.orch_tasks.outputs.due_tasks != 'none' || steps.orch_tasks.outputs.need_report == 'true'
+        run: echo "TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Setup sing-box egress (统一出站)
+        if: inputs.direct != true && steps.orch_tasks.outputs.due_tasks != 'none'
+        env:
+          AGENTROUTER_SINGBOX_CONFIG: ${{ secrets.AGENTROUTER_SINGBOX_CONFIG }}
+        run: |
+          set -euo pipefail
+          # 统一代理出站通道：由 sing-box 承载固定出口代理
+          # 代理出口状态记录至 Redis（proxy_setup 字段，14 天 TTL），用于链路诊断
+          stash_proxy_state() {
+            [ -n "$UPSTASH_REDIS_REST_URL" ] && [ -n "$UPSTASH_REDIS_REST_TOKEN" ] || return 0
+            python3 - "$1" "$2" "$3" "$4" <<'PY'
+          import datetime, json, os, subprocess, sys
+          mode, node, exit_ip, probe = (sys.argv + ["", "", "", ""])[1:5]
+          prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
+          tz = datetime.timezone(datetime.timedelta(hours=8))
+          now = datetime.datetime.now(tz)
+          dkey = f"{prefix}:raw:{now:%Y-%m-%d}"
+          val = json.dumps({"mode": mode, "node": node, "exit_ip": exit_ip,
+                            "nodeseek_probe": probe, "ts": now.isoformat(timespec="seconds")},
+                           ensure_ascii=False)
+          body = json.dumps([["HSET", dkey, "proxy_setup", val],
+                             ["EXPIRE", dkey, 1209600]])
+          try:
+              r = subprocess.run(
+                  ["curl", "-sS", "-m", "10", "-X", "POST",
+                   os.environ["UPSTASH_REDIS_REST_URL"].rstrip("/") + "/pipeline",
+                   "-H", "Authorization: Bearer " + os.environ["UPSTASH_REDIS_REST_TOKEN"],
+                   "-H", "Content-Type: application/json", "-d", body],
+                  capture_output=True, text=True, timeout=15)
+              reply = (r.stdout or r.stderr or "").strip().replace("\n", " ")
+              print(f"📜 proxy_setup → Redis({dkey}[proxy_setup]): {reply[:120]}")
+          except Exception as exc:
+              print(f"📜 proxy_setup → Redis 失败(忽略): {exc}")
+          PY
+          }
+
+          # sing-box 核心配置：加载配置并注入显式 DNS 与协议嗅探，防止 DNS 泄漏与解析抖动。
+          # inbound 统一收敛为本地 127.0.0.1:1080 SOCKS5 代理。
+          setup_singbox() {
+            test -n "$AGENTROUTER_SINGBOX_CONFIG" || { echo "AGENTROUTER_SINGBOX_CONFIG empty"; return 1; }
+            # 供应链安全加固：固定二进制版本并进行 SHA256 完整性校验
+            SINGBOX_SHA256="d2d6b4543d850269214ced70ffe41b13b1595baa1b6f9c016466abfba162c4d4"
+            curl -sL --max-time 60 -o /tmp/singbox.tar.gz               https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64-musl.tar.gz               || { echo "sing-box download failed"; return 1; }
+            echo "$SINGBOX_SHA256  /tmp/singbox.tar.gz" | sha256sum -c - >/dev/null              || { echo "sing-box checksum mismatch, aborting"; return 1; }
+            mkdir -p /tmp/singbox
+            tar xzf /tmp/singbox.tar.gz -C /tmp/singbox --strip-components=1               || { echo "sing-box extract failed"; return 1; }
+            test -x /tmp/singbox/sing-box || { echo "sing-box binary missing"; return 1; }
+            printf '%s' "$AGENTROUTER_SINGBOX_CONFIG" > /tmp/singbox-config.json
+            test -s /tmp/singbox-config.json || { echo "AGENTROUTER_SINGBOX_CONFIG empty"; return 1; }
+            python3 - <<'PY' || return 1
+          import json, sys
+          p = "/tmp/singbox-config.json"
+          try:
+              cfg = json.load(open(p, encoding="utf-8"))
+          except Exception as e:
+              print(f"AGENTROUTER_SINGBOX_CONFIG not valid JSON: {e}")
+              sys.exit(1)
+          # ── 传输安全加固与格式兼容 ────────────────────────────────────────
+          # 1) 出站协议与参数规范化（兼容 Clash/Mihomo 订阅与导出格式）及 Fail-Closed 安全核验
+          TYPE_MAP = {
+              "ss": "shadowsocks",
+              "ss2022": "shadowsocks",
+              "hy2": "hysteria2",
+              "socks5": "socks",
+              "socks4": "socks",
+              "socks4a": "socks",
+              "url-test": "urltest",
+          }
+          outbounds = cfg.get("outbounds") or []
+          for idx, ob in enumerate(outbounds):
+              if not isinstance(ob, dict):
+                  continue
+              # 协议类型别名归一化（如 ss -> shadowsocks, hy2 -> hysteria2）
+              raw_type = str(ob.get("type", "")).strip().lower()
+              if raw_type in TYPE_MAP:
+                  ob["type"] = TYPE_MAP[raw_type]
+              # 字段兼容性归一化
+              if "name" in ob and "tag" not in ob:
+                  ob["tag"] = ob.pop("name")
+              if "port" in ob and "server_port" not in ob:
+                  try:
+                      ob["server_port"] = int(ob.pop("port"))
+                  except (ValueError, TypeError):
+                      pass
+              if ob.get("type") == "shadowsocks":
+                  # Clash 格式 cipher 转换为 sing-box 规范的 method 字段
+                  if "cipher" in ob and "method" not in ob:
+                      ob["method"] = ob.pop("cipher")
+              elif ob.get("type") in ("selector", "urltest"):
+                  if "proxies" in ob and "outbounds" not in ob:
+                      ob["outbounds"] = ob.pop("proxies")
+              # 严格禁止 insecure 出站，防范中间人劫持
+              tls = ob.get("tls")
+              if isinstance(tls, dict) and tls.get("insecure"):
+                  print(f"❌ outbound [{ob.get('tag', '?')}] 配置了 tls.insecure=true，拒绝启动。"
+                        "请在 AGENTROUTER_SINGBOX_CONFIG 中移除 insecure 并配置受信证书/server_name。")
+                  sys.exit(1)
+          # 2) 最小化入站面：仅保留单个代理 inbound，统一收敛为 127.0.0.1:1080 SOCKS5
+          inbounds = cfg.get("inbounds") or []
+          picked = None
+          kept = []
+          for ib in inbounds:
+              if ib.get("type") in ("mixed", "socks", "http"):
+                  if picked is None:
+                      ib["listen"] = "127.0.0.1"
+                      ib["listen_port"] = 1080
+                      ib["type"] = "socks"
+                      picked = ib
+                      kept.append(ib)
+              else:
+                  kept.append(ib)
+          if picked is None:
+              kept.append({"type": "socks", "tag": "in_socks",
+                           "listen": "127.0.0.1", "listen_port": 1080})
+          cfg["inbounds"] = kept
+          # 3) 显式加密 DNS（DoT/DoH）：避免明文 DNS 劫持与系统解析抖动；规范化 servers 配置
+          import ipaddress as _ip, urllib.parse as _up
+          def _is_ip(host) -> bool:
+              try:
+                  _ip.ip_address(str(host).strip("[]"))
+                  return True
+              except ValueError:
+                  return False
+          dns = cfg.get("dns") or {}
+          servers = dns.get("servers")
+          if not servers:
+              servers = []
+          migrated = []
+          for idx, s in enumerate(servers):
+              if isinstance(s, str):
+                  migrated.append({"type": "udp", "tag": f"dns{idx}",
+                                   "server": s})
+                  continue
+              d = dict(s)
+              if "address" in d and "type" not in d:
+                  addr = d.pop("address")
+                  if isinstance(addr, str) and addr.startswith(("https://", "tls://")):
+                      u = _up.urlsplit(addr)
+                      d["server"] = u.hostname or addr.split("://", 1)[1]
+                      d["type"] = "https" if addr.startswith("https://") else "tls"
+                      if "server_port" not in d:
+                          d["server_port"] = u.port or (443 if d["type"] == "https" else 853)
+                  else:
+                      d["server"] = addr
+                      d["type"] = "udp"
+              elif "type" not in d:
+                  d["type"] = "udp"
+              d.setdefault("tag", f"dns{idx}")
+              migrated.append(d)
+          if not migrated:
+              # 默认加密 DNS：DoT(Google) + DoH(Cloudflare)，不再使用明文 UDP
+              migrated = [
+                  {"type": "tls", "tag": "dns-google-tls",
+                   "server": "8.8.8.8", "server_port": 853},
+                  {"type": "https", "tag": "dns-cloudflare-https",
+                   "server": "1.1.1.1", "server_port": 443},
+              ]
+          # 引导解析器：确保域名型 DNS 与 outbound 拥有直连 IP 的 bootstrap resolver
+          bootstrap = next(
+              (s for s in migrated if _is_ip(s.get("server", ""))), None)
+          if bootstrap is None:
+              bootstrap = {"type": "tls", "tag": "dns-bootstrap",
+                           "server": "8.8.8.8", "server_port": 853}
+              migrated.insert(0, bootstrap)
+          for s in migrated:
+              if not _is_ip(s.get("server", "")):
+                  s.setdefault("domain_resolver", {"server": bootstrap["tag"]})
+          dns["servers"] = migrated
+          dns.setdefault("strategy", "ipv4_only")
+          if not dns.get("final"):
+              dns["final"] = dns["servers"][0]["tag"]
+          cfg["dns"] = dns
+          if "route" not in cfg:
+              cfg["route"] = {}
+          routes = cfg["route"]
+          # 4) 路由策略：启用流量嗅探并劫持 DNS 请求交由 sing-box 核心解析
+          rules = routes.get("rules") or []
+          has_sniff = any(isinstance(r, dict) and r.get("action") == "sniff" for r in rules)
+          has_dns_hijack = any(isinstance(r, dict) and r.get("action") == "hijack-dns" for r in rules)
+          injected = []
+          if not has_sniff:
+              injected.append({"action": "sniff"})
+          if not has_dns_hijack:
+              injected.append({"protocol": "dns", "action": "hijack-dns"})
+          if injected:
+              routes["rules"] = injected + rules
+          # 5) 域名解析绑定：配置 default_domain_resolver 解析域名型 outbound
+          routes.setdefault("default_domain_resolver",
+                            {"server": bootstrap["tag"]})
+          cfg["route"] = routes
+          json.dump(cfg, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+          PY
+            # 启动前静态配置校验（Fail-Closed）：校验失败即刻中止
+            if ! check_out=$(/tmp/singbox/sing-box check --config /tmp/singbox-config.json 2>&1); then
+              echo "sing-box config check failed: $check_out"
+              return 1
+            fi
+            /tmp/singbox/sing-box run --config /tmp/singbox-config.json >/tmp/singbox.log 2>&1 &
+            SINGBOX_PID=$!
+            echo "SINGBOX_PID=$SINGBOX_PID" >> "$GITHUB_ENV"
+            for i in $(seq 1 30); do
+              if ss -tln 2>/dev/null | grep -q ":1080 "; then break; fi
+              sleep 0.5
+            done
+            sleep 1
+            if ! ss -tln 2>/dev/null | grep -q ":1080 "; then
+              echo "sing-box failed to listen on 1080; tail log:"; tail -n 20 /tmp/singbox.log || true
+              kill -9 "$SINGBOX_PID" 2>/dev/null || true; return 1
+            fi
+            # 出口探测加重试与备用目标：TW-X1-3 节点晨间偶发抖动（TCP 握手慢/单点限流），
+            # 单次 12s 失败即拆除会造成整轮假故障（agentrouter/nodeseek 等连锁公平失败）。
+            # 3 次重试 + socks5h 远程 DNS + ip.sb/icanhazip 备用目标，最坏 ~50s 换取抖动容错。
+            exit_ip=""
+            for attempt in 1 2 3; do
+              for probe_url in "https://api.ipify.org" "https://ip.sb" "https://icanhazip.com"; do
+                exit_ip=$(curl -sS -x "socks5h://127.0.0.1:1080" -m 10 "$probe_url" 2>/dev/null || curl -sS -x "socks5://127.0.0.1:1080" -m 10 "$probe_url" 2>/dev/null || echo "")
+                exit_ip=$(printf '%s' "$exit_ip" | tr -d '[:space:]')
+                [ -n "$exit_ip" ] && break 2
+              done
+              echo "sing-box egress probe attempt $attempt failed, retrying in 5s..."
+              sleep 5
+            done
+            if [ -z "$exit_ip" ]; then
+              echo "sing-box proxy forwarding failed; tearing down before fallback"; tail -n 20 /tmp/singbox.log || true
+              kill -9 "$SINGBOX_PID" 2>/dev/null || true
+              sleep 1
+              return 1
+            fi
+            node_tag=$(python3 -c "import json; cfg=json.load(open('/tmp/singbox-config.json')); print((cfg.get('outbounds') or [{}])[0].get('tag','singbox'))" 2>/dev/null || echo "singbox")
+            # 敏感信息脱敏：出口 IP 掩码后输出至日志，完整数据持久化至受保护的 Redis
+            masked_ip=$(printf '%s' "$exit_ip" | awk -F. 'NF==4{print $1".***.***."$4; next} {print substr($0,1,2)"***"}')
+            echo "sing-box ready (pid $SINGBOX_PID, outbound $node_tag, exit IP: $masked_ip)"
+            # 为依赖固定出口的任务注入代理环境变量
+            echo "AGENTROUTER_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
+            echo "NODESEEK_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
+            echo "2LIBRA_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
+            echo "CLOUDSTUDIO_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
+            ns_code=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
+            echo "sing-box egress ready on 127.0.0.1:1080 (pid $SINGBOX_PID), nodeseek probe HTTP $ns_code"
+            stash_proxy_state singbox "$node_tag" "$exit_ip" "$ns_code"
+            return 0
+          }
+
+          # sing-box 统一出站探活：启动失败时记录状态，依赖代理的任务按设计公平失败（避免无代理静默直连）
+          if ! setup_singbox; then
+            echo "代理出口不可用（sing-box 启动/探活失败）；依赖代理的任务将按设计触发公平失败"
+            stash_proxy_state none "" "" ""
+          fi
+
+      - name: Execute daily orchestrator
+        id: orchestrator
+        if: steps.orch_tasks.outputs.due_tasks != 'none'
+        env:
+          ORCH_TASKS: ${{ steps.orch_tasks.outputs.due_tasks }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          RESET_CIRCUIT: ${{ inputs.reset_circuit }}
+        run: |
+          RESET_FLAG=""
+          if [ "$RESET_CIRCUIT" = "true" ]; then
+            RESET_FLAG="--reset-circuit"
+          fi
+          if [ -n "$ORCH_TASKS" ] && [ "$ORCH_TASKS" != "none" ]; then
+            python3 scripts/daily_orchestrator.py --tasks "$ORCH_TASKS" $RESET_FLAG
+          else
+            python3 scripts/daily_orchestrator.py $RESET_FLAG
+          fi
+
+      # 日报邮件已收敛到 report-fallback job（20:00 主发 + 21:30 补发）；
+      # 此步骤只归档当日汇总并输出 failed_matrix 供自动重跑，绝不发邮件
+      - name: Archive daily summary
+        id: send_report
+        if: >-
+          always()
+          && (steps.orch_tasks.outputs.due_tasks != 'none' || steps.orch_tasks.outputs.need_report == 'true')
+          && !(github.event_name == 'repository_dispatch'
+               && contains(fromJSON('["latvi_next_sign","checkin_latvi","checkin_modelscope","workbuddy_travel_claim"]'), github.event.action))
+        env:
+          DAILY_PUSH: "true"
+          ARCHIVE_ONLY: "1"
+          GH_PAT: ${{ secrets.GH_PAT }}
+          RETRY_REPORT: ${{ inputs.retry == true && '1' || '0' }}
+        run: python3 scripts/unified_report.py
+
+      - name: Auto-retry failed sites
+        if: >-
+          always() && steps.send_report.outputs.failed_matrix != ''
+          && !(github.event_name == 'repository_dispatch'
+               && contains(fromJSON('["latvi_next_sign","checkin_latvi","checkin_morning","checkin_modelscope","workbuddy_travel_claim"]'), github.event.action))
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          FAILED_MATRIX: ${{ steps.send_report.outputs.failed_matrix }}
+        run: |
+          set -uo pipefail
+          # 1. 评估重试候选站点的重试资质与熔断状态（8次失败上限检查）
+          # 安全解析 key=value 输出，严格白名单导入环境变量，彻底避免 eval
+          while IFS='=' read -r key val; do
+            case "$key" in
+              TOTAL_CHECKED|SHOULD_RETRY|RETRYABLE_TASKS|DUE_TASKS|SUSPENDED_TASKS|NEXT_DELAY_SECONDS)
+                export "$key=$val"
+                ;;
+            esac
+          done < <(python3 scripts/circuit_breaker.py check-retry "$FAILED_MATRIX")
+          if [ -n "${SUSPENDED_TASKS:-}" ]; then
+            echo "🛑 任务已达 8 次失败上限触发熔断停用，停止自动重试（等待修复上线）: $SUSPENDED_TASKS"
+          fi
+          if [ "${SHOULD_RETRY:-false}" != "true" ]; then
+            echo "无可用重试任务（均已熔断或无需重跑），停止自动重试流程"
+            exit 0
+          fi
+
+          echo "分时段候选重试任务: $RETRYABLE_TASKS (等待时延: ${NEXT_DELAY_SECONDS:-900}s)"
+
+          # 2. 优先尝试 QStash 延时接力（零 runner 费用等待，待到期后精准 dispatch 回调）
+          QSTASH_OK=$(python3 - "${NEXT_DELAY_SECONDS:-900}" <<'PY'
+          import sys, os
+          from pathlib import Path
+          sys.path.insert(0, str(Path("scripts").resolve()))
+          from common import schedule_repo_dispatch
+          delay = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 900
+          ok, msg = schedule_repo_dispatch("checkin_retry", delay)
+          print(f"ok={str(ok).lower()};msg={msg}")
+          PY
+          )
+          echo "QStash 调度结果: $QSTASH_OK"
+
+          if echo "$QSTASH_OK" | grep -q "ok=true"; then
+            echo "✅ QStash 已安排在 ${NEXT_DELAY_SECONDS:-900}s 后延时回调 checkin_retry，期间零占用 runner 计费分钟数"
+            exit 0
+          fi
+
+          # 3. 若未配置 QStash：
+          # 重试计划已在 Redis/本地状态中持久化，由定时心跳轮询或下次定时运行到期拾取；
+          # 若时延极短（<= 120s），则可原地微等后触发 workflow_dispatch
+          if [ "${NEXT_DELAY_SECONDS:-900}" -le 120 ]; then
+            echo "等待 ${NEXT_DELAY_SECONDS}s 短时冷却..."
+            sleep "${NEXT_DELAY_SECONDS}"
+            if gh workflow run checkin.yml --ref "${GITHUB_REF_NAME:-main}" -f tasks="$RETRYABLE_TASKS" -f retry=true; then
+              echo "即时重跑已派发"
+            fi
+          else
+            echo "分时段重试：任务重试计划已记录到 Upstash Redis/状态缓存中，将由定时心跳轮询到期自动拾取，避免原地等待浪费 runner 额度。"
+          fi
+
+      - name: Save unified states
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0（SHA 固定，node24）
+        with:
+          path: |
+            .ai_router_state.json
+            .latvi_state.json
+            .agentrouter_state.json
+            .cloudstudio_state*.json
+            .2libra_state*.json
+            .modelscope_*.json
+            .juejin_state*.json
+            .alipan_state*.json
+            .smzdm_state*.json
+            .52pojie_state*.json
+            .notify_state_*.json
+          key: unified-states-${{ github.run_id }}
+
+      - name: Cleanup sing-box tunnel
+        if: always()
+        run: |
+          kill "${SINGBOX_PID:-}" 2>/dev/null || true
+          sudo -n kill "${SINGBOX_PID:-}" 2>/dev/null || true
+          sudo -n pkill -f '[s]ing-box' 2>/dev/null || true
+
+      - name: Upload unified results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1（SHA 固定，node24）
+        with:
+          name: unified-results
+          path: .task_results/
+          retention-days: 7
+          include-hidden-files: true
+          if-no-files-found: ignore # 空转 run 无结果文件，忽略即可
+
+  # ============================================================
+  # Job 2 — 每日汇总日报（20:00 BJT 主发；21:30 BJT 失败补发）
+  # 幂等：Redis sent marker + QStash 投递核查，已成功发送则秒退
+  #
+  # 定时主力 = QStash Cron（scripts/setup_report_schedule.py 注册，精确到分，
+  # 经 repository_dispatch(daily_report) 派发）；GitHub cron 仅作兜底。
+  #
+  # 原因（2026-09-15 排查）：GitHub schedule 在本仓库严重不准时。实测本应
+  # 20:00 BJT 送达的 "0 12 * * *" 日报 cron 屡次延迟约 5~6.7 小时，直到次日
+  # 凌晨 00:59 / 01:16 / 02:44 BJT 才落地（分别晚 5h16m / 4h59m / 5h14m）。
+  # unified_report 在运行时才计算 TODAY，于是这封「昨天的日报」取到的是新一天
+  # 几乎无任务的数据，发出「成功 4、待执行 25」的空报告——用户看到的就是
+  # 「每天凌晨推邮件」。注意：job 条件本身能正确识别日报 cron（故确实执行了），
+  # 它纠正不了「执行得太晚」；时序正确性只能靠下面两层。
+  #
+  # 双闸门：
+  #   1) job 前置解析真实 cron，放行日报时段与 daily_report 派发（其余秒退）；
+  #   2) unified_report 侧 19:00~23:59 BJT 时间窗守卫：晚到的日报只归档，
+  #      不发信也不写 sent marker（否则既发错日期的空数据，又压制次日 20:00 主发）。
+  # ============================================================
+  report-fallback:
+    if: >-
+      ${{ github.event_name == 'schedule' || github.event.action == 'daily_report' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: report-fallback-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      # 归一化真实 cron 并分类。放在最前且不依赖任何 action / 仓库内容，
+      # 非日报时段（晨间批次、漂移落地的心跳）在此秒退，不消耗 checkout 时间。
+      - name: Resolve schedule cron
+        id: sched
+        env:
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          set -euo pipefail
+          CRON="$(printf '%s' "$EVENT_SCHEDULE" | tr -s ' ' | sed 's/^ //; s/ $//')"
+          case "$CRON" in
+            "0 12 * * *"|"30 13 * * *") KIND="report" ;;
+            "0 23 * * *")               KIND="morning" ;;
+            "*/30 * * * *")             KIND="heartbeat" ;;
+            *)                          KIND="other" ;;
+          esac
+          echo "cron=[${CRON}] kind=${KIND}"
+          {
+            echo "cron=${CRON}"
+            echo "kind=${KIND}"
+          } >> "$GITHUB_OUTPUT"
+
+      # 日报主发/补发只认「真实 cron 属于日报时段」或 QStash 精确派发。
+      # 注意：此处无法纠正「日报 cron 执行得太晚」——那由 unified_report 的
+      # 19:00~23:59 BJT 时间窗守卫兜住（晚到只归档、不发信、不写 marker）。
+      - name: Gate to report slots only
+        id: gate
+        env:
+          KIND: ${{ steps.sched.outputs.kind }}
+          ACTION: ${{ github.event.action }}
+        run: |
+          set -euo pipefail
+          if [ "$ACTION" = "daily_report" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "✅ QStash 精确定时派发（daily_report），放行日报主发"
+          elif [ "$KIND" = "report" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "✅ 命中日报 cron 时段，放行"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "⏭️ 非日报时段（kind=${KIND:-<empty>}；cron 漂移落地的 ${KIND} 不参与发信），"
+            echo "   本 job 秒退；日报由 QStash 每日 20:00 BJT 精确派发主发。"
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1（SHA 固定，node24）
+        if: steps.gate.outputs.run == 'true'
+
+      # 自愈式排程注册：QStash 排程是日报的定时主力，一旦被误删或首次部署
+      # 缺失，本次 cron 命中即原地重建（固定 scheduleId => 幂等 update）。
+      # 刻意放在 setup-python 之前：common.py 此处只用到标准库（可用 runner
+      # 自带 python3），即使 Python 安装步骤失败也能把排程补上——这是今晚
+      # 20:00 能否精准发信的开关。失败不影响本次发信，仅告警。
+      - name: Ensure QStash report schedule
+        if: steps.gate.outputs.run == 'true'
+        env:
+          QSTASH_URL: ${{ secrets.QSTASH_URL }}
+          QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_REPO: ${{ github.repository }}
+        run: |
+          python3 scripts/setup_report_schedule.py || \
+            echo "⚠️ QStash 日报排程注册失败（不影响本次发信；日报仍可由 GitHub cron 兜底）"
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0（SHA 固定，node24）
+        if: steps.gate.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Syntax check
+        if: steps.gate.outputs.run == 'true'
+        run: python3 -m py_compile scripts/*.py
+
+      - name: Set TODAY
+        if: steps.gate.outputs.run == 'true'
+        run: echo "TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Check if report sent today (Redis marker)
+        id: check_sent
+        if: steps.gate.outputs.run == 'true'
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          TODAY: ${{ env.TODAY }}
+        run: |
+          python3 <<'EOF'
+          import os, json, sys, urllib.request
+          url = (os.getenv("UPSTASH_REDIS_REST_URL") or "").rstrip("/")
+          token = os.getenv("UPSTASH_REDIS_REST_TOKEN") or ""
+          today = os.getenv("TODAY", "")
+          gh_output = os.getenv("GITHUB_OUTPUT")
+          prefix = (os.getenv("CAT_CHECKIN_REDIS_PREFIX") or "cat_checkin:").rstrip(":")
+          marker_key = f"{prefix}:sent:{today}"
+          if not url or not token:
+              if gh_output:
+                  open(gh_output, "a", encoding="utf-8").write("sent=false\n")
+              sys.exit(0)
+          req = urllib.request.Request(f"{url}/get/{marker_key}", headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+          try:
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  data = json.loads(resp.read().decode())
+                  res = data.get("result")
+                  if res:
+                      marker = json.loads(res) if isinstance(res, str) else res
+                      if isinstance(marker, dict) and marker.get("date") == today:
+                          print(f"Redis marker hit: {marker_key} (sent_at={marker.get('sent_at')})")
+                          if gh_output:
+                              open(gh_output, "a", encoding="utf-8").write("sent=true\n")
+                              if marker.get("resend_msg_id"):
+                                  open(gh_output, "a", encoding="utf-8").write(f"resend_msg_id={marker.get('resend_msg_id')}\n")
+                          sys.exit(0)
+          except Exception as e:
+              print(f"check Redis marker error: {e}", file=sys.stderr)
+          open(gh_output, "a", encoding="utf-8").write("sent=false\n")
+          EOF
+
+      - name: Verify QStash email delivery
+        id: delivery
+        if: steps.gate.outputs.run == 'true'
+        env:
+          QSTASH_URL: ${{ secrets.QSTASH_URL }}
+          QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
+          RESEND_MSG_ID: ${{ steps.check_sent.outputs.resend_msg_id }}
+        run: python3 scripts/check_qstash_delivery.py
+
+      - name: Determine if execution is needed
+        id: should_run
+        if: steps.gate.outputs.run == 'true'
+        env:
+          TODAY: ${{ env.TODAY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ steps.check_sent.outputs.sent }}" = "true" ]; then
+            if [ "${{ steps.delivery.outputs.delivery }}" = "failed" ]; then
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              echo "QStash delivery failed, retry"
+              exit 0
+            fi
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Report already sent today (Redis marker), skip"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Report not sent today, fallback sending needed"
+
+      - name: Send unified report
+        id: send_report
+        if: steps.gate.outputs.run == 'true' && steps.should_run.outputs.skip != 'true'
+        env:
+          TZ: Asia/Shanghai
+          DAILY_PUSH: "true"
+          REPORT_FALLBACK: "1"
+          TASK_OUTPUT_DIR: .task_results
+          # 凭据年龄预警（secret_age.py）需要读 Secrets 的 updated_at
+          GH_PAT: ${{ secrets.GH_PAT }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM: ${{ secrets.RESEND_FROM }}
+          RESEND_TO: ${{ secrets.RESEND_TO }}
+          QSTASH_URL: ${{ secrets.QSTASH_URL }}
+          QSTASH_TOKEN: ${{ secrets.QSTASH_TOKEN }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          MAIL_HOST: ${{ secrets.MAIL_HOST }}
+          MAIL_PORT: ${{ secrets.MAIL_PORT }}
+          MAIL_USER: ${{ secrets.MAIL_USER }}
+          MAIL_PASS: ${{ secrets.MAIL_PASS }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: python3 scripts/unified_report.py
+
+      - name: Auto-retry failed sites
+        if: always() && steps.gate.outputs.run == 'true' && steps.should_run.outputs.skip != 'true' && steps.send_report.outputs.failed_matrix != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          FAILED_MATRIX: ${{ steps.send_report.outputs.failed_matrix }}
+        run: |
+          set -uo pipefail
+          RETRIED=$(python3 - <<'EOF'
+          import datetime as dt, json, subprocess
+          tz = dt.timezone(dt.timedelta(hours=8))
+          today = dt.datetime.now(tz).strftime("%Y-%m-%d")
+          try:
+              out = subprocess.check_output(
+                  ["gh", "run", "list", "--workflow", "checkin.yml", "--event", "workflow_dispatch",
+                   "--limit", "10", "--json", "createdAt"], text=True)
+              runs = json.loads(out)
+          except Exception:
+              print("unknown", flush=True)
+          else:
+              hit = any(
+                  dt.datetime.fromisoformat(r["createdAt"].replace("Z", "+00:00"))
+                  .astimezone(tz).strftime("%Y-%m-%d") == today
+                  for r in runs)
+              print("true" if hit else "false", flush=True)
+          EOF
+          )
+          if [ "$RETRIED" != "false" ]; then
+            echo "Today already has a workflow_dispatch checkin run ($RETRIED), skip auto-retry"
+            exit 0
+          fi
+          echo "Auto-retry failed sites: $FAILED_MATRIX"
+          if gh workflow run checkin.yml --ref "${GITHUB_REF_NAME:-main}" -f tasks="$FAILED_MATRIX" -f retry=true; then
+            echo "Retry dispatched"
+          else
+            echo "Retry dispatch failed"
+          fi

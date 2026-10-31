@@ -1,0 +1,1001 @@
+#!/usr/bin/env python3
+"""中国电信签到脚本单元测试。"""
+from __future__ import annotations
+
+import io
+import json
+import os
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+BASE = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE))
+
+import telecom
+from report_fields import extract_for
+
+
+class TestTelecom(unittest.TestCase):
+    def test_parse_account_key_value(self):
+        """键值格式抓包串解析。"""
+        raw = "phone=18912345678; sign=a1b2c3d4e5f67890a1b2c3d4e5f67890; authorization=Bearer test_jwt_token"
+        acc = telecom._parse_account_config(raw, 1)
+        self.assertEqual(acc.index, 1)
+        self.assertEqual(acc.phone, "18912345678")
+        self.assertEqual(acc.sign, "a1b2c3d4e5f67890a1b2c3d4e5f67890")
+        self.assertEqual(acc.authorization, "Bearer test_jwt_token")
+        self.assertTrue(acc.has_credentials())
+        # 2026-10-31 脱敏增强：手机号只保留末 4 位（不再露出前 3 位号段）
+        self.assertIn("*******5678", acc.display_name)
+
+    def test_parse_account_json(self):
+        """JSON 格式抓包串解析。"""
+        raw = json.dumps({
+            "phone": "13398765432",
+            "sign": "f0e1d2c3b4a59687f0e1d2c3b4a59687",
+            "authorization": "Bearer sample_token",
+        })
+        acc = telecom._parse_account_config(raw, 2)
+        self.assertEqual(acc.index, 2)
+        self.assertEqual(acc.phone, "13398765432")
+        self.assertEqual(acc.sign, "f0e1d2c3b4a59687f0e1d2c3b4a59687")
+        self.assertEqual(acc.authorization, "Bearer sample_token")
+        self.assertTrue(acc.has_credentials())
+
+    def test_parse_account_multiline_headers(self):
+        """多行 Header 抓包文本解析。"""
+        raw = (
+            "Host: wappark.189.cn\n"
+            "sign: 99887766554433221100aabbccddeeff\n"
+            "phone: 18011223344\n"
+            "Authorization: Bearer token_multi_header\n"
+        )
+        acc = telecom._parse_account_config(raw, 3)
+        self.assertEqual(acc.phone, "18011223344")
+        self.assertEqual(acc.sign, "99887766554433221100aabbccddeeff")
+        self.assertEqual(acc.authorization, "Bearer token_multi_header")
+
+    def test_parse_account_shorthand(self):
+        """简写格式解析。"""
+        raw = "18900112233#sign_secret_token_1234567890123#Bearer my_auth"
+        acc = telecom._parse_account_config(raw, 1)
+        self.assertEqual(acc.phone, "18900112233")
+        self.assertEqual(acc.sign, "sign_secret_token_1234567890123")
+        self.assertEqual(acc.authorization, "Bearer my_auth")
+
+    def test_load_all_accounts_from_env(self):
+        """环境变量序列加载。"""
+        fake_env = {
+            "TELECOM_HEADER_1": "phone=18911112222; sign=sign_token_user_one",
+            "TELECOM_HEADER_2": "phone=18933334444; sign=sign_token_user_two",
+        }
+        with patch.dict(os.environ, fake_env, clear=True):
+            accounts = telecom.load_all_accounts()
+            self.assertEqual(len(accounts), 2)
+            self.assertEqual(accounts[0].phone, "18911112222")
+            self.assertEqual(accounts[0].sign, "sign_token_user_one")
+            self.assertEqual(accounts[1].phone, "18933334444")
+            self.assertEqual(accounts[1].sign, "sign_token_user_two")
+
+    def test_load_all_accounts_multiline(self):
+        """多行抓包整串应保持单账号而不被按行拆分。"""
+        multiline_capture = (
+            "HTTP/2 200\n"
+            "server: openresty\n"
+            "content-type: application/json\n\n"
+            '{"userNum":"mock_user_num_aabbccddeeff1122","resoultCode":"0",'
+            '"sign":"mock_sign_token_aabbccddeeff1122","accId":"xxx","resoultMsg":"请求成功"}'
+        )
+        fake_env = {"TELECOM_HEADER_1": multiline_capture}
+        with patch.dict(os.environ, fake_env, clear=True):
+            accounts = telecom.load_all_accounts()
+            self.assertEqual(len(accounts), 1)
+            self.assertEqual(accounts[0].sign, "mock_sign_token_aabbccddeeff1122")
+
+    def test_parse_full_http_request_with_cookies(self):
+        """完整 HTTP 请求抓包解析（全量虚拟 Mock 数据：Cookie、UA、distinct_id 手机号反解与 sign）。"""
+        # MTg5MDAxMjM0NTY= 为虚拟手机号 18900123456 的 Base64
+        # UA 中的 MTIzNDU2!#!MTg5MDA 为 18900 与 123456 的分段 Base64
+        raw = (
+            "POST /jt-sign/webSign/homepage HTTP/2\n"
+            "host: wappark.189.cn\n"
+            "user-agent: CtClient;13.4.0;Android;9;mock_device;MTIzNDU2!#!MTg5MDA\n"
+            "sign: mock_sign_token_aabbccddeeff9988\n"
+            "cookie: 3k9kkc0re5ZOO=mock_cookie_val_1\n"
+            "cookie: zhizhendata2015jssdkcross=%7B%22distinct_id%22%3A%22MTg5MDAxMjM0NTY%3D%22%7D\n\n"
+            '{"para":"mock_payload_data"}'
+        )
+        acc = telecom._parse_account_config(raw, 1)
+        self.assertEqual(acc.sign, "mock_sign_token_aabbccddeeff9988")
+        self.assertEqual(acc.phone, "18900123456")
+        self.assertIn("CtClient;13.4.0", acc.user_agent)
+        self.assertIn("3k9kkc0re5ZOO", acc.cookie)
+        self.assertIn("zhizhendata2015jssdkcross", acc.cookie)
+        self.assertTrue(acc.has_credentials())
+
+    def test_load_all_accounts_empty(self):
+        """缺省无凭证处理。"""
+        with patch.dict(os.environ, {}, clear=True):
+            accounts = telecom.load_all_accounts()
+            self.assertEqual(accounts, [])
+
+    def test_aes_encrypt(self):
+        """AES 载荷加密与解密往返。"""
+        if not telecom.HAS_CRYPTO:
+            self.skipTest("缺少 pycryptodome 库，跳过测试")
+        data = {"phone": "18912345678", "date": 1725700000000}
+        enc_hex = telecom._encrypt_aes(data)
+        self.assertTrue(len(enc_hex) > 0)
+        self.assertEqual(len(enc_hex) % 32, 0)
+
+        from Crypto.Cipher import AES
+        from Crypto.Util.Padding import unpad
+
+        cipher = AES.new(telecom.AES_SIGN_KEY, AES.MODE_ECB)
+        decrypted = unpad(cipher.decrypt(bytes.fromhex(enc_hex)), 16)
+        parsed = json.loads(decrypted.decode("utf-8"))
+        self.assertEqual(parsed["phone"], "18912345678")
+        self.assertEqual(parsed["date"], 1725700000000)
+
+    def test_rsa_encrypt_chunked_hex(self):
+        """RSA 分段加密格式验证。"""
+        if not telecom.HAS_CRYPTO:
+            self.skipTest("缺少 pycryptodome 库，跳过测试")
+        data = {"phone": "18912345678", "shopId": "20001"}
+        enc_hex = telecom._encrypt_rsa(data)
+        self.assertTrue(len(enc_hex) >= 256)
+        self.assertEqual(len(enc_hex) % 256, 0)
+        self.assertRegex(enc_hex, r"^[0-9a-f]+$")
+
+    def test_candidate_proxies_fallback(self):
+        """CN 代理出口复用调度。"""
+        fake_env = {
+            "SMZDM_PROXY": "socks5://user:pass@114.114.114.114:1080#测试-CN出口",
+        }
+        with patch.dict(os.environ, fake_env, clear=True):
+            proxies = telecom._get_candidate_proxies()
+            self.assertTrue(len(proxies) >= 1)
+            self.assertIn("测试-CN出口", proxies[0].name)
+            self.assertEqual(proxies[0].protocol, "socks5")
+
+    def test_execute_telecom_task_success(self):
+        """业务流程执行模拟。"""
+        if not telecom.HAS_CRYPTO:
+            self.skipTest("缺少 pycryptodome 库，跳过测试")
+
+        acc = telecom.TelecomAccount(
+            index=1,
+            phone="18912345678",
+            sign="dummy_sign_token_1234567890123456",
+            authorization="Bearer test_token",
+        )
+        mock_http = MagicMock()
+        client = telecom.TelecomClient(acc, mock_http)
+
+        def fake_req(method, url, headers=None, json_data=None, data=None, timeout=15):
+            if "webSign/sign" in url:
+                return {"code": 0, "msg": "签到成功 +10 金豆"}
+            if "api/home/userStatusInfo" in url:
+                return {"code": 0, "data": {"signDay": 7}}
+            if "webSign/continueSignDays" in url:
+                return {"code": 0, "data": {"continueSignDays": 15}}
+            if "webSign/exchangePrize" in url:
+                return {"code": 0, "msg": "成功领取连签奖励"}
+            if "queryTurnTable" in url:
+                return {"code": 0, "biz": {"wzTurntable": {"code": "act_turntable_001"}}}
+            if "detail/check" in url:
+                return {"code": 0, "biz": {"resultInfo": {"userMaximum": 1, "userCount": 0}}}
+            if "golden/api/lottery" in url:
+                return {"code": 0, "biz": {"prizeName": "100M全国流量日包"}}
+            if "webSign/homepage" in url:
+                return {"code": 0, "data": {"biz": {"adItems": [{"taskId": "t1", "taskState": "0", "contentOne": "18"}]}}}
+            if "webSign/polymerize" in url:
+                return {"code": 0, "msg": "任务完成成功"}
+            if "paradise/food" in url:
+                return {"code": 0, "resoultMsg": "喂食成功，已达今日上限"}
+            if "paradise/getParadiseInfo" in url:
+                return {"code": 0, "data": {"coin": 2580}}
+            return {}
+
+        client._req = MagicMock(side_effect=fake_req)
+        with patch.object(client, "restore_cached_session", return_value=True), \
+             patch.object(client, "save_session", return_value=None), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            outcome = telecom.execute_telecom_task(client)
+
+        self.assertEqual(outcome["status"], "成功")
+        self.assertEqual(outcome["gain_bean"], 10)
+        self.assertEqual(outcome["streak_days"], 7)
+        self.assertEqual(outcome["lottery_res"], "100M全国流量日包")
+        self.assertEqual(outcome["task_res"], "完成1项")
+        self.assertEqual(outcome["food_res"], "喂食1次")
+        self.assertEqual(outcome["total_bean"], "2580")
+
+    def test_execute_telecom_task_expired_session(self):
+        """401 未授权访问或会话失效时必须明确报错失败，绝不冒充完成。"""
+        if not telecom.HAS_CRYPTO:
+            self.skipTest("缺少 pycryptodome 库，跳过测试")
+
+        acc = telecom.TelecomAccount(
+            index=1,
+            phone="18912345678",
+            sign="expired_sign_token_123456789012345",
+        )
+        mock_http = MagicMock()
+        client = telecom.TelecomClient(acc, mock_http)
+        client._req = MagicMock(return_value={"code": "401", "msg": "未授权访问"})
+
+        with patch.object(client, "restore_cached_session", return_value=True), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            outcome = telecom.execute_telecom_task(client)
+
+        self.assertEqual(outcome["status"], "失败")
+        self.assertIn("会话已失效", outcome["error"])
+        self.assertIn("未授权访问", outcome["error"])
+
+    def test_execute_telecom_task_network_http_error(self):
+        """网络异常或 WAF 412 时必须判定失败，触发代理重试或报错。"""
+        if not telecom.HAS_CRYPTO:
+            self.skipTest("缺少 pycryptodome 库，跳过测试")
+
+        acc = telecom.TelecomAccount(
+            index=1,
+            phone="18912345678",
+            sign="mock_sign_token_1234567890123456",
+        )
+        mock_http = MagicMock()
+        client = telecom.TelecomClient(acc, mock_http)
+        client._req = MagicMock(return_value={"code": 412, "msg": "HTTP 412", "_http_error": True})
+
+        with patch.object(client, "restore_cached_session", return_value=True), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            outcome = telecom.execute_telecom_task(client)
+
+        self.assertEqual(outcome["status"], "失败")
+        self.assertIn("网络请求异常", outcome["error"])
+
+    def test_run_account_proxy_rotation(self):
+        """主代理网络失败时应轮换到下一个候选代理并成功。"""
+        acc = telecom.TelecomAccount(
+            index=1,
+            phone="18912345678",
+            sign="mock_sign_token_1234567890123456",
+        )
+        ep1 = MagicMock()
+        ep1.display_name = "主出口"
+        ep1.url = "socks5://1.1.1.1:1080"
+        ep2 = MagicMock()
+        ep2.display_name = "备用出口"
+        ep2.url = "socks5://2.2.2.2:1080"
+
+        calls = []
+        def fake_exec(client):
+            calls.append(client.http)
+            if len(calls) == 1:
+                return {"status": "失败", "error": "网络请求异常（HTTP -1）"}
+            return {
+                "status": "成功",
+                "gain_bean": 10,
+                "streak_days": 1,
+                "lottery_res": "",
+                "task_res": "",
+                "food_res": "",
+                "total_bean": "100",
+                "error": "",
+            }
+
+        with patch.object(telecom, "_get_candidate_proxies", return_value=[ep1, ep2]), \
+             patch.object(telecom, "execute_telecom_task", side_effect=fake_exec), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok, outcome = telecom._run_account(acc)
+
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(outcome["status"], "成功")
+
+    def test_run_account_rotates_on_mint_network_failure(self):
+        """现签因出口网络失败未取得 sign 时，必须轮换下一代理而非放弃。"""
+        acc = telecom.TelecomAccount(index=1, phone="18912345678")
+        ep1 = MagicMock()
+        ep1.display_name = "主出口"
+        ep1.url = "socks5://1.1.1.1:1080"
+        ep2 = MagicMock()
+        ep2.display_name = "备用出口"
+        ep2.url = "socks5://2.2.2.2:1080"
+
+        calls = []
+        def fake_exec(client):
+            calls.append(client.http)
+            if len(calls) == 1:
+                return {"status": "失败",
+                        "error": "网络请求异常（现签未取得 sign：出口连接失败或被 WAF 拦截）"}
+            return {"status": "成功", "gain_bean": 10, "streak_days": 1,
+                    "lottery_res": "", "task_res": "", "food_res": "",
+                    "total_bean": "100", "error": ""}
+
+        with patch.object(telecom, "_get_candidate_proxies", return_value=[ep1, ep2]), \
+             patch.object(telecom, "execute_telecom_task", side_effect=fake_exec), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok, outcome = telecom._run_account(acc)
+
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(outcome["status"], "成功")
+
+    def test_run_account_no_rotation_on_real_missing_credentials(self):
+        """真正缺少凭据（prepare_auth 失败）仍应直接放弃，不轮换烧尝试次数。"""
+        acc = telecom.TelecomAccount(index=1, phone="18912345678")
+        ep1 = MagicMock()
+        ep1.display_name = "主出口"
+        ep1.url = "socks5://1.1.1.1:1080"
+
+        calls = []
+        def fake_exec(client):
+            calls.append(client.http)
+            return {"status": "失败", "error": "缺少 App 抓包凭据（请在 TELECOM_HEADER_1 配置抓包整串）"}
+
+        with patch.object(telecom, "_get_candidate_proxies", return_value=[ep1]), \
+             patch.object(telecom, "execute_telecom_task", side_effect=fake_exec), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok, outcome = telecom._run_account(acc)
+
+        self.assertFalse(ok)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("缺少 App 抓包凭据", outcome["error"])
+
+    def test_mint_network_failure_flag_on_timeout(self):
+        """mint 遇到连接超时/-1 响应时必须置 mint_network_failure 标记。"""
+        if not telecom.HAS_CRYPTO:
+            self.skipTest("缺少 pycryptodome 库，跳过测试")
+        from common import Response
+
+        acc = telecom.TelecomAccount(
+            index=1, phone="13800138000",
+            app_token="V1.0ABC", uid="1000000001", target_id="fake0000",
+        )
+        mock_http = MagicMock()
+        mock_http.request = MagicMock(return_value=Response(-1, None, b"", "url"))
+        client = telecom.TelecomClient(acc, mock_http)
+        with patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.mint_ticket_with_token()
+        self.assertFalse(ok)
+        self.assertTrue(client.mint_network_failure)
+
+    def test_is_credential_desc_patterns(self):
+        """密码类硬错误关键词判定（正向/负向）。"""
+        self.assertTrue(telecom._is_credential_desc("用户密码错误，请重新输入"))
+        self.assertTrue(telecom._is_credential_desc("弱密码，请点击“忘记密码”重置您的密码后登录"))
+        self.assertTrue(telecom._is_credential_desc("密码已被锁定，请24小时后再试"))
+        self.assertTrue(telecom._is_credential_desc("账号不存在"))
+        self.assertFalse(telecom._is_credential_desc("登录未成功"))
+        self.assertFalse(telecom._is_credential_desc("网络超时，请稍后重试"))
+        self.assertFalse(telecom._is_credential_desc(""))
+        self.assertFalse(telecom._is_credential_desc(None))
+
+    def test_login_credential_error_flagged(self):
+        """userLoginNormal 返回密码类硬错误时必须打上 credential_error 标记。"""
+        if not telecom.HAS_CRYPTO:
+            self.skipTest("缺少 pycryptodome 库，跳过测试")
+
+        from common import Response
+        acc = telecom.TelecomAccount(index=1, phone="18912345678", password="000000")
+        mock_http = MagicMock()
+        body = json.dumps({
+            "responseData": {
+                "resultCode": "8105",
+                "resultDesc": "弱密码，请点击“忘记密码”重置您的密码后登录",
+                "data": None,
+            }
+        }).encode("utf-8")
+        mock_http.request = MagicMock(return_value=Response(200, None, body, "url"))
+        client = telecom.TelecomClient(acc, mock_http)
+        with patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.login_with_password()
+        self.assertFalse(ok)
+        self.assertIn("弱密码", client.credential_error)
+
+    def test_execute_blocks_retry_after_credential_error(self):
+        """credential_error 置位后 execute_telecom_task 必须直接失败且不再触发登录。"""
+        acc = telecom.TelecomAccount(
+            index=1, phone="18912345678", sign="mock_sign_token_1234567890123456", password="000000",
+        )
+        client = telecom.TelecomClient(acc, MagicMock())
+        client.credential_error = "用户密码错误"
+        with patch.object(client, "prepare_auth", return_value=True), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            outcome = telecom.execute_telecom_task(client)
+        self.assertEqual(outcome["status"], "失败")
+        self.assertIn("服务密码凭证错误", outcome["error"])
+        self.assertIn("用户密码错误", outcome["error"])
+
+    def test_run_account_trips_breaker_on_credential_error(self):
+        """密码类硬错误必须立即熔断当日重试（防服务密码连错锁定 24h）。"""
+        acc = telecom.TelecomAccount(
+            index=1, phone="18912345678", sign="mock_sign_token_1234567890123456", password="000000",
+        )
+        with patch.object(telecom, "_get_candidate_proxies", return_value=[]), \
+             patch.object(telecom, "execute_telecom_task",
+                          return_value={"status": "失败",
+                                        "error": "服务密码凭证错误（用户密码错误）——已停止当日重试"}), \
+             patch.object(telecom, "trip_circuit_breaker") as mock_trip, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok, _ = telecom._run_account(acc)
+        self.assertFalse(ok)
+        mock_trip.assert_called_once()
+        self.assertEqual(mock_trip.call_args.args[0], "telecom")
+        self.assertIn("服务密码凭证错误", mock_trip.call_args.kwargs.get("reason", ""))
+
+    def test_token_only_account_passes_credential_filter(self):
+        """仅持 token 三件套的账号必须被 load_all_accounts/has_credentials 认可（CI 回归）。"""
+        acc = telecom._parse_account_config(
+            "phone=13800138000; "
+            "token=V1.0FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE; "
+            "uid=1000000001; target=deadbeefcafebabe0123456789abcdef00",
+            1,
+        )
+        self.assertTrue(acc.has_credentials())
+
+    def test_parse_token_triple(self):
+        """App 长效 Token 三件套（token/uid/target）解析。"""
+        acc = telecom._parse_account_config(
+            "phone=13800138000; "
+            "token=V1.0FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE; "
+            "uid=1000000001; "
+            "target=deadbeefcafebabe0123456789abcdef00",
+            1,
+        )
+        self.assertEqual(acc.phone, "13800138000")
+        self.assertTrue(acc.app_token.startswith("V1.0"))
+        self.assertEqual(acc.uid, "1000000001")
+        self.assertEqual(acc.target_id, "deadbeefcafebabe0123456789abcdef00")
+        # token 不得被误吞为 authorization
+        self.assertEqual(acc.authorization, "")
+
+    def test_build_getsingle_xml(self):
+        """getSingle XML 模板必须与 App 抓包结构一致（UserLoginName 带尾分号）。"""
+        xml = telecom._build_getsingle_xml("V1.0ABC", "1000000001", "fake0000", "20260919020000")
+        self.assertIn("<Code>getSingle</Code>", xml)
+        self.assertIn("<Timestamp>20260919020000</Timestamp>", xml)
+        self.assertIn("<Token>V1.0ABC</Token>", xml)
+        self.assertIn("<UserLoginName>1000000001;</UserLoginName>", xml)
+        self.assertIn("<TargetId>fake0000</TargetId>", xml)
+        self.assertIn("<SourcePassword>Sid98s</SourcePassword>", xml)
+
+    def test_mint_ticket_with_token(self):
+        """Token 现签：解析 Ticket（3DES）并经 ssoHomLogin 换 sign 的完整链路。"""
+        if not telecom.HAS_CRYPTO:
+            self.skipTest("缺少 pycryptodome 库，跳过测试")
+
+        from Crypto.Cipher import DES3
+        from Crypto.Util.Padding import pad
+        from common import Response
+
+        plain_ticket = "48cb5b01testticketplaintext0123456789abcdef"
+        des = DES3.new(telecom.KEY_3DES, DES3.MODE_CBC, telecom.IV_3DES)
+        ticket_hex = des.encrypt(pad(plain_ticket.encode(), DES3.block_size)).hex()
+        xml_resp = (
+            '<Response><HeaderInfos><Code>0000</Code><Reason>成功</Reason></HeaderInfos>'
+            f'<ResponseData><ResultCode>0000</ResultCode><Data><Ticket>{ticket_hex}</Ticket>'
+            '</Data></ResponseData></Response>'
+        )
+
+        acc = telecom.TelecomAccount(
+            index=1, phone="13800138000",
+            app_token="V1.0ABC", uid="1000000001", target_id="fake0000",
+        )
+        mock_http = MagicMock()
+        mock_http.request = MagicMock(return_value=Response(200, None, xml_resp.encode(), "url"))
+        client = telecom.TelecomClient(acc, mock_http)
+        client._req = MagicMock(return_value={"resoultCode": "0", "sign": "f" * 32})
+        with patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.mint_ticket_with_token()
+        self.assertTrue(ok)
+        self.assertEqual(client.ticket, plain_ticket)
+        self.assertEqual(client.sign, "f" * 32)
+
+    def test_prepare_auth_mints_fresh_session_over_stale_cache(self):
+        """持有 Token 三件套时必须先现签：陈旧缓存 sign 不得抢跑（wappark 对死会话 412 短路）。"""
+        acc = telecom.TelecomAccount(
+            index=1, phone="13800138000",
+            app_token="V1.0ABC", uid="1000000001", target_id="fake0000",
+        )
+        client = telecom.TelecomClient(acc, MagicMock())
+        client.sign = "stale_sign_from_2_days_ago_12345678"
+        client.cookie = "acw_sc__v2=stale_clearance"
+        client._cookie_from_cache = True
+        with patch.object(client, "restore_cached_session", return_value=True), \
+             patch.object(client, "mint_ticket_with_token", return_value=True) as m_mint, \
+             patch.object(client, "exchange_ticket", return_value=True) as m_exchange, \
+             patch.object(client, "login_with_password", return_value=False) as m_pwd, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.prepare_auth()
+        self.assertTrue(ok)
+        m_mint.assert_called_once()
+        m_exchange.assert_not_called()
+        m_pwd.assert_not_called()
+        self.assertEqual(client.cookie, "")
+
+    def test_prepare_auth_preserves_header_provided_cookie(self):
+        """用户 HEADER 抓包提供的 cookie（非缓存来源）不得被清理。"""
+        acc = telecom.TelecomAccount(
+            index=1, phone="13800138000",
+            app_token="V1.0ABC", uid="1000000001", target_id="fake0000",
+        )
+        client = telecom.TelecomClient(acc, MagicMock())
+        client.cookie = "cookie_from_header_capture=1"
+        with patch.object(client, "restore_cached_session", return_value=True), \
+             patch.object(client, "mint_ticket_with_token", return_value=True), \
+             patch.object(client, "exchange_ticket", return_value=True), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.prepare_auth()
+        self.assertTrue(ok)
+        self.assertEqual(client.cookie, "cookie_from_header_capture=1")
+
+    def test_prepare_auth_falls_back_to_cached_sign_when_mint_fails(self):
+        """现签失败（如 Token 过期）时回退缓存 sign，不再重复换票。"""
+        acc = telecom.TelecomAccount(
+            index=1, phone="13800138000",
+            app_token="V1.0ABC", uid="1000000001", target_id="fake0000",
+        )
+        client = telecom.TelecomClient(acc, MagicMock())
+        client.sign = "cached_sign_still_valid_1234567890"
+        with patch.object(client, "restore_cached_session", return_value=True), \
+             patch.object(client, "mint_ticket_with_token", return_value=False) as m_mint, \
+             patch.object(client, "exchange_ticket", return_value=True) as m_exchange, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.prepare_auth()
+        self.assertTrue(ok)
+        m_mint.assert_called_once()
+        m_exchange.assert_not_called()
+        self.assertEqual(client.sign, "cached_sign_still_valid_1234567890")
+
+    def test_prepare_auth_uses_cached_ticket_when_mint_fails_without_sign(self):
+        """现签失败且无缓存 sign 时，回退缓存 ticket 换票老路。"""
+        acc = telecom.TelecomAccount(
+            index=1, phone="13800138000",
+            app_token="V1.0ABC", uid="1000000001", target_id="fake0000",
+        )
+        client = telecom.TelecomClient(acc, MagicMock())
+        client.ticket = "c" * 256
+        with patch.object(client, "restore_cached_session", return_value=True), \
+             patch.object(client, "mint_ticket_with_token", return_value=False), \
+             patch.object(client, "exchange_ticket", return_value=True) as m_exchange, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.prepare_auth()
+        self.assertTrue(ok)
+        m_exchange.assert_called_once()
+
+    def test_prepare_auth_without_token_keeps_legacy_order(self):
+        """无 Token 三件套的老配置（ticket 路线）不受影响：缓存 ticket 照常换票。"""
+        acc = telecom.TelecomAccount(index=1, phone="13800138000")
+        client = telecom.TelecomClient(acc, MagicMock())
+        client.ticket = "c" * 256
+        with patch.object(client, "restore_cached_session", return_value=True), \
+             patch.object(client, "exchange_ticket", return_value=True) as m_exchange, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.prepare_auth()
+        self.assertTrue(ok)
+        m_exchange.assert_called_once()
+
+    def test_restore_cached_session_rejects_truncated_ua(self):
+        """状态恢复的截断 UA 必须弃用（wappark WAF 对非完整浏览器 UA 一律 412）。"""
+        acc = telecom.TelecomAccount(index=1, phone="13800138000")
+        client = telecom.TelecomClient(acc, MagicMock())
+        state = {
+            "sign": "s" * 32,
+            "user_agent": "Mozilla/5.0 (Linux; Android 12; zh-cn)",
+            "updated_at": "2026-09-17 07:07:53",
+        }
+        with patch("telecom.load_kv_state", return_value=state), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.restore_cached_session()
+        self.assertTrue(ok)
+        self.assertEqual(client.user_agent, "")
+
+    def test_restore_cached_session_accepts_full_ua(self):
+        """完整浏览器 UA（Mozilla+AppleWebKit+Safari）应正常恢复采用。"""
+        acc = telecom.TelecomAccount(index=1, phone="13800138000")
+        client = telecom.TelecomClient(acc, MagicMock())
+        ua = ("Mozilla/5.0 (Linux; U; Android 12; zh-cn) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Version/4.0 Mobile Safari/537.36 CtClient;10.4.1")
+        state = {
+            "sign": "s" * 32,
+            "user_agent": ua,
+            "updated_at": "2026-09-17 07:07:53",
+        }
+        with patch("telecom.load_kv_state", return_value=state), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok = client.restore_cached_session()
+        self.assertTrue(ok)
+        self.assertEqual(client.user_agent, ua)
+
+    def test_candidate_proxies_include_singbox_fallback(self):
+        """sing-box 统一出站应作为电信候选兜底（排在 CN 家宽之后）。"""
+        env = {
+            "TELECOM_PROXY": "http://113.9.9.9:8080#电信家宽",
+            "SINGBOX_SOCKS_URL": "socks5://127.0.0.1:1080",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            eps = telecom._get_candidate_proxies()
+        urls = [ep.url for ep in eps]
+        self.assertEqual(urls[0], "http://113.9.9.9:8080")
+        self.assertIn("socks5://127.0.0.1:1080", urls)
+
+    def test_candidate_proxies_dedup_singbox(self):
+        """sing-box 出口若与既有候选重复则不重复加入。"""
+        env = {
+            "TELECOM_PROXY": "socks5://127.0.0.1:1080#同址出口",
+            "SINGBOX_SOCKS_URL": "socks5://127.0.0.1:1080",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            eps = telecom._get_candidate_proxies()
+        self.assertEqual([ep.url for ep in eps].count("socks5://127.0.0.1:1080"), 1)
+
+    def test_report_fields_extractor(self):
+        """报告字段解析器提取验证。"""
+        sample_output = """
+【中国电信 签到】
+[proxy] 已加载境内 CN 代理出口: 电信CN代理#1
+
+👤 用户: 【189****1234】
+• 签到: 【成功】 (+10 金豆) 连签天数: 【7】天
+• 抽奖: 【100M全国流量日包】
+• 任务: 【完成1项】
+• 乐园: 【喂食1次】
+• 资产: 金豆 【2,580】
+• 目标: 【距离【10元话费直充券】(8000金豆) 还差 5420 金豆 (进度: 32.2%)】
+
+总结：成功 1/1
+"""
+        res = extract_for("telecom.py", sample_output)
+        self.assertEqual(len(res["lines"]), 1)
+        self.assertIn("189****1234", res["lines"][0])
+        self.assertIn("签到成功", res["lines"][0])
+        self.assertIn("+10金豆", res["lines"][0])
+        self.assertIn("连签 7 天", res["lines"][0])
+        self.assertIn("金豆 2,580", res["lines"][0])
+        self.assertIn("10元话费直充券", res["lines"][0])
+
+        self.assertEqual(res["streak"], 7)
+        self.assertIn(("金豆", 10.0), res["gains"])
+        self.assertIn(("金豆", 2580.0), res["assets"])
+        self.assertIn(("reward", "+10 金豆"), res["badges"])
+        self.assertIn(("streak", "连签 7 天"), res["badges"])
+        self.assertIn(("reward", "抽奖 100M全国流量日包"), res["badges"])
+
+    def test_exchange_goal_progress(self):
+        """金豆兑换目标进度计算与达标兑换。"""
+        if not telecom.HAS_CRYPTO:
+            self.skipTest("缺少 pycryptodome 库，跳过测试")
+
+        acc = telecom.TelecomAccount(
+            index=1,
+            phone="18912345678",
+            sign="mock_sign_token_1234567890123456",
+        )
+        mock_http = MagicMock()
+        client = telecom.TelecomClient(acc, mock_http)
+
+        def fake_req(method, url, headers=None, json_data=None, data=None, timeout=15):
+            if "webSign/sign" in url:
+                return {"resoultCode": "0", "data": {"code": 0}, "resoultMsg": "成功"}
+            if "userCoinInfo" in url:
+                return {"resoultCode": "0", "totalCoin": 1500}
+            return {"resoultCode": "0", "resoultMsg": "成功"}
+
+        client._req = MagicMock(side_effect=fake_req)
+        with patch.object(client, "restore_cached_session", return_value=True), \
+             patch.object(client, "save_session", return_value=None), \
+             patch.dict(os.environ, {"TELECOM_EXCHANGE_GOAL": "10元话费直充券", "TELECOM_EXCHANGE_BEANS": "8000"}), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            outcome = telecom.execute_telecom_task(client)
+
+        self.assertEqual(outcome["status"], "成功")
+        self.assertIn("距离【10元话费直充券】(8000金豆) 还差 6500 金豆", outcome["goal_res"])
+        self.assertIn("18.8%", outcome["goal_res"])
+
+    def _import_constants(self, extra_env):
+        """在独立子进程中导入 telecom，返回 (BADGES, GOAL) 常量，隔离模块级 env 解析。"""
+        code = (
+            "import os, sys\n"
+            f"sys.path.insert(0, {str(BASE)!r})\n"
+            "import telecom\n"
+            "print(telecom.TELECOM_EXCHANGE_BEANS, telecom.TELECOM_EXCHANGE_GOAL)\n"
+        )
+        env = {k: v for k, v in os.environ.items() if not k.startswith("TELECOM_")}
+        env.update(extra_env)
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(BASE.parent),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        beans, _, goal = proc.stdout.strip().partition(" ")
+        return int(beans), goal
+
+    def test_exchange_env_custom_value(self):
+        """自定义兑换目标与门槛应被正确读取。"""
+        beans, goal = self._import_constants(
+            {"TELECOM_EXCHANGE_BEANS": "12000", "TELECOM_EXCHANGE_GOAL": "20元话费券"}
+        )
+        self.assertEqual(beans, 12000)
+        self.assertEqual(goal, "20元话费券")
+
+    def test_exchange_env_fallback_non_numeric(self):
+        """门槛误配为非数字/空串/负数时应回退默认 8000，不得导入即崩。"""
+        for bad in ("abc", "", "   ", "-5", "0"):
+            with self.subTest(value=bad):
+                beans, goal = self._import_constants(
+                    {"TELECOM_EXCHANGE_BEANS": bad, "TELECOM_EXCHANGE_GOAL": "   "}
+                )
+                self.assertEqual(beans, 8000)
+                self.assertEqual(goal, "10元话费直充券")
+
+
+class TestJindouExchange(unittest.TestCase):
+    """金豆商城（wapact.189.cn:9001）话费抢兑链路测试。"""
+
+    def _client(self):
+        acc = telecom.TelecomAccount(index=1, phone="18912345678")
+        return telecom.TelecomClient(acc, MagicMock())
+
+    def test_ensure_bearer_from_existing_ticket(self):
+        """authorization 为空 + 现有 ticket 可用：统一登录一次即得 Bearer，不现签。"""
+        client = self._client()
+        client.ticket = "t" * 256
+        with patch.object(client, "jindou_unified_login", return_value="tok" * 40) as m_login, \
+             patch.object(client, "mint_ticket_with_token", return_value=True) as m_mint, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            bearer = client.ensure_jindou_bearer()
+        self.assertEqual(bearer, "tok" * 40)
+        self.assertEqual(client.authorization, "tok" * 40)
+        m_login.assert_called_once()
+        m_mint.assert_not_called()
+
+    def test_ensure_bearer_mints_when_ticket_stale(self):
+        """ticket 过期（统一登录 502）+ 持有 Token 三件套：现签新 ticket 后重试换取。"""
+        acc = telecom.TelecomAccount(index=1, phone="18912345678",
+                                     app_token="V1.0ABC", uid="1000000001",
+                                     target_id="fake0000")
+        client = telecom.TelecomClient(acc, MagicMock())
+        client.ticket = "stale" * 64
+        observed_tickets: list[str] = []
+
+        def login_side_effect() -> str:
+            # 记录每次统一登录时 client 实际持有的 ticket，用于断言重试已换新票
+            observed_tickets.append(client.ticket)
+            return "" if len(observed_tickets) == 1 else "fresh_bearer"
+
+        def mint_side_effect() -> bool:
+            client.ticket = "fresh_ticket"
+            return True
+
+        with patch.object(client, "jindou_unified_login",
+                          side_effect=login_side_effect) as m_login, \
+             patch.object(client, "mint_ticket_with_token",
+                          side_effect=mint_side_effect) as m_mint, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            bearer = client.ensure_jindou_bearer()
+        self.assertEqual(bearer, "fresh_bearer")
+        self.assertEqual(client.authorization, "fresh_bearer")
+        self.assertEqual(m_login.call_count, 2)
+        self.assertEqual(observed_tickets, ["stale" * 64, "fresh_ticket"])
+        m_mint.assert_called_once()
+
+    def test_ensure_bearer_failure_stays_empty(self):
+        """统一登录与现签均失败：返回空串且不误写 authorization。"""
+        acc = telecom.TelecomAccount(index=1, phone="18912345678",
+                                     app_token="V1.0ABC", uid="1000000001",
+                                     target_id="fake0000")
+        client = telecom.TelecomClient(acc, MagicMock())
+        client.ticket = "t" * 256
+        with patch.object(client, "jindou_unified_login", return_value=""), \
+             patch.object(client, "mint_ticket_with_token", return_value=False), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            bearer = client.ensure_jindou_bearer()
+        self.assertEqual(bearer, "")
+        self.assertEqual(client.authorization, "")
+
+    def test_ensure_bearer_reuses_existing_authorization(self):
+        """已持有 authorization：直接复用，不发任何换取请求。"""
+        client = self._client()
+        client.authorization = "already_have_bearer"
+        with patch.object(client, "jindou_unified_login") as m_login, \
+             patch.object(client, "mint_ticket_with_token") as m_mint:
+            bearer = client.ensure_jindou_bearer()
+        self.assertEqual(bearer, "already_have_bearer")
+        m_login.assert_not_called()
+        m_mint.assert_not_called()
+
+    # ---------- 转盘 Bearer 自愈（CodeRabbit 评审指认：状态缓存旧 Bearer 失效） ----------
+
+    def test_turntable_auth_reject_refreshes_and_retries_once(self):
+        """queryTurnTable 鉴权拒绝：清空 authorization 现场重取，重试一次后成功。"""
+        client = self._client()
+        calls = []
+
+        def fake_req(method, url, headers=None, **kw):
+            calls.append(headers.get("Authorization"))
+            if len(calls) == 1:
+                return {"code": 401, "msg": "HTTP 401"}   # 旧 Bearer 失效
+            return {"code": 0, "message": "成功", "biz": {"wzTurntable": {"code": "act1"}}}
+
+        client.authorization = "stale_bearer"
+        with patch.object(client, "ensure_jindou_bearer",
+                          side_effect=["stale_bearer", "fresh_bearer"]), \
+             patch.object(client, "_req", side_effect=fake_req):
+            res = client.jindou_query_turntable()
+        self.assertEqual(res.get("code"), 0)
+        self.assertEqual(client.authorization, "fresh_bearer")
+        self.assertEqual(calls, ["Bearer stale_bearer", "Bearer fresh_bearer"])
+
+    def test_turntable_non_auth_failure_no_retry(self):
+        """非鉴权类失败（业务错误）：不重试，单发原路返回。"""
+        client = self._client()
+        client.authorization = "bearer_ok"
+        with patch.object(client, "ensure_jindou_bearer", return_value="bearer_ok"), \
+             patch.object(client, "_req",
+                          return_value={"code": 5, "msg": "系统错误"}) as m_req:
+            res = client.jindou_query_turntable()
+        self.assertEqual(res.get("code"), 5)
+        m_req.assert_called_once()
+
+    def test_is_auth_reject_detects_transport_status(self):
+        """_req 透出的 _http_status（body 带非空 JSON 时 HTTP 状态不丢）可判定鉴权拒绝。"""
+        self.assertTrue(telecom.TelecomClient._is_auth_reject(
+            {"code": 0, "message": "Unauthorized", "_http_status": 401}))
+        self.assertTrue(telecom.TelecomClient._is_auth_reject({"code": 403}))
+        self.assertFalse(telecom.TelecomClient._is_auth_reject(
+            {"code": 5, "msg": "系统错误", "_http_status": 200}))
+        self.assertFalse(telecom.TelecomClient._is_auth_reject({"code": 999999}))
+
+    def test_turntable_no_bearer_short_circuits(self):
+        """换取 Bearer 失败：短路返回，不打转盘请求。"""
+        client = self._client()
+        with patch.object(client, "ensure_jindou_bearer", return_value=""), \
+             patch.object(client, "_req") as m_req:
+            res = client.jindou_query_turntable()
+        self.assertNotEqual(res.get("code"), 0)
+        m_req.assert_not_called()
+
+    def _goods(self):
+        return [
+            {"id": "g20", "title": "20元话费券", "amount": "16000"},
+            {"id": "g10", "title": "10元话费直充券", "amount": "8000"},
+            {"id": "g110", "title": "110元话费大额券", "amount": "88000"},
+        ]
+
+    def test_match_goal_goods(self):
+        """目标商品匹配：金额+话费双条件，金额带非数字前缀防 10 误中 110。"""
+        goods = self._goods()
+        hit = telecom._match_goal_goods("10元话费直充券", goods)
+        self.assertEqual(hit["id"], "g10")
+        self.assertIsNone(telecom._match_goal_goods("3元话费券", goods))
+        self.assertIsNone(telecom._match_goal_goods("", goods))
+
+    def test_next_window_math(self):
+        """场次窗口推进：上午前→10:00，两场之间→14:00，下午场后→次日 10:00。"""
+        with patch.object(telecom, "BJT", telecom.BJT):
+            morning = telecom._jindou_next_window(telecom.datetime(2026, 10, 31, 9, 0, tzinfo=telecom.BJT))
+            self.assertEqual((morning.hour, morning.minute), (10, 0))
+            noon = telecom._jindou_next_window(telecom.datetime(2026, 10, 31, 11, 30, tzinfo=telecom.BJT))
+            self.assertEqual((noon.hour, noon.minute), (14, 0))
+            late = telecom._jindou_next_window(telecom.datetime(2026, 10, 31, 15, 0, tzinfo=telecom.BJT))
+            self.assertEqual((late.day, late.hour, late.minute), (32 if late.day != 1 else 1, 10, 0))
+
+    def _run(self, client, *, balance=8214, goods="ok", burst=3, exchange_results=None):
+        """在 mock 掉 wapact 三接口的前提下执行 run_jindou_exchange。"""
+        def login():
+            return "tok" if balance is not None else ""
+
+        client.jindou_unified_login = MagicMock(side_effect=login)
+        client.jindou_query_balance = MagicMock(return_value=balance)
+        if goods == "ok":
+            client.jindou_fetch_goods = MagicMock(return_value=(self._goods(), ""))
+        elif goods is None:
+            client.jindou_fetch_goods = MagicMock(return_value=(None, "系统错误"))
+        else:
+            client.jindou_fetch_goods = MagicMock(return_value=([], ""))
+        seq = list(exchange_results or [])
+        client.jindou_exchange_once = MagicMock(side_effect=seq)
+        with patch.object(telecom.time, "sleep", lambda *_: None):
+            return telecom.run_jindou_exchange(
+                client, "10元话费直充券", 8000, wait_for_window=False, burst=burst)
+
+    def test_exchange_success(self):
+        ok, msg = self._run(self._client(), exchange_results=[
+            {"code": "0", "result_code": "0", "message": "成功"}])
+        self.assertTrue(ok)
+        self.assertIn("成功兑换", msg)
+        self.assertIn("10元话费直充券", msg)
+
+    def test_exchange_sold_out_terminal(self):
+        ok, msg = self._run(self._client(), exchange_results=[
+            {"code": "0", "result_code": "413", "message": ""}])
+        self.assertTrue(ok)
+        self.assertIn("售罄", msg)
+
+    def test_exchange_limit_terminal(self):
+        ok, msg = self._run(self._client(), exchange_results=[
+            {"code": "0", "result_code": "412", "message": ""}])
+        self.assertTrue(ok)
+        self.assertIn("次数上限", msg)
+
+    def test_exchange_burst_exhausted_transient(self):
+        ok, msg = self._run(self._client(), exchange_results=[
+            {"code": "0", "result_code": "410", "message": ""}] * 3)
+        self.assertFalse(ok)
+        self.assertIn("未成功", msg)
+
+    def test_exchange_goods_unavailable_transient(self):
+        ok, msg = self._run(self._client(), goods=None)
+        self.assertFalse(ok)
+        self.assertIn("列表不可用", msg)
+
+    def test_exchange_no_goal_item_terminal(self):
+        ok, msg = self._run(self._client(), goods="empty")
+        self.assertTrue(ok)
+        self.assertIn("无「10元话费直充券」上架", msg)
+
+    def test_exchange_below_target_terminal(self):
+        ok, msg = self._run(self._client(), balance=4000)
+        self.assertTrue(ok)
+        self.assertIn("未达目标", msg)
+
+    def test_try_exchange_no_more_fake_submitted(self):
+        """回归护栏：兑换响应为空/失败时严禁再出现旧链路的「已提交」假成功文案。"""
+        client = self._client()
+        client.jindou_unified_login = MagicMock(return_value="")
+        msg = client.try_exchange_phone_bill("10元话费直充券", 8000)
+        self.assertNotIn("已提交", msg)
+        self.assertIn("登录失败", msg)
+
+
+    def test_next_due_beijing_time(self):
+        """自排程下次到期时刻必须按北京时间场次推算（用户核心诉求）。
+
+        terminal=True → 明日 09:30 BJT（首个场次前 30 分钟）；
+        terminal=False → 下一个场次前 30 分钟（07:00→09:30，11:00→13:30，
+        15:00 已过下午场→明日 09:30）。"""
+        from datetime import datetime as _dt
+        cases = [
+            # (now BJT, terminal, 期望 时:分)
+            ((2026, 10, 31, 10, 5), True, (31 + 1, 9, 30)),   # 上午场后终局 → 明日 09:30
+            ((2026, 10, 31, 7, 0), False, (31, 9, 30)),        # 场次前探测失败 → 09:30
+            ((2026, 10, 31, 11, 0), False, (31, 13, 30)),      # 两场之间失败 → 13:30
+            ((2026, 10, 31, 15, 0), False, (32, 9, 30)),       # 下午场后失败 → 明日 09:30
+        ]
+        for (y, mo, d, h, mi), terminal, (exp_d, exp_h, exp_m) in cases:
+            with self.subTest(now=(y, mo, d, h, mi), terminal=terminal):
+                due = telecom._jindou_next_due(
+                    terminal, _dt(y, mo, d, h, mi, tzinfo=telecom.BJT))
+                # 期望日可能跨月（10-31 +1 → 11-01），按日差校验而非硬编码日号
+                day_delta = (due.date() - _dt(y, mo, d, tzinfo=telecom.BJT).date()).days
+                self.assertEqual((day_delta, due.hour, due.minute),
+                                 (exp_d - d, exp_h, exp_m))
+
+    def test_next_due_window_preceded_by_30min(self):
+        """到期时刻恒为场次前 30 分钟：配合任务内等待正好压在 09:59:15 突发。"""
+        from datetime import datetime as _dt
+        due = telecom._jindou_next_due(False, _dt(2026, 10, 31, 8, 0, tzinfo=telecom.BJT))
+        self.assertEqual((due.hour, due.minute), (9, 30))
+        self.assertEqual((due.hour * 60 + due.minute),
+                         (10 * 60) - 30)
+
+    def test_registry_task_is_rolling(self):
+        """telecom-exchange 必须注册为 rolling（24h），rolling 检查先于退避检查，
+        才能屏蔽心跳半点量化对突发时刻的推移。"""
+        from task_registry import TASKS
+        cfg = TASKS["telecom-exchange"]
+        self.assertEqual(cfg.get("sched", {}).get("type"), "rolling")
+        self.assertEqual(float(cfg["sched"].get("period_h")), 24.0)
+        self.assertEqual(cfg.get("env", {}).get("TELECOM_MODE"), "exchange")
+
+
+if __name__ == "__main__":
+    unittest.main()

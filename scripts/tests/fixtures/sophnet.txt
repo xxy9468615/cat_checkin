@@ -1,0 +1,19 @@
+发现 2 个 Sophnet 账号，开始执行签到...
+
+--- 处理第 1 个 Sophnet 账号 ---
+⚠️ 账号 #1 Token 已失效，自动尝试使用 Refresh Token 续期...
+🔄 账号 #1 正在使用 Refresh Token 无感续期...
+✅ 账号 #1 成功刷新令牌！(新 Token: eyJ***3Ns)
+✅ 账号 #1 Sophnet 签到成功！
+💰 账号 #1 当前 Token 余额: 3100000
+📅 连续签到: 18 天 | 累计签到: 24 天
+
+--- 处理第 2 个 Sophnet 账号 ---
+⚠️ 账号 #2 Token 已失效，自动尝试使用 Refresh Token 续期...
+🔄 账号 #2 正在使用 Refresh Token 无感续期...
+✅ 账号 #2 成功刷新令牌！(新 Token: eyJ***J-A)
+✅ 账号 #2 Sophnet 签到成功！
+💰 账号 #2 当前 Token 余额: 4730000
+📅 连续签到: 18 天 | 累计签到: 38 天
+
+✅ Sophnet 签到总结：2/2 全部成功
