@@ -13,6 +13,7 @@ import os
 import sys
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
@@ -63,13 +64,17 @@ class TestOkRunDays(unittest.TestCase):
         st = {"ok_days_total": 12, "first_seen_ts": _day_ts(-100)}
         self.assertEqual(cv.ok_run_days(st, now=_day_ts(0)), 12)
 
-    def test_falls_back_to_first_seen(self):
+    def test_no_counter_means_zero(self):
+        """评审口径：first_seen 只是凭据存在天数，不得冒充成功运行天数。"""
         st = {"first_seen_ts": _day_ts(-10)}
-        self.assertEqual(cv.ok_run_days(st, now=_day_ts(0)), 10)
+        self.assertEqual(cv.ok_run_days(st, now=_day_ts(0)), 0)
 
-    def test_falls_back_to_saved_ts(self):
-        st = {"saved_ts": _day_ts(-5)}
-        self.assertEqual(cv.ok_run_days(st, now=_day_ts(0)), 5)
+    def test_legacy_state_uses_used_days_wording(self):
+        """无 mark_ok 计数的历史状态：build_tag 沿用「已使用 N 天」且不发老化黄卡。"""
+        st = {"first_seen_ts": _day_ts(-60)}
+        tag = cv.build_tag(st, now=_day_ts(0))
+        self.assertIn("🔑 Cookie 有效期未知（已使用 60 天", tag)
+        self.assertNotIn("⚠️", tag)
 
     def test_empty_state(self):
         self.assertEqual(cv.ok_run_days({}, now=_day_ts(0)), 0)
@@ -167,3 +172,25 @@ class TestUpdateStateOkReset(unittest.TestCase):
         cv.update_state(st, "brand-new-cookie-value")
         self.assertEqual(st["ok_days_total"], 5)
         self.assertEqual(st["cookie_md5"], fp_now)
+
+
+class TestEnvThresholdGuard(unittest.TestCase):
+    def test_invalid_env_falls_back_to_default(self):
+        """COOKIE_UNKNOWN_AGING_WARN_DAYS 非整数：回退默认，不得在导入期炸掉全部任务。"""
+        self.assertEqual(cv._int_env("COOKIE_UNKNOWN_AGING_WARN_DAYS", 45), 45)
+        with patch("os.getenv", return_value="30d"):
+            self.assertEqual(cv._int_env("X", 45), 45)
+        with patch("os.getenv", return_value="30"):
+            self.assertEqual(cv._int_env("X", 45), 30)
+        with patch("os.getenv", return_value="-5"):
+            self.assertEqual(cv._int_env("X", 45), 45)
+        with patch("os.getenv", return_value=""):
+            self.assertEqual(cv._int_env("X", 45), 45)
+
+    def test_aging_unknown_runtime_wording(self):
+        """无计数历史状态超出声明窗口：「已运行」形态同样命中黄卡锚点。"""
+        import alert_levels
+        raw = ("👤 用户: 【***abc】 | 签到成功"
+               " | ⚠️ Cookie 有效期未知（已运行 60 天，超出 45 天估算窗口，建议预防性更新）")
+        out = alert_levels.classify("dji.py", True, raw)
+        self.assertEqual(out["level"], "warn")

@@ -386,37 +386,10 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
     error_msg = str(res_data.get("error_msg") or "")
     data = res_data.get("data", {}) if isinstance(res_data.get("data"), dict) else {}
 
-    # 4. 判定签到成败与幂等
-    is_success = str(error_code) == "0"
-    if is_success:
-        add_point = int(data.get("cpadd") or data.get("add_point") or 0)
-        checkin_num = int(data.get("daily_num") or data.get("checkin_num") or 0)
-        point = int(data.get("cpoints") or data.get("point") or 0)
-        exp = int(data.get("cexperience") or vip_info.get("exp_current") or data.get("exp") or 0)
-        gold = int(data.get("cgold") or data.get("gold") or 0)
-        rank = str(vip_info.get("exp_level") or data.get("rank") or "0")
-        slogan = str(data.get("slogan") or "")
-
-        clean_slogan = re.sub(r"<[^>]+>", "", slogan).strip()
-
-        is_already = (
-            (add_point == 0 and ("已" in error_msg or not error_msg))
-            or is_already_signed(error_msg, ("已签到", "今日已签", "已经签到", "请勿重复"))
-            or ("已领" in clean_slogan)
-            or ("已签" in clean_slogan)
-        )
-        status_label = "今日已签" if is_already else "成功"
-        gain_part = (
-            f"+{add_point} 积分"
-            if add_point > 0
-            else (clean_slogan if clean_slogan else ("今日已签" if is_already else "今日已领"))
-        )
-
-        print(f"• 签到: 【{status_label}】 连签天数: 【{checkin_num}】天 ({gain_part}) | 经验: 【{exp:,}】")
-        print(f"• 资产: 积分 【{point:,}】 · 金币 【{gold:,}】 · 等级 【V{rank}】")
-
-        # 5. 滚动保存状态（若有新 Set-Cookie 或更新保存时间）；同时持久化
-        #    共享引擎的凭据跟踪键（真实到期证据跨运行积累）
+    # 5. 滚动保存状态（若有新 Set-Cookie 或更新保存时间）；同时持久化
+    #    共享引擎的凭据跟踪键（真实到期证据跨运行积累）。成功与幂等已签
+    #    两条路径共用（评审：幂等路径不入账会让成功天数长期停滞）
+    def _persist_tracking() -> None:
         try:
             merged_cookie = _merge_cookie_str(cur_cookie, collected_set_cookies) if collected_set_cookies else cur_cookie
             tracked = cv.update_state(dict(state), merged_cookie, learned)
@@ -446,11 +419,42 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
         except Exception:
             pass
 
+    # 4. 判定签到成败与幂等
+    is_success = str(error_code) == "0"
+    if is_success:
+        add_point = int(data.get("cpadd") or data.get("add_point") or 0)
+        checkin_num = int(data.get("daily_num") or data.get("checkin_num") or 0)
+        point = int(data.get("cpoints") or data.get("point") or 0)
+        exp = int(data.get("cexperience") or vip_info.get("exp_current") or data.get("exp") or 0)
+        gold = int(data.get("cgold") or data.get("gold") or 0)
+        rank = str(vip_info.get("exp_level") or data.get("rank") or "0")
+        slogan = str(data.get("slogan") or "")
+
+        clean_slogan = re.sub(r"<[^>]+>", "", slogan).strip()
+
+        is_already = (
+            (add_point == 0 and ("已" in error_msg or not error_msg))
+            or is_already_signed(error_msg, ("已签到", "今日已签", "已经签到", "请勿重复"))
+            or ("已领" in clean_slogan)
+            or ("已签" in clean_slogan)
+        )
+        status_label = "今日已签" if is_already else "成功"
+        gain_part = (
+            f"+{add_point} 积分"
+            if add_point > 0
+            else (clean_slogan if clean_slogan else ("今日已签" if is_already else "今日已领"))
+        )
+
+        print(f"• 签到: 【{status_label}】 连签天数: 【{checkin_num}】天 ({gain_part}) | 经验: 【{exp:,}】")
+        print(f"• 资产: 积分 【{point:,}】 · 金币 【{gold:,}】 · 等级 【V{rank}】")
+
+        _persist_tracking()
         return True, "成功"
 
-    # error_code != 0 时的幂等判定
+    # error_code != 0 时的幂等判定：今日已签同为有效登录日，跟踪键照常入账
     if is_already_signed(error_msg, ("已签到", "今日已签", "已经签到", "请勿重复")):
         print(f"• 签到: 【今日已签】 ({error_msg})")
+        _persist_tracking()
         return True, "今日已签"
 
     # 真实失败

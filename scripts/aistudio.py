@@ -177,7 +177,6 @@ def _run_account(cookie: str, idx: int, total: int) -> Tuple[bool, str]:
     state_file = f".aistudio_state_{idx}.json"
     learned = cv.learn_from_jar(h.jar, credential_match=lambda n: n.startswith("BDUSS"))
     tracked = cv.update_state(load_kv_state(redis_key, state_file) or {}, cookie, learned)
-    cv.mark_ok(tracked)  # 成功运行日入账（无解析有效期凭据按执行天数反推寿命）
     validity_tag = cv.tag_for(
         cookie, tracked, learned, credential_match=lambda n: n.startswith("BDUSS")
     )
@@ -228,6 +227,17 @@ def _run_account(cookie: str, idx: int, total: int) -> Tuple[bool, str]:
             raise RuntimeError(f"百度登录态已失效或未授权：{err_msg}")
         else:
             raise RuntimeError(f"签到请求异常 [{r_sign.code}]：{err_msg}")
+
+    # 签到成功（含幂等「今日已签」）才入账成功运行日并补持久化——mark_ok
+    # 不得先于签到结果（评审：失败运行计入成功天数会让老化预警失真）
+    cv.mark_ok(tracked)
+    try:
+        save_kv_state(
+            redis_key, state_file,
+            {**tracked, "updated_at": int(datetime.now().timestamp())},
+        )
+    except Exception:
+        pass
 
     # 3. 每日算力卡领取（POST /studio/user/center/resource/receive?isInfoComplete=1）
     card_receive_msg = ""

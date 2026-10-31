@@ -59,8 +59,21 @@ DAY_SEC = 86400
 
 # 无解析有效期凭据的老化预警基线（天）：成功运行天数达到该值且仍无任何到期
 # 证据 → 升级 ⚠️ 建议预防性更新（2026-10-31 用户指令：按成功执行天数反推有效期
-# 实现预警；COOKIE_UNKNOWN_AGING_WARN_DAYS 可覆盖）
-UNKNOWN_AGING_WARN_DAYS = int((os.getenv("COOKIE_UNKNOWN_AGING_WARN_DAYS") or "45").strip() or 45)
+# 实现预警；COOKIE_UNKNOWN_AGING_WARN_DAYS 可覆盖，非法值回退默认不阻塞导入——
+# 本模块被全部任务共享，配置错误不能让无关任务起不来）
+def _int_env(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        print(f"⚠️ {name}={raw!r} 非整数，回退默认 {default} 天", flush=True)
+        return default
+    return v if v > 0 else default
+
+
+UNKNOWN_AGING_WARN_DAYS = _int_env("COOKIE_UNKNOWN_AGING_WARN_DAYS", 45)
 # ok_dates 明细保留窗口（天）：累计计数另存 ok_days_total，不受窗口裁剪影响
 OK_DATES_KEEP = 120
 
@@ -449,19 +462,14 @@ def mark_ok(state: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any
 
 
 def ok_run_days(state: Dict[str, Any], now: Optional[float] = None) -> int:
-    """成功运行天数：优先累计计数 ok_days_total；历史状态无计数时
-    以 first_seen_ts/saved_ts 为起点按日历天数近似（旧数据兼容口径）。"""
+    """经 mark_ok 确认的成功运行天数（ok_days_total）。
+
+    只认计数器，不做日历天数近似——first_seen 只说明「凭据已存在 N 天」，
+    不等于「成功运行 N 天」，混用会在首次入账时虚发老化预警（评审指认）。"""
     try:
-        total = int(state.get("ok_days_total") or 0)
+        return max(0, int(state.get("ok_days_total") or 0))
     except (TypeError, ValueError):
-        total = 0
-    if total > 0:
-        return total
-    first_seen = state.get("first_seen_ts") or state.get("saved_ts")
-    if isinstance(first_seen, (int, float)) and first_seen > 0:
-        now = now if now is not None else time.time()
-        return max(0, int((now - first_seen) / DAY_SEC))
-    return 0
+        return 0
 
 
 def build_tag(
@@ -495,7 +503,8 @@ def build_tag(
     if not isinstance(first_seen, (int, float)) or first_seen <= 0:
         # 兼容历史任务的自建键名（smzdm/52pojie 的 saved_ts：Cookie 首次启用时刻）
         first_seen = state.get("saved_ts")
-    ok_days = ok_run_days(state, now)
+    # 仅计入经 mark_ok 确认的成功运行日；无计数的历史状态沿用「已使用」口径
+    ok_days = ok_run_days(state)
     if isinstance(first_seen, (int, float)) and first_seen > 0:
         used_days = max(0, int((now - first_seen) / DAY_SEC))
         if fallback_lifetime_days:
@@ -508,9 +517,10 @@ def build_tag(
                 return f" | 🔑 {label} 剩余 {rem} 天"
             # 超出估算窗口仍存活：寿命下限已破，随时可能失效 → 升级 ⚠️
             # （「有效期未知」字面为 report_fields 解析锚点，不得改动）
+            days_txt = f"已成功运行 {ok_days} 天" if ok_days > 0 else f"已运行 {used_days} 天"
             return (
                 f" | ⚠️ {label} 有效期未知"
-                f"（已成功运行 {ok_days or used_days} 天，超出 {fallback_lifetime_days} 天估算窗口，建议预防性更新）"
+                f"（{days_txt}，超出 {fallback_lifetime_days} 天估算窗口，建议预防性更新）"
             )
         # 无兜底窗口：按成功运行天数反推——达到老化基线 → ⚠️ 建议预防性更新
         # （alert_levels 以「有效期未知（已成功运行 N 天 … 建议预防性更新」为黄卡锚点）

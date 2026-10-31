@@ -35,6 +35,7 @@
   说明：本部署签到只能通过登录触发；如需展示余额，登录后自动用 session 查询 /api/user/self，
   无需额外配置。session 与 uid 会持久化到本地 + Upstash Redis 供诊断。
 """
+import hashlib
 import json
 import os
 import re
@@ -441,10 +442,13 @@ def _run_one(idx: int, total: int, account: dict, base: str) -> str:
                 except (TypeError, ValueError):
                     quota_desc = ""
 
-            # 持久化 session/uid（诊断与后续展示用）；键名脱敏——明文邮箱不进 Redis/本地文件
+            # 持久化 session/uid（诊断与后续展示用）；键名用全量用户名摘要——
+            # 明文邮箱不进 Redis/本地文件，且脱敏值（***r123@*** 丢失域名）会
+            # 让不同域名的同名前缀互相覆盖 state（评审指认），摘要键保持唯一
+            _ukey = hashlib.md5((username or "").encode("utf-8")).hexdigest()[:12]
             state = _load_state()
-            state[f"login:{mask_str(username)}"] = session
-            state[f"uid:{mask_str(username)}"] = uid
+            state[f"login:{_ukey}"] = session
+            state[f"uid:{_ukey}"] = uid
             _save_state(state)
         except Exception as e:
             print(f"ℹ️ 余额展示跳过: {e}")
@@ -457,7 +461,7 @@ def _run_one(idx: int, total: int, account: dict, base: str) -> str:
     if session:
         cred_match = lambda n: n == "session"  # noqa: E731
         state = _load_state()
-        cv_key = f"cv:{user_tag}"
+        cv_key = f"cv:{hashlib.md5((uid or username or str(idx)).encode('utf-8')).hexdigest()[:12]}"
         learned = cv.learn_from_jar(h.jar, credential_match=cred_match)
         tracked = cv.update_state(state.get(cv_key) or {}, session, learned)
         cv.mark_ok(tracked)  # 成功运行日入账（无解析有效期凭据按执行天数反推寿命）

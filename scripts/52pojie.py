@@ -530,6 +530,10 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
     masked_uid = mask_str(uid, 2, 2) if uid != "未知" else "未知"
 
     learned_now = _collect_cookie_expiries(r_credit)
+    if env_changed:
+        # 换新凭据：先归零再入账当日——重置不能吞掉本日的首次成功（评审指认）
+        for _k in ("ok_days_total", "ok_first_date", "ok_last_date", "ok_dates"):
+            state.pop(_k, None)
     cv.mark_ok(state)  # 成功运行日入账（无解析有效期凭据按执行天数反推寿命）
     expiry_tag = _build_expiry_tag(cur_cookie, state, learned_now)
 
@@ -646,13 +650,11 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
             "nickname": mask_str(nickname),
             "uid": mask_str(uid),
             "is_qq": is_qq_bind,
-            # ok_* 键：成功运行日跟踪（cookie_validity.mark_ok 写入 state 后随此落库）。
-            # 换新凭据（env_changed）时归零重计——ok_days 度量当前凭据的服务天数，
-            # 跨凭据累计会让老化信号失真（与 update_state 指纹变更重置语义一致）
-            "ok_first_date": "" if env_changed else state.get("ok_first_date") or "",
-            "ok_last_date": "" if env_changed else state.get("ok_last_date") or "",
-            "ok_days_total": 0 if env_changed else state.get("ok_days_total") or 0,
-            "ok_dates": [] if env_changed else state.get("ok_dates") or [],
+            # ok_* 键：成功运行日跟踪（mark_ok 已按 env_changed 语义重置/入账后随此落库）
+            "ok_first_date": state.get("ok_first_date") or "",
+            "ok_last_date": state.get("ok_last_date") or "",
+            "ok_days_total": state.get("ok_days_total") or 0,
+            "ok_dates": state.get("ok_dates") or [],
             # saved_ts = 凭据寿命起点（≈ 用户登录并粘贴的时刻），换新凭据才重置；
             # 每次运行都刷新会让估算窗口变成假滑动，重新制造假 0 天告警
             "saved_ts": int(time.time()) if env_changed else int(state.get("saved_ts") or time.time()),
