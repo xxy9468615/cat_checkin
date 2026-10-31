@@ -76,5 +76,50 @@ class TestMustMatchUsesSanitize(unittest.TestCase):
         )
 
 
+class TestMaskEnhanced(unittest.TestCase):
+    """2026-10-31 脱敏增强：手机号只留末4 / 昵称末3 / 邮箱末4+域名全脱 / GDPR 通用。"""
+
+    def test_mask_phone_keeps_last4_only(self):
+        # 11 位手机号：只保留末 4 位，前 7 位全掩码（不再露出前 3 位号段）
+        self.assertEqual(common.mask_phone("13812345678"), "*******5678")
+        self.assertEqual(common.mask_str("13812345678"), "*******5678")
+        # 8~15 位纯数字 ID 同规则
+        self.assertEqual(common.mask_phone("12345678"), "****5678")
+        # 非 11 位形态回退通用规则
+        self.assertEqual(common.mask_phone("abc"), "***")
+
+    def test_mask_nickname_keeps_last3(self):
+        self.assertEqual(common.mask_nickname("王小虎要加油"), "***要加油")
+        self.assertEqual(common.mask_str("王小虎要加油"), "***要加油")
+        # ≤4 位全脱（防短名反推）
+        self.assertEqual(common.mask_nickname("张三"), "***")
+        self.assertEqual(common.mask_nickname("abcd"), "***")
+
+    def test_mask_email_last4_and_full_domain_mask(self):
+        # 前缀只留末 4 位，域名全额脱敏（不再保留首字符/TLD）
+        self.assertEqual(common.mask_email("user123@gmail.com"), "***r123@***")
+        self.assertEqual(common.mask_str("abc@aifre.cyou"), "***@***")
+        # 前缀 ≤4 位：全脱
+        self.assertEqual(common.mask_email("ab@x.com"), "***@***")
+        # 非邮箱形态回退通用规则
+        self.assertEqual(common.mask_email("plainname"), "***ame")
+
+    def test_mask_generic_gdpr_defaults(self):
+        # 通用：不露头部，定长掩码防长度泄漏；≤4 全脱；≥5 只露末 3
+        self.assertEqual(common.mask_str("hun8461"), "***461")
+        self.assertEqual(common.mask_str("yd_219491735"), "***735")
+        self.assertEqual(common.mask_str("admin"), "***min")
+        self.assertEqual(common.mask_str("张三"), "***")
+        self.assertEqual(common.mask_str(""), "")
+        self.assertEqual(common.mask_str(None), "")
+
+    def test_mask_explicit_keeps_backward_compat(self):
+        # 显式 keep_start/keep_end 维持旧语义（调用方显式决策，如 sign 4/4、代理 6/3）
+        self.assertEqual(common.mask_str("0123456789abcdef", 4, 4), "0123***cdef")
+        self.assertEqual(common.mask_str("abcdef123456", 6, 3), "abcdef***456")
+        # 含 @ 的串优先按邮箱路由（新旧一致），显式 keep 参数不改变该优先级
+        self.assertEqual(common.mask_str("a@b.com", 1, 1), "***@***")
+
+
 if __name__ == "__main__":
     unittest.main()

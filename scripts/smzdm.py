@@ -40,6 +40,7 @@ from common import (
     load_kv_state,
     main_guard,
     mask_str,
+    mask_nickname,
     parse_proxy_line,
     save_kv_state,
 )
@@ -357,8 +358,8 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
         if not smzdm_id:
             smzdm_id = str(u_data.get("smzdm_id") or "")
 
-    masked_name = mask_str(nickname, 1, 1) if nickname else f"账号 #{idx}"
-    masked_id = mask_str(smzdm_id, 2, 2) if smzdm_id else "未知"
+    masked_name = mask_nickname(nickname) if nickname else f"账号 #{idx}"
+    masked_id = mask_str(smzdm_id) if smzdm_id else "未知"
 
     remaining_days = _calc_cookie_expiry(cur_cookie, state)
     learned = cv.learn_from_set_cookies(collected_set_cookies)
@@ -425,8 +426,10 @@ def _run_account(raw_cookie: str, idx: int, total: int) -> Tuple[bool, str]:
                 {
                     "cookie": merged_cookie,
                     "env_hash": env_hash,
-                    "nickname": nickname,
-                    "smzdm_id": smzdm_id,
+                    # PII 脱敏后落盘（2026-10-31）：昵称/ID 属个人信息，
+                    # 状态文件+Redis 长期留存不得存明文
+                    "nickname": mask_str(nickname),
+                    "smzdm_id": mask_str(smzdm_id),
                     "saved_ts": int(state.get("saved_ts") or time.time()),
                     "cookie_md5": tracked.get("cookie_md5", ""),
                     "first_seen_ts": tracked.get("first_seen_ts") or int(state.get("saved_ts") or time.time()),

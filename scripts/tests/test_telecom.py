@@ -28,7 +28,8 @@ class TestTelecom(unittest.TestCase):
         self.assertEqual(acc.sign, "a1b2c3d4e5f67890a1b2c3d4e5f67890")
         self.assertEqual(acc.authorization, "Bearer test_jwt_token")
         self.assertTrue(acc.has_credentials())
-        self.assertIn("189****5678", acc.display_name)
+        # 2026-10-31 脱敏增强：手机号只保留末 4 位（不再露出前 3 位号段）
+        self.assertIn("*******5678", acc.display_name)
 
     def test_parse_account_json(self):
         """JSON 格式抓包串解析。"""
