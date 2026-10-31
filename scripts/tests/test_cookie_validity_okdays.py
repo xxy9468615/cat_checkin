@@ -177,7 +177,9 @@ class TestUpdateStateOkReset(unittest.TestCase):
 class TestEnvThresholdGuard(unittest.TestCase):
     def test_invalid_env_falls_back_to_default(self):
         """COOKIE_UNKNOWN_AGING_WARN_DAYS 非整数：回退默认，不得在导入期炸掉全部任务。"""
-        self.assertEqual(cv._int_env("COOKIE_UNKNOWN_AGING_WARN_DAYS", 45), 45)
+        # 隔离外部环境（本机可能设置了该变量）
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(cv._int_env("COOKIE_UNKNOWN_AGING_WARN_DAYS", 45), 45)
         with patch("os.getenv", return_value="30d"):
             self.assertEqual(cv._int_env("X", 45), 45)
         with patch("os.getenv", return_value="30"):
