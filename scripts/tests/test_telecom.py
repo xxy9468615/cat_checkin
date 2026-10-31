@@ -763,14 +763,27 @@ class TestJindouExchange(unittest.TestCase):
                                      target_id="fake0000")
         client = telecom.TelecomClient(acc, MagicMock())
         client.ticket = "stale" * 64
+        observed_tickets: list[str] = []
+
+        def login_side_effect() -> str:
+            # 记录每次统一登录时 client 实际持有的 ticket，用于断言重试已换新票
+            observed_tickets.append(client.ticket)
+            return "" if len(observed_tickets) == 1 else "fresh_bearer"
+
+        def mint_side_effect() -> bool:
+            client.ticket = "fresh_ticket"
+            return True
+
         with patch.object(client, "jindou_unified_login",
-                          side_effect=["", "fresh_bearer"]) as m_login, \
-             patch.object(client, "mint_ticket_with_token", return_value=True) as m_mint, \
+                          side_effect=login_side_effect) as m_login, \
+             patch.object(client, "mint_ticket_with_token",
+                          side_effect=mint_side_effect) as m_mint, \
              patch("sys.stdout", new_callable=io.StringIO):
             bearer = client.ensure_jindou_bearer()
         self.assertEqual(bearer, "fresh_bearer")
         self.assertEqual(client.authorization, "fresh_bearer")
         self.assertEqual(m_login.call_count, 2)
+        self.assertEqual(observed_tickets, ["stale" * 64, "fresh_ticket"])
         m_mint.assert_called_once()
 
     def test_ensure_bearer_failure_stays_empty(self):
