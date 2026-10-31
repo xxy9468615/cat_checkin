@@ -167,13 +167,16 @@ class TestImusicCrypto(unittest.TestCase):
 
 
 def _make_server(*, token_ok=True, left_num=4, templates=2, submit_ok=True,
-                 total=720, remaining=20, draw_awards=None, redeem_ok=True):
+                 total=720, remaining=20, draw_awards=None, redeem_ok=True,
+                 transient_fails=0):
     """构造可编排的 mock 网关与点数状态机。
 
     total/remaining 为活动点数（total 含已消耗）；每次成功制作 +20 点；
     抽奖扣 20 点并按 draw_awards 脚本循环发奖（{"awardIndex","name","points"}）；
-    兑换在 remaining>=1000 且 redeem_ok 时成功扣 1000。"""
-    state = {"submits": 0, "total": total, "remaining": remaining, "draws": 0, "redeems": 0}
+    兑换在 remaining>=1000 且 redeem_ok 时成功扣 1000；
+    transient_fails>0 时制作提交先返回「网络异常」瞬态拒绝若干次（验证重试）。"""
+    state = {"submits": 0, "total": total, "remaining": remaining, "draws": 0, "redeems": 0,
+             "transient_left": transient_fails}
     draw_awards = draw_awards or [{"awardIndex": "16320106", "name": ""}]
 
     def login_page(query, headers):
@@ -225,6 +228,12 @@ def _make_server(*, token_ok=True, left_num=4, templates=2, submit_ok=True,
     def make_api(query, headers):
         """template_make_add_v2：与 en/api 同款加解密，但 payload 无 apiName（与抓包一致）。"""
         params = _server_decrypt_form(query, headers)
+        if state["transient_left"] > 0:
+            # 「网络异常，请稍后重试」瞬态拒绝（2026-10-30 CI 实测形态）
+            state["transient_left"] -= 1
+            obj = {"code": "1001", "desc": "失败",
+                   "data": {"success": False, "message": "网络异常，请稍后重试"}}
+            return 200, _server_encrypt_resp(headers, obj)
         if submit_ok:
             state["submits"] += 1
             state["total"] += 20
@@ -283,6 +292,26 @@ class TestImusicFlow(unittest.TestCase):
         self.assertEqual(out["status"], "成功")
         self.assertEqual(out["videos"], 2)
         self.assertEqual(out["gain"], 40)
+
+    def test_run_submit_transient_retry(self):
+        """「网络异常」瞬态拒绝：退避后重试成功，不中断整轮提交（2026-10-30 CI 复盘）。"""
+        server, state = _make_server(left_num=2, templates=2, total=780, remaining=60,
+                                     transient_fails=1)
+        with patch.object(imusic.time, "sleep", lambda *_: None):
+            out = run_imusic_luck(server, "f" * 256, "13800138000")
+        self.assertEqual(out["videos"], 2)
+        self.assertEqual(state["submits"], 2)
+        self.assertNotIn("网络异常", out["msg"])
+
+    def test_run_submit_hard_failure_no_loop(self):
+        """非瞬态拒绝（次数不足）：不重试，如实失败。"""
+        server, state = _make_server(left_num=2, templates=2, total=780, remaining=60,
+                                     submit_ok=False)
+        with patch.object(imusic.time, "sleep", lambda *_: None):
+            out = run_imusic_luck(server, "f" * 256, "13800138000")
+        self.assertEqual(out["videos"], 0)
+        self.assertEqual(state["submits"], 0)
+        self.assertEqual(out["status"], "失败")
 
     def test_run_no_left(self):
         """次数用完且未开抽奖：不提交不抽奖，如实汇报（不依赖放量周期文案）。"""

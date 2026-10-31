@@ -3,7 +3,7 @@
 # new Env("统一任务注册表与调度队列")
 """统一任务注册表与调度队列管理器。
 
-定义项目中全部 25 个签到任务的元数据（脚本、结果文件、超时、账号、调度标签），
+定义项目中全部 26 个签到任务的元数据（脚本、结果文件、超时、账号、调度标签），
 作为统一执行引擎（checkin.yml）与统一报告（unified_report.py）
 的唯一事实来源（Single Source of Truth）。
 """
@@ -238,6 +238,27 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "timeout": 540,
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
+    },
+
+    # --- 中国电信 金豆商城话费抢兑（专项任务，TELECOM_MODE=exchange）---
+    # 场次（北京时间）：上午 10:00 / 下午 14:00 开抢（先到先得），00:50 主链路
+    # 时点必然错过场次（旧「已达标即直兑」从未成功过）。调度用 rolling 自排程：
+    # 任务运行后把 last_credit_ts 写为「目标时刻 - 24h」，due = ts + 24h 精确落在
+    # 场次前 30 分钟，由任务内等待对齐 09:59:15 突发——绕开心跳半点量化（若走
+    # 重试梯，07:15/08:45 会被量化到 07:30/09:00，突发实际落在 10:00 后，错过
+    # 开抢最激烈的头几十秒）。rolling 检查先于退避检查，此前一切触发被屏蔽。
+    # 退出码 0=今日终局（成功/售罄/限兑/无券/未达标），1=暂时性失败继续重试。
+    "telecom-exchange": {
+        "id": "telecom-exchange",
+        "script": "telecom.py",
+        "name": "中国电信 金豆商城抢兑",
+        "result": "telecom-exchange.json",
+        # 任务内可能等待开场最长 31 分钟 + 突发连发，预算 40 分钟
+        "timeout": 2400,
+        "account": "",
+        "env": {"TELECOM_MODE": "exchange"},
+        "sched": {"type": "rolling", "period_h": 24},
+        "tags": ["exchange", "daily"],
     },
 
     # --- 多账号站点（单 run 阶段 A 内联并发；旧 QStash 回程接力已退役） ---

@@ -26,7 +26,7 @@ import string
 import sys
 import time
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -75,6 +75,47 @@ except ValueError:
     TELECOM_EXCHANGE_BEANS = 8000
 if TELECOM_EXCHANGE_BEANS <= 0:
     TELECOM_EXCHANGE_BEANS = 8000
+
+# ---------- 金豆商城（wapact.189.cn:9001）话费抢兑 ----------
+# 2026-10-31 排障结论（本地实测 + 开源抢兑脚本交叉验证）：
+# 旧 try_exchange_phone_bill 直调 wappark paradise/receiverRights 属错误链路——
+# 该接口 payload 需权益 id + accId（缺 id 时服务端 NPE → HTTP 500，脚本却因
+# 响应无 msg 字段把失败美化成「已提交」），且目标商品「10元话费直充券」实际
+# 挂在金豆商城秒杀场，与乐园权益目录分属两套系统。真实链路：
+#   ticket → /unified/user/login（AES-ECB, key=telecom_wap_2018）→ Bearer token
+#   → /gateway/golden/api/queryInfo（商城侧金豆余额 amountTotal）
+#   → /gateway/golden/goldGoods/getGoodsList（场次商品列表；场次外返回
+#     code=999999「系统错误」，已实测与瑞数 Cookie/UA/HTTP 版本无关）
+#   → /gateway/standExchange/detailNew/exchange {"activityId": <商品id>}
+# biz.resultCode：0=成功 410=未开始 412=次数上限 413=已售罄；HTTP 429=限频。
+# 抢兑场次（BJT）：上午场 10:00 开抢（20元/10元话费券），下午场 14:00（小额券），
+# 先到先得。00:50 主链路时点必然错过场次，抢兑由专项任务 telecom-exchange
+# （TELECOM_MODE=exchange）在场次窗口内等待并发突发提交。
+JINDOU_AES_KEY = "telecom_wap_2018"
+JINDOU_LOGIN_URL = "https://wapact.189.cn:9001/unified/user/login"
+JINDOU_QUERY_URL = "https://wapact.189.cn:9001/gateway/golden/api/queryInfo"
+JINDOU_GOODS_URL = (
+    "https://wapact.189.cn:9001/gateway/golden/goldGoods/getGoodsList"
+    "?floorType=0&userType=1&page=1&order=3&tabOrder="
+)
+JINDOU_EXCHANGE_URL = "https://wapact.189.cn:9001/gateway/standExchange/detailNew/exchange"
+JINDOU_UA = (
+    "Mozilla/5.0 (Linux; Android 13; 22081212C Build/TKQ1.220829.002) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.5112.97 Mobile Safari/537.36"
+)
+JINDOU_REFERER = "https://wapact.189.cn:9001/JinDouMall/JinDouMall_independentDetails.html"
+JINDOU_WINDOWS: Tuple[Tuple[int, int], ...] = ((10, 0), (14, 0))
+# 开抢前 45 秒开始突发提交（占服务端队列），开抢后 120 秒仍拿不到列表视为今日列表不可用
+JINDOU_LEAD_SECONDS = 45
+JINDOU_TAIL_SECONDS = 120
+# 任务内等待开场的上限：超过则立即探测退出，交给 rolling 冷却重新排程（全部
+# 时刻按北京时间场次推算，下次运行被精确钉在场次前 30 分钟，见 _jindou_next_due）
+JINDOU_MAX_WAIT_SECONDS = 31 * 60
+# 单场突发兑换请求上限（开源参考实现单账号单商品一轮即 10 发，此处默认对齐并允许收敛）
+try:
+    JINDOU_BURST = max(1, min(20, int((os.getenv("TELECOM_EXCHANGE_BURST") or "").strip() or "10")))
+except ValueError:
+    JINDOU_BURST = 10
 
 # 电信网关登录公钥与 3DES 密钥
 LOGIN_RSA_PUB = (
@@ -495,6 +536,9 @@ class TelecomClient:
         # 现签 mint 遭遇网络类失败（连接超时/-1/WAF 412）标记：用于把「缺 sign」
         # 归因为出口网络问题以触发代理轮换，而非当成凭据缺失直接放弃
         self.mint_network_failure = False
+        # ssoHomLogin 返回的乐园账户 accId（等级权益/兑换记录等接口的账户标识，
+        # 2026-10-31 排障发现此前一直被丢弃——receiverRights 缺它直接 500）
+        self.acc_id = ""
 
     def _req(
         self,
@@ -719,6 +763,9 @@ class TelecomClient:
         if res.get("resoultCode") == "0" and res.get("sign"):
             self.sign = res["sign"]
             self.acc.sign = res["sign"]
+            # accId 与 sign 同源下发，乐园权益/兑换记录接口的账户标识（此前被丢弃）
+            if res.get("accId"):
+                self.acc_id = str(res["accId"])
             user_num = res.get("userNum", "")
             if user_num and HAS_CRYPTO:
                 try:
@@ -782,25 +829,108 @@ class TelecomClient:
         print(f"    [token] App 长效 Token 现签 Ticket 成功，正在换取 sign...", flush=True)
         return self.exchange_ticket()
 
-    def try_exchange_phone_bill(self, goal: str, target_beans: int) -> str:
-        """金豆达标时尝试调用金豆商城/权益接口自动兑换话费。"""
-        payload = {
-            "phone": self.phone,
-            "showType": "9003",
-            "showEffect": "8",
-            "czValue": "0",
-        }
-        res = self._req(
-            "POST",
-            "https://wappark.189.cn/jt-sign/paradise/receiverRights",
-            json_data={"para": _encrypt_rsa(payload)},
-            headers={"sign": self.sign},
+    # ---------- 金豆商城（wapact.189.cn:9001）抢兑 ----------
+
+    def _jindou_headers(self, token: str = "") -> Dict[str, str]:
+        h = {"User-Agent": JINDOU_UA, "Referer": JINDOU_REFERER}
+        if token:
+            h["Authorization"] = f"Bearer {token}"
+        return h
+
+    def jindou_unified_login(self) -> str:
+        """App 现签 ticket 经 wapact 统一登录换金豆商城 Bearer token（AES-ECB）。"""
+        if not (self.ticket and HAS_CRYPTO):
+            return ""
+        payload = json.dumps({
+            "ticket": self.ticket,
+            "backUrl": "https%3A%2F%2Fwapact.189.cn%3A9001",
+            "platformCode": "P201010301",
+            "loginType": 2,
+        })
+        try:
+            cipher = AES.new(JINDOU_AES_KEY.encode("utf-8"), AES.MODE_ECB)
+            enc = base64.b64encode(
+                cipher.encrypt(pad(payload.encode("utf-8"), AES.block_size))
+            ).decode("ascii")
+        except Exception:
+            return ""
+        res = self.http.request(
+            "POST", JINDOU_LOGIN_URL, data=enc,
+            headers={"Content-Type": "application/json;charset=UTF-8", **self._jindou_headers()},
+            timeout=15,
         )
-        msg = res.get("resoultMsg") or res.get("msg") or ""
-        code = str(res.get("resoultCode") if res.get("resoultCode") is not None else res.get("code", ""))
-        if code in ("0", "200") or "成功" in msg:
-            return f"🎉 成功自动兑换【{goal}】: {msg}"
-        return f"🎯 已达标！自动兑换响应: {msg or '已提交'}（请在电信 App 金豆商城核查到账）"
+        try:
+            data = res.json() or {}
+        except Exception:
+            data = {}
+        if res.code == 200 and data.get("code") == 0:
+            token = str((data.get("biz") or {}).get("token") or "")
+            if token:
+                return token
+        print(f"    [商城] 统一登录失败: http={res.code} code={data.get('code')} "
+              f"msg={str(data.get('message'))[:60]}", flush=True)
+        return ""
+
+    def jindou_query_balance(self, token: str) -> Optional[int]:
+        """金豆商城侧金豆余额（biz.amountTotal），失败返回 None。"""
+        res = self.http.request("GET", JINDOU_QUERY_URL, headers=self._jindou_headers(token), timeout=15)
+        try:
+            data = res.json() or {}
+        except Exception:
+            return None
+        if res.code == 200 and data.get("code") == 0:
+            try:
+                return int(float((data.get("biz") or {}).get("amountTotal")))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def jindou_fetch_goods(self, token: str) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+        """场次商品列表。返回 (列表 or None, 错误说明)；None=列表不可用（多为场次未开放，
+        服务端返回 code=999999「系统错误」——已实测与瑞数 Cookie/UA/HTTP 版本无关）。"""
+        res = self.http.request("GET", JINDOU_GOODS_URL, headers=self._jindou_headers(token), timeout=15)
+        try:
+            data = res.json() or {}
+        except Exception:
+            return None, f"HTTP {res.code}"
+        if res.code == 200 and data.get("code") == 0:
+            items = (data.get("biz") or {}).get("ExchangeGoodslist")
+            if isinstance(items, list):
+                return [it for it in items if isinstance(it, dict)], ""
+            return [], ""
+        return None, str(data.get("message") or f"code={data.get('code')}")
+
+    def jindou_exchange_once(self, token: str, activity_id: str) -> Dict[str, str]:
+        """提交一次兑换，返回归一化 {code, result_code, message}。"""
+        res = self.http.request(
+            "POST", JINDOU_EXCHANGE_URL,
+            json_data={"activityId": activity_id},
+            headers={"Content-Type": "application/json;charset=UTF-8", **self._jindou_headers(token)},
+            timeout=15,
+        )
+        if res.code == 412:
+            return {"code": "HTTP412", "result_code": "", "message": "WAF/风控拦截(HTTP 412)"}
+        if res.code == 429:
+            return {"code": "HTTP429", "result_code": "", "message": "请求频率受限(HTTP 429)"}
+        try:
+            data = res.json() or {}
+        except Exception:
+            return {"code": str(res.code), "result_code": "",
+                    "message": f"非JSON响应: {(res.text or '')[:60]}"}
+        biz = data.get("biz") or {}
+        return {
+            "code": str(data.get("code")),
+            "result_code": str(biz.get("resultCode") or ""),
+            "message": str(data.get("message") or ""),
+        }
+
+    def try_exchange_phone_bill(self, goal: str, target_beans: int) -> str:
+        """金豆达标时尝试金豆商城抢兑目标话费券（如实回报，不再美化失败）。
+
+        场次未开放/列表不可用时明确说明并指向专项抢兑任务，杜绝旧链路
+        「响应为空也报已提交」的假成功。"""
+        _, msg = run_jindou_exchange(self, goal, target_beans, wait_for_window=False, burst=1)
+        return msg
 
     def prepare_auth(self) -> bool:
         """准备可用鉴权票据：Token 现签优先（App 同款），缓存会话仅作回退。"""
@@ -1214,6 +1344,192 @@ def execute_telecom_task(client: TelecomClient) -> Dict[str, Any]:
     return res
 
 
+# ---------- 金豆商城抢兑主流程 ----------
+
+
+def _jindou_next_window(now: Optional[datetime] = None) -> datetime:
+    """下一个抢兑场次开抢时刻（BJT）。"""
+    now = now or datetime.now(BJT)
+    for h, m in JINDOU_WINDOWS:
+        w = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if w > now:
+            return w
+    return (now + timedelta(days=1)).replace(
+        hour=JINDOU_WINDOWS[0][0], minute=JINDOU_WINDOWS[0][1], second=0, microsecond=0)
+
+
+def _jindou_next_due(terminal: bool, now: Optional[datetime] = None) -> datetime:
+    """滚动冷却（sched.type=rolling）的下次到期时刻（BJT）。
+
+    全部时刻按北京时间场次（10:00/14:00 BJT）推算，把下次运行精确落在
+    「场次前 30 分钟」，由任务内等待对齐 09:59:15 突发，不依赖心跳的半点量化：
+    - terminal=True（今日终局：成功/售罄/限兑/无券/未达标）→ 明日 09:30；
+    - terminal=False（暂时性失败）→ 下一个场次前 30 分钟。"""
+    now = now or datetime.now(BJT)
+    if terminal:
+        base = (now + timedelta(days=1)).replace(
+            hour=JINDOU_WINDOWS[0][0], minute=JINDOU_WINDOWS[0][1], second=0, microsecond=0)
+        return base - timedelta(minutes=30)
+    return _jindou_next_window(now) - timedelta(minutes=30)
+
+
+def _jindou_schedule_next_run(terminal: bool) -> None:
+    """把下次到期时刻写进滚动冷却状态（due = last_credit_ts + period_h*24h）。
+
+    写入后 orchestrator 的 rolling 冷却检查会屏蔽此前的一切触发（含重试梯
+    next_retry_at——plan_due_tasks 中 rolling 检查先于退避检查），从而把
+    telecom-exchange 的实际运行时刻钉死在场次窗口边缘。"""
+    next_due = _jindou_next_due(terminal)
+    last_credit_ts = (next_due - timedelta(hours=24)).timestamp()
+    prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
+    try:
+        save_kv_state(
+            f"{prefix}:state:notify:telecom-exchange",
+            ".notify_state_telecom-exchange.json",
+            {"last_credit_ts": last_credit_ts},
+        )
+        print(f"    [商城] 下次运行已排定: {next_due.strftime('%Y-%m-%d %H:%M')} BJT（滚动冷却）",
+              flush=True)
+    except Exception as exc:
+        print(f"    [商城] 排程写入失败（退回重试梯兜底）: {exc}", flush=True)
+
+
+def _match_goal_goods(goal: str, goods: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """在场次商品里匹配目标话费券：标题需含目标金额（如 10元）与「话费」。
+
+    金额用「非数字前缀 + 金额 + 元」匹配，避免 10 误中 110 元类标题。"""
+    m = re.search(r"(\d+(?:\.\d+)?)\s*元", goal or "")
+    if not m:
+        return None
+    amount = re.escape(m.group(1))
+    for it in goods:
+        title = str(it.get("title") or "")
+        if "话费" in title and re.search(rf"(?<![0-9.]){amount}\s*元", title):
+            return it
+    return None
+
+
+def run_jindou_exchange(
+    client: TelecomClient,
+    goal: str,
+    target_beans: int,
+    wait_for_window: bool = False,
+    burst: Optional[int] = None,
+) -> Tuple[bool, str]:
+    """金豆商城话费券抢兑。返回 (今日是否终局, 可读结果)。
+
+    ok=True：今日无需再试（兑换成功 / 售罄 / 限兑 / 未达标 / 今日无此券）；
+    ok=False：暂时性失败（网络 / 场次未就绪 / 突发未中），由 rolling 自排程拉回场次窗口。
+
+    突发时机：wait_for_window=True 且距下一场次 ≤35 分钟时，任务内等待至
+    开抢前 JINDOU_LEAD_SECONDS 秒再连发（对齐开源抢兑脚本的预发排队策略）；
+    否则立即探测执行（场次已开时列表可直接服务，错峰探测亦不空耗）。"""
+    burst = burst or JINDOU_BURST
+    now = datetime.now(BJT)
+    window = _jindou_next_window(now)
+    lead = timedelta(seconds=JINDOU_LEAD_SECONDS)
+    gap = window - now
+    if wait_for_window and timedelta(0) < gap <= timedelta(minutes=35) and gap > lead:
+        wait_s = (gap - lead).total_seconds()
+        if wait_s <= JINDOU_MAX_WAIT_SECONDS:
+            print(f"    [商城] 距开抢 {int(gap.total_seconds())}s，任务内等待 "
+                  f"{int(wait_s)}s 后突发提交...", flush=True)
+            time.sleep(wait_s)
+
+    token = client.jindou_unified_login()
+    if not token:
+        return False, "金豆商城统一登录失败（ticket 失效或网络异常）"
+    balance = client.jindou_query_balance(token)
+    if balance is None:
+        return False, "金豆商城余额查询失败"
+    if balance < target_beans:
+        return True, f"金豆 {balance} 未达目标 {target_beans}，无需抢兑"
+
+    goods, goods_err = client.jindou_fetch_goods(token)
+    if goods is None:
+        return False, (f"场次商品列表不可用({goods_err[:30]})——多为场次未开放，"
+                       "由 telecom-exchange 任务在场次窗口(10:00/14:00 BJT)重试")
+    item = _match_goal_goods(goal, goods)
+    if not item:
+        titles = "、".join(
+            str(it.get("title") or "?") for it in goods[:6] if isinstance(it, dict)) or "无话费券"
+        return True, f"今日场次无「{goal}」上架（在场: {titles}）"
+    try:
+        cost = int(float(str(item.get("amount") or "0")))
+    except (TypeError, ValueError):
+        cost = 0
+    if cost and balance < cost:
+        return True, f"「{item.get('title')}」需 {cost} 金豆，余额 {balance} 不足"
+
+    activity_id = str(item.get("id") or "")
+    title = str(item.get("title") or goal)
+    print(f"    [商城] 目标商品: {title} ({cost}金豆) activityId={activity_id[:12]}…", flush=True)
+    result_code = ""
+    for attempt in range(1, burst + 1):
+        r = client.jindou_exchange_once(token, activity_id)
+        result_code = r["result_code"]
+        if r["code"] == "0" and result_code == "0":
+            print(f"    [商城] 🎉 第{attempt}发兑换成功: {title}", flush=True)
+            return True, f"🎉 成功兑换【{title}】(耗 {cost} 金豆)，按活动规则到账"
+        if result_code == "412":
+            return True, f"兑换【{title}】已达次数上限（限兑规则），今日终止"
+        if result_code == "413":
+            return True, f"【{title}】已售罄（先到先得），今日终止"
+        print(f"    [商城] 第{attempt}/{burst}发未中: result={result_code or r['code']} "
+              f"{r['message'][:40]}", flush=True)
+        time.sleep(random.uniform(2.0, 4.0))
+    return False, f"「{title}」连发 {burst} 次未成功（末次: {result_code or 'HTTP错误'}）"
+
+
+def run_exchange_mode() -> int:
+    """TELECOM_MODE=exchange 专项任务：金豆商城话费抢兑（含场次等待与突发提交）。
+
+    退出码语义：0=今日已终局（成功/售罄/限兑/无券/未达标），1=暂时性失败。
+    结束时自写 rolling 冷却状态，把下次运行精确排到下一个场次窗口边缘
+    （北京时间），全部时刻推算见 _jindou_next_due。"""
+    print("【中国电信 金豆商城话费抢兑】")
+    accounts = load_all_accounts()
+    if not accounts:
+        print("未配置电信凭据（TELECOM_HEADER_* 缺失且无本地/Redis 状态缓存）")
+        return 1
+
+    all_terminal = True
+    for acc in accounts:
+        print(f"\n👤 用户: 【{acc.display_name}】")
+        terminal = False
+        # 与 _run_account 同款出口候选：CN 家宽 → sing-box 兜底 → 直连（wapact 网关
+        # 对数据中心 IP 未实测拦截，直连保底必须入队，本地无代理时唯一可用出口）
+        proxy_queue: List[Optional[ProxyEndpoint]] = list(_get_candidate_proxies())
+        if None not in proxy_queue:
+            proxy_queue.append(None)
+        for candidate in proxy_queue[:3]:
+            p_url = candidate.url if candidate else ""
+            label = candidate.display_name if candidate else "直连出网"
+            print(f"  🌐 正在通过 [{label}] 执行抢兑...", flush=True)
+            http = Http(task_name="TELECOM", proxy=p_url, follow_redirects=True, impersonate="chrome124")
+            client = TelecomClient(acc, http)
+            if not client.prepare_auth():
+                # 现签失败多为出口网络问题（死节点吃满超时），换下一候选而非放弃
+                print("    [商城] 该出口无法取得有效票据，尝试下一候选", flush=True)
+                continue
+            terminal, msg = run_jindou_exchange(
+                client, TELECOM_EXCHANGE_GOAL, TELECOM_EXCHANGE_BEANS, wait_for_window=True)
+            print(f"• 抢兑: 【{msg}】", flush=True)
+            if terminal:
+                break
+            # 网络类暂时失败换出口重试；业务类失败（突发未中等）直接跳出等 rolling 重排
+            if not ("登录失败" in msg or "余额查询失败" in msg or "列表不可用" in msg):
+                break
+        if not terminal:
+            all_terminal = False
+
+    # 自排程：把下次运行钉在下一个场次窗口边缘（全部账号终局→明日 09:30；
+    # 存在暂时性失败→下一场次前 30 分钟）。滚动冷却优先于重试梯，杜绝心跳
+    # 半点量化把突发时刻推过 10:00:00 开抢点（2026-10-31 复盘修正）。
+    _jindou_schedule_next_run(all_terminal)
+    return 0 if all_terminal else 1
+
+
 # ---------- 账号执行与候选代理轮换 ----------
 
 
@@ -1276,6 +1592,10 @@ def _run_account(acc: TelecomAccount) -> Tuple[bool, Dict[str, Any]]:
 
 
 def main() -> None:
+    # 专项模式：金豆商城话费抢兑（telecom-exchange 任务），与 00:50 主签到链路分离
+    if (os.getenv("TELECOM_MODE") or "").strip().lower() == "exchange":
+        sys.exit(run_exchange_mode())
+
     print("【中国电信 签到】")
     accounts = load_all_accounts()
     if not accounts:

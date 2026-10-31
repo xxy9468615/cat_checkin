@@ -476,18 +476,34 @@ def run_imusic_luck(http: Any, ticket: str, phone: str = "") -> Dict[str, Any]:
             templates = client.get_templates()
             if not templates:
                 submit_err = "模板列表为空"
+
+            def _submit_once(tpl: Dict[str, Any]) -> tuple:
+                res = client.submit_make(tpl)
+                d = res.get("data") or {}
+                ok = res.get("code") == "0000" and (d.get("success") or d.get("makeId"))
+                err = "" if ok else str(d.get("message") or res.get("desc") or "提交被拒绝")
+                return ok, d, err
+
+            def _is_transient(err: str) -> bool:
+                # 服务端瞬态拒绝（网络抖动/风控滑窗）：「网络异常，请稍后重试」等
+                return any(k in err for k in ("网络异常", "稍后", "频繁", "超时"))
+
             for i in range(left):
                 if templates:
                     template = templates[i % len(templates)]
                 else:
                     break
-                make_res = client.submit_make(template)
-                data = make_res.get("data") or {}
-                if make_res.get("code") == "0000" and (data.get("success") or data.get("makeId")):
+                ok, data, err = _submit_once(template)
+                if not ok and _is_transient(err):
+                    # 「网络异常」类瞬态拒绝退避重试一次（2026-10-30 用户日志：
+                    # 800/1000 点卡在提交被拒，服务端消息为网络异常，非次数用尽）
+                    time.sleep(random.uniform(3.0, 5.0))
+                    ok, data, err = _submit_once(template)
+                if ok:
                     submitted += 1
                     print(f"    [imusic] 提交生成#{submitted}: {data.get('makeId')} ({template.get('videoName')})", flush=True)
                 else:
-                    submit_err = str(data.get("message") or make_res.get("desc") or "提交被拒绝")
+                    submit_err = err
                     print(f"    [imusic] 提交失败: {submit_err[:60]}", flush=True)
                     break
                 time.sleep(1.5)

@@ -736,5 +736,146 @@ class TestTelecom(unittest.TestCase):
                 self.assertEqual(goal, "10元话费直充券")
 
 
+class TestJindouExchange(unittest.TestCase):
+    """金豆商城（wapact.189.cn:9001）话费抢兑链路测试。"""
+
+    def _client(self):
+        acc = telecom.TelecomAccount(index=1, phone="18912345678")
+        return telecom.TelecomClient(acc, MagicMock())
+
+    def _goods(self):
+        return [
+            {"id": "g20", "title": "20元话费券", "amount": "16000"},
+            {"id": "g10", "title": "10元话费直充券", "amount": "8000"},
+            {"id": "g110", "title": "110元话费大额券", "amount": "88000"},
+        ]
+
+    def test_match_goal_goods(self):
+        """目标商品匹配：金额+话费双条件，金额带非数字前缀防 10 误中 110。"""
+        goods = self._goods()
+        hit = telecom._match_goal_goods("10元话费直充券", goods)
+        self.assertEqual(hit["id"], "g10")
+        self.assertIsNone(telecom._match_goal_goods("3元话费券", goods))
+        self.assertIsNone(telecom._match_goal_goods("", goods))
+
+    def test_next_window_math(self):
+        """场次窗口推进：上午前→10:00，两场之间→14:00，下午场后→次日 10:00。"""
+        with patch.object(telecom, "BJT", telecom.BJT):
+            morning = telecom._jindou_next_window(telecom.datetime(2026, 10, 31, 9, 0, tzinfo=telecom.BJT))
+            self.assertEqual((morning.hour, morning.minute), (10, 0))
+            noon = telecom._jindou_next_window(telecom.datetime(2026, 10, 31, 11, 30, tzinfo=telecom.BJT))
+            self.assertEqual((noon.hour, noon.minute), (14, 0))
+            late = telecom._jindou_next_window(telecom.datetime(2026, 10, 31, 15, 0, tzinfo=telecom.BJT))
+            self.assertEqual((late.day, late.hour, late.minute), (32 if late.day != 1 else 1, 10, 0))
+
+    def _run(self, client, *, balance=8214, goods="ok", burst=3, exchange_results=None):
+        """在 mock 掉 wapact 三接口的前提下执行 run_jindou_exchange。"""
+        def login():
+            return "tok" if balance is not None else ""
+
+        client.jindou_unified_login = MagicMock(side_effect=login)
+        client.jindou_query_balance = MagicMock(return_value=balance)
+        if goods == "ok":
+            client.jindou_fetch_goods = MagicMock(return_value=(self._goods(), ""))
+        elif goods is None:
+            client.jindou_fetch_goods = MagicMock(return_value=(None, "系统错误"))
+        else:
+            client.jindou_fetch_goods = MagicMock(return_value=([], ""))
+        seq = list(exchange_results or [])
+        client.jindou_exchange_once = MagicMock(side_effect=seq)
+        with patch.object(telecom.time, "sleep", lambda *_: None):
+            return telecom.run_jindou_exchange(
+                client, "10元话费直充券", 8000, wait_for_window=False, burst=burst)
+
+    def test_exchange_success(self):
+        ok, msg = self._run(self._client(), exchange_results=[
+            {"code": "0", "result_code": "0", "message": "成功"}])
+        self.assertTrue(ok)
+        self.assertIn("成功兑换", msg)
+        self.assertIn("10元话费直充券", msg)
+
+    def test_exchange_sold_out_terminal(self):
+        ok, msg = self._run(self._client(), exchange_results=[
+            {"code": "0", "result_code": "413", "message": ""}])
+        self.assertTrue(ok)
+        self.assertIn("售罄", msg)
+
+    def test_exchange_limit_terminal(self):
+        ok, msg = self._run(self._client(), exchange_results=[
+            {"code": "0", "result_code": "412", "message": ""}])
+        self.assertTrue(ok)
+        self.assertIn("次数上限", msg)
+
+    def test_exchange_burst_exhausted_transient(self):
+        ok, msg = self._run(self._client(), exchange_results=[
+            {"code": "0", "result_code": "410", "message": ""}] * 3)
+        self.assertFalse(ok)
+        self.assertIn("未成功", msg)
+
+    def test_exchange_goods_unavailable_transient(self):
+        ok, msg = self._run(self._client(), goods=None)
+        self.assertFalse(ok)
+        self.assertIn("列表不可用", msg)
+
+    def test_exchange_no_goal_item_terminal(self):
+        ok, msg = self._run(self._client(), goods="empty")
+        self.assertTrue(ok)
+        self.assertIn("无「10元话费直充券」上架", msg)
+
+    def test_exchange_below_target_terminal(self):
+        ok, msg = self._run(self._client(), balance=4000)
+        self.assertTrue(ok)
+        self.assertIn("未达目标", msg)
+
+    def test_try_exchange_no_more_fake_submitted(self):
+        """回归护栏：兑换响应为空/失败时严禁再出现旧链路的「已提交」假成功文案。"""
+        client = self._client()
+        client.jindou_unified_login = MagicMock(return_value="")
+        msg = client.try_exchange_phone_bill("10元话费直充券", 8000)
+        self.assertNotIn("已提交", msg)
+        self.assertIn("登录失败", msg)
+
+
+    def test_next_due_beijing_time(self):
+        """自排程下次到期时刻必须按北京时间场次推算（用户核心诉求）。
+
+        terminal=True → 明日 09:30 BJT（首个场次前 30 分钟）；
+        terminal=False → 下一个场次前 30 分钟（07:00→09:30，11:00→13:30，
+        15:00 已过下午场→明日 09:30）。"""
+        from datetime import datetime as _dt
+        cases = [
+            # (now BJT, terminal, 期望 时:分)
+            ((2026, 10, 31, 10, 5), True, (31 + 1, 9, 30)),   # 上午场后终局 → 明日 09:30
+            ((2026, 10, 31, 7, 0), False, (31, 9, 30)),        # 场次前探测失败 → 09:30
+            ((2026, 10, 31, 11, 0), False, (31, 13, 30)),      # 两场之间失败 → 13:30
+            ((2026, 10, 31, 15, 0), False, (32, 9, 30)),       # 下午场后失败 → 明日 09:30
+        ]
+        for (y, mo, d, h, mi), terminal, (exp_d, exp_h, exp_m) in cases:
+            with self.subTest(now=(y, mo, d, h, mi), terminal=terminal):
+                due = telecom._jindou_next_due(
+                    terminal, _dt(y, mo, d, h, mi, tzinfo=telecom.BJT))
+                # 期望日可能跨月（10-31 +1 → 11-01），按日差校验而非硬编码日号
+                day_delta = (due.date() - _dt(y, mo, d, tzinfo=telecom.BJT).date()).days
+                self.assertEqual((day_delta, due.hour, due.minute),
+                                 (exp_d - d, exp_h, exp_m))
+
+    def test_next_due_window_preceded_by_30min(self):
+        """到期时刻恒为场次前 30 分钟：配合任务内等待正好压在 09:59:15 突发。"""
+        from datetime import datetime as _dt
+        due = telecom._jindou_next_due(False, _dt(2026, 10, 31, 8, 0, tzinfo=telecom.BJT))
+        self.assertEqual((due.hour, due.minute), (9, 30))
+        self.assertEqual((due.hour * 60 + due.minute),
+                         (10 * 60) - 30)
+
+    def test_registry_task_is_rolling(self):
+        """telecom-exchange 必须注册为 rolling（24h），rolling 检查先于退避检查，
+        才能屏蔽心跳半点量化对突发时刻的推移。"""
+        from task_registry import TASKS
+        cfg = TASKS["telecom-exchange"]
+        self.assertEqual(cfg.get("sched", {}).get("type"), "rolling")
+        self.assertEqual(float(cfg["sched"].get("period_h")), 24.0)
+        self.assertEqual(cfg.get("env", {}).get("TELECOM_MODE"), "exchange")
+
+
 if __name__ == "__main__":
     unittest.main()
