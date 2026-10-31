@@ -82,36 +82,40 @@ class PlanModeTests(unittest.TestCase):
 
     def test_due_only_filters_cooldown_and_signed_latvi(self):
         env = {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:test:"}
-        # 冷却样例用真实 rolling 任务 modelscope（25h 未到期）；modelscope_ai 无冷却视为到期。
+        # 冷却样例模拟 rolling 元数据（modelscope 双实例已于 2026-10-28 退役，
+        # 注册表已无真实 rolling 任务，用 juejin 作冷却样例、glados 作到期样例）。
         with patch.dict(os.environ, env, clear=False), \
              patch.object(orch_mod, "is_task_suspended", return_value=False), \
              patch.object(orch_mod, "_cooldown_due_at",
-                          side_effect=lambda cfg: time.time() + 3600 if cfg["id"] == "modelscope" else None), \
+                          side_effect=lambda cfg: time.time() + 3600 if cfg["id"] == "juejin" else None), \
              patch.object(orch_mod, "_latvi_signed_today", return_value=True):
-            due = plan_due_tasks("modelscope,modelscope_ai,latvi", due_only=True)
-        self.assertNotIn("modelscope", due, "冷却未到期的 rolling 任务不应到期")
-        self.assertIn("modelscope_ai", due)
+            due = plan_due_tasks("juejin,glados,latvi", due_only=True)
+        self.assertNotIn("juejin", due, "冷却未到期的 rolling 任务不应到期")
+        self.assertIn("glados", due)
         self.assertNotIn("latvi", due, "今日已签的 latvi 不应到期")
 
     def test_due_only_includes_due_tasks(self):
         with patch.object(orch_mod, "is_task_suspended", return_value=False), \
              patch.object(orch_mod, "_cooldown_due_at", return_value=None), \
              patch.object(orch_mod, "_latvi_signed_today", return_value=False):
-            due = plan_due_tasks("modelscope,modelscope_ai,latvi", due_only=True)
-        self.assertEqual(due, ["modelscope", "modelscope_ai", "latvi"])
+            due = plan_due_tasks("juejin,glados,latvi", due_only=True)
+        self.assertEqual(due, ["juejin", "glados", "latvi"])
 
     def test_explicit_mode_ignores_cooldown(self):
-        """非 due_only（显式列表/主 cron）口径：候选内全部到期（重试列表已预过滤）。"""
+        """非 due_only（显式列表/主 cron）口径：候选内全部到期（重试列表已预过滤）。
+
+        原 modelscope → modelscope_ai 同脚本双实例展开覆盖已随 2026-10-28 退役移除。
+        """
         with patch.object(orch_mod, "is_task_suspended", return_value=False):
-            due = plan_due_tasks("modelscope,latvi", due_only=False)
-        self.assertEqual(due, ["modelscope", "modelscope_ai", "latvi"])
+            due = plan_due_tasks("juejin,glados,latvi", due_only=False)
+        self.assertEqual(due, ["juejin", "glados", "latvi"])
 
     def test_suspended_tasks_skipped(self):
         with patch.object(orch_mod, "is_task_suspended",
-                          side_effect=lambda tid: tid == "modelscope"):
-            due = plan_due_tasks("modelscope,juejin", due_only=False)
-        # modelscope 熔断跳过；其配对实例 modelscope_ai 独立判定，仍到期
-        self.assertEqual(due, ["modelscope_ai", "juejin"])
+                          side_effect=lambda tid: tid == "juejin"):
+            due = plan_due_tasks("juejin,glados", due_only=False)
+        # 熔断任务跳过，其余照常到期
+        self.assertEqual(due, ["glados"])
 
     def test_auto_plan_skips_successful_today(self):
         """自动全量巡检模式（raw_tasks=""）：今日已成功的任务自动跳过，未成功的任务判定为到期。"""
@@ -162,7 +166,8 @@ class PlanModeTests(unittest.TestCase):
         self.assertNotIn("52pojie", due, "夜间心跳不应提前执行常规单日任务")
         self.assertNotIn("smzdm", due, "夜间心跳不应提前执行常规单日任务")
         self.assertNotIn("cloud189", due, "夜间心跳不应提前执行常规单日任务")
-        self.assertIn("modelscope", due, "rolling 任务应按冷却评估")
+        # modelscope 双实例已退役（原 rolling 夜间样例）；当前注册表无 rolling 任务，
+        # 夜间心跳仅未签 latvi 到期
         self.assertIn("latvi", due, "未签到的 latvi 应到期")
 
     def test_auto_plan_due_only_daytime_includes_missed_tasks(self):

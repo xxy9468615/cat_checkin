@@ -3,7 +3,7 @@
 # new Env("统一任务注册表与调度队列")
 """统一任务注册表与调度队列管理器。
 
-定义项目中全部 27 个签到任务的元数据（脚本、结果文件、超时、账号、调度标签），
+定义项目中全部 25 个签到任务的元数据（脚本、结果文件、超时、账号、调度标签），
 作为统一执行引擎（checkin.yml）与统一报告（unified_report.py）
 的唯一事实来源（Single Source of Truth）。
 """
@@ -261,33 +261,11 @@ TASKS: Dict[str, Dict[str, Any]] = {
     },
 
     # --- 特殊窗口站点（09:10 BJT 窗口；单 run 中 max(now,09:10) 零等待） ---
-    # ModelScope CN 站与国际站（AI）拆为两个独立任务实例：分开调度、独立失败卡、
-    # 独立通知状态；MODELSCOPE_SITE 由 orchestrator 按 cfg["env"] 注入。
-    # 显式 tasks=modelscope 仍同时命中两实例（resolve_execution_queue 按脚本名匹配）。
-    "modelscope": {
-        "id": "modelscope",
-        "script": "modelscope.py",
-        "name": "ModelScope 国内站签到",
-        "result": "modelscope.json",
-        "timeout": 600,
-        "account": "",
-        "tags": ["09:10", "modelscope", "daily"],
-        "env": {"MODELSCOPE_SITE": "cn"},
-        # 滚动冷却型调度：daily_active 领取后 24h 才可再领，由心跳 run 按
-        # last_credit_ts 状态驱动（DUE_ONLY），不依赖固定启动时刻
-        "sched": {"type": "rolling", "period_h": 24},
-    },
-    "modelscope_ai": {
-        "id": "modelscope_ai",
-        "script": "modelscope.py",
-        "name": "ModelScope 国际站签到",
-        "result": "modelscope_ai.json",
-        "timeout": 600,
-        "account": "",
-        "tags": ["09:10", "modelscope", "modelscope_ai", "daily"],
-        "env": {"MODELSCOPE_SITE": "ai"},
-        "sched": {"type": "rolling", "period_h": 24},
-    },
+    # --- ModelScope 魔搭社区（2026-10-28 全站停用：国内站账号2封禁 + 测试号风控拉黑，
+    #     风控「可疑活动」判定呈账号簇关联态势，暂停全部自动化流量保住剩余账号。
+    #     脚本 modelscope.py 保留且已完成反风控加固（每账号UA/拟人间隔/黑名单自动
+    #     停用/纯登录最小足迹），恢复时把两个实例加回本表即可；互动任务由
+    #     MODELSCOPE_ENABLE_LIKE_TASKS / _AIGC_PUBLISH / _PROFILE_TASKS 开关独立控制）---
 
     # --- 24h 动态冷却站点（Latvi：last_sign_ts+24h 状态驱动，硬墙前 2min 进场） ---
     "latvi": {
