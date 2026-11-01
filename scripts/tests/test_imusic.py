@@ -168,7 +168,7 @@ class TestImusicCrypto(unittest.TestCase):
 
 def _make_server(*, token_ok=True, left_num=4, templates=2, submit_ok=True,
                  total=720, remaining=20, draw_awards=None, redeem_ok=True,
-                 transient_fails=0, gate_left=None, make_code=None):
+                 transient_fails=0, gate_left=None, make_code=None, make_limit_state=0):
     """构造可编排的 mock 网关与点数状态机。
 
     total/remaining 为活动点数（total 含已消耗）；每次成功制作 +20 点；
@@ -177,7 +177,9 @@ def _make_server(*, token_ok=True, left_num=4, templates=2, submit_ok=True,
     transient_fails>0 时制作提交先返回「网络异常」瞬态拒绝若干次（验证重试）；
     gate_left=None 时 queryAiMakeCount 返回未知接口（驱动兜底路径），
     否则返回该闸门计数（模拟与权益包计数不同步的真实形态）；
-    make_code 非 None 时制作提交固定返回该 code（如 10013 闸门拒绝）。"""
+    make_code 非 None 时制作提交固定返回该 code（如 10013 闸门拒绝）；
+    make_limit_state 为闸门响应的 makeLimitState 状态位（2026-11-01 实测
+    闸门>0 仍 10013 时该值为 2）。"""
     state = {"submits": 0, "make_calls": 0, "total": total, "remaining": remaining,
              "draws": 0, "redeems": 0, "transient_left": transient_fails}
     draw_awards = draw_awards or [{"awardIndex": "16320106", "name": ""}]
@@ -211,7 +213,7 @@ def _make_server(*, token_ok=True, left_num=4, templates=2, submit_ok=True,
                 obj = {"code": "0000", "desc": "成功",
                        "data": {"privilegeVrbtAIVideoLeftNum": g,
                                 "balanceMakeTimesTip": f"本月剩余{g}次，本次制作消耗1次",
-                                "monthFreeNum": g, "makeLimitState": 0}}
+                                "monthFreeNum": g, "makeLimitState": make_limit_state}}
         elif api.endswith("getOperationCurrentIssueInfo"):
             obj = {"code": "0000", "desc": "查询成功",
                    "data": {"issueName": "第6期", "issueNumber": "ai119_6", "activityId": "ai119"}}
@@ -373,6 +375,23 @@ class TestImusicFlow(unittest.TestCase):
         self.assertEqual(out["videos"], 0)
         self.assertEqual(out["status"], "失败")
         self.assertIn("10013", out["msg"])
+        self.assertEqual(out["remaining"], 140)       # 可用余额如实捕获
+
+    def test_run_gate_positive_but_state2_reported(self):
+        """2026-11-01 第8期实测回归：闸门计数>0（本月免费3次）但 makeLimitState=2，
+        提交被 10013 拒——失败消息必须携带 makeLimitState=2 诊断信号。"""
+        server, state = _make_server(left_num=3, gate_left=3, make_code="10013",
+                                     make_limit_state=2, total=840, remaining=140)
+        with patch.object(imusic.time, "sleep", lambda *_: None):
+            out = run_imusic_luck(server, "f" * 256, "13800138000")
+        self.assertEqual(state["make_calls"], 1)
+        self.assertEqual(out["videos"], 0)
+        self.assertEqual(out["status"], "失败")
+        self.assertEqual(out["left"], 3)
+        self.assertEqual(out["limit_state"], 2)
+        self.assertIn("10013", out["msg"])
+        self.assertIn("makeLimitState=2", out["msg"])
+        self.assertIn("本月剩余3次", out["msg"])
 
     def test_run_retry_then_gate_reject_relabel(self):
         """CodeRabbit 评审回归：瞬态重试后返回 10013 须按闸门拒绝归类上报，
@@ -513,7 +532,9 @@ class TestImusicFlow(unittest.TestCase):
         self.assertEqual(ImusicLuckClient.template_prompt({}), "")
 
     def test_submit_payload_shape(self):
-        """提交 payload 与逆向结论同构（关键固定字段与随机命名）。"""
+        """提交 payload 与 H5 活动页逐字段对齐（chunk20 submitChange + t.J 包装器，
+        2026-11-01 逆向）：isAI=1、background=templateId、arrangeId=模板自带、
+        imageRate 默认「9:16」、videoName 留空、templateName=模板名+随机后缀。"""
         server, state = _make_server(left_num=1, templates=1, total=0, remaining=0)
         with patch.object(imusic.time, "sleep", lambda *_: None):
             run_imusic_luck(server, "f" * 256, "13800138000")
@@ -526,7 +547,12 @@ class TestImusicFlow(unittest.TestCase):
         self.assertEqual(params["mobile"], "13800138000")
         self.assertEqual(params["userWords"], "提示词0")
         self.assertRegex(params["templateName"], r"^模板0\d{6}$")
-        self.assertEqual(params["templateName"], params["videoName"])
+        # H5 对齐字段（2026-11-01）
+        self.assertEqual(params["isAI"], 1)
+        self.assertEqual(params["background"], "ve_0")      # = templateId
+        self.assertEqual(params["imageRate"], "9:16")       # t.J 默认值
+        self.assertEqual(params["videoName"], "")           # 活动页不发 videoName
+        self.assertIn("arrangeId", params)                  # 模板无该字段时为空串
 
 
 class TestImusicReport(unittest.TestCase):

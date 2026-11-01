@@ -1386,10 +1386,20 @@ def execute_telecom_task(client: TelecomClient) -> Dict[str, Any]:
                     if im.get("draws"):
                         parts_im.append(f"抽奖{im['draws']}次")
                     if im.get("score"):
-                        parts_im.append(f"总点数{im['score']}")
+                        # remainingScore=可用余额（total 含已消耗，2026-11-01 实测
+                        # 840 总点仅剩 140 可用）；两者差距大时必须并列展示
+                        if im.get("remaining") is not None and str(im["remaining"]) != str(im["score"]):
+                            parts_im.append(f"总点数{im['score']}(可用{im['remaining']})")
+                        else:
+                            parts_im.append(f"总点数{im['score']}")
                     if im.get("issue"):
                         parts_im.append(str(im["issue"]))
                     detail = "，".join(parts_im) or str(im.get("msg") or "")
+                    # 失败时 msg 携带被拒原因（如「制作闸门拒绝(10013，makeLimitState=2)」），
+                    # 不得被点数/期次等展示字段挤掉（2026-11-01 复盘：通知只显示
+                    # 「失败(总点数840，第8期)」，根因完全不可见）
+                    if im.get("status") == "失败" and im.get("msg") and im["msg"] not in detail:
+                        detail = f"{detail}｜{im['msg']}" if detail else str(im["msg"])
                     res["imusic_res"] = f"{im.get('status')}({detail})" if detail else str(im.get("status"))
                     print(f"    [imusic] 赢花费活动: {res['imusic_res']}", flush=True)
                 except Exception as im_exc:

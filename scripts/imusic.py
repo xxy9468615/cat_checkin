@@ -315,8 +315,11 @@ class ImusicLuckClient:
 
         提交 template_make_add_v2 前服务端以此为准：月度免费次数（monthFreeNum /
         privilegeVrbtAIVideoLeftNum，提示语如「本月剩余0次，本次制作消耗1次」）。
-        闸门=0 时提交一律被拒，返回通用 10013「网络异常，请稍后重试」——
-        这是 2026-10 月第8期「提交从未成功」的根因（此前误读 pkgInfo 计数=1）。"""
+        ⚠️ 10013「网络异常，请稍后重试」是服务端**通用拒绝码**，已实测两种形态：
+        a) 闸门=0（月度配额耗尽，2026-10 第8期上半）；
+        b) 闸门>0 但 makeLimitState=2（2026-11-01：本月免费3次、报文与 H5 逐字段
+           一致仍被拒——拦截在服务端账户态，该状态字段不被任何 H5 页面消费，
+           属 App 原生制作页状态机；定位需 App 内手动制作一次对照）。"""
         return self._en_api(
             {"mobile": self.phone, "aid": ACTIVITY_ID, "channelId": CHANNEL_ID, "portal": PORTAL},
             "diy/AiAgentChatApi/queryAiMakeCount",
@@ -380,8 +383,16 @@ class ImusicLuckClient:
             return str(raw)
 
     def submit_make(self, template: Dict[str, Any]) -> Dict[str, Any]:
-        """提交一次 AI 视频生成（提交成功即 +20 积分，生成异步进行）。"""
-        base_name = str(template.get("videoName") or template.get("labelName") or "AI视频")
+        """提交一次 AI 视频生成（提交成功即 +20 积分，生成异步进行）。
+
+        payload 与 H5 活动页（chunk20 submitChange + t.J 包装器，2026-11-01 逆向）
+        逐字段对齐：isAI=1、background=templateId、arrangeId=模板自带值、
+        imageRate 默认「9:16」、videoName 留空（H5 活动页不发）。
+        2026-11-01 实测：旧报文缺 isAI/arrangeId、imageRate="" 与 H5 不一致，
+        但对齐后仍被 10013 拒——差异非 10013 根因，对齐只为收窄风控面。"""
+        tid = str(template.get("templateId") or "")
+        base_name = str(template.get("templateName") or template.get("videoName")
+                        or template.get("labelName") or "AI视频")
         suffix = f"{random.randint(0, 999999):06d}"
         payload = {
             "channelId": CHANNEL_ID,
@@ -389,29 +400,31 @@ class ImusicLuckClient:
             "mobile": self.phone,
             "openId": "",
             "makeId": "",
-            "background": "",
+            "background": tid,
             "userPhotos": "",
             "userWords": self.template_prompt(template),
             "templateName": f"{base_name}{suffix}",
-            "videoName": f"{base_name}{suffix}",
-            "templateId": str(template.get("templateId") or ""),
+            "videoName": "",
+            "templateId": tid,
             "templateConfId": str(template.get("templateConfId") or ""),
             "aid": ACTIVITY_ID,
             "inviterMobile": "",
+            "isAI": 1,
             "aiPack": 0,
-            "arrangeId": "",
+            "arrangeId": str(template.get("arrangeId") or ""),
             "autoOrderUgc": 0,
             "aiGatewayImagMakeId": "",
             "fromType": "",
             "sessionId": "",
             "voice": "",
+            "invitationCode": "",
             "videoOwnerCode": "",
             "videoResourceCode": "",
             "workId": "",
             "imageMakeType": "",
             "songId": "",
-            "imageRate": "",
-            "productionType": "",
+            "imageRate": "9:16",
+            "productionType": str(template.get("productionType") or ""),
         }
         return self._post_encrypted("/hapi/diy_video/au/template_make_add_v2", payload, timeout=40)
 
@@ -451,7 +464,8 @@ def run_imusic_luck(http: Any, ticket: str, phone: str = "") -> Dict[str, Any]:
     "draws", "prizes", "redeemed", "redeem_err"}；失败不抛异常，由调用方决定是否影响主任务结果。
     """
     out: Dict[str, Any] = {"status": "跳过", "msg": "", "issue": "", "score": "", "gain": 0,
-                           "videos": 0, "left": None, "draws": 0, "prizes": [], "redeemed": "", "redeem_err": ""}
+                           "videos": 0, "left": None, "draws": 0, "prizes": [], "redeemed": "", "redeem_err": "",
+                           "remaining": None, "limit_state": None, "month_free": None}
     if not HAS_CRYPTO:
         out["msg"] = "缺少 pycryptodome"
         return out
@@ -491,6 +505,11 @@ def run_imusic_luck(http: Any, ticket: str, phone: str = "") -> Dict[str, Any]:
             gate_left = left  # 闸门响应异常时退回权益包计数（旧行为）
         left = gate_left
         out["left"] = left
+        # 2026-11-01 第8期新增观测：闸门计数>0（本月免费3次）但提交仍被 10013 拒，
+        # 唯一伴随信号是 makeLimitState=2（该字段不被任何 H5 页面消费，属 App 原生
+        # 页状态机）——如实捕获上报，供人工对比 App 内手动制作结果定位。
+        out["limit_state"] = cnt_data.get("makeLimitState")
+        out["month_free"] = cnt_data.get("monthFreeNum")
 
         # 1. 用光免费制作次数：以服务端制作闸门计数为准（见上 gate_left）；
         #    提交成功即 +20 点到账，无需等待生成完成
@@ -537,8 +556,11 @@ def run_imusic_luck(http: Any, ticket: str, phone: str = "") -> Dict[str, Any]:
                 else:
                     if is_gate_reject:
                         tip = str(cnt_data.get("balanceMakeTimesTip") or "")
-                        submit_err = f"制作闸门拒绝(10013){('：' + tip) if tip else '（月度免费次数耗尽/风控）'}"
-                        print(f"    [imusic] 提交被拒(10013)：{tip or '服务端制作闸门拒绝'}——非网络问题，本次不再重试", flush=True)
+                        state_note = (f"，makeLimitState={out['limit_state']}"
+                                      if out.get("limit_state") is not None else "")
+                        submit_err = (f"制作闸门拒绝(10013{state_note})"
+                                      f"{('：' + tip) if tip else '（月度免费次数耗尽/风控）'}")
+                        print(f"    [imusic] 提交被拒(10013{state_note})：{tip or '服务端制作闸门拒绝'}——非网络问题，本次不再重试", flush=True)
                     else:
                         submit_err = err
                         print(f"    [imusic] 提交失败: {submit_err[:60]}", flush=True)
@@ -561,6 +583,9 @@ def run_imusic_luck(http: Any, ticket: str, phone: str = "") -> Dict[str, Any]:
             remaining = int(remaining or 0)
         except (TypeError, ValueError):
             remaining = 0
+        # remainingScore 是可用于抽奖/兑换的余额（totalScore 含已消耗——2026-11-01
+        # 实测总点数 840 但可用仅 140，只展示 total 会让人误判「快攒够 1000 了」）
+        out["remaining"] = remaining
         redeem_failed = False
         if _env_flag("TELECOM_IMUSIC_REDEEM", True) and remaining >= REDEEM_COST:
             redeem_res = client.redeem_phone_bill()
