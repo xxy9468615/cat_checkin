@@ -8,6 +8,7 @@ on:
       - 'scripts/**'
       - 'requirements.txt'
       - '.github/workflows/test.yml'
+      - '**/*.md'
   pull_request:
     branches:
       - main
@@ -15,6 +16,7 @@ on:
       - 'scripts/**'
       - 'requirements.txt'
       - '.github/workflows/test.yml'
+      - '**/*.md'
   workflow_dispatch:
 
 permissions:
@@ -38,7 +40,10 @@ jobs:
 
       # 机器审核防线：高置信度凭据形态扫描（电信 V1.0 长串 / GitHub token /
       # OpenAI key / Telegram bot token）。测试夹具一律合成数据（CLAUDE.md
-      # 规则3），合成 token 必须用 V1.0FAKE 前缀。排除 *.md 与本文件（自匹配）。
+      # 规则3），合成 token 必须用 V1.0FAKE 前缀。
+      # 扫描必须覆盖 *.md：CodeRabbit 评审排除 markdown（凭据防线声明在本
+      # 工作流），若这里也排除则 markdown-only PR 绕过全部门禁（2026-11-01
+      # 评审指认的盲区）。仅排除本文件避免模式文本自匹配。
       - name: Secret scan (deny real credentials in tracked files)
         run: |
           matches=$(git grep -nE \
@@ -46,7 +51,7 @@ jobs:
             -e 'gh[pous]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}' \
             -e 'sk-[A-Za-z0-9]{30,}' \
             -e '[0-9]{8,10}:[A-Za-z0-9_-]{30,}' \
-            -- . ':!*.md' ':!.github/workflows/test.yml' || true)
+            -- . ':!.github/workflows/test.yml' || true)
           # 合成夹具白名单：V1.0FAKE 前缀 = 测试专用假 token（约定见 CLAUDE.md 规则10）
           matches=$(printf '%s\n' "$matches" | grep -v 'V1\.0FAKE' || true)
           if [ -n "$matches" ]; then
