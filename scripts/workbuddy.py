@@ -10,8 +10,8 @@
 2. 动态放风跟踪与回程领奖：
    - 不依赖硬编码的 4 小时，完全基于服务端返回的真实 `arrive_at` 与 `server_now` 动态计算。
    - 单 run 全内联（2026-08-22 起）：放风进行中时打印 `TRAVEL_EVENT` 机器行，由
-     `daily_orchestrator` 在 `arrive_at+60s` 定时回访领奖（受 Latvi 进场截止线约束，超线
-     留次日领）；旧 QStash 延时接力（`workbuddy_travel_claim`）已退役，未设
+     `daily_orchestrator` 在 `arrive_at+60s` 定时回访领奖（超线留次日领）；
+     旧 QStash 延时接力（`workbuddy_travel_claim`）已退役，未设
      `WORKBUDDY_NO_RELAY` 时仍兼容旧行为。
 3. 连登兑换与抽奖追踪：
    - 自动核算当月连登天数，符合 7d/14d/28d 档位时自动兑换奖励与抽奖机会。

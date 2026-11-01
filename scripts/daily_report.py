@@ -596,7 +596,7 @@ def _collect_overview(rows: List[Tuple[str, Path, str, float, str]], yesterday: 
 
         elif st == "fail":
             # 连签将断：昨天还成功、今天失败的脚本（读通知状态 last_ok_date）。
-            # pending/调度中不算——latvi 等窗口型任务未到点是正常现象，避免误报。
+            # pending/调度中不算——窗口型任务未到点是正常现象，避免误报。
             # 状态键是 orchestrator 任务 id：经 task_registry 反查（workbuddy.py 有
             # 多个账号实例 state），查不到再回退脚本 stem。
             try:

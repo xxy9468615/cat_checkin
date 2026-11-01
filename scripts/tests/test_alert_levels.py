@@ -30,8 +30,6 @@ CASES = [
     ("orchestrator spawn 报 workbuddy 缺 Cookie → unconfigured", "workbuddy.py", False,
      "failed to spawn: workbuddy 账号 2 缺少 WORKBUDDY_COOKIE_2（secret 未配置或为空），"
      "拒绝继承其他账号的 cookie", "unconfigured", "WORKBUDDY_COOKIE_2"),
-    ("2libra 未配置 cookie → unconfigured", "2libra.py", False,
-     "签到失败： 未配置 2LIBRA_COOKIES 或 2LIBRA_cookie", "unconfigured", None),
 
     # --- 🔴 红色：真故障不得被误判为未配置（回归护栏） ---
     ("sophnet Token 已过期 ≠ 未配置（凭据死了是真故障）", "sophnet.py", False,
@@ -61,23 +59,12 @@ CASES = [
      "    [diag] qcloud 换票第 4 步失败：grant HTTP 200 code=NOT-LOGINED——skey/uin 可能已失效\n"
      "✅ 签到成功",
      "warn", "换票失败"),
-    ("2libra token 换新失败但旧 token 仍可签到", "2libra.py", True,
-     "[keepalive] ⚠️ token 换新失败（HTTP 400）——当前 access_token 到期前仍可签到\n签到成功 +300金币",
-     "warn", "refresh_token 换新失败"),
     ("sophnet refresh_token 续期异常但本次成功", "sophnet.py", True,
      "Refresh token 无效或已过期（回退旧 token 签到成功）", "warn", "refresh_token 续期失败"),
-    ("latvi 服务器自动延长失败", "latvi.py", True,
-     "🔄 服务器自动延长 (#1): HTTP 503 Service Unavailable\n✅ 签到成功 +5",
-     "warn", "自动延长失败"),
 
     # --- 🟢 绿色：无感续期任务不报「剩余天数」也不报奖励有效期 ---
     ("cloudstudio 续票成功", "tencent_cloudstudio.py", True,
      "🔑 SSO 主动续票成功，使用新 session: abcd***\n✅ 签到成功", "ok", None),
-    ("2libra 换新成功", "2libra.py", True,
-     "[keepalive] ✅ token 已换新并持久化，新 access_token 到期 2026-10-28 BJT\n签到成功",
-     "ok", None),
-    ("latvi 延长成功（HTTP 200）", "latvi.py", True,
-     "🔄 服务器自动延长 (#1): HTTP 200 OK\n✅ 签到成功", "ok", None),
     ("smzdm 滚动续期：剩余 2 天不提示（滚动窗口非死线）", "smzdm.py", True,
      "签到成功 +5积分 | 🔑 Cookie 剩余 2 天", "ok", None),
     ("modelscope 魔粒奖励有效期不误报为凭据过期", "modelscope.py", True,
@@ -95,8 +82,8 @@ CASES = [
     # --- 边界 ---
     ("未知脚本默认绿色", "new_site.py", True, "签到成功", "ok", None),
     ("空输出", "glados.py", True, "", "ok", None),
-    ("warns 去重：同文案只留一条", "2libra.py", True,
-     "[keepalive] ⚠️ token 换新失败（HTTP 400）\n[keepalive] ⚠️ token 换新失败（HTTP 400）",
+    ("warns 去重：同文案只留一条", "sophnet.py", True,
+     "Refresh token 无效或已过期（回退旧 token 签到成功）\nRefresh token 无效或已过期（回退旧 token 签到成功）",
      "warn", None),
 ]
 
@@ -113,8 +100,8 @@ def main() -> None:
         print(f"[{'PASS' if good else 'FAIL'}] {desc} → {got['level']} ({len(got['warns'])} 提示)")
 
     # 去重上限：warns 去重后应只有 1 条
-    got = classify("2libra.py", True,
-                   "[keepalive] ⚠️ token 换新失败（HTTP 400）\n[keepalive] ⚠️ token 换新失败（HTTP 400）")
+    got = classify("sophnet.py", True,
+                   "Refresh token 无效或已过期\nRefresh token 无效或已过期")
     if len(got["warns"]) != 1:
         failures.append(f"去重失效：期望 1 条，实际 {len(got['warns'])}")
 

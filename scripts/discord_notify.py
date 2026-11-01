@@ -529,7 +529,7 @@ def notify_task_result(
     info: Optional[Dict[str, Any]] = None
     try:
         import report_fields
-        # 按任务定制解析（与统一日报同源）：资产覆盖 2libra 金币/agentrouter 额度/
+        # 按任务定制解析（与统一日报同源）：资产覆盖 agentrouter 额度/
         # ai_router USD/CloudStudio 机时等全局启发式抓不到的字段
         info = report_fields.extract_for(script, output or "")
         assets = report_fields.assets_text(info) or "—"

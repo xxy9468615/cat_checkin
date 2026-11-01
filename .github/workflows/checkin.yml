@@ -17,8 +17,6 @@ on:
     types:
       - checkin_morning
       - checkin_modelscope
-      - checkin_latvi
-      - latvi_next_sign
       - workbuddy_travel_claim
       - daily_report
       - checkin_retry
@@ -93,7 +91,6 @@ jobs:
       RAILGUN_COOKIE_3: ${{ secrets.RAILGUN_COOKIE_3 }}
       RAILGUN_AUTO_EXCHANGE: "true"
       RAILGUN_DOMAINS: railgun.info
-      "2LIBRA_COOKIE_1": ${{ secrets.TWO_LIBRA_COOKIE_1 }}
       BIANJIE_AI_USERNAME_1: ${{ secrets.BIANJIE_AI_USERNAME_1 }}
       BIANJIE_AI_PASSWORD_1: ${{ secrets.BIANJIE_AI_PASSWORD_1 }}
       BIANJIE_AI_USERNAME_2: ${{ secrets.BIANJIE_AI_USERNAME_2 }}
@@ -173,9 +170,6 @@ jobs:
       MODELSCOPE_AI_COOKIE_1: ${{ secrets.MODELSCOPE_AI_COOKIE_1 }}
       MODELSCOPE_AI_COOKIE_2: ${{ secrets.MODELSCOPE_AI_COOKIE_2 }}
       MODELSCOPE_AI_COOKIE_3: ${{ secrets.MODELSCOPE_AI_COOKIE_3 }}
-      LATVI_EMAIL_1: ${{ secrets.LATVI_EMAIL }}
-      LATVI_PASSWORD_1: ${{ secrets.LATVI_PASSWORD }}
-      LATVI_STATE_FILE: .latvi_state.json
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
       RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
       RESEND_FROM: ${{ secrets.RESEND_FROM }}
@@ -199,10 +193,8 @@ jobs:
         with:
           path: |
             .ai_router_state.json
-            .latvi_state.json
             .agentrouter_state.json
             .cloudstudio_state*.json
-            .2libra_state*.json
             .modelscope_*.json
             .juejin_state*.json
             .alipan_state*.json
@@ -213,7 +205,6 @@ jobs:
           restore-keys: |
             unified-states-
             ai-router-state-
-            latvi-state-
             agentrouter-state-
 
       # ── 到期前置判定与自愈调度 ─────────────────────────
@@ -245,7 +236,6 @@ jobs:
             fi
           elif [ -n "${EVENT_ACTION:-}" ]; then
             case "$EVENT_ACTION" in
-              latvi_next_sign|checkin_latvi) CANDIDATES="latvi" ;;
               workbuddy_travel_claim)        CANDIDATES="workbuddy" ;;
               # ModelScope 双实例已于 2026-10-28 退役（风控簇风险）——遗留 dispatch 入口指向空队列
               checkin_modelscope)            CANDIDATES="none" ;;
@@ -287,7 +277,6 @@ jobs:
         run: |
           echo "NODESEEK_PROXY=" >> "$GITHUB_ENV"
           echo "AGENTROUTER_PROXY=" >> "$GITHUB_ENV"
-          echo "2LIBRA_PROXY=" >> "$GITHUB_ENV"
           echo "CLOUDSTUDIO_PROXY=" >> "$GITHUB_ENV"
           echo "direct 诊断模式：跳过代理，任务用 runner IP 直连"
       - name: no_cffi mode (nodeseek 强制 urllib)
@@ -540,7 +529,6 @@ jobs:
             # 为依赖固定出口的任务注入代理环境变量
             echo "AGENTROUTER_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             echo "NODESEEK_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
-            echo "2LIBRA_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             echo "CLOUDSTUDIO_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             ns_code=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
             echo "sing-box egress ready on 127.0.0.1:1080 (pid $SINGBOX_PID), nodeseek probe HTTP $ns_code"
@@ -580,7 +568,7 @@ jobs:
           always()
           && (steps.orch_tasks.outputs.due_tasks != 'none' || steps.orch_tasks.outputs.need_report == 'true')
           && !(github.event_name == 'repository_dispatch'
-               && contains(fromJSON('["latvi_next_sign","checkin_latvi","checkin_modelscope","workbuddy_travel_claim"]'), github.event.action))
+               && contains(fromJSON('["checkin_modelscope","workbuddy_travel_claim"]'), github.event.action))
         env:
           DAILY_PUSH: "true"
           ARCHIVE_ONLY: "1"
@@ -592,7 +580,7 @@ jobs:
         if: >-
           always() && steps.send_report.outputs.failed_matrix != ''
           && !(github.event_name == 'repository_dispatch'
-               && contains(fromJSON('["latvi_next_sign","checkin_latvi","checkin_morning","checkin_modelscope","workbuddy_travel_claim"]'), github.event.action))
+               && contains(fromJSON('["checkin_morning","checkin_modelscope","workbuddy_travel_claim"]'), github.event.action))
         env:
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           FAILED_MATRIX: ${{ steps.send_report.outputs.failed_matrix }}
@@ -654,10 +642,8 @@ jobs:
         with:
           path: |
             .ai_router_state.json
-            .latvi_state.json
             .agentrouter_state.json
             .cloudstudio_state*.json
-            .2libra_state*.json
             .modelscope_*.json
             .juejin_state*.json
             .alipan_state*.json

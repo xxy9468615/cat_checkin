@@ -67,38 +67,6 @@ def _fmt_bjt(ts: float) -> str:
     return datetime.fromtimestamp(ts, BJT).strftime("%H:%M:%S")
 
 
-def _read_latvi_last_sign() -> Optional[float]:
-    prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
-    try:
-        ok, res = upstash_redis_command(["GET", f"{prefix}:state:latvi"])
-        if ok and isinstance(res, dict):
-            raw = res.get("result")
-            if raw:
-                data = json.loads(raw) if isinstance(raw, str) else raw
-                if isinstance(data, dict) and data.get("last_sign_ts"):
-                    return float(data["last_sign_ts"])
-    except Exception as exc:
-        print(f"WARN: latvi 上次签到时间 Redis 读取失败，回退本地状态文件: {exc}", file=sys.stderr)
-    state_file = Path(os.getenv("LATVI_STATE_FILE", str(ROOT_DIR / ".latvi_state.json")))
-    if not state_file.is_absolute():
-        state_file = ROOT_DIR / state_file
-    if state_file.exists():
-        try:
-            data = json.loads(state_file.read_text(encoding="utf-8"))
-            if data.get("last_sign_ts"):
-                return float(data["last_sign_ts"])
-        except Exception:
-            pass
-    return None
-
-
-def _latvi_signed_today() -> bool:
-    last = _read_latvi_last_sign()
-    if not last:
-        return False
-    return datetime.fromtimestamp(last, BJT).date() == bjt_now().date()
-
-
 def _get_today_successful_tasks() -> Set[str]:
     """获取今日已成功执行的任务 ID 集合（通过 Redis 与本地结果目录双通道校验）。"""
     today = bjt_now().strftime("%Y-%m-%d")
@@ -168,8 +136,6 @@ def build_task_env(cfg: Dict[str, Any]) -> Dict[str, str]:
         env["WORKBUDDY_REFRESH_TOKEN_1"] = refresh
         env["WORKBUDDY_ACCOUNT_IDX"] = n
         env["WORKBUDDY_WAIT_TRAVEL"] = "true"
-    if cfg["id"] == "latvi":
-        env.setdefault("LATVI_STATE_FILE", ".latvi_state.json")
     for k, v in (cfg.get("env") or {}).items():
         env[str(k)] = str(v)
     env["TASK_ID"] = cfg["id"]
@@ -394,13 +360,12 @@ def plan_due_tasks(raw_tasks: str = "", due_only: bool = False) -> List[str]:
 
     1. 若显式指定 raw_tasks：
        按照指定的任务队列匹配。
-       若 due_only=True（显式心跳过滤），则对 rolling 任务和 latvi 做冷却判断；
+       若 due_only=True（显式心跳过滤），则对 rolling 任务做冷却判断；
        若 due_only=False，候选任务中非熔断任务全部执行。
     2. 若未指定 raw_tasks（日常调度 / 心跳兜底 / 漏跑自愈）：
        全量巡检 TASKS 全部注册任务：
        - 熔断停用 (suspended) -> 跳过；
        - 今日已成功 (ok=True) -> 跳过；
-       - 今日已签的 latvi -> 跳过；
        - 冷却中的 rolling 任务 (due_at > now) -> 跳过；
        - 今日失败且处于退避等待期的任务 (next_retry_at > now) -> 跳过；
        其余所有今日未完成、遗漏未执行或到期重试的任务均判定为 DUE。
@@ -419,13 +384,9 @@ def plan_due_tasks(raw_tasks: str = "", due_only: bool = False) -> List[str]:
             if is_task_suspended(tid):
                 continue
             if due_only:
-                if tid == "latvi":
-                    if _latvi_signed_today():
-                        continue
-                else:
-                    due_at = _cooldown_due_at(cfg)
-                    if due_at and due_at > now:
-                        continue
+                due_at = _cooldown_due_at(cfg)
+                if due_at and due_at > now:
+                    continue
             due.append(tid)
         return due
 
@@ -436,9 +397,6 @@ def plan_due_tasks(raw_tasks: str = "", due_only: bool = False) -> List[str]:
             continue
         if tid in successful_today:
             continue
-        if tid == "latvi":
-            if _latvi_signed_today():
-                continue
         due_at = _cooldown_due_at(cfg)
         if due_at and due_at > now:
             continue
@@ -450,9 +408,9 @@ def plan_due_tasks(raw_tasks: str = "", due_only: bool = False) -> List[str]:
                 continue
         elif due_only and bjt_hour < 7:
             # 心跳模式且在晨间主批次（07:00 BJT）前：不提前执行常规单日任务（避免夜间心跳偷跑主批次且抑制日报）
-            # 仅允许 rolling 任务、latvi 与到期重试任务执行
+            # 仅允许 rolling 任务与到期重试任务执行
             is_rolling = bool(cfg.get("sched") and cfg.get("sched", {}).get("type") == "rolling")
-            if not is_rolling and tid != "latvi":
+            if not is_rolling:
                 continue
         due.append(tid)
     return due
@@ -497,7 +455,7 @@ def main() -> None:
     parser.add_argument("--reset-circuit", action="store_true", help="reset circuit breaker state and resume tasks")
     parser.add_argument("--reset-circuit-tasks", type=str, default="", help="comma-separated task list to resume from circuit breaker")
     parser.add_argument("--plan", action="store_true", help="evaluate the due task set and exit without executing anything (prints DUE_TASKS=<list|none>)")
-    parser.add_argument("--due-only", action="store_true", help="plan mode: apply heartbeat DUE_ONLY filtering (rolling cooldown / latvi signed-today)")
+    parser.add_argument("--due-only", action="store_true", help="plan mode: apply heartbeat DUE_ONLY filtering (rolling cooldown)")
     args = parser.parse_args()
 
     is_explicit = bool(args.tasks.strip())

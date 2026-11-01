@@ -9,7 +9,7 @@
 范围约定：
 - 只登记已证实有硬寿命上限、且脚本侧无法自动续期的凭据（WorkBuddy 登录会话
   7 天硬上限，HAR 逆向结论：二进制 opaque 票据、无滑动续期、无 refresh 端点）；
-- 自动续期型凭据（alipan/2libra/modelscope/cloudstudio 等）的续期失败提示由
+- 自动续期型凭据（alipan/modelscope/cloudstudio 等）的续期失败提示由
   alert_levels 覆盖，不在此重复登记；
 - 无 token / API 失败 / 本地运行 → 静默返回 []，绝不影响主流程。
 """

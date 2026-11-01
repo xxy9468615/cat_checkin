@@ -5,7 +5,7 @@
 orchestrator 原地 sleep 干等（曾 4h），堵死同一并发组的后续 run。
 历史事故 2：失败重试梯子（15m~3h）同样在进程内堆等待，run 挂起数小时。
 2026-09-06 运行模型改造：重试与领奖回程全部跨 run 延时接力
-（QStash checkin_retry / workbuddy_travel_claim / latvi_next_sign +
+（QStash checkin_retry / workbuddy_travel_claim +
 30 分钟心跳 get-due-retries 兜底），orchestrator 不再为任何未来事件驻留。
 """
 import io
@@ -80,26 +80,22 @@ class PlanModeTests(unittest.TestCase):
         self.assertEqual(resolve_execution_queue("NONE"), [])
         self.assertEqual(resolve_execution_queue(""), [])
 
-    def test_due_only_filters_cooldown_and_signed_latvi(self):
+    def test_due_only_filters_cooldown(self):
         env = {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:test:"}
-        # 冷却样例模拟 rolling 元数据（modelscope 双实例已于 2026-10-28 退役，
-        # 注册表已无真实 rolling 任务，用 juejin 作冷却样例、glados 作到期样例）。
+        # 冷却样例模拟 rolling 元数据（用 juejin 作冷却样例、glados 作到期样例）。
         with patch.dict(os.environ, env, clear=False), \
              patch.object(orch_mod, "is_task_suspended", return_value=False), \
              patch.object(orch_mod, "_cooldown_due_at",
-                          side_effect=lambda cfg: time.time() + 3600 if cfg["id"] == "juejin" else None), \
-             patch.object(orch_mod, "_latvi_signed_today", return_value=True):
-            due = plan_due_tasks("juejin,glados,latvi", due_only=True)
+                          side_effect=lambda cfg: time.time() + 3600 if cfg["id"] == "juejin" else None):
+            due = plan_due_tasks("juejin,glados", due_only=True)
         self.assertNotIn("juejin", due, "冷却未到期的 rolling 任务不应到期")
         self.assertIn("glados", due)
-        self.assertNotIn("latvi", due, "今日已签的 latvi 不应到期")
 
     def test_due_only_includes_due_tasks(self):
         with patch.object(orch_mod, "is_task_suspended", return_value=False), \
-             patch.object(orch_mod, "_cooldown_due_at", return_value=None), \
-             patch.object(orch_mod, "_latvi_signed_today", return_value=False):
-            due = plan_due_tasks("juejin,glados,latvi", due_only=True)
-        self.assertEqual(due, ["juejin", "glados", "latvi"])
+             patch.object(orch_mod, "_cooldown_due_at", return_value=None):
+            due = plan_due_tasks("juejin,glados", due_only=True)
+        self.assertEqual(due, ["juejin", "glados"])
 
     def test_explicit_mode_ignores_cooldown(self):
         """非 due_only（显式列表/主 cron）口径：候选内全部到期（重试列表已预过滤）。
@@ -107,8 +103,8 @@ class PlanModeTests(unittest.TestCase):
         原 modelscope → modelscope_ai 同脚本双实例展开覆盖已随 2026-10-28 退役移除。
         """
         with patch.object(orch_mod, "is_task_suspended", return_value=False):
-            due = plan_due_tasks("juejin,glados,latvi", due_only=False)
-        self.assertEqual(due, ["juejin", "glados", "latvi"])
+            due = plan_due_tasks("juejin,glados", due_only=False)
+        self.assertEqual(due, ["juejin", "glados"])
 
     def test_suspended_tasks_skipped(self):
         with patch.object(orch_mod, "is_task_suspended",
@@ -122,14 +118,12 @@ class PlanModeTests(unittest.TestCase):
         fake_successful = {"glados", "smzdm", "telecom"}
         with patch.object(orch_mod, "_get_today_successful_tasks", return_value=fake_successful), \
              patch.object(orch_mod, "is_task_suspended", return_value=False), \
-             patch.object(orch_mod, "_latvi_signed_today", return_value=True), \
              patch.object(orch_mod, "_cooldown_due_at", return_value=None), \
              patch.object(orch_mod, "load_circuit_state", return_value={}):
             due = plan_due_tasks("", due_only=False)
         self.assertNotIn("glados", due)
         self.assertNotIn("smzdm", due)
         self.assertNotIn("telecom", due)
-        self.assertNotIn("latvi", due)
         self.assertIn("alipan", due)
         self.assertIn("52pojie", due)
 
@@ -144,7 +138,6 @@ class PlanModeTests(unittest.TestCase):
         }
         with patch.object(orch_mod, "_get_today_successful_tasks", return_value=set()), \
              patch.object(orch_mod, "is_task_suspended", return_value=False), \
-             patch.object(orch_mod, "_latvi_signed_today", return_value=True), \
              patch.object(orch_mod, "_cooldown_due_at", return_value=None), \
              patch.object(orch_mod, "load_circuit_state",
                           side_effect=lambda tid: fake_circuit if tid == "52pojie" else {}):
@@ -153,22 +146,20 @@ class PlanModeTests(unittest.TestCase):
         self.assertIn("alipan", due)
 
     def test_auto_plan_due_only_night_skips_regular_tasks(self):
-        """夜间（00:00~06:59 BJT）心跳模式：不偷跑常规单日任务，仅允许 rolling 任务与未签 latvi。"""
+        """夜间（00:00~06:59 BJT）心跳模式：不偷跑常规单日任务，仅允许 rolling 任务。"""
         from datetime import datetime
         fake_bjt_night = datetime(2026, 9, 11, 2, 30, 0, tzinfo=orch_mod.BJT)
         with patch.object(orch_mod, "bjt_now", return_value=fake_bjt_night), \
              patch.object(orch_mod, "_get_today_successful_tasks", return_value=set()), \
              patch.object(orch_mod, "is_task_suspended", return_value=False), \
-             patch.object(orch_mod, "_latvi_signed_today", return_value=False), \
              patch.object(orch_mod, "_cooldown_due_at", return_value=None), \
              patch.object(orch_mod, "load_circuit_state", return_value={}):
             due = plan_due_tasks("", due_only=True)
         self.assertNotIn("52pojie", due, "夜间心跳不应提前执行常规单日任务")
         self.assertNotIn("smzdm", due, "夜间心跳不应提前执行常规单日任务")
         self.assertNotIn("cloud189", due, "夜间心跳不应提前执行常规单日任务")
-        # modelscope 双实例已退役（原 rolling 夜间样例）；当前注册表无 rolling 任务，
-        # 夜间心跳仅未签 latvi 到期
-        self.assertIn("latvi", due, "未签到的 latvi 应到期")
+        # telecom-exchange 为 rolling 自排程任务，夜间心跳允许到期
+        self.assertIn("telecom-exchange", due, "rolling 任务应被夜间心跳放行")
 
     def test_auto_plan_due_only_daytime_includes_missed_tasks(self):
         """白日（>=07:00 BJT）心跳模式：未成功的常规任务视为漏跑自愈，允许补跑。"""
@@ -177,7 +168,6 @@ class PlanModeTests(unittest.TestCase):
         with patch.object(orch_mod, "bjt_now", return_value=fake_bjt_day), \
              patch.object(orch_mod, "_get_today_successful_tasks", return_value={"smzdm"}), \
              patch.object(orch_mod, "is_task_suspended", return_value=False), \
-             patch.object(orch_mod, "_latvi_signed_today", return_value=True), \
              patch.object(orch_mod, "_cooldown_due_at", return_value=None), \
              patch.object(orch_mod, "load_circuit_state", return_value={}):
             due = plan_due_tasks("", due_only=True)

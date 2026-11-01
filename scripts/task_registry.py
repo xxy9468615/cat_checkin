@@ -37,15 +37,9 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
-    "2libra": {
-        "id": "2libra",
-        "script": "2libra.py",
-        "name": "2Libra 签到",
-        "result": "2libra.json",
-        "timeout": 300,
-        "account": "",
-        "tags": ["00:50", "matrix", "daily"],
-    },
+    # --- 2Libra（2026-11-01 用户指令下线：脚本/解析器/工作流接线已随本次清理移除，
+    #     恢复：从 git 历史恢复 scripts/2libra.py + 注册表条目 + checkin.yml 接线，
+    #     GH Secret TWO_LIBRA_COOKIE_1 清理时保留未删）---
     "bianjie_ai": {
         "id": "bianjie_ai",
         "script": "bianjie_ai.py",
@@ -292,16 +286,10 @@ TASKS: Dict[str, Dict[str, Any]] = {
     #     停用/纯登录最小足迹），恢复时把两个实例加回本表即可；互动任务由
     #     MODELSCOPE_ENABLE_LIKE_TASKS / _AIGC_PUBLISH / _PROFILE_TASKS 开关独立控制）---
 
-    # --- 24h 动态冷却站点（Latvi：last_sign_ts+24h 状态驱动，硬墙前 2min 进场） ---
-    "latvi": {
-        "id": "latvi",
-        "script": "latvi.py",
-        "name": "Latvi 每日奖励及服务器自动续期",
-        "result": "latvi.json",
-        "timeout": 7000,
-        "account": "",
-        "tags": ["18:00", "latvi", "relay", "daily"],
-    },
+    # --- Latvi（2026-11-01 用户指令下线：24h 动态冷却/18:00 场次/QStash latvi_next_sign
+    #     接力随本次清理一并移除；恢复：从 git 历史恢复 scripts/latvi.py + 注册表条目 +
+    #     checkin.yml 接线（dispatch 类型/cache 路径/contains 过滤），
+    #     GH Secrets LATVI_EMAIL/LATVI_PASSWORD 清理时保留未删）---
 }
 
 
