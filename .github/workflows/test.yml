@@ -22,6 +22,11 @@ on:
 permissions:
   contents: read
 
+# 旧运行抢占 runner 会拖慢后续场次（md 变更现已纳入触发），过期运行直接取消
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Run Unit Tests & Syntax Check
@@ -46,14 +51,20 @@ jobs:
       # 评审指认的盲区）。仅排除本文件避免模式文本自匹配。
       - name: Secret scan (deny real credentials in tracked files)
         run: |
-          matches=$(git grep -nE \
-            -e 'V1\.0[A-Za-z0-9+/=]{50,}' \
-            -e 'gh[pous]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}' \
-            -e 'sk-[A-Za-z0-9]{30,}' \
-            -e '[0-9]{8,10}:[A-Za-z0-9_-]{30,}' \
+          SCAN_PATTERNS=(
+            -e 'V1\.0[A-Za-z0-9+/=]{50,}'
+            -e 'gh[pous]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}'
+            -e 'sk-[A-Za-z0-9]{30,}'
+            -e '[0-9]{8,10}:[A-Za-z0-9_-]{30,}'
+          )
+          matches=$(git grep -nE "${SCAN_PATTERNS[@]}" \
             -- . ':!.github/workflows/test.yml' || true)
-          # 合成夹具白名单：V1.0FAKE 前缀 = 测试专用假 token（约定见 CLAUDE.md 规则10）
-          matches=$(printf '%s\n' "$matches" | grep -v 'V1\.0FAKE' || true)
+          # 合成夹具豁免（V1.0FAKE 前缀 = 测试专用假 token，约定见 CLAUDE.md 规则10）：
+          # 只剔除合成 token 本体后用同一组模式二次匹配——不得整行放行，
+          # 否则同一行混排的真实凭据会漏检（2026-11-01 评审指认）
+          matches=$(printf '%s\n' "$matches" \
+            | sed -E 's/V1\.0FAKE[A-Za-z0-9+/=]+//g' \
+            | grep -E "${SCAN_PATTERNS[@]}" || true)
           if [ -n "$matches" ]; then
             echo "::error::检测到疑似真实凭据/PII 入库（测试只允许合成夹具），明细如下"
             echo "$matches"
