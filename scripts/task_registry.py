@@ -73,15 +73,9 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
-    "moxing_vip": {
-        "id": "moxing_vip",
-        "script": "moxing_vip.py",
-        "name": "moxing.vip 签到",
-        "result": "moxing_vip.json",
-        "timeout": 300,
-        "account": "",
-        "tags": ["00:50", "matrix", "daily"],
-    },
+    # --- moxing.vip（2026-11-01 用户指令下线：任务退役。脚本 moxing_vip.py 与
+    #     report_fields 解析器保留；恢复时加回本表 + checkin.yml 环境变量段 +
+    #     GH Secrets（MOXING_USERNAME/PASSWORD/UA，2026-11-01 清理时已保留未删））---
     "naixi_forum": {
         "id": "naixi_forum",
         "script": "naixi_forum.py",
