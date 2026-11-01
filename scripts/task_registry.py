@@ -150,8 +150,18 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
-    # --- OPPO商城（2026-10-11 退役：HeyTap acIdAuthSession 为 7 天短命凭据、
-    #     更新成本高，2026-10-05 熔断后停用；脚本 oppo.py 保留，恢复时加回本表即可）---
+    # --- OPPO商城（hd.opposhop.cn 打卡签到与浏览任务；2026-10-11 曾因 HeyTap
+    #     acIdAuthSession 7 天短命凭据退役，2026-11-01 逆向 App 端 TOKENSID
+    #     长效令牌（约 30 天寿命）后恢复）---
+    "oppo": {
+        "id": "oppo",
+        "script": "oppo.py",
+        "name": "OPPO商城 签到",
+        "result": "oppo.json",
+        "timeout": 300,
+        "account": "",
+        "tags": ["00:50", "matrix", "daily"],
+    },
     # --- NodeSeek（nodeseek.com 每日随机/固定鸡腿签到，支持代理出口）---
     "nodeseek": {
         "id": "nodeseek",
