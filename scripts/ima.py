@@ -73,7 +73,6 @@ from common import (
     BJT,
     Http,
     env_seq,
-    is_already_signed,
     load_kv_state,
     main_guard,
     mask_str,
@@ -216,6 +215,10 @@ def _post_json(http: Http, url: str, body: Dict[str, Any], headers: Dict[str, st
         }
     if isinstance(data, dict):
         data.setdefault("http_status", status)
+        msg = data.get("msg")
+        if isinstance(msg, str) and msg:
+            # 服务端原始响应文案经脱敏后才进入 stdout（公开 Actions 日志 / 日报）
+            data["msg"] = sanitize_snippet(msg)
         return data
     return {"code": -1, "msg": f"HTTP {status} 异常响应结构", "http_status": status}
 
@@ -253,11 +256,15 @@ def _extract_refresh_expiry(data: Dict[str, Any]) -> int:
     return best
 
 
-def mint_access_token(http: Http, uid: str, refresh_token: str, guid: str) -> Tuple[bool, str, str, int]:
+def mint_access_token(
+    http: Http, uid: str, refresh_token: str, guid: str
+) -> Tuple[bool, str, str, int, str]:
     """用长效 refreshToken 现签约 2 小时叶会话 IMA-TOKEN。
 
-    返回 (ok, token|"", msg, new_refresh_expiry)。设备 Cookie 仅 IMA-GUID + PLATFORM=H5
-    （对齐 ima 内置浏览器刷新链路），不携带旧 IMA-TOKEN（telecom 先例：死会话前置有害）。
+    返回 (ok, token|"", msg, refresh_exp, rotated_refresh_token|"")。
+    设备 Cookie 仅 IMA-GUID + PLATFORM=H5（对齐 ima 内置浏览器刷新链路），
+    不携带旧 IMA-TOKEN（telecom 先例：死会话前置有害）；refresh 响应若轮换
+    下发新 refreshToken 则透传给调用方持久化（实测不轮换，防御性兼容）。
     """
     device_cookie = f"IMA-GUID={guid}; PLATFORM=H5"
     headers = _base_headers()
@@ -266,9 +273,10 @@ def mint_access_token(http: Http, uid: str, refresh_token: str, guid: str) -> Tu
     data = _post_json(http, REFRESH_URL, body, headers)
     token = str(data.get("token") or "")
     if data.get("code") == CODE_OK and token:
-        return True, token, "换票成功", _extract_refresh_expiry(data)
+        rotated = str(data.get("refreshToken") or data.get("refresh_token") or "")
+        return True, token, "换票成功", _extract_refresh_expiry(data), rotated
     msg = str(data.get("msg") or f"HTTP {data.get('http_status')}")
-    return False, "", msg, 0
+    return False, "", msg, 0, ""
 
 
 def find_item(info: Dict[str, Any], top: str) -> Optional[Dict[str, Any]]:
@@ -315,10 +323,14 @@ def _run_account(raw_cookie: str, index: int, total: int) -> Tuple[bool, str]:
 
     # 2. Fresh-Mint-First：每次现签新 IMA-TOKEN（约 2h 叶令牌，缓存无意义）
     print(f"\n[{index}/{total}] 👤 用户: {mask_str(uid) if uid else f'账号 #{index}'}")
-    ok_mint, token, mint_msg, refresh_exp = mint_access_token(http, uid, refresh_token, guid)
+    ok_mint, token, mint_msg, refresh_exp, rotated = mint_access_token(http, uid, refresh_token, guid)
     if not ok_mint:
         return False, f"换票失败（IMA-REFRESH-TOKEN 可能已失效，请重新抓包更新 IMA_COOKIE_{index}）: {mint_msg}"
     print("  🔑 已用长效刷新令牌现签新会话令牌（约 2 小时叶令牌，每次运行现签）")
+    # 服务端若轮换 refreshToken 则跟随最新值（实测不轮换，防御性兼容）
+    if rotated and rotated != refresh_token:
+        refresh_token = rotated
+        print("  🔄 服务端已轮换 refreshToken，已同步持久化最新值")
 
     cookie_str = build_ima_cookie(items, token)
     headers = _headers_with_cookie(cookie_str, token)
@@ -341,11 +353,8 @@ def _run_account(raw_cookie: str, index: int, total: int) -> Tuple[bool, str]:
             got = _reward_of(resp)
             print(f"  🎉 签到成功！获得 +{got} 算力" if got else "  🎉 签到成功")
             summary_parts.append("签到成功" + (f" +{got} 算力" if got else ""))
-        elif code == CODE_ALREADY_CHECKED_IN or (
-            code != CODE_NOT_FULL_WEEK and is_already_signed(str(resp.get("msg") or ""))
-        ):
-            # 1001（未满签）是满签奖励专属业务码：日签链路绝不因其文案含
-            # "claimed" 被英文幂等启发式误判为已签（否则日签奖励静默丢失）
+        elif code == CODE_ALREADY_CHECKED_IN:
+            # 幂等判定只认协议业务码：文案启发式会把真实拒绝误判成假成功
             print("  ℹ️ 今日已签到，幂等放行")
             summary_parts.append("今日已签到")
         else:
@@ -354,15 +363,18 @@ def _run_account(raw_cookie: str, index: int, total: int) -> Tuple[bool, str]:
         print("  ℹ️ 今日已签到，幂等放行")
         summary_parts.append("今日已签到")
     else:
-        print(f"  ⚠️ 今日不可签到（status={today_status} {STATUS_TEXT.get(today_status, '未知')}）")
-        summary_parts.append(f"今日不可签（{STATUS_TEXT.get(today_status, '未知')}）")
+        # 协议外状态（已过期/未解锁出现在「今日」格）说明服务端状态机异常，
+        # 如实判失败交外层重试与熔断，绝不当作成功吞掉
+        return False, f"今日格状态异常（status={today_status} {STATUS_TEXT.get(today_status, '未知')}），请人工核查"
 
     # 5. 满签奖励：连续 7 天解锁（周一挂起、周日结算），按服务端 status 驱动
     #    （非日历锚定——status=3 即可领，日签成功后重拉信息确保第 7 天当轮即领）
-    info = _post_json(http, ACTIVITY_INFO_URL, {}, headers)
-    if info.get("code") != CODE_OK:
-        # 重拉失败不致命：沿用签到前快照结算展示
-        print(f"  ⚠️ 复核活动信息失败: code={info.get('code')} msg={info.get('msg')}")
+    info_refetch = _post_json(http, ACTIVITY_INFO_URL, {}, headers)
+    if info_refetch.get("code") == CODE_OK:
+        info = info_refetch
+    else:
+        # 重拉失败不致命：沿用签到前快照做满签判定与连签统计
+        print(f"  ⚠️ 复核活动信息失败（沿用签到前快照）: code={info_refetch.get('code')} msg={info_refetch.get('msg')}")
     bonus = find_item(info, BONUS_TITLE) if isinstance(info, dict) else None
     if bonus is not None and bonus.get("status") == STATUS_AVAILABLE:
         resp = _post_json(http, CHECK_IN_URL, {"type": CHECKIN_TYPE_WEEKLY_BONUS}, headers)
@@ -373,7 +385,7 @@ def _run_account(raw_cookie: str, index: int, total: int) -> Tuple[bool, str]:
             summary_parts.append("满签奖励" + (f" +{got} 算力" if got else ""))
         elif code == CODE_NOT_FULL_WEEK:
             print("  ℹ️ 满签奖励未达条件（本周未签满）")
-        elif code == CODE_ALREADY_CHECKED_IN or is_already_signed(str(resp.get("msg") or "")):
+        elif code == CODE_ALREADY_CHECKED_IN:
             print("  ℹ️ 满签奖励本期已领取")
         else:
             # 未知拒绝（含限流 -1）只记录不判失败，日签收益已落袋
@@ -385,13 +397,7 @@ def _run_account(raw_cookie: str, index: int, total: int) -> Tuple[bool, str]:
     if days is not None and points is not None:
         print(f"  📊 本周连签 {days} 天 · 本周累计 +{points} 算力")
 
-    # 服务端若轮换 refreshToken，落库跟随（HAR 实测不轮换，防御性兼容）
-    rotated = ""
-    if isinstance(info, dict):
-        rotated = str(info.get("refreshToken") or info.get("refresh_token") or "")
-    final_refresh = rotated if rotated and rotated != refresh_token else refresh_token
-    if rotated and rotated != refresh_token:
-        print("  🔄 服务端已轮换 refreshToken，已同步持久化最新值")
+    final_refresh = refresh_token  # 轮换跟随已在换票步处理（取自 refresh 响应）
 
     final_cookie = build_ima_cookie({**items, "IMA-REFRESH-TOKEN": final_refresh}, token)
     learned = {"IMA-REFRESH-TOKEN": refresh_exp} if refresh_exp else {}
@@ -463,7 +469,9 @@ def main() -> None:
     print(f"🏁 执行完毕: 成功 {success_count}/{total} 个账号")
     print("=" * 50)
 
-    if success_count == 0:
+    # 任一账号失败即非零退出（cloud189 同款语义）：外层熔断/重试按任务粒度接管，
+    # 已成功账号次日重跑时走幂等放行，无重复收益风险
+    if success_count < total:
         sys.exit(1)
 
 

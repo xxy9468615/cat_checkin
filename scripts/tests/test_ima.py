@@ -162,22 +162,32 @@ class TestMintAccessToken(unittest.TestCase):
         http = _mock_http({
             ima.REFRESH_URL: {"code": 0, "token": "NEW_LEAF", "msg": "ok"},
         })
-        ok, token, msg, exp = ima.mint_access_token(http, "uid123", "rt456", "guid789")
+        ok, token, msg, exp, rotated = ima.mint_access_token(http, "uid123", "rt456", "guid789")
         self.assertTrue(ok)
         self.assertEqual(token, "NEW_LEAF")
+        self.assertEqual(rotated, "")  # 未轮换
         # 设备 Cookie 只带 IMA-GUID + PLATFORM，不携带旧叶令牌
         sent_headers = http.request.call_args[1]["headers"]
         self.assertIn("IMA-GUID=guid789", sent_headers["x-ima-cookie"])
         self.assertNotIn("IMA-TOKEN", sent_headers["x-ima-cookie"])
         self.assertNotIn("x-ima-bkn", sent_headers)
 
+    def test_mint_rotated_refresh_token_returned(self):
+        http = _mock_http({
+            ima.REFRESH_URL: {"code": 0, "token": "NEW_LEAF", "refreshToken": "ROTATED_RT"},
+        })
+        ok, token, _, _, rotated = ima.mint_access_token(http, "uid123", "rt456", "guid789")
+        self.assertTrue(ok)
+        self.assertEqual(rotated, "ROTATED_RT")  # 轮换值来自 refresh 响应（非活动信息响应）
+
     def test_mint_rejected(self):
         http = _mock_http({
             ima.REFRESH_URL: {"code": 4, "msg": "refresh token invalid"},
         })
-        ok, token, msg, _ = ima.mint_access_token(http, "uid123", "rt456", "guid789")
+        ok, token, msg, _, rotated = ima.mint_access_token(http, "uid123", "rt456", "guid789")
         self.assertFalse(ok)
         self.assertEqual(token, "")
+        self.assertEqual(rotated, "")
         self.assertIn("invalid", msg)
 
 
@@ -258,6 +268,70 @@ class TestRunAccount(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("每日签到被拒", desc)
 
+    def test_unknown_idempotent_text_without_code_fails(self):
+        # 回归位：文案说"已签"但业务码非 1002 —— 协议异常必须如实判失败（防假成功）
+        ok, desc, _ = self._run(
+            _activity_payload(today_status=3, bonus_status=4),
+            [{"code": 7, "msg": "already signed today"}],
+        )
+        self.assertFalse(ok)
+        self.assertIn("每日签到被拒", desc)
+
+    def test_unexpected_today_status_fails(self):
+        # 「今日」格出现已过期/未解锁等协议外状态 → 判失败交熔断，绝不假成功
+        ok, desc, _ = self._run(
+            _activity_payload(today_status=1, bonus_status=4),
+            [],
+        )
+        self.assertFalse(ok)
+        self.assertIn("今日格状态异常", desc)
+        self.assertIn("已过期", desc)
+
+    def test_refetch_failure_keeps_pre_sign_snapshot(self):
+        # 回归位：复核重拉失败必须沿用签到前快照（满签判定 + 连签统计都来自快照）
+        ok_info = _activity_payload(today_status=3, bonus_status=3)
+        with patch.object(ima, "save_kv_state") as mock_save, \
+             patch.object(ima, "load_kv_state", return_value={}), \
+             patch.object(ima, "Http") as mock_http_cls:
+            http = MagicMock()
+            info_calls = {"n": 0}
+
+            def route(method, url, **kw):
+                if url.startswith(ima.REFRESH_URL):
+                    return _mock_response({"code": 0, "token": "NEW_LEAF", "msg": "ok"})
+                if url.startswith(ima.ACTIVITY_INFO_URL):
+                    info_calls["n"] += 1
+                    if info_calls["n"] == 1:
+                        return _mock_response(ok_info)
+                    return _mock_response({"code": -1, "msg": "HTTP 403 空响应（可能被限流，稍后重试）"})
+                if url.startswith(ima.CHECK_IN_URL):
+                    return _mock_response({"code": 0, "reward_received": 50, "msg": "ok"})
+                return _mock_response({"code": -1, "msg": "unrouted"})
+
+            http.request.side_effect = route
+            mock_http_cls.return_value = http
+            ok, desc = ima._run_account(_synthetic_cookie(), 1, 1)
+        self.assertTrue(ok)
+        # 快照里满签格 status=3 → 试领发生（check_in 被调用两次：日签+满签）
+        self.assertIn("签到成功", desc)
+        self.assertIn("满签奖励", desc)
+        # 连签统计来自快照而非错误响应
+        self.assertIn("本周连签 1 天", desc)
+
+    def test_server_rotated_refresh_token_persisted(self):
+        with patch.object(ima, "save_kv_state") as mock_save, \
+             patch.object(ima, "load_kv_state", return_value={}), \
+             patch.object(ima, "Http") as mock_http_cls:
+            http = _mock_http({
+                ima.REFRESH_URL: {"code": 0, "token": "NEW_LEAF", "refreshToken": "ROTATED_RT"},
+                ima.ACTIVITY_INFO_URL: _activity_payload(today_status=2, bonus_status=4),
+            })
+            mock_http_cls.return_value = http
+            ok, desc = ima._run_account(_synthetic_cookie(), 1, 1)
+        self.assertTrue(ok)
+        saved = mock_save.call_args[0][2]
+        self.assertEqual(saved.get("refresh_token"), "ROTATED_RT")
+
     def test_refresh_rejected_fails(self):
         with patch.object(ima, "save_kv_state") as mock_save, \
              patch.object(ima, "load_kv_state", return_value={}), \
@@ -312,12 +386,34 @@ class TestReportFieldsExIma(unittest.TestCase):
         self.assertTrue(any("***6789" in line for line in res["lines"]))
         self.assertTrue(any("签到成功" in line for line in res["lines"]))
         self.assertTrue(any("本周连签 7 天" in line for line in res["lines"]))
-        self.assertIn(("算力", 400.0), res["assets"])
+        # 本周累计是周期收益（流量）非账户余额，不进 assets
+        self.assertNotIn(("算力", 400.0), res["assets"])
         self.assertIn(("算力", 50.0), res["gains"])
         self.assertIn(("算力", 100.0), res["gains"])
         self.assertIn(("reward", "签到 +50 算力"), res["badges"])
         self.assertIn(("reward", "满签奖励 +100 算力"), res["badges"])
         self.assertEqual(res["streak"], 7)
+
+    def test_extract_numberless_success(self):
+        # 服务端未下发奖励数值时状态仍需被识别（不丢签到事实）
+        synthetic_output = """
+[1/1] 👤 用户: ***6789
+  🎉 签到成功
+  📊 本周连签 2 天 · 本周累计 +100 算力
+"""
+        res = extract_for("ima.py", synthetic_output)
+        self.assertTrue(any("签到成功" in line for line in res["lines"]))
+        self.assertNotIn(("算力", 0.0), res["gains"])
+
+    def test_extract_failure_line_before_account_block(self):
+        # 缺凭据账号在 👤 行之前即失败 —— 失败行无论是否在账号块内都必须捕获
+        synthetic_output = """
+[1/1] 👤 用户: ***6789
+  ℹ️ 今日已签到，幂等放行
+[2/2] ❌ 缺少登录凭据（x-ima-cookie 须同时含 IMA-UID 与 IMA-REFRESH-TOKEN）
+"""
+        res = extract_for("ima.py", synthetic_output)
+        self.assertTrue(any("缺少登录凭据" in line for line in res["error_lines"]))
 
     def test_extract_already_signed(self):
         synthetic_output = """
@@ -327,7 +423,7 @@ class TestReportFieldsExIma(unittest.TestCase):
 """
         res = extract_for("ima.py", synthetic_output)
         self.assertTrue(any("今日已签" in line for line in res["lines"]))
-        self.assertIn(("算力", 150.0), res["assets"])
+        self.assertEqual(res["streak"], 3)
 
     def test_extract_failure_lines(self):
         synthetic_output = """

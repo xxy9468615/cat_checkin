@@ -1398,6 +1398,12 @@ def ex_oppo(output: str, res: Dict[str, Any]) -> None:
 def ex_ima(output: str, res: Dict[str, Any]) -> None:
     """腾讯 IMA：👤 用户: ... + 日签 / 满签奖励 / 本周连签·算力 行。"""
     cur: Any = None
+
+    def _fail(ln: str, raw: str) -> None:
+        # 失败行无论是否落在账号块内都必须捕获（如缺凭据账号在 👤 行之前即失败）
+        res["fail_lines"].append(_clean(ln))
+        res["error_lines"].append(raw)
+
     for raw in output.splitlines():
         ln = raw.strip()
         m = re.search(r"\[\d+/\d+\]\s*👤\s*用户:\s*(.+)", ln)
@@ -1406,34 +1412,36 @@ def ex_ima(output: str, res: Dict[str, Any]) -> None:
                 cur.flush(res)
             cur = _Block(m.group(1))
             continue
+        # 先判失败行（避免与已签文案混排时被吞），再识别状态行
+        if "❌" in ln or "失败" in ln:
+            _fail(ln, raw)
+            continue
         if cur is None:
             continue
-        m_sign = re.search(r"签到成功.*?\+\s*([\d,]+)\s*算力", ln)
-        if m_sign:
+        _m_num = re.search(r"\+\s*([\d,]+)\s*算力", ln)
+        if "签到成功" in ln and "满签" not in ln:
             cur.parts.append("签到成功")
-            res["badges"].append(("reward", f"签到 +{_d(m_sign.group(1))} 算力"))
-            res["gains"].append(("算力", _f(m_sign.group(1))))
+            if _m_num:
+                res["badges"].append(("reward", f"签到 +{_d(_m_num.group(1))} 算力"))
+                res["gains"].append(("算力", _f(_m_num.group(1))))
             continue
-        m_bonus = re.search(r"满签奖励已领取.*?\+\s*([\d,]+)\s*算力", ln)
-        if m_bonus:
+        if "满签奖励已领取" in ln:
             cur.parts.append("满签奖励已领")
-            res["badges"].append(("reward", f"满签奖励 +{_d(m_bonus.group(1))} 算力"))
-            res["gains"].append(("算力", _f(m_bonus.group(1))))
+            if _m_num:
+                res["badges"].append(("reward", f"满签奖励 +{_d(_m_num.group(1))} 算力"))
+                res["gains"].append(("算力", _f(_m_num.group(1))))
             continue
         if "今日已签到" in ln:
             cur.parts.append("今日已签")
             continue
         m_week = re.search(r"本周连签\s*(\d+)\s*天.*?本周累计\s*\+?\s*([\d,]+)\s*算力", ln)
         if m_week:
+            # 本周累计是周期收益（流量）而非账户余额（存量），只进摘要不进 assets
             days = int(m_week.group(1))
             cur.parts.append(f"本周连签 {days} 天 · 本周算力 {_d(m_week.group(2))}")
             res["streak"] = max(res["streak"], days)
             res["badges"].append(("streak", f"连签 {days} 天"))
-            res["assets"].append(("算力", _f(m_week.group(2))))
             continue
-        if "❌" in ln or "失败" in ln:
-            res["fail_lines"].append(_clean(ln))
-            res["error_lines"].append(ln)
 
     if cur:
         cur.flush(res)
