@@ -129,52 +129,6 @@ def _add_summary(res: Dict[str, Any], output: str) -> None:
 # 各任务解析器（锚定 scripts/<task>.py 当前 print 格式）
 # =====================================================================
 
-def ex_2libra(output: str, res: Dict[str, Any]) -> None:
-    """【2Libra 签到】：[i/N] 名字（第 N 号会员）+ 3 行详情；失败为 [i/N] 签到失败：...。"""
-    cur: Any = None
-    for raw in output.splitlines():
-        s = raw.strip()
-        m = re.match(r"\[(\d+)/(\d+)\] (\S+?)（第 (\d+) 号会员）", s)
-        if m:
-            if cur:
-                cur.flush(res)
-            cur = _Block(m.group(3))
-            continue
-        if "签到失败" in s and s.startswith("["):
-            if cur:
-                cur.flush(res)
-                cur = None
-            res["fail_lines"].append(_clean(s))
-            res["error_lines"].append(s)
-            continue
-        if cur is None:
-            continue
-        mm = re.search(r"本次签到获得 (\d+) 金币", s)
-        if mm:
-            cur.parts.append(f"+{mm.group(1)}金币")
-            res["gains"].append(("金币", _f(mm.group(1))))
-            res["badges"].append(("reward", f"+{mm.group(1)} 金币"))
-            continue
-        mm = re.search(r"当前金币总数为 (\d+) 个，已累计签到 (\d+) 天", s)
-        if mm:
-            cur.parts.append(f"余额 {int(mm.group(1)):,}")
-            cur.parts.append(f"连签 {mm.group(2)} 天")
-            res["assets"].append(("金币", _f(mm.group(1))))
-            res["streak"] = max(res["streak"], int(mm.group(2)))
-            res["badges"].append(("streak", f"连签 {mm.group(2)} 天"))
-            continue
-        mm = re.search(r"当前用户等级为 (\d+) 级，经验值为 (\d+) 点", s)
-        if mm:
-            cur.parts.append(f"Lv{mm.group(1)}（{mm.group(2)}点）")
-            continue
-        if "已经签到" in s and "签到时间为：" in s:
-            cur.parts.append("今日已签（幂等）")
-    if cur:
-        cur.flush(res)
-    _keepalive_badge(output, res)
-    _add_summary(res, output)
-
-
 def _keepalive_badge(output: str, res: Dict[str, Any]) -> None:
     if "[keepalive] ✅" in output:
         m = re.search(r"\[keepalive\] ✅ token 已换新并持久化，新 access_token 到期 ([\d-]+)", output)
@@ -1211,34 +1165,6 @@ def ex_modelscope(output: str, res: Dict[str, Any]) -> None:
         res["badges"].append(("summary", f"✅ {mm.group(1)}/{mm.group(2)}"))
 
 
-def ex_latvi(output: str, res: Dict[str, Any]) -> None:
-    """Latvi：✅ 签到成功 +N（连续N天），余额 N + 🔄 服务器自动延长。"""
-    for raw in output.splitlines():
-        ln = raw.strip()
-        mm = re.search(r"签到成功 \+(\S+)（连续(\d+)天），余额 (\S+)", ln)
-        if mm:
-            res["lines"].append(_acc_line("账号", [f"+{mm.group(1)}", f"连签 {mm.group(2)} 天", f"余额 {mm.group(3)}"]))
-            res["gains"].append(("积分", _f(mm.group(1))))
-            res["assets"].append(("积分", _f(mm.group(3))))
-            res["streak"] = max(res["streak"], int(mm.group(2)))
-            res["badges"].append(("reward", f"+{mm.group(1)}"))
-            res["badges"].append(("streak", f"连签 {mm.group(2)} 天"))
-            continue
-        mm = re.search(r"今日已于 (\S+) 签到过，无需重复执行", ln)
-        if mm:
-            res["lines"].append(_acc_line("账号", [f"今日已于 {mm.group(1)} 签到过"]))
-            continue
-        mm = re.search(r"服务器自动延长 \(#(\d+)\): (.+)$", ln)
-        if mm:
-            state = "✓" if ("HTTP 200" in mm.group(2) or "成功" in mm.group(2)) else _clean(mm.group(2), 18)
-            res["lines"].append(f"续期 #{mm.group(1)}  {state}")
-            continue
-        if "签到失败" in ln:
-            res["fail_lines"].append(_clean(ln))
-            res["error_lines"].append(ln)
-    _add_summary(res, output)
-
-
 def ex_cloud189(output: str, res: Dict[str, Any]) -> None:
     """天翼云盘：👤 用户: 【xx】 + • 签到 / 抽奖 / 空间 行。"""
     cur: Any = None
@@ -1472,7 +1398,6 @@ def ex_oppo(output: str, res: Dict[str, Any]) -> None:
 # 注册表：key = 脚本文件名（task_registry 的 script 字段 / 结果 JSON 的 script 字段）
 SCRIPT_EXTRACTORS = {
     "oppo.py": ex_oppo,
-    "2libra.py": ex_2libra,
     "glados.py": ex_glados,
     "railgun.py": ex_railgun,
     "bianjie_ai.py": ex_bianjie_ai,
@@ -1497,7 +1422,6 @@ SCRIPT_EXTRACTORS = {
     "cloud189.py": ex_cloud189,
     "workbuddy.py": ex_workbuddy,
     "modelscope.py": ex_modelscope,
-    "latvi.py": ex_latvi,
 }
 
 

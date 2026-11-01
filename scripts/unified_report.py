@@ -14,7 +14,7 @@
   晚到的日报只归档、不发信、不写 marker，既不推错日期数据也不压制当日主发。
 
 优先从 Upstash Redis `cat_checkin:raw:<TODAY>`（HGETALL）汇聚，
-兜底扫描 `.task_results/` 本地 JSON；Latvi 若今日无结果则回退昨日（24h 冷却跨日）。
+兜底扫描 `.task_results/` 本地 JSON。
 
 2026-08-29 日报回归邮件通道（HTML 卡片 + 今日概览小结，浏览/归档体验优于 Discord），
 Discord 保留频道1 失败即时提醒（discord_notify.notify_task_result）。
@@ -39,8 +39,6 @@ import report_fields  # noqa: E402  按任务定制的字段解析（归档结�
 from daily_report import _extract_fields, build_report, send_email, send_resend  # noqa: E402
 from task_registry import TASKS, get_expected_results  # noqa: E402
 
-# Latvi 的结果文件名（24h 间隔约束，18:00 运行，报告取昨日结果）
-LATVI_RESULT_FILE = "latvi.json"
 
 # 日报发信时间窗（北京时间）：20:00 主发 + 21:30 失败补发。
 # 窗口起点，早于此点一律拒发（见 _daily_report_window_blocks）。
@@ -130,7 +128,7 @@ def _load_single_result(path: Path, accepted_dates: Set[str]) -> Optional[dict]:
         return None
 
 
-def collect_all_results(today: str, yesterday: str) -> Tuple[List[Tuple[bool, Path, str, float]], Dict[str, dict]]:
+def collect_all_results(today: str) -> Tuple[List[Tuple[bool, Path, str, float]], Dict[str, dict]]:
     """收集所有任务结果。返回 (build_report 所需元组列表, 原始结果字典 key→data)。
 
     原始字典供归档使用（key 区分 workbuddy-account-1/2 等同名脚本多账号）。
@@ -160,25 +158,11 @@ def collect_all_results(today: str, yesterday: str) -> Tuple[List[Tuple[bool, Pa
                         data = json.loads(value) if isinstance(value, str) else value
                         if isinstance(data, dict):
                             date_val = data.get("date")
-                            dates = {today, yesterday} if field == LATVI_RESULT_FILE else {today}
+                            dates = {today}
                             if date_val in dates:
                                 collected[field] = data
                     except Exception:
                         pass
-
-            # Latvi 24h 间隔约束：若今日 Redis 暂存中没有 latvi.json，尝试读取昨日
-            if LATVI_RESULT_FILE not in collected:
-                raw_key_yesterday = f"{prefix}:raw:{yesterday}"
-                ok2, res2 = upstash_redis_command(["HGET", raw_key_yesterday, LATVI_RESULT_FILE])
-                if ok2 and isinstance(res2, dict):
-                    lv_val = res2.get("result")
-                    if lv_val:
-                        try:
-                            lv_data = json.loads(lv_val) if isinstance(lv_val, str) else lv_val
-                            if isinstance(lv_data, dict) and lv_data.get("date") == yesterday:
-                                collected[LATVI_RESULT_FILE] = lv_data
-                        except Exception:
-                            pass
             if collected:
                 print(f"📡 已从 Upstash Redis 汇聚 {len(collected)} 个任务结果")
         except Exception as e:
@@ -189,7 +173,7 @@ def collect_all_results(today: str, yesterday: str) -> Tuple[List[Tuple[bool, Pa
     if task_results_dir.exists() and task_results_dir.is_dir():
         for json_file in sorted(task_results_dir.rglob("*.json")):
             if json_file.name not in collected:
-                dates = {today, yesterday} if json_file.name == LATVI_RESULT_FILE else {today}
+                dates = {today}
                 res = _load_single_result(json_file, dates)
                 if res:
                     collected[json_file.name] = res
@@ -418,9 +402,8 @@ def main() -> None:
     tz = dt.timezone(dt.timedelta(hours=8))
     now = dt.datetime.now(tz)
     today = os.getenv("TODAY") or now.strftime("%Y-%m-%d")
-    yesterday = (now - dt.timedelta(days=1)).strftime("%Y-%m-%d")
 
-    results, collected = collect_all_results(today, yesterday)
+    results, collected = collect_all_results(today)
 
     if not results:
         print("❌ 今日（10:00 前）未收集到任何完成的签到任务结果，跳过推送。")

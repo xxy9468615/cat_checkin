@@ -17,13 +17,6 @@ FIXTURES = BASE / "tests" / "fixtures"
 
 # 每个 fixture 的断言：(结果文件名→script名, 断言函数)
 EXPECT = {
-    "2libra": lambda r: (
-        len(r["lines"]) == 1
-        and "余额 24,616" in r["lines"][0]
-        and "连签 22 天" in r["lines"][0]
-        and ("金币", 300.0) in r["gains"]
-        and r["streak"] == 22
-    ),
     "agentrouter": lambda r: (
         len(r["lines"]) == 1 and "额度 324,690,566" in r["lines"][0] and "（已用 309,434）" in r["lines"][0]
     ),
@@ -44,9 +37,6 @@ EXPECT = {
     "railgun": lambda r: (
         len(r["lines"]) == 3 and "今日已签" in r["lines"][0] and "剩余 14 天" in r["lines"][0]
         and "+1积分" in r["lines"][1] and "+1积分" in r["lines"][2] and "积分 1" in r["lines"][0]
-    ),
-    "latvi": lambda r: (
-        any("续期 #48216" in ln for ln in r["lines"]) and ("积分", 5.0) in r["gains"] and r["streak"] == 32
     ),
     "modelscope": lambda r: (
         len(r["lines"]) == 2 and "+200魔粒" in r["lines"][0] and "冷却中" in r["lines"][1]

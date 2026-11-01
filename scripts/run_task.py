@@ -4,7 +4,7 @@
 用法：
   python3 scripts/run_task.py glados.py
   python3 scripts/run_task.py workbuddy.py
-  python3 scripts/run_task.py scripts/latvi.py
+  python3 scripts/run_task.py scripts/cloud189.py
 
 环境变量：
   TASK_OUTPUT_DIR       结果 JSON 保存目录，默认 .task_results

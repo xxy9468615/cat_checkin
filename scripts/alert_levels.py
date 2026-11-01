@@ -42,10 +42,8 @@ from typing import Dict, List, Optional
 # 不做「即将过期」提示；续期失败（仍能签到的场景）才值得黄色提示。
 AUTO_RENEW_SCRIPTS = {
     "tencent_cloudstudio.py",  # Keycloak SSO 长期票静默换 session
-    "2libra.py",               # refresh_token 换新 access_token
     "alipan.py",               # OAuth2 refresh_token 官方轮换
     "sophnet.py",              # refresh_token 换新
-    "latvi.py",                # 服务器自动延长
     "smzdm.py",                # Set-Cookie 滚动保活
     "modelscope.py",           # Set-Cookie 滑动续期（国内/国际共用脚本）
     "workbuddy.py",            # 插件 OAuth refresh_token 滚动续期（60/90 天，每日刷新）
@@ -63,19 +61,12 @@ _RENEWAL_FAIL_PATTERNS: Dict[str, tuple] = {
         r"qcloud 换票",
         r"qcloud 授权链",
     ),
-    "2libra.py": (
-        r"token 换新失败",
-    ),
     "alipan.py": (
         r"刷新 Token 失败",
     ),
     "sophnet.py": (
         r"无法自动续期",
         r"[Rr]efresh [Tt]oken (?:无效|已过期)",
-    ),
-    "latvi.py": (
-        # 延长结果行不含「HTTP 200 / 成功」即视为失败（与 ex_latvi 的 ✓ 判定同源）
-        r"服务器自动延长 \(#\d+\): (?!.*(HTTP 200|成功))",
     ),
     "workbuddy.py": (
         r"refresh_token 续期失败",
@@ -89,10 +80,8 @@ _RENEWAL_FAIL_PATTERNS: Dict[str, tuple] = {
 # 续期失败提示语（提示读者该做什么，而不是只抛日志原文）
 _RENEWAL_HINTS: Dict[str, str] = {
     "tencent_cloudstudio.py": "自动换票失败（qcloud skey 失效 / KEYCLOAK 长期票据被吊销或要求交互登录），本次用旧票签成；请更新 Secrets 中的 skey+uin 或完整 Cookie",
-    "2libra.py": "refresh_token 换新失败，当前 access_token 到期前仍可签到，请尽快重新登录更新 Cookie",
     "alipan.py": "refresh_token 轮换异常，请检查凭据",
     "sophnet.py": "refresh_token 续期失败，请检查凭据",
-    "latvi.py": "服务器自动延长失败，请检查站点",
     "workbuddy.py": "refresh_token 滚动续期失败（可能闲置被清理），本次用 Cookie 兜底签到，请重跑 scripts/workbuddy_device_login.py",
     "oppo.py": "HeyTap SSO 换票续期失败，本次使用现有令牌打卡，请检查 acIdAuthSession 是否有效",
 }
@@ -205,10 +194,6 @@ if __name__ == "__main__":
         ("cloudstudio 签到失败 → 红色（压过黄色）",
          "tencent_cloudstudio.py", False,
          "[diag] SSO 未取到新 session\n签到失败：Cookie 已失效", "fail", None),
-        ("2libra 换新失败但 token 仍可用 → 黄色",
-         "2libra.py", True,
-         "[keepalive] ⚠️ token 换新失败（HTTP 400）——当前 access_token 到期前仍可签到\n签到成功",
-         "warn", "换新失败"),
         ("glados 无法续期且剩余 1 天 → 黄色提前提示",
          "glados.py", True, "🔑 Cookie 剩余 1 天\n签到成功", "warn", "仅剩 1 天"),
         ("glados 剩余 30 天 → 绿色",

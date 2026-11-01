@@ -5,6 +5,9 @@
 
 核心逻辑：
 1. 凭证解析、长效 SSO 根凭据与自动换票续期保活：
+   - 优先支持 OPPO 商城 App 抓包的 TOKENSID（欢太账号 App 端 SSO 令牌，TOKEN_ 前缀 ECDSA JWT，
+     约 30 天寿命）：复刻 App 内 H5 鉴权链路（s_channel=oppo_appstore + constToken 请求头）直连
+     商城接口，无需 24 小时 webAccessToken；剩余寿命不足 72 小时在执行摘要预警；
    - 提取并解析 webAccessToken（JWT），校验过期时间（会话级 24 小时）；
    - 支持欢太账号中心 SSO 根凭据 (acIdAuthSession)，通过底层 Web SDK (account_web_sdk) 换票链路：
      a. GET /cn/oapi/auth/api/account/state?bizAppKey=... 获取 OAuth state；
@@ -15,6 +18,7 @@
    - 凭据状态自动同步持久化至 Upstash Redis (cat_checkin:state:oppo_{idx}) 与本地文件 (.oppo_state_{idx}.json)；
    - 即使 runner 销毁，下一次运行时也能基于长效 SSO 根凭据自动静默无感换票，实现数月长期免维护。
 3. 每日打卡签到 (signIn)：
+   - 签到 activityId 每月轮换，运行时自动从签到页 HTML 的 activityInfo 提取当月场次，失败回退内置常量；
    - POST /api/cn/oapi/marketing/cumulativeSignIn/signIn；
    - 幂等放行：已签到（code 5008 / "今天已经签到过啦"）自动识别，新签到返回 +10 积分收益。
 4. 连签里程碑奖励自动领取 (drawCumulativeAward)：
@@ -38,6 +42,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -81,13 +86,24 @@ from common import (
     mask_str,
     save_kv_state,
 )
+import cookie_validity as cv
 
 PREFIX = "OPPO_"
 BASE_HOST = "https://hd.opposhop.cn"
 BIZ_APP_KEY = "WJ9mxZSYJBYQL91FFowN6X"
-SIGN_IN_ACTIVITY_ID = "2094340289534894080"
+# 签到场次每月轮换（2026-11 场次）；运行时会自动从签到页 activityInfo 发现最新 ID，此处仅兜底
+SIGN_IN_ACTIVITY_ID = "2116078703745441792"
+SIGN_IN_PAGE_PATH = "/bp/b371ce270f7509f0"
 CREDITS_ADD_ACTION_ID = "1788913e6d9e4683b8b9ab0088733560"
 TASK_ACTIVITY_ID = "1919591795180969984"
+# App 内 H5（com.oppo.store WebView）请求头特征：网关对 App 链路按 TOKENSID 会话校验
+APP_CONST_TOKEN = "GxZ5UMBinzhFCBUEURPcU9YriSSLdQnb@bj"
+APP_UA = (
+    "Mozilla/5.0 (Linux; Android 12; PJJ110 Build/V417IR; wv) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Version/4.0 Chrome/110.0.5481.154 Mobile Safari/537.36 "
+    "oppostore/500401 ColorOS/ brand/OPPO model/PJJ110;kyc/h5face;kyc/2.0;"
+    "netType:NETWORK_WIFI;appVersion:500401;packageName:com.oppo.store"
+)
 
 
 def _decode_jwt_payload(token: str) -> Optional[Dict[str, Any]]:
@@ -103,11 +119,12 @@ def _decode_jwt_payload(token: str) -> Optional[Dict[str, Any]]:
 
 
 def _decode_jwt_exp(token: str) -> Optional[int]:
-    """从 JWT webAccessToken 中提取 exp 过期时间戳（秒级）。"""
-    payload = _decode_jwt_payload(token)
-    if payload and isinstance(payload, dict):
-        return payload.get("exp")
-    return None
+    """从 JWT webAccessToken 中提取 exp 过期时间戳（秒级）。
+
+    统一走共享引擎 cookie_validity（规则 8）：毫秒级 exp（App 端 TOKENSID 等）
+    由 cv._norm_epoch 归一化，TOKEN_ 前缀不影响第 2 段 payload 定位。
+    """
+    return cv.parse_jwt_exp(token)
 
 
 def _parse_cookie_items(raw_cookie: str) -> Dict[str, str]:
@@ -128,7 +145,7 @@ def _format_cookie_str(items: Dict[str, str]) -> str:
 
 
 def _extract_user_info(cookie_items: Dict[str, str]) -> Tuple[str, str, str]:
-    """从 Cookie 的 memberinfo 字段提取昵称、UID 与 oid。"""
+    """从 Cookie 的 memberinfo 字段提取昵称、UID 与 oid；缺失时回退 TOKENSID 载荷。"""
     member_raw = cookie_items.get("memberinfo", "")
     if member_raw:
         try:
@@ -137,9 +154,14 @@ def _extract_user_info(cookie_items: Dict[str, str]) -> Tuple[str, str, str]:
             uid = str(data.get("id", "") or "")
             name = str(data.get("name", "") or "")
             oid = str(data.get("oid", "") or "")
-            return name, uid, oid
+            if uid:
+                return name, uid, oid
         except Exception:
             pass
+    raw = cookie_items.get("TOKENSID", "")
+    payload = _decode_jwt_payload(raw[6:] if raw.startswith("TOKEN_") else raw)
+    if isinstance(payload, dict) and payload.get("id"):
+        return "", str(payload["id"]), ""
     return "", "", ""
 
 
@@ -298,38 +320,55 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
             cookie_items["acIdAuthSession"] = str(state["acIdAuthSession"])
 
     web_token = cookie_items.get("webAccessToken", "")
+    tokensid = cookie_items.get("TOKENSID", "")
     has_sso = bool(cookie_items.get("acIdAuthSession"))
 
-    http = Http(task_name="oppo")
+    # 兼容旧配置：整串直接粘贴裸 JWT 时视作 webAccessToken
+    if not web_token and not tokensid and raw_cookie.startswith("eyJ") and "." in raw_cookie:
+        web_token = raw_cookie
+        cookie_items["webAccessToken"] = web_token
 
-    # 2. 凭证初始化：若缺少 webAccessToken 但具备 acIdAuthSession，先换票初始化
-    if not web_token:
-        if raw_cookie.startswith("eyJ") and "." in raw_cookie:
-            web_token = raw_cookie
-            cookie_items["webAccessToken"] = web_token
-        elif has_sso:
-            print(f"[{index}/{total}] 🔄 检测到欢太 SSO 根凭据(acIdAuthSession)，正在初始化换取商城令牌...")
-            ok_ref, new_items, ref_msg = _try_refresh_oppo_token(http, cookie_items)
-            if ok_ref:
-                cookie_items = new_items
-                web_token = cookie_items.get("webAccessToken", "")
-                print(f"[{index}/{total}] ✅ 初始换票成功，已生成有效 webAccessToken")
-            else:
-                print(f"[{index}/{total}] ❌ 初始换票失败: {ref_msg}")
-                return False, f"初始换票失败: {ref_msg}"
+    http = Http(task_name="oppo")
+    now_ts = int(time.time())
+    web_exp = _decode_jwt_exp(web_token) if web_token else None
+    ts_exp = _decode_jwt_exp(tokensid) if tokensid else None
+
+    # 2. 凭证仲裁：TOKENSID（约 30 天）> webAccessToken（24 小时）> SSO 换票兜底
+    if ts_exp and ts_exp - now_ts > 300:
+        mode = "app"
+    elif web_token and (not web_exp or web_exp - now_ts > 300):
+        mode = "web"
+    elif has_sso:
+        print(f"[{index}/{total}] 🔄 商城会话已失效，正在用欢太 SSO 根凭据(acIdAuthSession)初始化换票...")
+        ok_ref, new_items, ref_msg = _try_refresh_oppo_token(http, cookie_items)
+        if ok_ref:
+            cookie_items = new_items
+            web_token = cookie_items.get("webAccessToken", "")
+            web_exp = _decode_jwt_exp(web_token)
+            mode = "web"
+            print(f"[{index}/{total}] ✅ 初始换票成功，已生成有效 webAccessToken")
         else:
-            print(f"[{index}/{total}] ❌ 未在 Cookie 中检测到 webAccessToken 登录令牌")
-            return False, "缺少登录凭据(webAccessToken 或 acIdAuthSession)"
+            print(f"[{index}/{total}] ❌ 初始换票失败: {ref_msg}")
+            return False, f"初始换票失败: {ref_msg}"
+    else:
+        print(f"[{index}/{total}] ❌ 未检测到有效登录凭据（TOKENSID / webAccessToken 均缺失或已过期）")
+        return False, "缺少登录凭据(TOKENSID 或 webAccessToken 或 acIdAuthSession)"
 
     user_name, user_id, user_oid = _extract_user_info(cookie_items)
     display_id = mask_str(user_id) if user_id else f"账号 #{index}"
     display_name = f"（{mask_str(user_name)}）" if user_name else ""
     print(f"\n[{index}/{total}] 👤 用户: {display_id}{display_name}")
 
-    # 3. 凭据有效期评估与提前静默换票
-    exp_ts = _decode_jwt_exp(web_token)
-    if exp_ts:
-        now_ts = int(time.time())
+    # 3. 凭据有效期评估与保活
+    exp_ts = ts_exp if mode == "app" else web_exp
+    if mode == "app":
+        rem_sec = (ts_exp or 0) - now_ts
+        rem_days = rem_sec / 86400
+        exp_dt = datetime.fromtimestamp(ts_exp, tz=BJT).strftime("%Y-%m-%d %H:%M:%S") if ts_exp else "未知"
+        print(f"  🔑 App 长效令牌 TOKENSID 有效: 剩余 {rem_days:.1f} 天（到期时间: {exp_dt}）")
+        if rem_sec < 3 * 86400:
+            print(f"  ⚠️ TOKENSID 即将过期（不足 3 天），请尽快在 OPPO 商城 App 重新登录并抓包更新 OPPO_COOKIE_{index}！")
+    elif exp_ts:
         rem_sec = exp_ts - now_ts
         rem_hours = rem_sec / 3600
         exp_dt = datetime.fromtimestamp(exp_ts, tz=BJT).strftime("%Y-%m-%d %H:%M:%S")
@@ -360,43 +399,88 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
         else:
             print(f"  🔑 凭据有效: 剩余 {rem_hours:.1f} 小时（到期时间: {exp_dt}）")
             if not has_sso:
-                print("  💡 提示: 若需长期免维护，建议在 OPPO_COOKIE 中配置欢太 SSO 根凭据(acIdAuthSession)")
+                print("  💡 提示: 若需长期免维护，建议改用 OPPO 商城 App 抓包的 TOKENSID 长效令牌（约 30 天）")
 
-    # 4. 补齐鉴权必须的辅助 Cookie 与请求头
-    # OPPO Mall 接口网关校验 cookie 中的 authHost 与 sa_distinct_id，若未提供易报 403 用户未登录。
+    # 4. 补齐鉴权必须的辅助 Cookie 与请求头（App 模式 / Web 模式分别对齐线上链路）
     sa_id = cookie_items.get("sa_distinct_id") or user_oid or ""
-    if "authHost" not in cookie_items:
-        cookie_items["authHost"] = "www.opposhop.cn"
     if "sa_distinct_id" not in cookie_items and sa_id:
         cookie_items["sa_distinct_id"] = sa_id
 
-    req_cookie = _format_cookie_str(cookie_items)
-
-    common_headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json",
-        "Cookie": req_cookie,
-        "s_channel": "h5_m",
-        "source_type": "504",
-        "Origin": BASE_HOST,
-        "Referer": f"{BASE_HOST}/bp/b371ce270f7509f0?nightModelEnable=true&us=huiyuanpindao",
-    }
+    if mode == "app":
+        # App 链路：网关按 Cookie 中的 TOKENSID 会话校验，辅助字段与 App WebView 抓包保持一致
+        cookie_items.setdefault("ENCODE_TOKENSID", tokensid)
+        cookie_items.setdefault("source_type", "501")
+        cookie_items.setdefault("s_channel", "oppo_appstore")
+        cookie_items.setdefault("s_version", "500401")
+        cookie_items.pop("authHost", None)
+        req_cookie = _format_cookie_str(cookie_items)
+        common_headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "Cookie": req_cookie,
+            "s_channel": "oppo_appstore",
+            "source_type": "501",
+            "s_version": "500401",
+            "osSystem": "android",
+            "clientPackage": "com.oppo.store",
+            "brand": "OPPO",
+            "constToken": APP_CONST_TOKEN,
+            "X-Requested-With": "com.oppo.store",
+            "Origin": BASE_HOST,
+            "Referer": f"{BASE_HOST}{SIGN_IN_PAGE_PATH}?nightModelEnable=true&us=wode&um=qiandaobanner",
+            "User-Agent": APP_UA,
+        }
+    else:
+        # Web 链路：OPPO Mall 接口网关校验 cookie 中的 authHost 与 sa_distinct_id，
+        # 若未提供易报 403 用户未登录。
+        if "authHost" not in cookie_items:
+            cookie_items["authHost"] = "www.opposhop.cn"
+        req_cookie = _format_cookie_str(cookie_items)
+        common_headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "Cookie": req_cookie,
+            "s_channel": "h5_m",
+            "source_type": "504",
+            "Origin": BASE_HOST,
+            "Referer": f"{BASE_HOST}{SIGN_IN_PAGE_PATH}?nightModelEnable=true&us=huiyuanpindao",
+        }
     if sa_id:
         common_headers["sa_distinct_id"] = sa_id
 
-    # 5. 查询签到详情
+    # 5. 发现当月签到场次（activityId 每月轮换，内嵌于签到页 HTML activityInfo 节点）
+    activity_id = ""
+    try:
+        resp_page = http.request("GET", f"{BASE_HOST}{SIGN_IN_PAGE_PATH}", headers=common_headers)
+        page_html = resp_page.text if resp_page else ""
+        # 页面含多个 activityInfo 节点（推荐位等），优先取 activityName 带「签到」的主场次
+        m_activity = (
+            re.search(r'"activityInfo"\s*:\s*\{"activityId"\s*:\s*"(\d+)"\s*,\s*"activityName"\s*:\s*"[^"]*签到', page_html)
+            or re.search(r'"activityInfo"\s*:\s*\{"activityId"\s*:\s*"(\d+)"', page_html)
+        )
+        if m_activity and m_activity.group(1):
+            activity_id = m_activity.group(1)
+    except Exception:
+        pass
+    if not activity_id:
+        activity_id = SIGN_IN_ACTIVITY_ID
+        print(f"  🗓️ 签到场次 activityId: {activity_id}（页面发现失败，使用内置兜底）")
+    else:
+        print(f"  🗓️ 签到场次 activityId: {activity_id}")
+
+    # 6. 查询签到详情
     print("  📋 查询签到状态与连签进度...")
-    detail_url = f"{BASE_HOST}/api/cn/oapi/marketing/cumulativeSignIn/getSignInDetail?activityId={SIGN_IN_ACTIVITY_ID}"
+    detail_url = f"{BASE_HOST}/api/cn/oapi/marketing/cumulativeSignIn/getSignInDetail?activityId={activity_id}"
     resp_detail = http.request("GET", detail_url, headers=common_headers)
     sign_detail_data = {}
     if resp_detail and resp_detail.code == 200:
         sign_detail_data = resp_detail.json() or {}
 
-    # 6. 每日打卡签到
+    # 7. 每日打卡签到
     print("  👉 提交每日打卡签到...")
     sign_in_url = f"{BASE_HOST}/api/cn/oapi/marketing/cumulativeSignIn/signIn"
     sign_body = {
-        "activityId": SIGN_IN_ACTIVITY_ID,
+        "activityId": activity_id,
         "creditsAddActionId": CREDITS_ADD_ACTION_ID,
         "business": 1,
     }
@@ -446,22 +530,25 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
                 else:
                     return False, f"登录态失效且换票未通过: {ref_msg}"
             else:
+                if mode == "app" and not has_sso:
+                    return False, f"登录态失效: {err_msg}（TOKENSID 已过期，请在 OPPO 商城 App 重新登录抓包更新 OPPO_COOKIE_{index}）"
                 return False, f"登录态失效: {err_msg}"
         else:
             sign_ok = True
 
-    # 7. 连签里程碑奖励提取
-    milestones = sign_detail_data.get("data", {}).get("cumulativeAwardList", []) if isinstance(sign_detail_data.get("data"), dict) else []
+    # 8. 连签里程碑奖励提取（接口字段为 cumulativeAwards，status==1 表示达成可领）
+    sign_data_root = sign_detail_data.get("data") if isinstance(sign_detail_data.get("data"), dict) else {}
+    milestones = sign_data_root.get("cumulativeAwards") or sign_data_root.get("cumulativeAwardList") or []
     if milestones:
         for award in milestones:
             award_id = award.get("awardId") or award.get("id")
             award_status = award.get("status")
-            award_name = award.get("awardName", "里程碑奖励")
+            award_name = award.get("awardName") or award.get("awardValue") or "里程碑奖励"
             if award_status == 1 and award_id:
                 print(f"  🎁 发现可领取的连签里程碑: {award_name}，正在领取...")
                 draw_url = f"{BASE_HOST}/api/cn/oapi/marketing/cumulativeSignIn/drawCumulativeAward"
                 draw_body = {
-                    "activityId": SIGN_IN_ACTIVITY_ID,
+                    "activityId": activity_id,
                     "awardId": award_id,
                     "creditsAddActionId": CREDITS_ADD_ACTION_ID,
                     "business": 1,
@@ -473,7 +560,7 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
                 else:
                     print(f"  ℹ️ 领取结果: {draw_res.get('message', '未成功')}")
 
-    # 8. 日常赚积分任务（自动完成上报与一键领取奖励）
+    # 9. 日常赚积分任务（自动完成上报与一键领取奖励）
     print("  🚀 获取日常赚积分任务列表...")
     task_url = f"{BASE_HOST}/api/cn/oapi/marketing/task/queryTaskList?activityId={TASK_ACTIVITY_ID}&source=c"
     resp_tasks = http.request("GET", task_url, headers=common_headers)
@@ -532,7 +619,7 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
                     print(f"    ⚠️ 领奖失败: {t_name} ({aw_msg})")
                 time.sleep(0.5)
 
-    # 9. 查询会员总积分资产
+    # 10. 查询会员总积分资产
     total_credit = "未知"
     credit_url = f"{BASE_HOST}/api/cn/oapi/marketing/member/queryMemberCreditInfo"
     resp_credit = http.request("GET", credit_url, headers=common_headers)
@@ -548,18 +635,33 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
         else:
             print(f"  💰 当前账户总积分: {total_credit}")
 
-    # 10. 持久化最新状态至 Upstash Redis 与本地文件
+    # 11. 持久化最新状态至 Upstash Redis 与本地文件；凭据有效期经共享引擎跟踪
+    # （learn → update_state → mark_ok → build_tag，标签口径与 alert_levels/report_fields 一致）
     ref_token = cookie_items.get("refreshToken", "")
     if not ref_token and web_token:
         payload = _decode_jwt_payload(web_token)
         if payload and isinstance(payload, dict):
             ref_token = str(payload.get("refreshToken", "") or "")
 
+    final_cookie = _format_cookie_str(cookie_items)
+    learned = cv.learn_from_jar(http.jar)
+    tracked = cv.update_state(dict(state), final_cookie, learned)
+    cv.mark_ok(tracked)  # 成功运行日入账（无解析有效期凭据按执行天数反推寿命）
+    tag = cv.tag_for(
+        final_cookie,
+        tracked,
+        learned,
+        credential_match=lambda n: n in ("TOKENSID", "ENCODE_TOKENSID", "webAccessToken"),
+    )
+    if tag:
+        print(f"  {tag.lstrip(' |')}")
+
     save_kv_state(
         redis_key,
         state_file,
         {
-            "cookie": _format_cookie_str(cookie_items),
+            **tracked,
+            "cookie": final_cookie,
             "webAccessToken": web_token,
             "refreshToken": ref_token,
             "acIdAuthSession": cookie_items.get("acIdAuthSession", ""),

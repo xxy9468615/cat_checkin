@@ -37,15 +37,9 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
-    "2libra": {
-        "id": "2libra",
-        "script": "2libra.py",
-        "name": "2Libra 签到",
-        "result": "2libra.json",
-        "timeout": 300,
-        "account": "",
-        "tags": ["00:50", "matrix", "daily"],
-    },
+    # --- 2Libra（2026-11-01 用户指令下线：脚本/解析器/工作流接线已随本次清理移除，
+    #     恢复：从 git 历史恢复 scripts/2libra.py + 注册表条目 + checkin.yml 接线，
+    #     GH Secret TWO_LIBRA_COOKIE_1 清理时保留未删）---
     "bianjie_ai": {
         "id": "bianjie_ai",
         "script": "bianjie_ai.py",
@@ -73,15 +67,9 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
-    "moxing_vip": {
-        "id": "moxing_vip",
-        "script": "moxing_vip.py",
-        "name": "moxing.vip 签到",
-        "result": "moxing_vip.json",
-        "timeout": 300,
-        "account": "",
-        "tags": ["00:50", "matrix", "daily"],
-    },
+    # --- moxing.vip（2026-11-01 用户指令下线：任务退役。脚本 moxing_vip.py 与
+    #     report_fields 解析器保留；恢复时加回本表 + checkin.yml 环境变量段 +
+    #     GH Secrets（MOXING_USERNAME/PASSWORD/UA，2026-11-01 清理时已保留未删））---
     "naixi_forum": {
         "id": "naixi_forum",
         "script": "naixi_forum.py",
@@ -150,8 +138,18 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
-    # --- OPPO商城（2026-10-11 退役：HeyTap acIdAuthSession 为 7 天短命凭据、
-    #     更新成本高，2026-10-05 熔断后停用；脚本 oppo.py 保留，恢复时加回本表即可）---
+    # --- OPPO商城（hd.opposhop.cn 打卡签到与浏览任务；2026-10-11 曾因 HeyTap
+    #     acIdAuthSession 7 天短命凭据退役，2026-11-01 逆向 App 端 TOKENSID
+    #     长效令牌（约 30 天寿命）后恢复）---
+    "oppo": {
+        "id": "oppo",
+        "script": "oppo.py",
+        "name": "OPPO商城 签到",
+        "result": "oppo.json",
+        "timeout": 300,
+        "account": "",
+        "tags": ["00:50", "matrix", "daily"],
+    },
     # --- NodeSeek（nodeseek.com 每日随机/固定鸡腿签到，支持代理出口）---
     "nodeseek": {
         "id": "nodeseek",
@@ -288,16 +286,10 @@ TASKS: Dict[str, Dict[str, Any]] = {
     #     停用/纯登录最小足迹），恢复时把两个实例加回本表即可；互动任务由
     #     MODELSCOPE_ENABLE_LIKE_TASKS / _AIGC_PUBLISH / _PROFILE_TASKS 开关独立控制）---
 
-    # --- 24h 动态冷却站点（Latvi：last_sign_ts+24h 状态驱动，硬墙前 2min 进场） ---
-    "latvi": {
-        "id": "latvi",
-        "script": "latvi.py",
-        "name": "Latvi 每日奖励及服务器自动续期",
-        "result": "latvi.json",
-        "timeout": 7000,
-        "account": "",
-        "tags": ["18:00", "latvi", "relay", "daily"],
-    },
+    # --- Latvi（2026-11-01 用户指令下线：24h 动态冷却/18:00 场次/QStash latvi_next_sign
+    #     接力随本次清理一并移除；恢复：从 git 历史恢复 scripts/latvi.py + 注册表条目 +
+    #     checkin.yml 接线（dispatch 类型/cache 路径/contains 过滤），
+    #     GH Secrets LATVI_EMAIL/LATVI_PASSWORD 清理时保留未删）---
 }
 
 
