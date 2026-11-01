@@ -33,8 +33,8 @@ def _synthetic_cookie() -> str:
     return (
         "PLATFORM=H5; CLIENT-TYPE=256021; IMA-GUID=1111111111111111; "
         "IMA-Q36=synthetic_q36_hash; "
-        "IMA-UID=abcdef0123456789; IMA-TOKEN=SYNTHETIC_LEAF_TOKEN_VALUE; "
-        "IMA-REFRESH-TOKEN=SYNTHETIC_REFRESH_TOKEN_VALUE; UID-TYPE=2"
+        "IMA-UID=abcdef0123456789; IMA-TOKEN=V1.0FAKE_LEAF_TOKEN_VALUE; "
+        "IMA-REFRESH-TOKEN=V1.0FAKE_REFRESH_TOKEN_VALUE; UID-TYPE=2"
     )
 
 
@@ -95,12 +95,12 @@ class TestImaCookie(unittest.TestCase):
         raw = _synthetic_cookie()
         items = ima.parse_ima_cookie(raw)
         self.assertEqual(items.get("IMA-UID"), "abcdef0123456789")
-        self.assertEqual(items.get("IMA-REFRESH-TOKEN"), "SYNTHETIC_REFRESH_TOKEN_VALUE")
+        self.assertEqual(items.get("IMA-REFRESH-TOKEN"), "V1.0FAKE_REFRESH_TOKEN_VALUE")
 
         rebuilt = ima.build_ima_cookie(items, "NEW_LEAF_TOKEN")
         self.assertIn("IMA-UID=abcdef0123456789", rebuilt)
         self.assertIn("IMA-TOKEN=NEW_LEAF_TOKEN", rebuilt)  # 叶令牌被现签值覆盖
-        self.assertIn("IMA-REFRESH-TOKEN=SYNTHETIC_REFRESH_TOKEN_VALUE", rebuilt)
+        self.assertIn("IMA-REFRESH-TOKEN=V1.0FAKE_REFRESH_TOKEN_VALUE", rebuilt)
         self.assertIn("IMA-Q36=synthetic_q36_hash", rebuilt)  # 附加字段保留
         self.assertIn("PLATFORM=H5", rebuilt)
         self.assertIn("UID-TYPE=2", rebuilt)
@@ -160,11 +160,11 @@ class TestPostJsonNormalization(unittest.TestCase):
 class TestMintAccessToken(unittest.TestCase):
     def test_mint_success(self):
         http = _mock_http({
-            ima.REFRESH_URL: {"code": 0, "token": "NEW_LEAF", "msg": "ok"},
+            ima.REFRESH_URL: {"code": 0, "token": "V1.0FAKE_NEW_LEAF", "msg": "ok"},
         })
         ok, token, msg, exp, rotated = ima.mint_access_token(http, "uid123", "rt456", "guid789")
         self.assertTrue(ok)
-        self.assertEqual(token, "NEW_LEAF")
+        self.assertEqual(token, "V1.0FAKE_NEW_LEAF")
         self.assertEqual(rotated, "")  # 未轮换
         # 设备 Cookie 只带 IMA-GUID + PLATFORM，不携带旧叶令牌
         sent_headers = http.request.call_args[1]["headers"]
@@ -174,11 +174,11 @@ class TestMintAccessToken(unittest.TestCase):
 
     def test_mint_rotated_refresh_token_returned(self):
         http = _mock_http({
-            ima.REFRESH_URL: {"code": 0, "token": "NEW_LEAF", "refreshToken": "ROTATED_RT"},
+            ima.REFRESH_URL: {"code": 0, "token": "V1.0FAKE_NEW_LEAF", "refreshToken": "V1.0FAKE_ROTATED_RT"},
         })
         ok, token, _, _, rotated = ima.mint_access_token(http, "uid123", "rt456", "guid789")
         self.assertTrue(ok)
-        self.assertEqual(rotated, "ROTATED_RT")  # 轮换值来自 refresh 响应（非活动信息响应）
+        self.assertEqual(rotated, "V1.0FAKE_ROTATED_RT")  # 轮换值来自 refresh 响应（非活动信息响应）
 
     def test_mint_rejected(self):
         http = _mock_http({
@@ -200,7 +200,7 @@ class TestRunAccount(unittest.TestCase):
              patch.object(ima, "load_kv_state", return_value=state or {}), \
              patch.object(ima, "Http") as mock_http_cls:
             http = MagicMock()
-            refresh = _mock_response({"code": 0, "token": "NEW_LEAF", "msg": "ok"})
+            refresh = _mock_response({"code": 0, "token": "V1.0FAKE_NEW_LEAF", "msg": "ok"})
 
             def route(method, url, **kw):
                 if url.startswith(ima.REFRESH_URL):
@@ -224,7 +224,7 @@ class TestRunAccount(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("签到成功", desc)
         saved = mock_save.call_args[0][2]
-        self.assertEqual(saved.get("refresh_token"), "SYNTHETIC_REFRESH_TOKEN_VALUE")
+        self.assertEqual(saved.get("refresh_token"), "V1.0FAKE_REFRESH_TOKEN_VALUE")
         self.assertEqual(saved.get("uid"), "abcdef0123456789")
         self.assertTrue(saved.get("env_hash"))
         self.assertTrue(saved.get("ok_last_date"))  # mark_ok 成功日入账
@@ -298,7 +298,7 @@ class TestRunAccount(unittest.TestCase):
 
             def route(method, url, **kw):
                 if url.startswith(ima.REFRESH_URL):
-                    return _mock_response({"code": 0, "token": "NEW_LEAF", "msg": "ok"})
+                    return _mock_response({"code": 0, "token": "V1.0FAKE_NEW_LEAF", "msg": "ok"})
                 if url.startswith(ima.ACTIVITY_INFO_URL):
                     info_calls["n"] += 1
                     if info_calls["n"] == 1:
@@ -323,14 +323,43 @@ class TestRunAccount(unittest.TestCase):
              patch.object(ima, "load_kv_state", return_value={}), \
              patch.object(ima, "Http") as mock_http_cls:
             http = _mock_http({
-                ima.REFRESH_URL: {"code": 0, "token": "NEW_LEAF", "refreshToken": "ROTATED_RT"},
+                ima.REFRESH_URL: {"code": 0, "token": "V1.0FAKE_NEW_LEAF", "refreshToken": "V1.0FAKE_ROTATED_RT"},
                 ima.ACTIVITY_INFO_URL: _activity_payload(today_status=2, bonus_status=4),
             })
             mock_http_cls.return_value = http
             ok, desc = ima._run_account(_synthetic_cookie(), 1, 1)
         self.assertTrue(ok)
+        # 轮换发生时换票步立即先持久化一次（消除中途崩溃丢失新令牌窗口）
+        first_save = mock_save.call_args_list[0][0][2]
+        self.assertEqual(first_save.get("refresh_token"), "V1.0FAKE_ROTATED_RT")
+        # 最终保存同样携带轮换值
         saved = mock_save.call_args[0][2]
-        self.assertEqual(saved.get("refresh_token"), "ROTATED_RT")
+        self.assertEqual(saved.get("refresh_token"), "V1.0FAKE_ROTATED_RT")
+
+    def test_no_rotation_single_save(self):
+        with patch.object(ima, "save_kv_state") as mock_save, \
+             patch.object(ima, "load_kv_state", return_value={}), \
+             patch.object(ima, "Http") as mock_http_cls:
+            http = _mock_http({
+                ima.REFRESH_URL: {"code": 0, "token": "V1.0FAKE_NEW_LEAF", "msg": "ok"},
+                ima.ACTIVITY_INFO_URL: _activity_payload(today_status=2, bonus_status=4),
+            })
+            mock_http_cls.return_value = http
+            ok, _ = ima._run_account(_synthetic_cookie(), 1, 1)
+        self.assertTrue(ok)
+        self.assertEqual(mock_save.call_count, 1)  # 未轮换只走结算期最终保存
+
+    def test_server_msg_pii_masked(self):
+        # 服务端 msg 中的裸手机号/邮箱必须脱敏后才进 stdout（规则 4：PII 与凭据同等级）
+        http = MagicMock()
+        resp = MagicMock()
+        resp.code = 200
+        resp.text = json.dumps({"code": 5, "msg": "用户 13912345678 (foo.bar@example.com) 请求过于频繁"})
+        http.request.return_value = resp
+        data = ima._post_json(http, "https://ima.qq.com/x", {}, {})
+        self.assertNotIn("13912345678", data["msg"])
+        self.assertNotIn("foo.bar@example.com", data["msg"])
+        self.assertIn("5678", data["msg"])  # mask_phone 只留末 4
 
     def test_refresh_rejected_fails(self):
         with patch.object(ima, "save_kv_state") as mock_save, \
@@ -356,7 +385,7 @@ class TestRunAccount(unittest.TestCase):
              patch.object(ima, "load_kv_state", return_value={}), \
              patch.object(ima, "Http") as mock_http_cls:
             http = _mock_http({
-                ima.REFRESH_URL: {"code": 0, "token": "NEW_LEAF"},
+                ima.REFRESH_URL: {"code": 0, "token": "V1.0FAKE_NEW_LEAF"},
                 ima.ACTIVITY_INFO_URL: {"code": 0, "infos": []},
             })
             mock_http_cls.return_value = http
@@ -414,6 +443,23 @@ class TestReportFieldsExIma(unittest.TestCase):
 """
         res = extract_for("ima.py", synthetic_output)
         self.assertTrue(any("缺少登录凭据" in line for line in res["error_lines"]))
+
+    def test_extract_warning_lines_not_failures(self):
+        # ⚠️ 警告行（复核未成功沿用快照 / 满签试领未成功）不进失败通道；
+        # 源头文案也不含「失败/异常/403」等错误关键词，报告兜底降噪扫描不会误捞
+        synthetic_output = """
+[1/1] 👤 用户: ***6789
+  🎉 签到成功！获得 +50 算力
+  ⚠️ 复核活动信息未成功（沿用签到前快照）: code=-1
+  ⚠️ 满签奖励试领未成功: code=-1
+  📊 本周连签 1 天 · 本周累计 +50 算力
+"""
+        res = extract_for("ima.py", synthetic_output)
+        self.assertEqual(res["fail_lines"], [])
+        self.assertEqual(res["error_lines"], [])
+        # 异常 msg 里携带的「已领取」文案绝不能被推断成收益（假成功防线）
+        self.assertNotIn(("算力", 100.0), res["gains"])
+        self.assertIn(("算力", 50.0), res["gains"])
 
     def test_extract_already_signed(self):
         synthetic_output = """

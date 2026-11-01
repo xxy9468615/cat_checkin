@@ -75,6 +75,8 @@ from common import (
     env_seq,
     load_kv_state,
     main_guard,
+    mask_email,
+    mask_phone,
     mask_str,
     sanitize_snippet,
     save_kv_state,
@@ -185,6 +187,16 @@ def _base_headers() -> Dict[str, str]:
     }
 
 
+def _mask_pii(text: str) -> str:
+    """对服务端文案中的裸手机号/邮箱脱敏（sanitize_snippet 不覆盖裸 PII，规则 4）。"""
+    text = re.sub(r"(?<!\d)1[3-9]\d{9}(?!\d)", lambda m: mask_phone(m.group(0)), text)
+    return re.sub(
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+        lambda m: mask_email(m.group(0)),
+        text,
+    )
+
+
 def _post_json(http: Http, url: str, body: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
     """POST JSON 并归一化响应：空 body（限流 403）/ 非 JSON / 网络异常 → code=-1 结构。
 
@@ -217,8 +229,9 @@ def _post_json(http: Http, url: str, body: Dict[str, Any], headers: Dict[str, st
         data.setdefault("http_status", status)
         msg = data.get("msg")
         if isinstance(msg, str) and msg:
-            # 服务端原始响应文案经脱敏后才进入 stdout（公开 Actions 日志 / 日报）
-            data["msg"] = sanitize_snippet(msg)
+            # 服务端原始响应文案：先脱裸 PII（手机号/邮箱），再过 sanitize_snippet
+            # （抹 Cookie/token 形态）后才进 stdout（公开 Actions 日志 / 日报）
+            data["msg"] = sanitize_snippet(_mask_pii(msg))
         return data
     return {"code": -1, "msg": f"HTTP {status} 异常响应结构", "http_status": status}
 
@@ -327,9 +340,24 @@ def _run_account(raw_cookie: str, index: int, total: int) -> Tuple[bool, str]:
     if not ok_mint:
         return False, f"换票失败（IMA-REFRESH-TOKEN 可能已失效，请重新抓包更新 IMA_COOKIE_{index}）: {mint_msg}"
     print("  🔑 已用长效刷新令牌现签新会话令牌（约 2 小时叶令牌，每次运行现签）")
-    # 服务端若轮换 refreshToken 则跟随最新值（实测不轮换，防御性兼容）
+    # 服务端若轮换 refreshToken 则跟随最新值（实测不轮换，防御性兼容）：
+    # 轮换发生时立即先持久化一次，消除「本次运行中途崩溃丢失新令牌」窗口；
+    # 持久化沿用 save_kv_state 双通道「失败仅警告」契约（与全仓库一致），
+    # 提示在保存动作之后输出，成功与否经其自身的 ☁️/⚠️ 行可观测
     if rotated and rotated != refresh_token:
         refresh_token = rotated
+        save_kv_state(
+            redis_key,
+            state_file,
+            {
+                **state,
+                "refresh_token": refresh_token,
+                "uid": uid,
+                "guid": guid,
+                "env_hash": env_hash,
+                "updated_at": datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        )
         print("  🔄 服务端已轮换 refreshToken，已同步持久化最新值")
 
     cookie_str = build_ima_cookie(items, token)
@@ -373,8 +401,10 @@ def _run_account(raw_cookie: str, index: int, total: int) -> Tuple[bool, str]:
     if info_refetch.get("code") == CODE_OK:
         info = info_refetch
     else:
-        # 重拉失败不致命：沿用签到前快照做满签判定与连签统计
-        print(f"  ⚠️ 复核活动信息失败（沿用签到前快照）: code={info_refetch.get('code')} msg={info_refetch.get('msg')}")
+        # 重拉失败不致命：沿用签到前快照做满签判定与连签统计。
+        # 警告行只打 code 不回显 msg：msg 常含「失败/403」等错误关键词，
+        # 会被报告兜底降噪扫描误捞进 error_lines（账号实际是成功的）
+        print(f"  ⚠️ 复核活动信息未成功（沿用签到前快照）: code={info_refetch.get('code')}")
     bonus = find_item(info, BONUS_TITLE) if isinstance(info, dict) else None
     if bonus is not None and bonus.get("status") == STATUS_AVAILABLE:
         resp = _post_json(http, CHECK_IN_URL, {"type": CHECKIN_TYPE_WEEKLY_BONUS}, headers)
@@ -388,8 +418,9 @@ def _run_account(raw_cookie: str, index: int, total: int) -> Tuple[bool, str]:
         elif code == CODE_ALREADY_CHECKED_IN:
             print("  ℹ️ 满签奖励本期已领取")
         else:
-            # 未知拒绝（含限流 -1）只记录不判失败，日签收益已落袋
-            print(f"  ⚠️ 满签奖励试领异常: code={code} msg={resp.get('msg')}")
+            # 未知拒绝（含限流 -1）只记录不判失败，日签收益已落袋；
+            # 同上只打 code，防止 msg 关键词被报告兜底扫描误判为账号失败
+            print(f"  ⚠️ 满签奖励试领未成功: code={code}")
 
     # 6. 结算展示 + 凭据有效期（共享引擎：无内嵌证据按成功运行日反推老化信号）
     days = info.get("checkin_days") if isinstance(info, dict) else None

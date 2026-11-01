@@ -1412,20 +1412,25 @@ def ex_ima(output: str, res: Dict[str, Any]) -> None:
                 cur.flush(res)
             cur = _Block(m.group(1))
             continue
-        # 先判失败行（避免与已签文案混排时被吞），再识别状态行
+        # 警告行（⚠️，如「复核活动信息失败（沿用签到前快照）」）不是账号失败，
+        # 不得进入失败通道占用错误展示名额；失败行（❌/失败）先于状态行判定
+        if "⚠️" in ln:
+            continue
         if "❌" in ln or "失败" in ln:
             _fail(ln, raw)
             continue
         if cur is None:
             continue
         _m_num = re.search(r"\+\s*([\d,]+)\s*算力", ln)
-        if "签到成功" in ln and "满签" not in ln:
+        # 成功状态锚定脚本输出的 🎉/🎁 emoji：服务端异常 msg（⚠️ 行）即使携带
+        # 「已领取」文案也不会被误判为成功收益（绝不允许假成功）
+        if "🎉" in ln and "签到成功" in ln:
             cur.parts.append("签到成功")
             if _m_num:
                 res["badges"].append(("reward", f"签到 +{_d(_m_num.group(1))} 算力"))
                 res["gains"].append(("算力", _f(_m_num.group(1))))
             continue
-        if "满签奖励已领取" in ln:
+        if "🎁" in ln and "满签奖励已领取" in ln:
             cur.parts.append("满签奖励已领")
             if _m_num:
                 res["badges"].append(("reward", f"满签奖励 +{_d(_m_num.group(1))} 算力"))
