@@ -98,10 +98,6 @@ jobs:
       BIANJIE_AI_PASSWORD_1: ${{ secrets.BIANJIE_AI_PASSWORD_1 }}
       BIANJIE_AI_USERNAME_2: ${{ secrets.BIANJIE_AI_USERNAME_2 }}
       BIANJIE_AI_PASSWORD_2: ${{ secrets.BIANJIE_AI_PASSWORD_2 }}
-      MOXING_USERNAME_1: ${{ secrets.MOXING_USERNAME }}
-      MOXING_PASSWORD_1: ${{ secrets.MOXING_PASSWORD }}
-      MOXING_DOMAIN: https://moxing.chat
-      MOXING_UA: ${{ secrets.MOXING_UA }}
       UGNAS_COOKIE_1: ${{ secrets.UGNAS_COOKIE_1 }}
       CLOUDSTUDIO_COOKIE_1: ${{ secrets.CLOUDSTUDIO_COOKIE_1 }}
       NAIXI_USERNAME_1: ${{ secrets.NAIXI_USERNAME_1 }}
