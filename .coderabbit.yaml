@@ -9,7 +9,9 @@ reviews:
     enabled: true                # 公开仓 ≥10 星：每个 PR 自动评审
     drafts: false                # draft 不审，转正式后自动开审
   path_filters:
-    - "**/*.md"                  # 文档类不进评审（凭据防线由 CI 密钥扫描把守）
+    - "!**/*.md"                 # 文档类不进评审（凭据防线由 CI 密钥扫描把守）。
+                                 # 注意必须带 ! 否则语义反转为「仅审 .md」——2026-11-01
+                                 # 发现扁平列表正则被当作 include-only，全 PR 评审被跳过
   path_instructions:
     - path: "scripts/**"
       instructions: >-
