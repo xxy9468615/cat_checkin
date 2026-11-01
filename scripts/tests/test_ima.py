@@ -327,7 +327,7 @@ class TestRunAccount(unittest.TestCase):
                 ima.ACTIVITY_INFO_URL: _activity_payload(today_status=2, bonus_status=4),
             })
             mock_http_cls.return_value = http
-            ok, desc = ima._run_account(_synthetic_cookie(), 1, 1)
+            ok, _ = ima._run_account(_synthetic_cookie(), 1, 1)
         self.assertTrue(ok)
         # 轮换发生时换票步立即先持久化一次（消除中途崩溃丢失新令牌窗口）
         first_save = mock_save.call_args_list[0][0][2]
