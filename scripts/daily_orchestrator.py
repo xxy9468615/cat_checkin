@@ -266,7 +266,7 @@ class Orchestrator:
             print(f"WARN: Discord 失败提醒推送失败: {exc}", file=sys.stderr)
 
         for _m in TRAVEL_EVENT_RE.findall(out or "")[-1:]:
-            print(f"  -> travel event {_m[0]} (回程由 workbuddy 接力派发，本 run 不等待)")
+            print(f"  -> travel event {_m[0]} (内联模式仅记录此事件，无自动回访；自动领奖走 QStash workbuddy_travel_claim 接力)")
 
     def run(self) -> int:
         due_only = os.getenv("DUE_ONLY", "0").lower() in {"1", "true", "yes"}

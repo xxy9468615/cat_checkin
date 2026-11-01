@@ -9,10 +9,11 @@
    - 自动检测并领取 `POST /billing/meter/check-gift-claimed` 专享算力礼包（如 +1500 算力）。
 2. 动态放风跟踪与回程领奖：
    - 不依赖硬编码的 4 小时，完全基于服务端返回的真实 `arrive_at` 与 `server_now` 动态计算。
-   - 单 run 全内联（2026-08-22 起）：放风进行中时打印 `TRAVEL_EVENT` 机器行，由
-     `daily_orchestrator` 在 `arrive_at+60s` 定时回访领奖（超线留次日领）；
-     旧 QStash 延时接力（`workbuddy_travel_claim`）已退役，未设
-     `WORKBUDDY_NO_RELAY` 时仍兼容旧行为。
+   - 短 run + QStash 接力（当前唯一自动领奖通道）：放风进行中时调度
+     `workbuddy_travel_claim` 延时 repository_dispatch（arrive_at+5min 缓冲），
+     由下一轮工作流接力自动领奖，单 run 不等待放风时长。
+   - `WORKBUDDY_NO_RELAY=1` 内联模式仅打印 `TRAVEL_EVENT` 机器行供 orchestrator
+     记录——不会自动回访领奖，仅限本地诊断；自动领奖请勿开启此开关。
 3. 连登兑换与抽奖追踪：
    - 自动核算当月连登天数，符合 7d/14d/28d 档位时自动兑换奖励与抽奖机会。
    - 追踪当前剩余抽奖次数，>0 时自动循环抽奖并统计获得的奖品。
@@ -903,14 +904,14 @@ def _schedule_travel_claim(remaining_seconds: int) -> str:
     由下一轮 workbuddy.yml 接力发现 arrived 状态后自动领奖，避免长时间占用 Runner。
     （QStash publish URL 拼接 / 鉴权透传统一在 common.schedule_repo_dispatch）
 
-    内联模式（WORKBUDDY_NO_RELAY=1，orchestrator 注入）：不再调度接力，改为打印
-    TRAVEL_EVENT 机器行供 orchestrator 解析后排入回程领奖事件。
+    内联模式（WORKBUDDY_NO_RELAY=1，仅本地手动诊断）：不再调度接力，只打印
+    TRAVEL_EVENT 机器行供 orchestrator 记录——无自动回访，自动领奖请走 QStash 接力。
     """
     if _is_no_relay():
-        # orchestrator 解析此行后按 arrive_at+60s 排入 claim 事件
+        # orchestrator 仅记录此事件，不排定回访（自动领奖由 QStash 接力通道负责）
         arrive_at = int(time.time()) + remaining_seconds
         print(f"TRAVEL_EVENT state=traveling arrive_at={arrive_at}")
-        return "已记录放风回程（内联模式，等待 orchestrator 定时回访）"
+        return "已记录放风回程（内联模式：无自动回访领奖，如需自动领取请改走 QStash 接力）"
     delay = remaining_seconds + 300  # 5 分钟缓冲，防止时钟/接口延迟导致提前到达
     ok, detail = schedule_repo_dispatch("workbuddy_travel_claim", delay)
     if ok:

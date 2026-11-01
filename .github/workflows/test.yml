@@ -59,12 +59,16 @@ jobs:
           )
           matches=$(git grep -nE "${SCAN_PATTERNS[@]}" \
             -- . ':!.github/workflows/test.yml' || true)
+          # 二进制文件命中时 git grep 只输出「Binary file … matches」提示行（无内容），
+          # 会被下方文本二次匹配过滤掉——必须单独保留并视为扫描失败（评审指认）
+          binary_hits=$(printf '%s\n' "$matches" | grep '^Binary file ' || true)
           # 合成夹具豁免（V1.0FAKE 前缀 = 测试专用假 token，约定见 CLAUDE.md 规则10）：
           # 只剔除合成 token 本体后用同一组模式二次匹配——不得整行放行，
           # 否则同一行混排的真实凭据会漏检（2026-11-01 评审指认）
           matches=$(printf '%s\n' "$matches" \
             | sed -E 's/V1\.0FAKE[A-Za-z0-9+/=]+//g' \
             | grep -E "${SCAN_PATTERNS[@]}" || true)
+          matches=$(printf '%s\n%s\n' "$matches" "$binary_hits" | sed '/^$/d')
           if [ -n "$matches" ]; then
             echo "::error::检测到疑似真实凭据/PII 入库（测试只允许合成夹具），明细如下"
             echo "$matches"
