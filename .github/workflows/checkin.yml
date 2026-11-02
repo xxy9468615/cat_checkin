@@ -156,6 +156,9 @@ jobs:
       OPPO_COOKIE_1: ${{ secrets.OPPO_COOKIE_1 }}
       OPPO_COOKIE_2: ${{ secrets.OPPO_COOKIE_2 }}
       OPPO_PROXY: ${{ secrets.OPPO_PROXY || secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
+      # 腾讯 IMA 每日登录福利（x-ima-cookie 整串，根凭据为 IMA-REFRESH-TOKEN）
+      IMA_COOKIE_1: ${{ secrets.IMA_COOKIE_1 }}
+      IMA_COOKIE_2: ${{ secrets.IMA_COOKIE_2 }}
       # WorkBuddy OAuth 刷新令牌
       WORKBUDDY_REFRESH_TOKEN_1: ${{ secrets.WORKBUDDY_REFRESH_TOKEN_1 }}
       WORKBUDDY_REFRESH_TOKEN_2: ${{ secrets.WORKBUDDY_REFRESH_TOKEN_2 }}
@@ -200,6 +203,7 @@ jobs:
             .alipan_state*.json
             .smzdm_state*.json
             .52pojie_state*.json
+            .ima_state*.json
             .notify_state_*.json
           key: unified-states-${{ github.run_id }}
           restore-keys: |
@@ -649,6 +653,7 @@ jobs:
             .alipan_state*.json
             .smzdm_state*.json
             .52pojie_state*.json
+            .ima_state*.json
             .notify_state_*.json
           key: unified-states-${{ github.run_id }}
 

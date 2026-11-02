@@ -1395,9 +1395,71 @@ def ex_oppo(output: str, res: Dict[str, Any]) -> None:
     _add_summary(res, output)
 
 
+def ex_ima(output: str, res: Dict[str, Any]) -> None:
+    """腾讯 IMA：👤 用户: ... + 日签 / 满签奖励 / 本周连签·算力 行。"""
+    cur: Any = None
+    cur_failed = False  # 当前账号块是否已出现失败行（失败后不再解析成功行，防续行误判）
+
+    def _fail(ln: str, raw: str) -> None:
+        # 失败行无论是否落在账号块内都必须捕获（如缺凭据账号在 👤 行之前即失败）
+        res["fail_lines"].append(_clean(ln))
+        res["error_lines"].append(raw)
+
+    for raw in output.splitlines():
+        ln = raw.strip()
+        m = re.search(r"\[\d+/\d+\]\s*👤\s*用户:\s*(.+)", ln)
+        if m:
+            if cur:
+                cur.flush(res)
+            cur = _Block(m.group(1))
+            cur_failed = False  # 新账号块重置失败状态
+            continue
+        # 警告行（⚠️，如「复核活动信息未成功（沿用签到前快照）」）不是账号失败，
+        # 不得进入失败通道占用错误展示名额；失败行（❌/失败）先于状态行判定
+        if "⚠️" in ln:
+            continue
+        if "❌" in ln or "失败" in ln:
+            _fail(ln, raw)
+            cur_failed = True
+            continue
+        if cur is None or cur_failed:
+            continue
+        _m_num = re.search(r"\+\s*([\d,]+)\s*算力", ln)
+        # 成功状态锚定脚本输出的 🎉/🎁 emoji：服务端异常 msg（⚠️ 行）即使携带
+        # 「已领取」文案也不会被误判为成功收益（绝不允许假成功）
+        if "🎉" in ln and "签到成功" in ln:
+            cur.parts.append("签到成功")
+            if _m_num:
+                res["badges"].append(("reward", f"签到 +{_d(_m_num.group(1))} 算力"))
+                res["gains"].append(("算力", _f(_m_num.group(1))))
+            continue
+        if "🎁" in ln and "满签奖励已领取" in ln:
+            cur.parts.append("满签奖励已领")
+            if _m_num:
+                res["badges"].append(("reward", f"满签奖励 +{_d(_m_num.group(1))} 算力"))
+                res["gains"].append(("算力", _f(_m_num.group(1))))
+            continue
+        if "今日已签到" in ln:
+            cur.parts.append("今日已签")
+            continue
+        m_week = re.search(r"本周连签\s*(\d+)\s*天.*?本周累计\s*\+?\s*([\d,]+)\s*算力", ln)
+        if m_week:
+            # 本周累计是周期收益（流量）而非账户余额（存量），只进摘要不进 assets
+            days = int(m_week.group(1))
+            cur.parts.append(f"本周连签 {days} 天 · 本周算力 {_d(m_week.group(2))}")
+            res["streak"] = max(res["streak"], days)
+            res["badges"].append(("streak", f"连签 {days} 天"))
+            continue
+
+    if cur:
+        cur.flush(res)
+    _add_summary(res, output)
+
+
 # 注册表：key = 脚本文件名（task_registry 的 script 字段 / 结果 JSON 的 script 字段）
 SCRIPT_EXTRACTORS = {
     "oppo.py": ex_oppo,
+    "ima.py": ex_ima,
     "glados.py": ex_glados,
     "railgun.py": ex_railgun,
     "bianjie_ai.py": ex_bianjie_ai,

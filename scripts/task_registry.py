@@ -150,6 +150,18 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },
+    # --- 腾讯 IMA（ima.qq.com 每日登录福利签到、满签奖励与算力资产；
+    #     2026-11-02 逆向 H5 签到页接口接入：x-ima-cookie 根凭据（REFRESH-TOKEN，
+    #     寿命以周/月计）每次运行现签约 2h 叶令牌 IMA-TOKEN，bkn=djb2(token) 本地推导）---
+    "ima": {
+        "id": "ima",
+        "script": "ima.py",
+        "name": "腾讯 IMA 签到",
+        "result": "ima.json",
+        "timeout": 300,
+        "account": "",
+        "tags": ["00:50", "matrix", "daily"],
+    },
     # --- NodeSeek（nodeseek.com 每日随机/固定鸡腿签到，支持代理出口）---
     "nodeseek": {
         "id": "nodeseek",
