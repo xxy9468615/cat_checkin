@@ -318,6 +318,86 @@ class TestRunAccount(unittest.TestCase):
         # 连签统计来自快照而非错误响应
         self.assertIn("本周连签 1 天", desc)
 
+    def test_refetch_failure_day7_bonus_at_stake_fails(self):
+        # 回归位：日签刚提交 + 快照满签格未入账 + 复核重拉失败——第 7 天同请求
+        # 解锁的奖励可能被吞 → 账号判失败交框架重试（绝不当成功结算）
+        with patch.object(ima, "save_kv_state"), \
+             patch.object(ima, "load_kv_state", return_value={}), \
+             patch.object(ima, "Http") as mock_http_cls:
+            http = MagicMock()
+            info_calls = {"n": 0}
+
+            def route(method, url, **kw):
+                if url.startswith(ima.REFRESH_URL):
+                    return _mock_response({"code": 0, "token": "V1.0FAKE_NEW_LEAF", "msg": "ok"})
+                if url.startswith(ima.ACTIVITY_INFO_URL):
+                    info_calls["n"] += 1
+                    if info_calls["n"] == 1:
+                        return _mock_response(_activity_payload(today_status=3, bonus_status=4))
+                    return _mock_response({"code": -1, "msg": "限流"})
+                if url.startswith(ima.CHECK_IN_URL):
+                    return _mock_response({"code": 0, "reward_received": 50, "msg": "ok"})
+                return _mock_response({"code": -1, "msg": "unrouted"})
+
+            http.request.side_effect = route
+            mock_http_cls.return_value = http
+            ok, desc = ima._run_account(_synthetic_cookie(), 1, 1)
+        self.assertFalse(ok)
+        self.assertIn("签到成功", desc)  # 日签收益如实保留在摘要中
+        self.assertIn("重试", desc)
+
+    def test_refetch_failure_idempotent_run_not_fatal(self):
+        # 幂等放行轮（今日已签）复核重拉失败：无状态变化，满签奖励无新增风险 → 不判失败
+        with patch.object(ima, "save_kv_state"), \
+             patch.object(ima, "load_kv_state", return_value={}), \
+             patch.object(ima, "Http") as mock_http_cls:
+            http = MagicMock()
+            info_calls = {"n": 0}
+
+            def route(method, url, **kw):
+                if url.startswith(ima.REFRESH_URL):
+                    return _mock_response({"code": 0, "token": "V1.0FAKE_NEW_LEAF", "msg": "ok"})
+                if url.startswith(ima.ACTIVITY_INFO_URL):
+                    info_calls["n"] += 1
+                    if info_calls["n"] == 1:
+                        return _mock_response(_activity_payload(today_status=2, bonus_status=4))
+                    return _mock_response({"code": -1, "msg": "限流"})
+                return _mock_response({"code": -1, "msg": "unrouted"})
+
+            http.request.side_effect = route
+            mock_http_cls.return_value = http
+            ok, desc = ima._run_account(_synthetic_cookie(), 1, 1)
+        self.assertTrue(ok)
+        self.assertIn("今日已签到", desc)
+
+    def test_bonus_unknown_rejection_fails_daily_preserved(self):
+        # 回归位：满签试领被未知码拒绝（拒绝≠核实不可领）→ 账号判失败交重试，
+        # 日签收益保留在摘要中
+        with patch.object(ima, "save_kv_state"), \
+             patch.object(ima, "load_kv_state", return_value={}), \
+             patch.object(ima, "Http") as mock_http_cls:
+            http = MagicMock()
+            checkin_calls = {"n": 0}
+
+            def route(method, url, **kw):
+                if url.startswith(ima.REFRESH_URL):
+                    return _mock_response({"code": 0, "token": "V1.0FAKE_NEW_LEAF", "msg": "ok"})
+                if url.startswith(ima.ACTIVITY_INFO_URL):
+                    return _mock_response(_activity_payload(today_status=3, bonus_status=3))
+                if url.startswith(ima.CHECK_IN_URL):
+                    checkin_calls["n"] += 1
+                    if checkin_calls["n"] == 1:
+                        return _mock_response({"code": 0, "reward_received": 50, "msg": "ok"})
+                    return _mock_response({"code": 7, "msg": "server busy"})
+                return _mock_response({"code": -1, "msg": "unrouted"})
+
+            http.request.side_effect = route
+            mock_http_cls.return_value = http
+            ok, desc = ima._run_account(_synthetic_cookie(), 1, 1)
+        self.assertFalse(ok)
+        self.assertIn("签到成功", desc)
+        self.assertIn("满签奖励试领未成功", desc)
+
     def test_server_rotated_refresh_token_persisted(self):
         with patch.object(ima, "save_kv_state") as mock_save, \
              patch.object(ima, "load_kv_state", return_value={}), \
@@ -358,8 +438,34 @@ class TestRunAccount(unittest.TestCase):
         http.request.return_value = resp
         data = ima._post_json(http, "https://ima.qq.com/x", {}, {})
         self.assertNotIn("13912345678", data["msg"])
-        self.assertNotIn("foo.bar@example.com", data["msg"])
         self.assertIn("5678", data["msg"])  # mask_phone 只留末 4
+        # 邮箱按 mask_email 语义：前缀只留末 4 + 域名全脱
+        self.assertNotIn("example.com", data["msg"])
+        self.assertIn("***.bar@***", data["msg"])
+
+    def test_non_mainland_11digit_masked(self):
+        # 非 1[3-9] 开头的 11 位独立号码段同样脱敏（13 位时间戳/16 位 GUID 不误伤）
+        http = MagicMock()
+        resp = MagicMock()
+        resp.code = 200
+        resp.text = json.dumps({"code": 5, "msg": "回拨 85212345678 或见 1793568463000 与 7522761681417944"})
+        http.request.return_value = resp
+        data = ima._post_json(http, "https://ima.qq.com/x", {}, {})
+        self.assertNotIn("85212345678", data["msg"])
+        self.assertIn("1793568463000", data["msg"])  # 13 位毫秒时间戳不误伤
+        self.assertIn("7522761681417944", data["msg"])  # 16 位 docid 不误伤
+
+    def test_non_json_body_pii_masked(self):
+        # 非 JSON 响应（拦截页 HTML）与 dict 分支同级：裸 PII 同样脱敏
+        http = MagicMock()
+        resp = MagicMock()
+        resp.code = 502
+        resp.text = "<html>请联系 13912345678 或 admin@corp.example.com</html>"
+        http.request.return_value = resp
+        data = ima._post_json(http, "https://ima.qq.com/x", {}, {})
+        self.assertEqual(data["code"], -1)
+        self.assertNotIn("13912345678", data["msg"])
+        self.assertNotIn("admin@corp.example.com", data["msg"])
 
     def test_refresh_rejected_fails(self):
         with patch.object(ima, "save_kv_state") as mock_save, \
@@ -443,6 +549,19 @@ class TestReportFieldsExIma(unittest.TestCase):
 """
         res = extract_for("ima.py", synthetic_output)
         self.assertTrue(any("缺少登录凭据" in line for line in res["error_lines"]))
+
+    def test_extract_success_lines_skipped_after_fail(self):
+        # 失败行之后同一账号块内不再解析成功行（防失败 msg 续行被误判成收益）
+        synthetic_output = """
+[1/1] 👤 用户: ***6789
+  🎉 签到成功！获得 +50 算力
+[1/1] ❌ 每日签到被拒: code=5 msg=server busy
+  🎉 签到成功！获得 +500 算力
+"""
+        res = extract_for("ima.py", synthetic_output)
+        self.assertIn(("算力", 50.0), res["gains"])
+        self.assertNotIn(("算力", 500.0), res["gains"])
+        self.assertTrue(any("每日签到被拒" in line for line in res["error_lines"]))
 
     def test_extract_warning_lines_not_failures(self):
         # ⚠️ 警告行（复核未成功沿用快照 / 满签试领未成功）不进失败通道；

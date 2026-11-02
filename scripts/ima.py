@@ -188,8 +188,13 @@ def _base_headers() -> Dict[str, str]:
 
 
 def _mask_pii(text: str) -> str:
-    """对服务端文案中的裸手机号/邮箱脱敏（sanitize_snippet 不覆盖裸 PII，规则 4）。"""
-    text = re.sub(r"(?<!\d)1[3-9]\d{9}(?!\d)", lambda m: mask_phone(m.group(0)), text)
+    """对服务端文案中的裸号码/邮箱脱敏（sanitize_snippet 不覆盖裸 PII，规则 4）。
+
+    - 11 位独立数字段（大陆手机号与其他 11 位号码形态均覆盖）→ mask_phone 只留末 4；
+      前后邻接数字时不命中，13 位毫秒时间戳 / 16 位 IMA-GUID / 长 docid 不受影响；
+    - 邮箱 → mask_email（前缀末 4 + 域名全脱）。
+    """
+    text = re.sub(r"(?<!\d)\d{11}(?!\d)", lambda m: mask_phone(m.group(0)), text)
     return re.sub(
         r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
         lambda m: mask_email(m.group(0)),
@@ -222,7 +227,9 @@ def _post_json(http: Http, url: str, body: Dict[str, Any], headers: Dict[str, st
     except ValueError:
         return {
             "code": -1,
-            "msg": f"HTTP {status} 非 JSON 响应: {sanitize_snippet(raw)}",
+            # 非 JSON 响应（拦截页/网关错误页）与 dict 分支同级对待：先脱裸 PII
+            # 再过 sanitize_snippet，才允许进入公开日志
+            "msg": f"HTTP {status} 非 JSON 响应: {sanitize_snippet(_mask_pii(raw))}",
             "http_status": status,
         }
     if isinstance(data, dict):
@@ -374,10 +381,12 @@ def _run_account(raw_cookie: str, index: int, total: int) -> Tuple[bool, str]:
         return False, "未找到「今日」条目，活动可能已改版，请人工核查"
     today_status = today.get("status")
     summary_parts: List[str] = []
+    daily_newly_signed = False  # 本次运行真实提交了日签（非幂等放行）
     if today_status == STATUS_AVAILABLE:
         resp = _post_json(http, CHECK_IN_URL, {"type": CHECKIN_TYPE_DAILY}, headers)
         code = resp.get("code")
         if code == CODE_OK:
+            daily_newly_signed = True
             got = _reward_of(resp)
             print(f"  🎉 签到成功！获得 +{got} 算力" if got else "  🎉 签到成功")
             summary_parts.append("签到成功" + (f" +{got} 算力" if got else ""))
@@ -397,29 +406,39 @@ def _run_account(raw_cookie: str, index: int, total: int) -> Tuple[bool, str]:
 
     # 5. 满签奖励：连续 7 天解锁（周一挂起、周日结算），按服务端 status 驱动
     #    （非日历锚定——status=3 即可领，日签成功后重拉信息确保第 7 天当轮即领）
+    refetch_failed = False
     info_refetch = _post_json(http, ACTIVITY_INFO_URL, {}, headers)
     if info_refetch.get("code") == CODE_OK:
         info = info_refetch
     else:
-        # 重拉失败不致命：沿用签到前快照做满签判定与连签统计。
+        # 重拉失败时沿用签到前快照继续判定；是否致命由退出段裁决——
+        # 若日签刚提交且快照显示满签奖励未入账，第 7 天同请求解锁的奖励
+        # 可能被本次重拉失败吞掉 → 账号判失败交框架重试（下轮日签幂等放行）。
         # 警告行只打 code 不回显 msg：msg 常含「失败/403」等错误关键词，
-        # 会被报告兜底降噪扫描误捞进 error_lines（账号实际是成功的）
+        # 会被报告兜底降噪扫描误捞进 error_lines
+        refetch_failed = True
         print(f"  ⚠️ 复核活动信息未成功（沿用签到前快照）: code={info_refetch.get('code')}")
     bonus = find_item(info, BONUS_TITLE) if isinstance(info, dict) else None
+    bonus_secured = False       # 满签奖励已确定入账（本次领取成功 / 服务端已领取）
+    bonus_pending_fail = False  # 试领被未知码拒绝 → 需要重试
     if bonus is not None and bonus.get("status") == STATUS_AVAILABLE:
         resp = _post_json(http, CHECK_IN_URL, {"type": CHECKIN_TYPE_WEEKLY_BONUS}, headers)
         code = resp.get("code")
         if code == CODE_OK:
+            bonus_secured = True
             got = _reward_of(resp)
             print(f"  🎁 满签奖励已领取 +{got} 算力" if got else "  🎁 满签奖励已领取")
             summary_parts.append("满签奖励" + (f" +{got} 算力" if got else ""))
         elif code == CODE_NOT_FULL_WEEK:
             print("  ℹ️ 满签奖励未达条件（本周未签满）")
         elif code == CODE_ALREADY_CHECKED_IN:
+            bonus_secured = True
             print("  ℹ️ 满签奖励本期已领取")
         else:
-            # 未知拒绝（含限流 -1）只记录不判失败，日签收益已落袋；
-            # 同上只打 code，防止 msg 关键词被报告兜底扫描误判为账号失败
+            # 未知拒绝（含限流 -1）：拒绝 ≠ 核实不可领，绝不当作成功吞掉——
+            # 账号判失败交框架重试（日签收益已入账，重试只补试领）；
+            # 警告行只打 code，防 msg 关键词被报告兜底扫描误捞
+            bonus_pending_fail = True
             print(f"  ⚠️ 满签奖励试领未成功: code={code}")
 
     # 6. 结算展示 + 凭据有效期（共享引擎：无内嵌证据按成功运行日反推老化信号）
@@ -460,6 +479,19 @@ def _run_account(raw_cookie: str, index: int, total: int) -> Tuple[bool, str]:
     summary_desc = "；".join(summary_parts) or "无动作"
     if days is not None:
         summary_desc += f"，本周连签 {days} 天"
+
+    # 退出裁决：满签奖励存在「未入账且可能可领」的风险时如实判失败交框架
+    # 重试（日签收益已入账且已在 summary 中保留，状态/轮换令牌也已持久化）；
+    # 下轮日签幂等放行，只补试领，无重复收益风险
+    if bonus_pending_fail:
+        return False, f"{summary_desc}；满签奖励试领未成功（日签收益已入账），交由框架重试"
+    if (
+        refetch_failed
+        and daily_newly_signed
+        and bonus is not None
+        and not (bonus_secured or bonus.get("status") == STATUS_CLAIMED)
+    ):
+        return False, f"{summary_desc}；复核活动信息未成功且满签奖励可能已解锁待领，交由框架重试"
     return True, summary_desc
 
 
@@ -489,8 +521,10 @@ def main() -> None:
                 success_count += 1
                 statuses.append(desc)
             else:
-                # 失败明细必须落到 stdout：unified_report / alert_levels 只认任务原始输出
-                print(f"[{idx}/{total}] ❌ {desc}")
+                # 失败明细必须落到 stdout：unified_report / alert_levels 只认任务原始输出；
+                # desc 拍平换行，防止服务端 msg 续行被报告解析器拆成独立行误判
+                flat_desc = " ".join(str(desc).split())
+                print(f"[{idx}/{total}] ❌ {flat_desc}")
                 statuses.append(f"失败: {desc}")
         except Exception as exc:
             print(f"[{idx}/{total}] ❌ 执行异常: {exc}")
