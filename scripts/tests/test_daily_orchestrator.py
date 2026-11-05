@@ -119,42 +119,44 @@ class PlanModeTests(unittest.TestCase):
         一次性兼容（不回写）：旧实现把排程与 notify 状态共键，仅当任务进程在
         「排程写入」与「notify 同步」之间崩溃时旧键才残留有效时间戳。"""
         calls = []
+        fixed_ts = 1750000000.0
 
         def fake_load(redis_key, state_file):
-            calls.append(redis_key)
+            calls.append((redis_key, state_file))
             if "state:rolling:" in redis_key:
                 return {}
-            return {"last_credit_ts": time.time() - 60}
+            return {"last_credit_ts": fixed_ts}
 
         cfg = {"id": "telecom-exchange", "sched": {"type": "rolling", "period_h": 24}}
         with patch.dict(os.environ, {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:"}, clear=False), \
              patch("common.load_kv_state", side_effect=fake_load):
             due_at = orch_mod._cooldown_due_at(cfg)
-        self.assertIsNotNone(due_at)
+        self.assertEqual(due_at, fixed_ts + 24 * 3600)
         self.assertEqual(calls, [
-            "cat_checkin:state:rolling:telecom-exchange",
-            "cat_checkin:state:notify:telecom-exchange",
+            ("cat_checkin:state:rolling:telecom-exchange", ".rolling_state_telecom-exchange.json"),
+            ("cat_checkin:state:notify:telecom-exchange", ".notify_state_telecom-exchange.json"),
         ])
 
     def test_cooldown_due_at_non_numeric_fallback(self):
         """rolling 状态中 last_credit_ts 为非数字异常值时，安全回退到 legacy 键，
         避免抛出异常提前返回 None（评审指认）。"""
         calls = []
+        fixed_ts = 1750000000.0
 
         def fake_load(redis_key, state_file):
-            calls.append(redis_key)
+            calls.append((redis_key, state_file))
             if "state:rolling:" in redis_key:
                 return {"last_credit_ts": "corrupted_timestamp"}
-            return {"last_credit_ts": time.time() - 120}
+            return {"last_credit_ts": fixed_ts}
 
         cfg = {"id": "telecom-exchange", "sched": {"type": "rolling", "period_h": 24}}
         with patch.dict(os.environ, {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:"}, clear=False), \
              patch("common.load_kv_state", side_effect=fake_load):
             due_at = orch_mod._cooldown_due_at(cfg)
-        self.assertIsNotNone(due_at)
+        self.assertEqual(due_at, fixed_ts + 24 * 3600)
         self.assertEqual(calls, [
-            "cat_checkin:state:rolling:telecom-exchange",
-            "cat_checkin:state:notify:telecom-exchange",
+            ("cat_checkin:state:rolling:telecom-exchange", ".rolling_state_telecom-exchange.json"),
+            ("cat_checkin:state:notify:telecom-exchange", ".notify_state_telecom-exchange.json"),
         ])
 
     def test_cooldown_due_at_non_rolling_and_missing_state(self):
