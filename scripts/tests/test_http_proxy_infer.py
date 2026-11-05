@@ -61,6 +61,20 @@ class TestHttpProxyInfer(unittest.TestCase):
         self.assertTrue(h_direct.direct_no_env_proxy)
         self.assertFalse(h_explicit.direct_no_env_proxy)
 
+    def test_stdin_argv_never_scan_all_site_proxies(self):
+        """heredoc/stdin 执行（argv[0]="-"）不得触发「扫描全部站点代理」。
+
+        2026-11-05 复盘：workflow auto-retry 步骤的 QStash 发布运行在空转 run
+        （未装依赖，缺 pysocks），其 Http(proxy="") 推断出空前缀 →
+        get_all_proxy_endpoints 扫描全部站点代理 → 捡起 NODESEEK_PROXY(SOCKS)
+        → import socks 崩溃，QStash 重试接力静默断链。"""
+        env = {"NODESEEK_PROXY": "socks5://127.0.0.1:1080"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch("sys.argv", ["-"]):
+            h = Http(proxy="")
+        self.assertFalse(h.has_proxy)
+        self.assertIsNone(h.proxy_endpoint)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -389,7 +389,14 @@ def get_task_proxy_endpoints(task_name: str) -> List[ProxyEndpoint]:
     3. 国内站点（如 52POJIE, CLOUD189, SMZDM, TELECOM, OPPO）智能复用仓库共享 CN 代理出口
     4. 节点敏感 IP、端口与密码统一脱敏
     """
-    clean_task = re.sub(r"[^a-zA-Z0-9_]", "", task_name).upper()
+    clean_task = re.sub(r"[^a-zA-Z0-9_]", "", task_name).upper().rstrip("_")
+    # 空任务名（如 Http 代理推断从 stdin/heredoc argv 推断出 "-"；或纯下划线
+    # "_"——get_all_proxy_endpoints 内部同样 rstrip("_")，不在此提前归一会漏网）
+    # 不是任务：直接返回空，避免落入 get_all_proxy_endpoints 的「空前缀扫描
+    # 全部站点代理」诊断模式，把 NODESEEK_PROXY 等站点代理捡给无关调用方
+    # （2026-11-05 复盘）。
+    if not clean_task:
+        return []
     return get_all_proxy_endpoints(task_prefix=clean_task)
 
 

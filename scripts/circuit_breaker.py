@@ -322,15 +322,21 @@ def evaluate_retry_candidates(
     else:
         tasks = list(raw_tasks)
 
-    # 规范化为任务 ID（若传入的是 script 名如 agentrouter.py，映射为 agentrouter）
+    # 规范化为任务 ID。脚本名（如 telecom.py）可能同时服务多个注册任务
+    # （telecom.py = telecom 每日签到 + telecom-exchange 抢兑），必须映射到
+    # 「全部」共用该脚本的任务——只取首个 id 匹配会把重试接力点到未失败的
+    # 任务上，真正失败的任务反而无人接力（2026-11-05 复盘）。
     normalized: List[str] = []
     for t in tasks:
-        tid = t
         if t.endswith(".py"):
-            tid = t[:-3]
-        matched = next((k for k, v in TASKS.items() if k == tid or v.get("script") == t), tid)
-        if matched not in normalized:
-            normalized.append(matched)
+            matched = [k for k, v in TASKS.items() if v.get("script") == t]
+            if not matched:
+                matched = [t[:-3]]
+        else:
+            matched = [t]
+        for tid in matched:
+            if tid not in normalized:
+                normalized.append(tid)
 
     retryable: List[str] = []
     due_now: List[str] = []
@@ -345,6 +351,12 @@ def evaluate_retry_candidates(
 
         if is_susp:
             suspended.append(tid)
+            continue
+
+        # 重试评估器只面向「今日确有失败」的任务：昨日/陈旧状态（attempt_date
+        # 非今日）不算失败——否则从未参与今日执行的任务（如 stale 的 telecom）
+        # 会被误判为可重试并立即到期，触发 0s 延时接力空转（2026-11-05 复盘）。
+        if att <= 0 or str(state.get("last_ok_date") or "") == today:
             continue
 
         if att >= max_attempts:

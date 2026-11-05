@@ -996,6 +996,31 @@ class TestJindouExchange(unittest.TestCase):
         self.assertEqual(float(cfg["sched"].get("period_h")), 24.0)
         self.assertEqual(cfg.get("env", {}).get("TELECOM_MODE"), "exchange")
 
+    def test_jindou_schedule_writes_dedicated_rolling_key(self):
+        """滚动排程必须写专用 state:rolling: 键 + .rolling_state_ 文件。
+
+        notify 状态键（cat_checkin:state:notify:telecom-exchange）在任务结束后被
+        orchestrator 的 notify 状态同步整键覆盖——旧实现复用该键导致
+        last_credit_ts 每次运行即被抹掉，rolling 冷却静默失效（2026-11-05 复盘）。"""
+        captured = {}
+
+        def fake_save(redis_key, state_file, state):
+            captured["redis_key"] = redis_key
+            captured["state_file"] = state_file
+            captured["state"] = state
+
+        from datetime import datetime
+        with patch.dict(os.environ, {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:"}, clear=False), \
+             patch.object(telecom, "save_kv_state", side_effect=fake_save), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            telecom._jindou_schedule_next_run(terminal=False)
+        self.assertEqual(captured["redis_key"], "cat_checkin:state:rolling:telecom-exchange")
+        self.assertEqual(captured["state_file"], ".rolling_state_telecom-exchange.json")
+        next_due = float(captured["state"]["last_credit_ts"]) + 24 * 3600
+        due_dt = datetime.fromtimestamp(next_due, telecom.BJT)
+        # 下一个场次（10:00/14:00 BJT）前 30 分钟
+        self.assertIn(due_dt.strftime("%H:%M"), ("09:30", "13:30"))
+
 
 if __name__ == "__main__":
     unittest.main()

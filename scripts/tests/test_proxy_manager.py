@@ -85,6 +85,26 @@ class TestProxyManager(unittest.TestCase):
         self.assertEqual(eps[2].display_name, "【自建-韩国】")
         self.assertEqual(eps[2].url, "socks5://12.0.0.3:1080")
 
+    def test_empty_task_name_never_scan_all(self):
+        """空任务名与纯下划线不得触发全站点代理扫描。
+
+        空任务名不是任务：Http 代理推断在 stdin/heredoc 场景会从 argv 推断出
+        "-"（clean 后为空前缀），若落入 get_all_proxy_endpoints 的「空前缀扫描
+        全部站点代理」诊断模式，会把 NODESEEK_PROXY 等站点代理捡给无关调用方
+        （2026-11-05 复盘：qstash_publish 因此被劫持到 SOCKS，空转 run 未装
+        pysocks 时 ModuleNotFoundError 崩溃）。"""
+        from proxy_manager import get_task_proxy_endpoints
+
+        env = {"NODESEEK_PROXY": "socks5://127.0.0.1:1080"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(get_task_proxy_endpoints("-"), [])
+            self.assertEqual(get_task_proxy_endpoints(""), [])
+            self.assertEqual(get_task_proxy_endpoints("!!!"), [])
+            # 纯下划线：get_all_proxy_endpoints 内部 rstrip("_") 后为空前缀，
+            # 必须在入口提前归一拦截（评审指认）
+            self.assertEqual(get_task_proxy_endpoints("_"), [])
+            self.assertEqual(get_task_proxy_endpoints("juejin___"), [])
+
     def test_task_specific_only_scheduling(self):
         # 全局池（自建/备用）已废弃（2026-09-06 代理收敛）：即使残留在环境中
         # 也不参与调度，仅任务级 {TASK}_PROXY 族变量生效
