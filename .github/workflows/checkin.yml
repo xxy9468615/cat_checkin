@@ -594,6 +594,7 @@ jobs:
       - name: Auto-retry failed sites
         if: >-
           always() && steps.send_report.outputs.failed_matrix != ''
+          && steps.orch_tasks.outcome == 'success'
           && steps.orch_tasks.outputs.due_tasks != 'none'
           && !(github.event_name == 'repository_dispatch'
                && contains(fromJSON('["checkin_morning","checkin_modelscope","workbuddy_travel_claim"]'), github.event.action))
@@ -645,7 +646,7 @@ jobs:
           if [ "${NEXT_DELAY_SECONDS:-900}" -le 120 ]; then
             echo "等待 ${NEXT_DELAY_SECONDS}s 短时冷却..."
             sleep "${NEXT_DELAY_SECONDS}"
-            if gh workflow run checkin.yml --ref "${GITHUB_REF_NAME:-main}" -f tasks="$RETRYABLE_TASKS" -f retry=true; then
+            if gh workflow run checkin.yml --ref "${GITHUB_REF_NAME:-main}" -f tasks="$RETRYABLE_TASKS" -f retry=true -f due_only=true; then
               echo "即时重跑已派发"
             fi
           else

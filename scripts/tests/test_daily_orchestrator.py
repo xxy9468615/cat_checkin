@@ -136,6 +136,27 @@ class PlanModeTests(unittest.TestCase):
             "cat_checkin:state:notify:telecom-exchange",
         ])
 
+    def test_cooldown_due_at_non_numeric_fallback(self):
+        """rolling 状态中 last_credit_ts 为非数字异常值时，安全回退到 legacy 键，
+        避免抛出异常提前返回 None（评审指认）。"""
+        calls = []
+
+        def fake_load(redis_key, state_file):
+            calls.append(redis_key)
+            if "state:rolling:" in redis_key:
+                return {"last_credit_ts": "corrupted_timestamp"}
+            return {"last_credit_ts": time.time() - 120}
+
+        cfg = {"id": "telecom-exchange", "sched": {"type": "rolling", "period_h": 24}}
+        with patch.dict(os.environ, {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:"}, clear=False), \
+             patch("common.load_kv_state", side_effect=fake_load):
+            due_at = orch_mod._cooldown_due_at(cfg)
+        self.assertIsNotNone(due_at)
+        self.assertEqual(calls, [
+            "cat_checkin:state:rolling:telecom-exchange",
+            "cat_checkin:state:notify:telecom-exchange",
+        ])
+
     def test_cooldown_due_at_non_rolling_and_missing_state(self):
         """非 rolling 任务与无状态场景均返回 None（视为已到期）。"""
         with patch.dict(os.environ, {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:"}, clear=False), \
