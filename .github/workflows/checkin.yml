@@ -205,6 +205,7 @@ jobs:
             .52pojie_state*.json
             .ima_state*.json
             .notify_state_*.json
+            .rolling_state_*.json
           key: unified-states-${{ github.run_id }}
           restore-keys: |
             unified-states-
@@ -234,7 +235,11 @@ jobs:
             RETRY_CANDIDATES=$(python3 scripts/circuit_breaker.py get-due-retries 2>/dev/null || echo "")
             echo "分时段重试接力: 就绪任务 = ${RETRY_CANDIDATES:-<无>}"
             if [ -n "$RETRY_CANDIDATES" ]; then
-              PLAN_ARGS="--tasks $RETRY_CANDIDATES"
+              # --due-only：显式任务路径也执行 rolling 冷却检查（plan_due_tasks
+              # 仅在 due_only=True 时检查）。rolling 型任务（telecom-exchange）
+              # 的自排程（场次窗口前 30 分钟）优先于重试梯，防止 QStash 重试
+              # 回调把冷却中的任务在窗口外反复唤醒烧掉当日 8 次配额（2026-11-05 复盘）。
+              PLAN_ARGS="--tasks $RETRY_CANDIDATES --due-only"
             else
               PLAN_ARGS="--tasks none"
             fi
@@ -583,6 +588,7 @@ jobs:
       - name: Auto-retry failed sites
         if: >-
           always() && steps.send_report.outputs.failed_matrix != ''
+          && steps.orch_tasks.outputs.due_tasks != 'none'
           && !(github.event_name == 'repository_dispatch'
                && contains(fromJSON('["checkin_morning","checkin_modelscope","workbuddy_travel_claim"]'), github.event.action))
         env:
@@ -655,6 +661,7 @@ jobs:
             .52pojie_state*.json
             .ima_state*.json
             .notify_state_*.json
+            .rolling_state_*.json
           key: unified-states-${{ github.run_id }}
 
       - name: Cleanup sing-box tunnel
@@ -905,7 +912,7 @@ jobs:
             exit 0
           fi
           echo "Auto-retry failed sites: $FAILED_MATRIX"
-          if gh workflow run checkin.yml --ref "${GITHUB_REF_NAME:-main}" -f tasks="$FAILED_MATRIX" -f retry=true; then
+          if gh workflow run checkin.yml --ref "${GITHUB_REF_NAME:-main}" -f tasks="$FAILED_MATRIX" -f retry=true -f due_only=true; then
             echo "Retry dispatched"
           else
             echo "Retry dispatch failed"

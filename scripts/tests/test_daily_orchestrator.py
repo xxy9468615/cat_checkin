@@ -91,6 +91,39 @@ class PlanModeTests(unittest.TestCase):
         self.assertNotIn("juejin", due, "冷却未到期的 rolling 任务不应到期")
         self.assertIn("glados", due)
 
+    def test_cooldown_due_at_reads_dedicated_rolling_key(self):
+        """rolling 冷却读取专用 state:rolling: 键——不得复用 notify 状态键。
+
+        notify 键在每次任务结束后被 orchestrator 的 notify 状态同步整键覆盖，
+        last_credit_ts 会被抹掉 → rolling 冷却静默失效（2026-11-05 复盘：
+        telecom-exchange 的「场次窗口前 30 分钟」自排程因此从未生效）。"""
+        captured = {}
+
+        def fake_load(redis_key, state_file):
+            captured["redis_key"] = redis_key
+            captured["state_file"] = state_file
+            return {"last_credit_ts": time.time() - 3600}
+
+        cfg = {"id": "telecom-exchange", "sched": {"type": "rolling", "period_h": 24}}
+        env = {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:"}
+        with patch.dict(os.environ, env, clear=False), \
+             patch("common.load_kv_state", side_effect=fake_load):
+            due_at = orch_mod._cooldown_due_at(cfg)
+        self.assertIsNotNone(due_at)
+        self.assertEqual(captured["redis_key"], "cat_checkin:state:rolling:telecom-exchange")
+        self.assertEqual(captured["state_file"], ".rolling_state_telecom-exchange.json")
+
+    def test_cooldown_due_at_non_rolling_and_missing_state(self):
+        """非 rolling 任务与无状态场景均返回 None（视为已到期）。"""
+        with patch.dict(os.environ, {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:"}, clear=False), \
+             patch("common.load_kv_state", side_effect=AssertionError("非 rolling 任务不应读取状态")):
+            self.assertIsNone(orch_mod._cooldown_due_at({"id": "glados", "sched": {"type": "daily"}}))
+            self.assertIsNone(orch_mod._cooldown_due_at({"id": "glados"}))
+        with patch.dict(os.environ, {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:"}, clear=False), \
+             patch("common.load_kv_state", return_value={}):
+            self.assertIsNone(orch_mod._cooldown_due_at(
+                {"id": "telecom-exchange", "sched": {"type": "rolling", "period_h": 24}}))
+
     def test_due_only_includes_due_tasks(self):
         with patch.object(orch_mod, "is_task_suspended", return_value=False), \
              patch.object(orch_mod, "_cooldown_due_at", return_value=None):

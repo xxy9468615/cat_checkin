@@ -526,7 +526,11 @@ def qstash_publish(
     if content_dedup:
         headers["Upstash-Content-Based-Deduplication"] = "true"
 
-    resp = Http(proxy="").request("POST", publish_url, headers=headers, data=body, timeout=15)
+    # QStash 发布是控制面调用，必须直连：proxy="" 语义为「禁用任务代理」，
+    # 但 infer_proxy 默认开启会在 stdin/异常 argv 场景推断出空前缀 →
+    # get_all_proxy_endpoints 扫描全部站点代理 → 捡起 NODESEEK_PROXY(SOCKS)，
+    # 空转 run 未装 pysocks 时直接 ModuleNotFoundError 崩溃（2026-11-05 复盘）。
+    resp = Http(proxy="", infer_proxy=False).request("POST", publish_url, headers=headers, data=body, timeout=15)
     if resp.code in (200, 201, 202):
         data = resp.json()
         msg_id = str(data.get("messageId", "") or "") if isinstance(data, dict) else ""
@@ -578,7 +582,8 @@ def create_qstash_schedule(
     for name, value in (forward_headers or {}).items():
         headers[f"Upstash-Forward-{name}"] = value
 
-    resp = Http(proxy="").request("POST", url, headers=headers, data=body, timeout=15)
+    # 控制面调用强制直连（同 qstash_publish，禁用任务代理推断）
+    resp = Http(proxy="", infer_proxy=False).request("POST", url, headers=headers, data=body, timeout=15)
     if resp.code in (200, 201, 202):
         data = resp.json()
         sid = str(data.get("scheduleId", "") or "") if isinstance(data, dict) else ""
@@ -643,7 +648,8 @@ def _upstash_redis_request(url: str, token: str, body: str) -> tuple[bool, Any]:
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    resp = Http(proxy="").request("POST", url, headers=headers, data=body, timeout=15)
+    # 控制面调用强制直连（同 qstash_publish，禁用任务代理推断）
+    resp = Http(proxy="", infer_proxy=False).request("POST", url, headers=headers, data=body, timeout=15)
     if resp.code == 200:
         return True, resp.json()
     return False, f"HTTP {resp.code}: {resp.text[:200]}"

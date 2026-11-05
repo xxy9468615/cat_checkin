@@ -1449,14 +1449,20 @@ def _jindou_schedule_next_run(terminal: bool) -> None:
 
     写入后 orchestrator 的 rolling 冷却检查会屏蔽此前的一切触发（含重试梯
     next_retry_at——plan_due_tasks 中 rolling 检查先于退避检查），从而把
-    telecom-exchange 的实际运行时刻钉死在场次窗口边缘。"""
+    telecom-exchange 的实际运行时刻钉死在场次窗口边缘。
+
+    状态独立存放于 cat_checkin:state:rolling:telecom-exchange（2026-11-05 复盘）：
+    此前复用 notify 状态键 cat_checkin:state:notify:telecom-exchange，而
+    orchestrator 任务结束后的 notify 状态同步会整键覆盖同一 key，把
+    last_credit_ts 抹掉 → rolling 冷却每次运行后立即失效，任务被心跳/重试梯
+    在任意时刻反复唤醒。"""
     next_due = _jindou_next_due(terminal)
     last_credit_ts = (next_due - timedelta(hours=24)).timestamp()
     prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
     try:
         save_kv_state(
-            f"{prefix}:state:notify:telecom-exchange",
-            ".notify_state_telecom-exchange.json",
+            f"{prefix}:state:rolling:telecom-exchange",
+            ".rolling_state_telecom-exchange.json",
             {"last_credit_ts": last_credit_ts},
         )
         print(f"    [商城] 下次运行已排定: {next_due.strftime('%Y-%m-%d %H:%M')} BJT（滚动冷却）",

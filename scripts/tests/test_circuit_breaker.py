@@ -246,6 +246,61 @@ class TestCircuitBreaker(unittest.TestCase):
                 self.assertIn("cloud189", res["due_now"])
                 self.assertEqual(res["next_delay_seconds"], 900)
 
+    def test_evaluate_retry_candidates_shared_script_mapping(self):
+        """telecom.py 同时服务 telecom 与 telecom-exchange 两个任务：脚本名必须
+        映射到全部共用任务，且只评估「今日确有失败」的任务。
+
+        2026-11-05 复盘：旧逻辑只取首个 id 匹配（telecom.py → telecom），把
+        QStash 重试接力点到只有陈旧状态的 telecom 上，真正失败的
+        telecom-exchange 无人接力，且以 0s 延时回调空转烧 run。"""
+        today = circuit_breaker._bjt_today()
+        now_ts = 1750000000.0
+
+        tasks_state = {
+            # telecom 每日签到：昨日失败留下的陈旧状态（attempt_date 非今日）→ 不参与
+            "telecom": {
+                "attempt_date": "2020-01-01",
+                "attempts": 3,
+                "next_retry_at": now_ts - 3600,
+                "status": "active",
+            },
+            # telecom-exchange 抢兑：今日第 2 次失败，下次重试 15 分钟后
+            "telecom-exchange": {
+                "attempt_date": today,
+                "attempts": 2,
+                "next_retry_at": now_ts + 900,
+                "status": "active",
+            },
+        }
+
+        with mock.patch.object(circuit_breaker, "load_circuit_state",
+                               side_effect=lambda tid: tasks_state.get(tid, {})):
+            with mock.patch.object(circuit_breaker, "_bjt_now_ts", return_value=now_ts):
+                res = circuit_breaker.evaluate_retry_candidates("telecom.py")
+        self.assertEqual(res["retryable"], ["telecom-exchange"])
+        self.assertNotIn("telecom", res["retryable"])
+        self.assertNotIn("telecom", res["due_now"])
+        self.assertEqual(res["next_delay_seconds"], 900)
+
+    def test_evaluate_retry_candidates_ignores_succeeded_today(self):
+        """今日失败后已重试成功的任务不再进入重试接力（last_ok_date=today）。"""
+        today = circuit_breaker._bjt_today()
+        tasks_state = {
+            "glados": {
+                "attempt_date": today,
+                "attempts": 2,
+                "next_retry_at": 1750000000.0 - 60,
+                "last_ok_date": today,
+                "status": "active",
+            },
+        }
+        with mock.patch.object(circuit_breaker, "load_circuit_state",
+                               side_effect=lambda tid: tasks_state.get(tid, {})):
+            with mock.patch.object(circuit_breaker, "_bjt_now_ts", return_value=1750000000.0):
+                res = circuit_breaker.evaluate_retry_candidates("glados.py")
+        self.assertEqual(res["retryable"], [])
+        self.assertEqual(res["due_now"], [])
+
 
 class TestDailyOrchestratorCircuitIntegration(unittest.TestCase):
     """编排器与熔断机制集成测试。"""
