@@ -231,6 +231,12 @@ jobs:
             CANDIDATES=$(printf '%s' "$INPUT_TASKS" | tr '\n' ' ')
             echo "显式指定任务: $CANDIDATES"
             PLAN_ARGS="--tasks $CANDIDATES"
+            # 显式任务 + due_only=true（report-fallback 自动重跑派发）：显式路径
+            # 也执行 rolling 冷却检查（plan_due_tasks 仅在 due_only=True 时检查），
+            # 冷却中的任务（telecom-exchange）不被窗口外拉起（2026-11-05 复盘）
+            if [ "${INPUT_DUE_ONLY:-false}" = "true" ]; then
+              PLAN_ARGS="$PLAN_ARGS --due-only"
+            fi
           elif [ "${EVENT_ACTION:-}" = "checkin_retry" ]; then
             RETRY_CANDIDATES=$(python3 scripts/circuit_breaker.py get-due-retries 2>/dev/null || echo "")
             echo "分时段重试接力: 就绪任务 = ${RETRY_CANDIDATES:-<无>}"

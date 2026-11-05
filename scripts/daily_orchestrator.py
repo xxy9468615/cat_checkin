@@ -163,6 +163,13 @@ def _cooldown_due_at(cfg: Dict[str, Any]) -> Optional[float]:
         from common import load_kv_state
         state = load_kv_state(f"{prefix}:state:rolling:{task_id}", f".rolling_state_{task_id}.json")
         ts = float(state.get("last_credit_ts") or 0)
+        if ts <= 0:
+            # 一次性兼容（只读，不回写，下次任务运行自然落新键）：旧实现把
+            # last_credit_ts 与 notify 状态共键，会被 notify 同步整键覆盖——
+            # 仅当任务进程在「排程写入」与「notify 同步」之间崩溃时旧键才残留
+            # 有效时间戳，此时读出以避免升级后错过一次已排定的窗口。
+            legacy = load_kv_state(f"{prefix}:state:notify:{task_id}", f".notify_state_{task_id}.json")
+            ts = float(legacy.get("last_credit_ts") or 0)
     except Exception:
         return None
     if ts <= 0:

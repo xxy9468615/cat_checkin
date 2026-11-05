@@ -1010,7 +1010,8 @@ class TestJindouExchange(unittest.TestCase):
             captured["state"] = state
 
         from datetime import datetime
-        with patch.object(telecom, "save_kv_state", side_effect=fake_save), \
+        with patch.dict(os.environ, {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:"}, clear=False), \
+             patch.object(telecom, "save_kv_state", side_effect=fake_save), \
              patch("sys.stdout", new_callable=io.StringIO):
             telecom._jindou_schedule_next_run(terminal=False)
         self.assertEqual(captured["redis_key"], "cat_checkin:state:rolling:telecom-exchange")

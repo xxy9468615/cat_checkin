@@ -113,6 +113,29 @@ class PlanModeTests(unittest.TestCase):
         self.assertEqual(captured["redis_key"], "cat_checkin:state:rolling:telecom-exchange")
         self.assertEqual(captured["state_file"], ".rolling_state_telecom-exchange.json")
 
+    def test_cooldown_due_at_legacy_notify_key_fallback(self):
+        """新 rolling 键无状态时只读回退旧 notify 键的 last_credit_ts。
+
+        一次性兼容（不回写）：旧实现把排程与 notify 状态共键，仅当任务进程在
+        「排程写入」与「notify 同步」之间崩溃时旧键才残留有效时间戳。"""
+        calls = []
+
+        def fake_load(redis_key, state_file):
+            calls.append(redis_key)
+            if "state:rolling:" in redis_key:
+                return {}
+            return {"last_credit_ts": time.time() - 60}
+
+        cfg = {"id": "telecom-exchange", "sched": {"type": "rolling", "period_h": 24}}
+        with patch.dict(os.environ, {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:"}, clear=False), \
+             patch("common.load_kv_state", side_effect=fake_load):
+            due_at = orch_mod._cooldown_due_at(cfg)
+        self.assertIsNotNone(due_at)
+        self.assertEqual(calls, [
+            "cat_checkin:state:rolling:telecom-exchange",
+            "cat_checkin:state:notify:telecom-exchange",
+        ])
+
     def test_cooldown_due_at_non_rolling_and_missing_state(self):
         """非 rolling 任务与无状态场景均返回 None（视为已到期）。"""
         with patch.dict(os.environ, {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:"}, clear=False), \

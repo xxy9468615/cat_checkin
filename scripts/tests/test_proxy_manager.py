@@ -98,6 +98,10 @@ class TestProxyManager(unittest.TestCase):
             self.assertEqual(get_task_proxy_endpoints("-"), [])
             self.assertEqual(get_task_proxy_endpoints(""), [])
             self.assertEqual(get_task_proxy_endpoints("!!!"), [])
+            # 纯下划线：get_all_proxy_endpoints 内部 rstrip("_") 后为空前缀，
+            # 必须在入口提前归一拦截（评审指认）
+            self.assertEqual(get_task_proxy_endpoints("_"), [])
+            self.assertEqual(get_task_proxy_endpoints("juejin___"), [])
 
     def test_task_specific_only_scheduling(self):
         # 全局池（自建/备用）已废弃（2026-09-06 代理收敛）：即使残留在环境中
