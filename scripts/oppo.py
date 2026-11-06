@@ -685,6 +685,8 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
     task_success_cnt = 0
     task_total_points = 0
     dwell_budget = 60.0  # 浏览驻留总预算（秒/账号），保护 registry 超时
+    browse_deadline = time.monotonic() + 90.0  # 本账号任务阶段硬上限：超时后跳过落地页与驻留直接上报
+    claim_attempted: set = set()  # 已尝试过领奖的任务（首轮失败者交框架重试，二次补领不重复领取）
     if task_dtos:
         print(f"  📦 发现 {len(task_dtos)} 项活动任务，正在自动处理...")
         for t in task_dtos:
@@ -702,6 +704,7 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
             # 步骤零：App 端事件类任务（如打开消息通知）userEventStatus==1 表示完成事件已上报，
             # 状态可能仍停在 1 —— 直接尝试领奖；状态语义未完全逆向，容错处理（quiet）
             if user_event == 1 and t_status == 1 and t_id:
+                claim_attempted.add(str(t_id))
                 ok_claim, pts = _claim_award(t, quiet=True)
                 if ok_claim:
                     task_success_cnt += 1
@@ -713,12 +716,17 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
             # 其余类型（预约/点赞/认证/首单等）需真实用户操作或存在风控/真实副作用，不自动化。
             if t_status == 1 and t_type == 1 and t_id:
                 link = (t.get("attachConfigTwo") or {}).get("link") or t.get("actionUrl") or ""
-                if link and dwell_budget > 0:
+                # 落地页为任意外部活动页：显式限短超时（timeout=10）并单次尝试（retries=1），
+                # 防慢响应 × 重试退避耗尽 registry 时限；browse_deadline 到点后跳过落地页与
+                # 驻留直接上报，保证当前账号状态能落盘、后续账号能继续执行
+                if link and dwell_budget > 0 and time.monotonic() < browse_deadline:
                     try:
                         http.request(
                             "GET",
                             link,
                             headers={**common_headers, "Referer": f"{BASE_HOST}{SIGN_IN_PAGE_PATH}?nightModelEnable=true&us=jifensdk&um=2435"},
+                            timeout=10,
+                            retries=1,
                         )
                     except Exception:
                         pass
@@ -749,6 +757,7 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
             # 步骤二：待领奖状态 (status 2: GO_AWARD)，领取积分奖励 (2 -> 3)；
             # 非浏览类任务若被用户手动做到可领奖状态，也在此兜底领取
             if t_status == 2 and t_id:
+                claim_attempted.add(str(t_id))
                 ok_claim, pts = _claim_award(t)
                 if ok_claim:
                     task_success_cnt += 1
@@ -756,11 +765,13 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
                 time.sleep(0.5)
 
         # 步骤三：二次补领 —— 上报与领取间存在服务端状态流转延迟，收尾重查一次任务列表，
-        # 对已流转到待领奖 (status 2) 的任务补领（单次重查，非轮询）
+        # 仅补领「新流转到待领奖 (status 2) 且首轮未尝试过领奖」的任务（单次重查，非轮询）；
+        # 首轮已尝试过领奖的失败任务不在脚本内重试，交由框架重试梯子处理
         try:
             second_dtos = _fetch_task_dtos()
             for t in second_dtos:
-                if t.get("taskStatus") == 2 and t.get("taskId"):
+                t_id = t.get("taskId")
+                if t.get("taskStatus") == 2 and t_id and str(t_id) not in claim_attempted:
                     ok_claim, pts = _claim_award(t, quiet=True)
                     if ok_claim:
                         task_success_cnt += 1

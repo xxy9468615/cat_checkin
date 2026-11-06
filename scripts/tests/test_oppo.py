@@ -563,6 +563,56 @@ class TestOppo(unittest.TestCase):
         self.assertIn("刷完 1 个任务 (+1分)", desc)
         self.assertEqual(query_calls["n"], 2)
 
+    @patch.object(oppo, "save_kv_state")
+    @patch.object(oppo, "load_kv_state")
+    @patch.object(oppo.time, "sleep")
+    @patch.object(oppo, "Http")
+    def test_run_account_second_pass_skips_attempted_tasks(self, mock_http_cls, mock_sleep, mock_load_state, mock_save_state):
+        """首轮已尝试领奖的失败任务，二次补领不得在脚本内重试（交框架重试梯子）。"""
+        mock_load_state.return_value = {}
+        mock_http = MagicMock()
+        mock_http_cls.return_value = mock_http
+        mock_http.jar = CookieJar()
+
+        tokensid = _make_fake_tokensid(int(time.time()) + 30 * 86400)
+        task = {
+            "taskId": "2222333344445555",
+            "taskName": "浏览教育优惠",
+            "taskType": 1,
+            "taskStatus": 2,  # 直接处于待领奖状态
+            "attachConfigOne": {"browseTime": 0},
+            "attachConfigTwo": {},
+            "awardAttachConfig": {"pointsNum": "2"},
+        }
+        award_calls = {"n": 0}
+
+        def mock_request(method, url, **kwargs):
+            resp = MagicMock()
+            resp.code = 200
+            if "/bp/b371ce270f7509f0" in url:
+                resp.text = _SYNTHETIC_PAGE_HTML
+            elif "getSignInDetail" in url:
+                resp.json.return_value = {"code": 200, "data": {"cumulativeAwards": []}}
+            elif "cumulativeSignIn/signIn" in url:
+                resp.json.return_value = {"code": 200, "data": {"awardValue": "2"}}
+            elif "queryTaskList" in url:
+                resp.json.return_value = {"code": 200, "data": {"taskDTOList": [dict(task)]}}
+            elif "receiveAward" in url:
+                award_calls["n"] += 1
+                resp.json.return_value = {"code": 500, "message": "系统繁忙"}
+            elif "queryMemberCreditInfo" in url:
+                resp.json.return_value = {"code": 200, "data": {"amount": 4, "userLevel": 51}}
+            else:
+                resp.json.return_value = {}
+            return resp
+
+        mock_http.request.side_effect = mock_request
+
+        ok, desc = oppo._run_account(f"TOKENSID={tokensid}", 1, 1)
+        self.assertTrue(ok)
+        self.assertIn("刷完 0 个任务 (+0分)", desc)
+        self.assertEqual(award_calls["n"], 1)  # 首轮 1 次，二次补领不再重试
+
     # ---------- 多账号循环 / 退出码语义 ----------
 
     @patch.dict(os.environ, {"OPPO_COOKIE_1": "TOKENSID=V1.0FAKE_cookie_one", "OPPO_COOKIE_2": "TOKENSID=V1.0FAKE_cookie_two"})

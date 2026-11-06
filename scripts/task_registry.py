@@ -148,7 +148,8 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "script": "oppo.py",
         "name": "OPPO商城 签到",
         "result": "oppo.json",
-        "timeout": 300,
+        # 多账号（2 个）× 落地页驻留仿真（每账号驻留预算 60s + 任务阶段硬上限 90s）+ 账号间错峰
+        "timeout": 420,
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },

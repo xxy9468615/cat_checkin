@@ -1350,6 +1350,7 @@ def ex_oppo(output: str, res: Dict[str, Any]) -> None:
     task_pts = 0
 
     def _flush_tasks() -> None:
+        """将当前账号块累计的任务完成数与积分归集进报告，并重置计数（多账号按块独立）。"""
         # 任务完成数与积分按账号块独立归集（多账号下不重置会把前账号的量累计到后账号行）
         nonlocal tasks_done, task_pts
         if tasks_done > 0:
