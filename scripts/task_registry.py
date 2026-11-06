@@ -140,7 +140,9 @@ TASKS: Dict[str, Dict[str, Any]] = {
     },
     # --- OPPO商城（hd.opposhop.cn 打卡签到与浏览任务；2026-10-11 曾因 HeyTap
     #     acIdAuthSession 7 天短命凭据退役，2026-11-01 逆向 App 端 TOKENSID
-    #     长效令牌（约 30 天寿命）后恢复）---
+    #     长效令牌（约 30 天寿命）后恢复；2026-11-06 接入账户2、任务场次改为
+    #     签到页 taskActivityInfo 动态发现、日签奖励口径修正为 2 积分/天、
+    #     浏览任务补落地页驻留仿真与二次补领）---
     "oppo": {
         "id": "oppo",
         "script": "oppo.py",

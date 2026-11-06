@@ -1344,26 +1344,43 @@ def ex_telecom(output: str, res: Dict[str, Any]) -> None:
 
 
 def ex_oppo(output: str, res: Dict[str, Any]) -> None:
-    """OPPO 商城：👤 用户: ... + 签到 / 任务 / 积分余额 行。"""
+    """OPPO 商城：👤 用户: ... + 签到 / 任务 / 积分余额 行（多账号按账号块独立归集）。"""
     cur: Any = None
     tasks_done = 0
     task_pts = 0
+
+    def _flush_tasks() -> None:
+        # 任务完成数与积分按账号块独立归集（多账号下不重置会把前账号的量累计到后账号行）
+        nonlocal tasks_done, task_pts
+        if tasks_done > 0:
+            res["badges"].append(("reward", f"浏览任务 +{task_pts} 积分"))
+            res["gains"].append(("积分", float(task_pts)))
+            if cur:
+                cur.parts.append(f"完成 {tasks_done} 项日常任务 (+{task_pts}分)")
+        tasks_done = 0
+        task_pts = 0
+
     for raw in output.splitlines():
         ln = raw.strip()
         m = re.search(r"\[\d+/\d+\]\s*👤\s*用户:\s*(.+)", ln)
         if m:
             if cur:
+                _flush_tasks()
                 cur.flush(res)
             cur = _Block(m.group(1))
             continue
         if cur is None:
             continue
         if "签到成功" in ln or "今日已签到" in ln:
-            sign_status = "签到成功 (+10 积分)" if "签到成功" in ln else "今日已签到"
-            cur.parts.append(sign_status)
+            # 奖励口径以输出行为准（2026-11 场次实测 2 积分/天，旧行硬编码 +10 已失真）
+            m_sign = re.search(r"获得\s*\+(\d+)\s*积分", ln)
             if "签到成功" in ln:
-                res["badges"].append(("reward", "签到 +10 积分"))
-                res["gains"].append(("积分", 10.0))
+                cur.parts.append(f"签到成功 (+{m_sign.group(1)} 积分)" if m_sign else "签到成功")
+                if m_sign:
+                    res["badges"].append(("reward", f"签到 +{m_sign.group(1)} 积分"))
+                    res["gains"].append(("积分", float(m_sign.group(1))))
+            else:
+                cur.parts.append("今日已签到")
             continue
         m_task = re.search(r"(?:领奖成功|完成):\s*(.+?)\s*\(\+(\d+)\s*积分\)", ln)
         if m_task:
@@ -1384,11 +1401,7 @@ def ex_oppo(output: str, res: Dict[str, Any]) -> None:
             res["fail_lines"].append(_clean(ln))
             res["error_lines"].append(ln)
 
-    if tasks_done > 0:
-        res["badges"].append(("reward", f"浏览任务 +{task_pts} 积分"))
-        res["gains"].append(("积分", float(task_pts)))
-        if cur:
-            cur.parts.append(f"完成 {tasks_done} 项日常任务 (+{task_pts}分)")
+    _flush_tasks()
 
     if cur:
         cur.flush(res)
