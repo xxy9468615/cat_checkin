@@ -613,6 +613,135 @@ class TestOppo(unittest.TestCase):
         self.assertIn("刷完 0 个任务 (+0分)", desc)
         self.assertEqual(award_calls["n"], 1)  # 首轮 1 次，二次补领不再重试
 
+    @patch.object(oppo, "save_kv_state")
+    @patch.object(oppo, "load_kv_state")
+    @patch.object(oppo.time, "sleep")
+    @patch.object(oppo, "Http")
+    def test_run_account_untrusted_landing_page_no_credentials(self, mock_http_cls, mock_sleep, mock_load_state, mock_save_state):
+        """第三方落地页不携带账号凭据（Cookie/constToken/sa_distinct_id），可信 opposhop.cn 域才带。"""
+        mock_load_state.return_value = {}
+        mock_http = MagicMock()
+        mock_http_cls.return_value = mock_http
+        mock_http.jar = CookieJar()
+
+        tokensid = _make_fake_tokensid(int(time.time()) + 30 * 86400)
+        task = {
+            "taskId": "3333444455556666",
+            "taskName": "参与互动赢好物",
+            "taskType": 1,
+            "taskStatus": 1,
+            "attachConfigOne": {"browseTime": 0},
+            "attachConfigTwo": {"link": "https://evil.example.com/promo"},
+            "actionUrl": "https://evil.example.com/promo",
+            "awardAttachConfig": {"pointsNum": "1"},
+        }
+
+        def mock_request(method, url, **kwargs):
+            resp = MagicMock()
+            resp.code = 200
+            if "/bp/b371ce270f7509f0" in url:
+                resp.text = _SYNTHETIC_PAGE_HTML
+            elif "getSignInDetail" in url:
+                resp.json.return_value = {"code": 200, "data": {"cumulativeAwards": []}}
+            elif "cumulativeSignIn/signIn" in url:
+                resp.json.return_value = {"code": 200, "data": {"awardValue": "2"}}
+            elif "queryTaskList" in url:
+                resp.json.return_value = {"code": 200, "data": {"taskDTOList": [task]}}
+            elif "signInOrShareTask" in url:
+                resp.json.return_value = {"code": 200, "data": 200}
+            elif "receiveAward" in url:
+                resp.json.return_value = {"code": 200, "data": {"receiveStatus": 1}}
+            elif "queryMemberCreditInfo" in url:
+                resp.json.return_value = {"code": 200, "data": {"amount": 2, "userLevel": 51}}
+            else:
+                resp.json.return_value = {}
+            return resp
+
+        mock_http.request.side_effect = mock_request
+        ok, desc = oppo._run_account(f"TOKENSID={tokensid}", 1, 1)
+        self.assertTrue(ok)
+
+        # 第三方落地页请求存在，且不携带任何账号凭据头
+        third_party = [c for c in mock_http.request.call_args_list if "evil.example.com" in c.args[1]]
+        self.assertTrue(third_party)
+        for call in third_party:
+            headers = call.kwargs.get("headers") or {}
+            self.assertNotIn("Cookie", headers)
+            self.assertNotIn("constToken", headers)
+            self.assertNotIn("sa_distinct_id", headers)
+
+        # 可信域（本测试中的签到页 hd.opposhop.cn）请求仍携带凭据头
+        trusted = [c for c in mock_http.request.call_args_list if "hd.opposhop.cn" in c.args[1]]
+        self.assertTrue(trusted)
+        self.assertTrue(any("Cookie" in (c.kwargs.get("headers") or {}) for c in trusted))
+
+    @patch.object(oppo, "save_kv_state")
+    @patch.object(oppo, "load_kv_state")
+    @patch.object(oppo.time, "sleep")
+    @patch.object(oppo.time, "monotonic")
+    @patch.object(oppo, "Http")
+    def test_run_account_task_deadline_stops_remaining(self, mock_http_cls, mock_mono, mock_sleep, mock_load_state, mock_save_state):
+        """任务阶段硬时限到点后：跳过剩余任务与二次补领（保护状态落盘与后续账号）。"""
+        mock_load_state.return_value = {}
+        mock_http = MagicMock()
+        mock_http_cls.return_value = mock_http
+        mock_http.jar = CookieJar()
+
+        clock = {"t": 1000.0}
+        mono_calls = {"n": 0}
+
+        def fake_monotonic():
+            mono_calls["n"] += 1
+            if mono_calls["n"] > 1:
+                clock["t"] = 1200.0  # deadline 初始化（首次调用 1000+90）之后，循环检查前越过时限
+            return clock["t"]
+
+        mock_mono.side_effect = fake_monotonic
+
+        tokensid = _make_fake_tokensid(int(time.time()) + 30 * 86400)
+        task = {
+            "taskId": "7777888899990000",
+            "taskName": "浏览新品平板",
+            "taskType": 1,
+            "taskStatus": 1,
+            "attachConfigOne": {"browseTime": 5},
+            "attachConfigTwo": {"link": "https://hd.opposhop.cn/bp/anotherpage"},
+            "awardAttachConfig": {"pointsNum": "1"},
+        }
+
+        def mock_request(method, url, **kwargs):
+            resp = MagicMock()
+            resp.code = 200
+            if "/bp/b371ce270f7509f0" in url:
+                resp.text = _SYNTHETIC_PAGE_HTML
+            elif "getSignInDetail" in url:
+                resp.json.return_value = {"code": 200, "data": {"cumulativeAwards": []}}
+            elif "cumulativeSignIn/signIn" in url:
+                resp.json.return_value = {"code": 200, "data": {"awardValue": "2"}}
+            elif "queryTaskList" in url:
+                resp.json.return_value = {"code": 200, "data": {"taskDTOList": [task]}}
+            elif "queryMemberCreditInfo" in url:
+                resp.json.return_value = {"code": 200, "data": {"amount": 2, "userLevel": 51}}
+            else:
+                resp.json.return_value = {}
+            return resp
+
+        mock_http.request.side_effect = mock_request
+
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ok, desc = oppo._run_account(f"TOKENSID={tokensid}", 1, 1)
+        self.assertTrue(ok)
+        self.assertIn("刷完 0 个任务 (+0分)", desc)
+        self.assertIn("任务阶段时限已到", buf.getvalue())
+        urls = [c.args[1] for c in mock_http.request.call_args_list]
+        self.assertFalse(any("signInOrShareTask" in u for u in urls))  # 剩余任务不再上报
+        self.assertFalse(any("receiveAward" in u for u in urls))  # 领奖与二次补领均停止
+        # queryTaskList 仅首轮 1 次（二次补领被时限跳过）
+        self.assertEqual(sum(1 for u in urls if "queryTaskList" in u), 1)
+
     # ---------- 多账号循环 / 退出码语义 ----------
 
     @patch.dict(os.environ, {"OPPO_COOKIE_1": "TOKENSID=V1.0FAKE_cookie_one", "OPPO_COOKIE_2": "TOKENSID=V1.0FAKE_cookie_two"})

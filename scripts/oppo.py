@@ -628,9 +628,9 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
     task_url = f"{BASE_HOST}/api/cn/oapi/marketing/task/queryTaskList?activityId={task_activity_id}&source=c"
 
     def _fetch_task_dtos() -> List[Dict[str, Any]]:
-        """拉取任务列表（queryTaskList 携带 timeStamp 头，与 App 抓包对齐）。"""
+        """拉取任务列表（queryTaskList 携带 timeStamp 头，与 App 抓包对齐；限短超时单次尝试）。"""
         ts_ms = str(int(time.time() * 1000))
-        resp = http.request("GET", task_url, headers={**common_headers, "timeStamp": ts_ms})
+        resp = http.request("GET", task_url, headers={**common_headers, "timeStamp": ts_ms}, timeout=15, retries=1)
         list_data = resp.json() if resp and resp.code == 200 else {}
         if isinstance(list_data.get("data"), dict):
             return list_data["data"].get("taskDTOList", []) or []
@@ -648,7 +648,7 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
             f"{BASE_HOST}/api/cn/oapi/marketing/task/receiveAward?taskId={t_id}"
             f"&activityId={task_activity_id}&creditsAddActionId={CREDITS_ADD_ACTION_ID}&business=1"
         )
-        resp_award = http.request("GET", award_url, headers=common_headers)
+        resp_award = http.request("GET", award_url, headers=common_headers, timeout=15, retries=1)
         award_res = resp_award.json() if resp_award and resp_award.code == 200 else {}
         aw_code = award_res.get("code")
         aw_data = award_res.get("data") or {}
@@ -685,11 +685,16 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
     task_success_cnt = 0
     task_total_points = 0
     dwell_budget = 60.0  # 浏览驻留总预算（秒/账号），保护 registry 超时
-    browse_deadline = time.monotonic() + 90.0  # 本账号任务阶段硬上限：超时后跳过落地页与驻留直接上报
+    # 任务阶段硬上限（覆盖落地页+驻留+上报+领奖+二次补领）：到点停止剩余任务，
+    # 为账号状态落盘与后续账号执行预留时间，防慢响应链耗尽 registry 超时被强杀
+    task_deadline = time.monotonic() + 90.0
     claim_attempted: set = set()  # 已尝试过领奖的任务（首轮失败者交框架重试，二次补领不重复领取）
     if task_dtos:
         print(f"  📦 发现 {len(task_dtos)} 项活动任务，正在自动处理...")
         for t in task_dtos:
+            if time.monotonic() >= task_deadline:
+                print("    ⏭️ 任务阶段时限已到，跳过剩余任务（为状态保存与后续账号预留时间）")
+                break
             t_id = t.get("taskId")
             t_name = t.get("taskName", "未知任务")
             t_type = t.get("taskType", 1)
@@ -716,18 +721,34 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
             # 其余类型（预约/点赞/认证/首单等）需真实用户操作或存在风控/真实副作用，不自动化。
             if t_status == 1 and t_type == 1 and t_id:
                 link = (t.get("attachConfigTwo") or {}).get("link") or t.get("actionUrl") or ""
-                # 落地页为任意外部活动页：显式限短超时（timeout=10）并单次尝试（retries=1），
-                # 防慢响应 × 重试退避耗尽 registry 时限；browse_deadline 到点后跳过落地页与
-                # 驻留直接上报，保证当前账号状态能落盘、后续账号能继续执行
-                if link and dwell_budget > 0 and time.monotonic() < browse_deadline:
+                # 落地页 URL 来自远程任务列表（不可信输入）：仅当 https 且 host 属于商城域名
+                # （opposhop.cn 及其子域）时才携带账号凭据（Cookie/constToken）；第三方落地页
+                # 改用不带任何凭据的独立直连客户端模拟访问，防止 TOKENSID 泄漏给外部域。
+                # 请求显式限短超时（timeout=10）并单次尝试（retries=1），防慢响应 × 重试退避
+                # 耗尽 registry 时限；task_deadline 到点后跳过落地页与驻留直接上报
+                if link and dwell_budget > 0 and time.monotonic() < task_deadline:
+                    link_parts = urllib.parse.urlsplit(link)
+                    link_host = (link_parts.hostname or "").lower()
+                    trusted_link = link_parts.scheme == "https" and (
+                        link_host == "opposhop.cn" or link_host.endswith(".opposhop.cn")
+                    )
                     try:
-                        http.request(
-                            "GET",
-                            link,
-                            headers={**common_headers, "Referer": f"{BASE_HOST}{SIGN_IN_PAGE_PATH}?nightModelEnable=true&us=jifensdk&um=2435"},
-                            timeout=10,
-                            retries=1,
-                        )
+                        if trusted_link:
+                            http.request(
+                                "GET",
+                                link,
+                                headers={**common_headers, "Referer": f"{BASE_HOST}{SIGN_IN_PAGE_PATH}?nightModelEnable=true&us=jifensdk&um=2435"},
+                                timeout=10,
+                                retries=1,
+                            )
+                        else:
+                            Http(proxy="", infer_proxy=False).request(
+                                "GET",
+                                link,
+                                headers={"User-Agent": APP_UA, "Accept": "text/html,application/xhtml+xml,*/*"},
+                                timeout=10,
+                                retries=1,
+                            )
                     except Exception:
                         pass
                     try:
@@ -741,7 +762,7 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
                         time.sleep(pause)
 
                 report_url = f"{BASE_HOST}/api/cn/oapi/marketing/taskReport/signInOrShareTask?taskId={t_id}&activityId={task_activity_id}&taskType={t_type}"
-                resp_rep = http.request("GET", report_url, headers=common_headers)
+                resp_rep = http.request("GET", report_url, headers=common_headers, timeout=15, retries=1)
                 rep_res = resp_rep.json() if resp_rep and resp_rep.code == 200 else {}
                 if rep_res.get("code") == 200 and rep_res.get("data") == 200:
                     t_status = 2
@@ -766,18 +787,20 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
 
         # 步骤三：二次补领 —— 上报与领取间存在服务端状态流转延迟，收尾重查一次任务列表，
         # 仅补领「新流转到待领奖 (status 2) 且首轮未尝试过领奖」的任务（单次重查，非轮询）；
-        # 首轮已尝试过领奖的失败任务不在脚本内重试，交由框架重试梯子处理
-        try:
-            second_dtos = _fetch_task_dtos()
-            for t in second_dtos:
-                t_id = t.get("taskId")
-                if t.get("taskStatus") == 2 and t_id and str(t_id) not in claim_attempted:
-                    ok_claim, pts = _claim_award(t, quiet=True)
-                    if ok_claim:
-                        task_success_cnt += 1
-                        task_total_points += pts
-        except Exception:
-            pass
+        # 首轮已尝试过领奖的失败任务不在脚本内重试，交由框架重试梯子处理；
+        # 任务阶段时限已到时整体跳过，为状态落盘与后续账号预留时间
+        if time.monotonic() < task_deadline:
+            try:
+                second_dtos = _fetch_task_dtos()
+                for t in second_dtos:
+                    t_id = t.get("taskId")
+                    if t.get("taskStatus") == 2 and t_id and str(t_id) not in claim_attempted:
+                        ok_claim, pts = _claim_award(t, quiet=True)
+                        if ok_claim:
+                            task_success_cnt += 1
+                            task_total_points += pts
+            except Exception:
+                pass
 
     # 10. 查询会员总积分资产
     total_credit = "未知"
