@@ -661,8 +661,11 @@ class TestOppo(unittest.TestCase):
         ok, desc = oppo._run_account(f"TOKENSID={tokensid}", 1, 1)
         self.assertTrue(ok)
 
-        # 第三方落地页请求存在，且不携带任何账号凭据头
-        third_party = [c for c in mock_http.request.call_args_list if "evil.example.com" in c.args[1]]
+        # 第三方落地页请求存在，且不携带任何账号凭据头（hostname 精确解析，不做 URL 子串匹配）
+        def _host(url: str) -> str:
+            return (urllib.parse.urlsplit(url).hostname or "").lower()
+
+        third_party = [c for c in mock_http.request.call_args_list if _host(c.args[1]) == "evil.example.com"]
         self.assertTrue(third_party)
         for call in third_party:
             headers = call.kwargs.get("headers") or {}
@@ -671,7 +674,7 @@ class TestOppo(unittest.TestCase):
             self.assertNotIn("sa_distinct_id", headers)
 
         # 可信域（本测试中的签到页 hd.opposhop.cn）请求仍携带凭据头
-        trusted = [c for c in mock_http.request.call_args_list if "hd.opposhop.cn" in c.args[1]]
+        trusted = [c for c in mock_http.request.call_args_list if _host(c.args[1]) == "hd.opposhop.cn"]
         self.assertTrue(trusted)
         self.assertTrue(any("Cookie" in (c.kwargs.get("headers") or {}) for c in trusted))
 
