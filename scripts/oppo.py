@@ -18,16 +18,24 @@
    - 凭据状态自动同步持久化至 Upstash Redis (cat_checkin:state:oppo_{idx}) 与本地文件 (.oppo_state_{idx}.json)；
    - 即使 runner 销毁，下一次运行时也能基于长效 SSO 根凭据自动静默无感换票，实现数月长期免维护。
 3. 每日打卡签到 (signIn)：
-   - 签到 activityId 每月轮换，运行时自动从签到页 HTML 的 activityInfo 提取当月场次，失败回退内置常量；
+   - 签到 activityId 周期轮换，运行时自动从签到页 HTML 的 activityInfo 提取当前场次，失败回退内置常量；
    - POST /api/cn/oapi/marketing/cumulativeSignIn/signIn；
-   - 幂等放行：已签到（code 5008 / "今天已经签到过啦"）自动识别，新签到返回 +10 积分收益。
+   - 幂等放行：已签到（code 5008 / "今天已经签到过啦"）自动识别；
+   - 奖励口径如实上报（2026-11 场次实测 2 积分/天）：优先取 signIn 响应 data，回退签到详情
+     baseAwards 中 signTime==今日 的 awardValue，均不可得则不标注积分数。
 4. 连签里程碑奖励自动领取 (drawCumulativeAward)：
    - GET /api/cn/oapi/marketing/cumulativeSignIn/getSignInDetail 评估连签进度；
-   - 达标 3/7/14/28 天连签里程碑且未领取的奖励自动一键领取。
-5. 日常 8 大浏览赚积分任务自动一键上报 (signInOrShareTask)：
-   - GET /api/cn/oapi/marketing/task/queryTaskList 拉取今日任务列表；
-   - 过滤浏览类日常任务（taskType=1），直接向 taskReport 接口上报完成；
-   - 稳拿 8 × 2 = 16 积分。
+   - 达标（如 7/14/28 天，奖品为包邮券/优惠券/积分等）且未领取的奖励自动一键领取。
+5. 日常赚积分任务自动完成 (queryTaskList + signInOrShareTask + receiveAward)：
+   - 任务场次 activityId 内嵌于签到页 HTML 的 taskActivityInfo 节点（与 activityInfo 键名不同），
+     运行时同步动态发现，失败回退内置常量；
+   - 浏览类任务（taskType=1）模拟 App 链路：先 GET 任务落地页并驻留 attachConfigOne.browseTime 秒，
+     再向 taskReport 接口上报完成，随后 receiveAward 领取积分（fallback 顺序 awardValue → pointsNum → 2）；
+   - App 端事件类任务（userEventStatus==1，如打开消息通知）完成事件已上报，直接尝试领奖（容错）；
+   - 收尾重查一次任务列表，对已流转到待领奖（status 2）的任务二次补领；
+   - 明确不自动化（需真实用户操作或存在风控/真实副作用）：type 4 预约商品、type 18 内容点赞
+     （UGC 风控，遵循 modelscope 封号前例）、type 13/14/16/17/22 人工类任务；此类仅在其已达
+     可领奖状态时兜底领取。
 6. 积分资产查询 (queryMemberCreditInfo)：
    - 实时拉取最新积分总余额、等级与抵扣额。
 
@@ -42,6 +50,7 @@ import base64
 import hashlib
 import json
 import os
+import random
 import re
 import secrets
 import sys
@@ -91,10 +100,11 @@ import cookie_validity as cv
 PREFIX = "OPPO_"
 BASE_HOST = "https://hd.opposhop.cn"
 BIZ_APP_KEY = "WJ9mxZSYJBYQL91FFowN6X"
-# 签到场次每月轮换（2026-11 场次）；运行时会自动从签到页 activityInfo 发现最新 ID，此处仅兜底
+# 签到场次周期轮换（2026-11 场次）；运行时会自动从签到页 activityInfo 发现最新 ID，此处仅兜底
 SIGN_IN_ACTIVITY_ID = "2116078703745441792"
 SIGN_IN_PAGE_PATH = "/bp/b371ce270f7509f0"
 CREDITS_ADD_ACTION_ID = "1788913e6d9e4683b8b9ab0088733560"
+# 任务场次（【商城积分乐园】成长任务）内嵌于签到页 taskActivityInfo 节点，运行时动态发现，此处仅兜底
 TASK_ACTIVITY_ID = "1919591795180969984"
 # App 内 H5（com.oppo.store WebView）请求头特征：网关对 App 链路按 TOKENSID 会话校验
 APP_CONST_TOKEN = "GxZ5UMBinzhFCBUEURPcU9YriSSLdQnb@bj"
@@ -297,6 +307,42 @@ def _try_refresh_oppo_token(http: Http, cookie_items: Dict[str, str]) -> Tuple[b
     return True, new_items, "换票续期成功"
 
 
+def _resolve_sign_points(sign_res: Dict[str, Any], sign_detail_data: Dict[str, Any]) -> Optional[int]:
+    """解析本次签到实际入账积分（2026-11 场次实测 2 积分/天，旧硬编码 +10 已失真）。
+
+    优先取 signIn 响应 data 中的常见奖励字段，回退签到详情 baseAwards 中 signTime==今日(BJT)
+    的积分档位（awardType 1 为积分，2 为券类不计）；均不可得返回 None，由调用方省略积分数标注。
+    """
+    data = sign_res.get("data")
+    if isinstance(data, dict):
+        for key in ("awardValue", "points", "score", "integral", "credit", "credits", "amount"):
+            val = data.get(key)
+            if val:
+                try:
+                    parsed = int(val)
+                except (TypeError, ValueError):
+                    continue
+                if parsed > 0:
+                    return parsed
+    detail_root = sign_detail_data.get("data") if isinstance(sign_detail_data.get("data"), dict) else {}
+    base_awards = detail_root.get("baseAwards") or []
+    today_str = datetime.now(BJT).strftime("%Y-%m-%d")
+    for award in base_awards:
+        if not isinstance(award, dict):
+            continue
+        if str(award.get("signTime", "")) != today_str:
+            continue
+        if award.get("awardType") not in (None, 1, "1"):
+            continue
+        try:
+            parsed = int(award.get("awardValue") or 0)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return None
+
+
 def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
     raw_cookie = cookie_str.strip()
     env_hash = hashlib.md5(raw_cookie.encode("utf-8")).hexdigest()
@@ -448,8 +494,10 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
     if sa_id:
         common_headers["sa_distinct_id"] = sa_id
 
-    # 5. 发现当月签到场次（activityId 每月轮换，内嵌于签到页 HTML activityInfo 节点）
+    # 5. 发现当前签到场次与任务场次（内嵌于签到页 HTML 的 activityInfo / taskActivityInfo 节点）
     activity_id = ""
+    task_activity_id = ""
+    page_html = ""
     try:
         resp_page = http.request("GET", f"{BASE_HOST}{SIGN_IN_PAGE_PATH}", headers=common_headers)
         page_html = resp_page.text if resp_page else ""
@@ -460,6 +508,10 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
         )
         if m_activity and m_activity.group(1):
             activity_id = m_activity.group(1)
+        # 任务场次在 taskActivityInfo 节点下（键名与 activityInfo 不同，需独立正则）
+        m_task_act = re.search(r'"taskActivityInfo"\s*:\s*\{"activityId"\s*:\s*"(\d+)"', page_html)
+        if m_task_act and m_task_act.group(1):
+            task_activity_id = m_task_act.group(1)
     except Exception:
         pass
     if not activity_id:
@@ -467,6 +519,11 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
         print(f"  🗓️ 签到场次 activityId: {activity_id}（页面发现失败，使用内置兜底）")
     else:
         print(f"  🗓️ 签到场次 activityId: {activity_id}")
+    if not task_activity_id:
+        task_activity_id = TASK_ACTIVITY_ID
+        print(f"  🧩 任务场次 activityId: {task_activity_id}（页面发现失败，使用内置兜底）")
+    else:
+        print(f"  🧩 任务场次 activityId: {task_activity_id}")
 
     # 6. 查询签到详情
     print("  📋 查询签到状态与连签进度...")
@@ -494,8 +551,11 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
 
     if code == 200:
         sign_ok = True
-        gained_points = 10
-        print(f"  🎉 签到成功！获得 +10 积分")
+        gained_points = _resolve_sign_points(sign_res, sign_detail_data)
+        if gained_points:
+            print(f"  🎉 签到成功！获得 +{gained_points} 积分")
+        else:
+            print("  🎉 签到成功！")
     elif code in (5008, 1001, 1002) or is_already_signed(msg) or "已经签到" in msg or "已签到" in msg or "已完成" in msg:
         sign_ok = True
         print(f"  ℹ️ 今日已签到，跳过打卡 ({msg or '今日已完成签到'})")
@@ -520,8 +580,11 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
                     msg = sign_res.get("message", "") or sign_res.get("errorMessage", "")
                     if code == 200:
                         sign_ok = True
-                        gained_points = 10
-                        print(f"  🎉 重试签到成功！获得 +10 积分")
+                        gained_points = _resolve_sign_points(sign_res, sign_detail_data)
+                        if gained_points:
+                            print(f"  🎉 重试签到成功！获得 +{gained_points} 积分")
+                        else:
+                            print("  🎉 重试签到成功！")
                     elif code in (5008, 1001, 1002) or is_already_signed(msg):
                         sign_ok = True
                         print(f"  ℹ️ 重试确认今日已签到，跳过打卡")
@@ -560,34 +623,146 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
                 else:
                     print(f"  ℹ️ 领取结果: {draw_res.get('message', '未成功')}")
 
-    # 9. 日常赚积分任务（自动完成上报与一键领取奖励）
+    # 9. 日常赚积分任务（模拟 App 链路完成浏览任务并领取奖励）
     print("  🚀 获取日常赚积分任务列表...")
-    task_url = f"{BASE_HOST}/api/cn/oapi/marketing/task/queryTaskList?activityId={TASK_ACTIVITY_ID}&source=c"
-    resp_tasks = http.request("GET", task_url, headers=common_headers)
-    task_list_data = resp_tasks.json() if resp_tasks and resp_tasks.code == 200 else {}
-    task_dtos = []
-    if isinstance(task_list_data.get("data"), dict):
-        task_dtos = task_list_data["data"].get("taskDTOList", [])
+    task_url = f"{BASE_HOST}/api/cn/oapi/marketing/task/queryTaskList?activityId={task_activity_id}&source=c"
+
+    def _fetch_task_dtos() -> List[Dict[str, Any]]:
+        """拉取任务列表（queryTaskList 携带 timeStamp 头，与 App 抓包对齐；限短超时单次尝试）。"""
+        ts_ms = str(int(time.time() * 1000))
+        resp = http.request("GET", task_url, headers={**common_headers, "timeStamp": ts_ms}, timeout=15, retries=1)
+        list_data = resp.json() if resp and resp.code == 200 else {}
+        if isinstance(list_data.get("data"), dict):
+            return list_data["data"].get("taskDTOList", []) or []
+        return []
+
+    def _claim_award(task: Dict[str, Any], quiet: bool = False) -> Tuple[bool, int]:
+        """领取任务奖励 (status 2 -> 3)，返回 (是否入账, 积分)。
+
+        quiet=True 用于容错性尝试（App 端事件直领 / 二次补领），失败仅 info 不入失败行，
+        避免状态语义未完全逆向时污染报告 error_lines（规则：⚠️/❌ 行必须对应真实失败）。
+        """
+        t_id = task.get("taskId")
+        t_name = task.get("taskName", "未知任务")
+        award_url = (
+            f"{BASE_HOST}/api/cn/oapi/marketing/task/receiveAward?taskId={t_id}"
+            f"&activityId={task_activity_id}&creditsAddActionId={CREDITS_ADD_ACTION_ID}&business=1"
+        )
+        resp_award = http.request("GET", award_url, headers=common_headers, timeout=15, retries=1)
+        award_res = resp_award.json() if resp_award and resp_award.code == 200 else {}
+        aw_code = award_res.get("code")
+        aw_data = award_res.get("data") or {}
+        if aw_code == 200 and (aw_data.get("receiveStatus") or aw_data.get("awardValue")):
+            # 积分兜底顺序：响应 awardValue → 任务配置 pointsNum → 2
+            pts_fallback = 2
+            attach_cfg = task.get("awardAttachConfig") or {}
+            try:
+                pts_fallback = int(attach_cfg.get("pointsNum") or 2)
+            except (TypeError, ValueError):
+                pass
+            try:
+                pts = int(aw_data.get("awardValue") or pts_fallback)
+            except (TypeError, ValueError):
+                pts = pts_fallback
+            print(f"    🎉 领奖成功: {t_name} (+{pts} 积分)")
+            return True, pts
+        if aw_code == 1000005:
+            print(f"    ℹ️ 已领取或未达标: {t_name}")
+        elif quiet:
+            aw_msg = award_res.get("message") or award_res.get("errorMessage", "未知错误")
+            print(f"    ℹ️ 暂不可领: {t_name} ({aw_msg})")
+        else:
+            aw_msg = award_res.get("message") or award_res.get("errorMessage", "未知错误")
+            print(f"    ⚠️ 领奖失败: {t_name} ({aw_msg})")
+        return False, 0
+
+    task_dtos: List[Dict[str, Any]] = []
+    try:
+        task_dtos = _fetch_task_dtos()
+    except Exception:
+        pass
 
     task_success_cnt = 0
     task_total_points = 0
+    dwell_budget = 60.0  # 浏览驻留总预算（秒/账号），保护 registry 超时
+    # 任务阶段硬上限（覆盖落地页+驻留+上报+领奖+二次补领）：到点停止剩余任务，
+    # 为账号状态落盘与后续账号执行预留时间，防慢响应链耗尽 registry 超时被强杀
+    task_deadline = time.monotonic() + 90.0
+    claim_attempted: set = set()  # 已尝试过领奖的任务（首轮失败者交框架重试，二次补领不重复领取）
     if task_dtos:
         print(f"  📦 发现 {len(task_dtos)} 项活动任务，正在自动处理...")
         for t in task_dtos:
+            if time.monotonic() >= task_deadline:
+                print("    ⏭️ 任务阶段时限已到，跳过剩余任务（为状态保存与后续账号预留时间）")
+                break
             t_id = t.get("taskId")
             t_name = t.get("taskName", "未知任务")
             t_type = t.get("taskType", 1)
             t_status = t.get("taskStatus", 1)
+            user_event = t.get("userEventStatus")
 
             # 已完成并已领奖 (status 3: FINISHED)
             if t_status == 3:
                 print(f"    ℹ️ 今日已领奖: {t_name}")
                 continue
 
-            # 步骤一：未完成且为可直接上报的浏览类日常任务 (taskType == 1)，上报完成条件 (status 1: PREPARE_FINISH -> 2: GO_AWARD)
+            # 步骤零：App 端事件类任务（如打开消息通知）userEventStatus==1 表示完成事件已上报，
+            # 状态可能仍停在 1 —— 直接尝试领奖；状态语义未完全逆向，容错处理（quiet）
+            if user_event == 1 and t_status == 1 and t_id:
+                claim_attempted.add(str(t_id))
+                ok_claim, pts = _claim_award(t, quiet=True)
+                if ok_claim:
+                    task_success_cnt += 1
+                    task_total_points += pts
+                continue
+
+            # 步骤一：浏览类日常任务 (taskType == 1)：先 GET 落地页模拟打开并驻留 browseTime 秒
+            # （「浏览5秒可领奖励」），再上报完成 (status 1: PREPARE_FINISH -> 2: GO_AWARD)。
+            # 其余类型（预约/点赞/认证/首单等）需真实用户操作或存在风控/真实副作用，不自动化。
             if t_status == 1 and t_type == 1 and t_id:
-                report_url = f"{BASE_HOST}/api/cn/oapi/marketing/taskReport/signInOrShareTask?taskId={t_id}&activityId={TASK_ACTIVITY_ID}&taskType={t_type}"
-                resp_rep = http.request("GET", report_url, headers=common_headers)
+                link = (t.get("attachConfigTwo") or {}).get("link") or t.get("actionUrl") or ""
+                # 落地页 URL 来自远程任务列表（不可信输入）：仅当 https 且 host 属于商城域名
+                # （opposhop.cn 及其子域）时才携带账号凭据（Cookie/constToken）；第三方落地页
+                # 改用不带任何凭据的独立直连客户端模拟访问，防止 TOKENSID 泄漏给外部域。
+                # 请求显式限短超时（timeout=10）并单次尝试（retries=1），防慢响应 × 重试退避
+                # 耗尽 registry 时限；task_deadline 到点后跳过落地页与驻留直接上报
+                if link and dwell_budget > 0 and time.monotonic() < task_deadline:
+                    link_parts = urllib.parse.urlsplit(link)
+                    link_host = (link_parts.hostname or "").lower()
+                    trusted_link = link_parts.scheme == "https" and (
+                        link_host == "opposhop.cn" or link_host.endswith(".opposhop.cn")
+                    )
+                    try:
+                        if trusted_link:
+                            http.request(
+                                "GET",
+                                link,
+                                headers={**common_headers, "Referer": f"{BASE_HOST}{SIGN_IN_PAGE_PATH}?nightModelEnable=true&us=jifensdk&um=2435"},
+                                timeout=10,
+                                retries=1,
+                            )
+                        else:
+                            Http(proxy="", infer_proxy=False).request(
+                                "GET",
+                                link,
+                                headers={"User-Agent": APP_UA, "Accept": "text/html,application/xhtml+xml,*/*"},
+                                timeout=10,
+                                retries=1,
+                            )
+                    except Exception:
+                        pass
+                    try:
+                        browse_sec = int((t.get("attachConfigOne") or {}).get("browseTime") or 0)
+                    except (TypeError, ValueError):
+                        browse_sec = 0
+                    pause = max(0.0, min(browse_sec, 8)) + random.uniform(0.3, 1.5)
+                    pause = min(pause, dwell_budget)
+                    dwell_budget -= pause
+                    if pause > 0:
+                        time.sleep(pause)
+
+                report_url = f"{BASE_HOST}/api/cn/oapi/marketing/taskReport/signInOrShareTask?taskId={t_id}&activityId={task_activity_id}&taskType={t_type}"
+                resp_rep = http.request("GET", report_url, headers=common_headers, timeout=15, retries=1)
                 rep_res = resp_rep.json() if resp_rep and resp_rep.code == 200 else {}
                 if rep_res.get("code") == 200 and rep_res.get("data") == 200:
                     t_status = 2
@@ -600,24 +775,32 @@ def _run_account(cookie_str: str, index: int, total: int) -> Tuple[bool, str]:
                         continue
                 time.sleep(0.5)
 
-            # 步骤二：待领奖状态 (status 2: GO_AWARD)，调用 receiveAward 领取积分奖励 (2 -> 3)
+            # 步骤二：待领奖状态 (status 2: GO_AWARD)，领取积分奖励 (2 -> 3)；
+            # 非浏览类任务若被用户手动做到可领奖状态，也在此兜底领取
             if t_status == 2 and t_id:
-                award_url = f"{BASE_HOST}/api/cn/oapi/marketing/task/receiveAward?taskId={t_id}&activityId={TASK_ACTIVITY_ID}&creditsAddActionId={CREDITS_ADD_ACTION_ID}&business=1"
-                resp_award = http.request("GET", award_url, headers=common_headers)
-                award_res = resp_award.json() if resp_award and resp_award.code == 200 else {}
-                aw_code = award_res.get("code")
-                aw_data = award_res.get("data") or {}
-                if aw_code == 200 and (aw_data.get("receiveStatus") or aw_data.get("awardValue")):
-                    pts = int(aw_data.get("awardValue") or 2)
+                claim_attempted.add(str(t_id))
+                ok_claim, pts = _claim_award(t)
+                if ok_claim:
                     task_success_cnt += 1
                     task_total_points += pts
-                    print(f"    🎉 领奖成功: {t_name} (+{pts} 积分)")
-                elif aw_code == 1000005:
-                    print(f"    ℹ️ 已领取或未达标: {t_name}")
-                else:
-                    aw_msg = award_res.get("message") or award_res.get("errorMessage", "未知错误")
-                    print(f"    ⚠️ 领奖失败: {t_name} ({aw_msg})")
                 time.sleep(0.5)
+
+        # 步骤三：二次补领 —— 上报与领取间存在服务端状态流转延迟，收尾重查一次任务列表，
+        # 仅补领「新流转到待领奖 (status 2) 且首轮未尝试过领奖」的任务（单次重查，非轮询）；
+        # 首轮已尝试过领奖的失败任务不在脚本内重试，交由框架重试梯子处理；
+        # 任务阶段时限已到时整体跳过，为状态落盘与后续账号预留时间
+        if time.monotonic() < task_deadline:
+            try:
+                second_dtos = _fetch_task_dtos()
+                for t in second_dtos:
+                    t_id = t.get("taskId")
+                    if t.get("taskStatus") == 2 and t_id and str(t_id) not in claim_attempted:
+                        ok_claim, pts = _claim_award(t, quiet=True)
+                        if ok_claim:
+                            task_success_cnt += 1
+                            task_total_points += pts
+            except Exception:
+                pass
 
     # 10. 查询会员总积分资产
     total_credit = "未知"
@@ -695,6 +878,11 @@ def main() -> None:
     statuses: List[str] = []
 
     for idx, c in enumerate(cookies, 1):
+        # 多账号随机错峰：同 IP 连续打卡易构成设备聚类信号（遵循 modelscope 反聚类前例）
+        if idx > 1:
+            gap = random.uniform(10, 30)
+            print(f"\n⏳ 账号间随机错峰 {gap:.0f}s ...")
+            time.sleep(gap)
         try:
             ok, desc = _run_account(c, idx, total)
             if ok:
@@ -710,7 +898,8 @@ def main() -> None:
     print(f"🏁 执行完毕: 成功 {success_count}/{total} 个账号")
     print("=" * 50)
 
-    if success_count == 0:
+    # 任一账号失败即整体失败（对齐 ima 先例），交由框架重试梯子重跑；已签到账号幂等无副作用
+    if success_count < total:
         sys.exit(1)
 
 

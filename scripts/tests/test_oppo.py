@@ -7,17 +7,22 @@
 3. HeyTap Web SDK 规范 PKCE 密钥对生成 (codeVerifier, codeChallenge)
 4. 基于 acIdAuthSession 根凭据的 SSO 换票与会话更新全流程 Mock
 5. 凭证缺失或失效时的降级与异常处理
-6. report_fields 中 ex_oppo 的报告提取逻辑验证
+6. 签到奖励口径解析（响应 data → baseAwards 今日档位 → 无数值）
+7. 浏览任务链路（落地页驻留 → 上报 → 领奖 pointsNum 兜底）、userEventStatus 直领、二次补领
+8. 多账号循环错峰与任一失败退出码语义
+9. report_fields 中 ex_oppo 的报告提取逻辑验证（含实际 +N 积分口径）
 """
 from __future__ import annotations
 
 import base64
 import hashlib
 import json
+import os
 import sys
 import time
 import unittest
 import urllib.parse
+from datetime import datetime
 from http.cookiejar import CookieJar
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -26,6 +31,7 @@ BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
 import oppo
+from common import BJT
 from report_fields import extract_for
 
 
@@ -34,6 +40,25 @@ def _make_mock_jwt(payload: dict) -> str:
     payload_b64 = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("utf-8").rstrip("=")
     signature_b64 = base64.urlsafe_b64encode(b"synthetic_mock_sig").decode("utf-8").rstrip("=")
     return f"{header_b64}.{payload_b64}.{signature_b64}"
+
+
+def _make_fake_tokensid(exp_seconds: int) -> str:
+    """App 端 TOKENSID 形态（TOKEN_ 前缀 ECDSA JWT，毫秒级 exp）；合成夹具凭据一律 V1.0FAKE 语义。"""
+    header_b64 = base64.urlsafe_b64encode(json.dumps({"alg": "ECDSA", "v": "1"}).encode("utf-8")).decode("utf-8").rstrip("=")
+    payload_b64 = base64.urlsafe_b64encode(json.dumps({"exp": exp_seconds * 1000, "id": "1392822015", "idc": "V1.0FAKE"}).encode("utf-8")).decode("utf-8").rstrip("=")
+    signature_b64 = base64.urlsafe_b64encode(b"V1.0FAKE_synthetic_ecdsa_sig").decode("utf-8").rstrip("=")
+    return f"TOKEN_{header_b64}.{payload_b64}.{signature_b64}"
+
+
+# 合成签到页 HTML：含 activityInfo（签到场次）与 taskActivityInfo（任务场次）节点，验证动态发现
+_SYNTHETIC_PAGE_HTML = (
+    '<html><script>window.__PAGE_DATA__={"template":{'
+    '"SignIn_82c7796e":{"type":"SignIn","attr":{'
+    '"activityInfo":{"activityId":"2116078703745441792","activityName":"11月积分商城签到"}}},'
+    '"Task_9f2c1a3e":{"type":"Task","attr":{'
+    '"taskActivityInfo":{"activityId":"1919591795180969984","activityName":"【商城积分乐园】一次性成长任务"}}}'
+    "}}</script></html>"
+)
 
 
 class TestOppo(unittest.TestCase):
@@ -318,6 +343,478 @@ class TestOppo(unittest.TestCase):
         self.assertIn(("积分", 580.0), res["assets"])
         self.assertIn(("积分", 10.0), res["gains"])
         self.assertIn(("积分", 4.0), res["gains"])
+
+    # ---------- 签到奖励口径解析 ----------
+
+    def test_resolve_sign_points_prefers_response_data(self):
+        sign_res = {"code": 200, "data": {"awardValue": "2"}}
+        detail = {"data": {"baseAwards": [{"signTime": "2099-01-01", "awardType": 1, "awardValue": "5"}]}}
+        self.assertEqual(oppo._resolve_sign_points(sign_res, detail), 2)
+
+    def test_resolve_sign_points_falls_back_to_today_base_award(self):
+        today = datetime.now(BJT).strftime("%Y-%m-%d")
+        sign_res = {"code": 200, "data": None}
+        detail = {"data": {"baseAwards": [
+            {"signTime": "2026-11-01", "awardType": 1, "awardValue": "2"},
+            {"signTime": today, "awardType": 1, "awardValue": "2"},
+        ]}}
+        self.assertEqual(oppo._resolve_sign_points(sign_res, detail), 2)
+
+    def test_resolve_sign_points_ignores_coupon_and_nonpositive(self):
+        today = datetime.now(BJT).strftime("%Y-%m-%d")
+        # awardType 2 为券类（包邮券），不计积分；非今日档位忽略
+        detail = {"data": {"baseAwards": [
+            {"signTime": today, "awardType": 2, "awardValue": "包邮券"},
+            {"signTime": "2026-01-01", "awardType": 1, "awardValue": "9"},
+        ]}}
+        self.assertIsNone(oppo._resolve_sign_points({}, detail))
+
+    def test_resolve_sign_points_unknown_shape_returns_none(self):
+        self.assertIsNone(oppo._resolve_sign_points({"code": 200, "data": {"unknownField": 1}}, {}))
+        self.assertIsNone(oppo._resolve_sign_points({}, {}))
+
+    # ---------- 浏览任务链路 / 动态场次发现 ----------
+
+    @patch.object(oppo, "save_kv_state")
+    @patch.object(oppo, "load_kv_state")
+    @patch.object(oppo.time, "sleep")
+    @patch.object(oppo, "Http")
+    def test_run_account_browse_task_full_chain(self, mock_http_cls, mock_sleep, mock_load_state, mock_save_state):
+        """App 模式全链路：动态场次发现 → 落地页驻留 → 上报 → 领奖（pointsNum 兜底）。"""
+        mock_load_state.return_value = {}
+        mock_http = MagicMock()
+        mock_http_cls.return_value = mock_http
+        mock_http.jar = CookieJar()
+
+        tokensid = _make_fake_tokensid(int(time.time()) + 30 * 86400)
+        task = {
+            "taskId": "1111222233334444",
+            "taskName": "逛逛11.11主会场",
+            "taskType": 1,
+            "taskStatus": 1,
+            "userEventStatus": None,
+            "attachConfigOne": {"browseTime": 5},
+            "attachConfigTwo": {"link": "https://hd.opposhop.cn/bp/fakebrowsepage"},
+            "actionUrl": "https://hd.opposhop.cn/bp/fakebrowsepage",
+            "awardAttachConfig": {"pointsNum": "2"},
+        }
+        calls: list = []
+
+        def mock_request(method, url, **kwargs):
+            calls.append((method, url))
+            resp = MagicMock()
+            resp.code = 200
+            if "/bp/b371ce270f7509f0" in url:
+                resp.text = _SYNTHETIC_PAGE_HTML
+            elif "getSignInDetail" in url:
+                today = datetime.now(BJT).strftime("%Y-%m-%d")
+                resp.json.return_value = {"code": 200, "data": {
+                    "baseAwards": [{"signTime": today, "awardType": 1, "awardValue": "2"}],
+                    "cumulativeAwards": [],
+                }}
+            elif "cumulativeSignIn/signIn" in url:
+                # 响应不带可解析积分字段 → 回退 baseAwards 今日档位（2 分）
+                resp.json.return_value = {"code": 200, "data": {}}
+            elif "queryTaskList" in url:
+                resp.json.return_value = {"code": 200, "data": {"taskDTOList": [task]}}
+            elif "signInOrShareTask" in url:
+                resp.json.return_value = {"code": 200, "data": 200}
+            elif "receiveAward" in url:
+                # 响应无 awardValue → 回退任务配置 pointsNum=2
+                resp.json.return_value = {"code": 200, "data": {"receiveStatus": 1}}
+            elif "queryMemberCreditInfo" in url:
+                resp.json.return_value = {"code": 200, "data": {"amount": 12, "userLevel": 51}}
+            else:
+                resp.json.return_value = {}
+            return resp
+
+        mock_http.request.side_effect = mock_request
+
+        ok, desc = oppo._run_account(f"TOKENSID={tokensid}", 1, 1)
+        self.assertTrue(ok)
+        self.assertIn("刷完 1 个任务 (+2分)", desc)
+
+        joined = [u for _, u in calls]
+        # 场次动态发现：请求均使用页面 taskActivityInfo 中发现的任务场次
+        self.assertTrue(any("queryTaskList?activityId=1919591795180969984" in u for u in joined))
+        self.assertTrue(any("getSignInDetail?activityId=2116078703745441792" in u for u in joined))
+        # 链路顺序：落地页 GET → 上报 → 领奖
+        self.assertIn(("GET", "https://hd.opposhop.cn/bp/fakebrowsepage"), calls)
+        link_idx = next(i for i, (m, u) in enumerate(calls) if u.endswith("/bp/fakebrowsepage"))
+        report_idx = next(i for i, (m, u) in enumerate(calls) if "signInOrShareTask" in u)
+        award_idx = next(i for i, (m, u) in enumerate(calls) if "receiveAward" in u)
+        self.assertLess(link_idx, report_idx)
+        self.assertLess(report_idx, award_idx)
+
+    @patch.object(oppo, "save_kv_state")
+    @patch.object(oppo, "load_kv_state")
+    @patch.object(oppo.time, "sleep")
+    @patch.object(oppo, "Http")
+    def test_run_account_user_event_direct_claim(self, mock_http_cls, mock_sleep, mock_load_state, mock_save_state):
+        """userEventStatus==1（如打开通知）直领：成功入账 + 失败容错（无 ⚠️ 领奖失败行）。"""
+        mock_load_state.return_value = {}
+        mock_http = MagicMock()
+        mock_http_cls.return_value = mock_http
+        mock_http.jar = CookieJar()
+
+        tokensid = _make_fake_tokensid(int(time.time()) + 30 * 86400)
+        task = {
+            "taskId": "9999888877776666",
+            "taskName": "打开消息通知",
+            "taskType": 23,
+            "taskStatus": 1,
+            "userEventStatus": 1,
+            "awardAttachConfig": {"pointsNum": "20"},
+        }
+
+        def make_request(award_json):
+            def mock_request(method, url, **kwargs):
+                resp = MagicMock()
+                resp.code = 200
+                if "/bp/b371ce270f7509f0" in url:
+                    resp.text = _SYNTHETIC_PAGE_HTML
+                elif "getSignInDetail" in url:
+                    resp.json.return_value = {"code": 200, "data": {"cumulativeAwards": []}}
+                elif "cumulativeSignIn/signIn" in url:
+                    resp.json.return_value = {"code": 200, "data": {"awardValue": "2"}}
+                elif "queryTaskList" in url:
+                    resp.json.return_value = {"code": 200, "data": {"taskDTOList": [task]}}
+                elif "receiveAward" in url:
+                    resp.json.return_value = award_json
+                elif "queryMemberCreditInfo" in url:
+                    resp.json.return_value = {"code": 200, "data": {"amount": 20, "userLevel": 51}}
+                else:
+                    resp.json.return_value = {}
+                return resp
+            return mock_request
+
+        # 成功分支：直领入账 20 分，且未走 signInOrShareTask 上报
+        mock_http.request.side_effect = make_request({"code": 200, "data": {"receiveStatus": 1}})
+        ok, desc = oppo._run_account(f"TOKENSID={tokensid}", 1, 1)
+        self.assertTrue(ok)
+        self.assertIn("刷完 1 个任务 (+20分)", desc)
+        urls = [c.args[1] for c in mock_http.request.call_args_list]
+        self.assertFalse(any("signInOrShareTask" in u for u in urls))
+
+        # 失败分支：容错降级为 info（不得出现 ⚠️ 领奖失败，避免污染 error_lines）
+        mock_http.request.side_effect = make_request({"code": 500, "message": "系统繁忙"})
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ok2, desc2 = oppo._run_account(f"TOKENSID={tokensid}", 1, 1)
+        self.assertTrue(ok2)
+        self.assertIn("刷完 0 个任务 (+0分)", desc2)
+        self.assertNotIn("领奖失败", buf.getvalue())
+        self.assertIn("暂不可领", buf.getvalue())
+
+    @patch.object(oppo, "save_kv_state")
+    @patch.object(oppo, "load_kv_state")
+    @patch.object(oppo.time, "sleep")
+    @patch.object(oppo, "Http")
+    def test_run_account_second_pass_claim(self, mock_http_cls, mock_sleep, mock_load_state, mock_save_state):
+        """二次补领：首轮上报失败跳过的任务，收尾重查后状态流转到 2 时补领成功。"""
+        mock_load_state.return_value = {}
+        mock_http = MagicMock()
+        mock_http_cls.return_value = mock_http
+        mock_http.jar = CookieJar()
+
+        tokensid = _make_fake_tokensid(int(time.time()) + 30 * 86400)
+        task_first = {
+            "taskId": "5555666677778888",
+            "taskName": "浏览活动中心",
+            "taskType": 1,
+            "taskStatus": 1,
+            "attachConfigOne": {"browseTime": 0},
+            "attachConfigTwo": {},
+            "awardAttachConfig": {"pointsNum": "1"},
+        }
+        query_calls = {"n": 0}
+
+        def mock_request(method, url, **kwargs):
+            resp = MagicMock()
+            resp.code = 200
+            if "/bp/b371ce270f7509f0" in url:
+                resp.text = _SYNTHETIC_PAGE_HTML
+            elif "getSignInDetail" in url:
+                resp.json.return_value = {"code": 200, "data": {"cumulativeAwards": []}}
+            elif "cumulativeSignIn/signIn" in url:
+                resp.json.return_value = {"code": 200, "data": {"awardValue": "2"}}
+            elif "queryTaskList" in url:
+                query_calls["n"] += 1
+                dto = dict(task_first)
+                if query_calls["n"] >= 2:
+                    dto["taskStatus"] = 2  # 收尾重查时已流转到待领奖
+                resp.json.return_value = {"code": 200, "data": {"taskDTOList": [dto]}}
+            elif "signInOrShareTask" in url:
+                resp.json.return_value = {"code": 200, "data": 500, "message": "请先浏览页面后再上报"}
+            elif "receiveAward" in url:
+                resp.json.return_value = {"code": 200, "data": {"receiveStatus": 1}}
+            elif "queryMemberCreditInfo" in url:
+                resp.json.return_value = {"code": 200, "data": {"amount": 33, "userLevel": 51}}
+            else:
+                resp.json.return_value = {}
+            return resp
+
+        mock_http.request.side_effect = mock_request
+
+        ok, desc = oppo._run_account(f"TOKENSID={tokensid}", 1, 1)
+        self.assertTrue(ok)
+        self.assertIn("刷完 1 个任务 (+1分)", desc)
+        self.assertEqual(query_calls["n"], 2)
+
+    @patch.object(oppo, "save_kv_state")
+    @patch.object(oppo, "load_kv_state")
+    @patch.object(oppo.time, "sleep")
+    @patch.object(oppo, "Http")
+    def test_run_account_second_pass_skips_attempted_tasks(self, mock_http_cls, mock_sleep, mock_load_state, mock_save_state):
+        """首轮已尝试领奖的失败任务，二次补领不得在脚本内重试（交框架重试梯子）。"""
+        mock_load_state.return_value = {}
+        mock_http = MagicMock()
+        mock_http_cls.return_value = mock_http
+        mock_http.jar = CookieJar()
+
+        tokensid = _make_fake_tokensid(int(time.time()) + 30 * 86400)
+        task = {
+            "taskId": "2222333344445555",
+            "taskName": "浏览教育优惠",
+            "taskType": 1,
+            "taskStatus": 2,  # 直接处于待领奖状态
+            "attachConfigOne": {"browseTime": 0},
+            "attachConfigTwo": {},
+            "awardAttachConfig": {"pointsNum": "2"},
+        }
+        award_calls = {"n": 0}
+
+        def mock_request(method, url, **kwargs):
+            resp = MagicMock()
+            resp.code = 200
+            if "/bp/b371ce270f7509f0" in url:
+                resp.text = _SYNTHETIC_PAGE_HTML
+            elif "getSignInDetail" in url:
+                resp.json.return_value = {"code": 200, "data": {"cumulativeAwards": []}}
+            elif "cumulativeSignIn/signIn" in url:
+                resp.json.return_value = {"code": 200, "data": {"awardValue": "2"}}
+            elif "queryTaskList" in url:
+                resp.json.return_value = {"code": 200, "data": {"taskDTOList": [dict(task)]}}
+            elif "receiveAward" in url:
+                award_calls["n"] += 1
+                resp.json.return_value = {"code": 500, "message": "系统繁忙"}
+            elif "queryMemberCreditInfo" in url:
+                resp.json.return_value = {"code": 200, "data": {"amount": 4, "userLevel": 51}}
+            else:
+                resp.json.return_value = {}
+            return resp
+
+        mock_http.request.side_effect = mock_request
+
+        ok, desc = oppo._run_account(f"TOKENSID={tokensid}", 1, 1)
+        self.assertTrue(ok)
+        self.assertIn("刷完 0 个任务 (+0分)", desc)
+        self.assertEqual(award_calls["n"], 1)  # 首轮 1 次，二次补领不再重试
+
+    @patch.object(oppo, "save_kv_state")
+    @patch.object(oppo, "load_kv_state")
+    @patch.object(oppo.time, "sleep")
+    @patch.object(oppo, "Http")
+    def test_run_account_untrusted_landing_page_no_credentials(self, mock_http_cls, mock_sleep, mock_load_state, mock_save_state):
+        """第三方落地页不携带账号凭据（Cookie/constToken/sa_distinct_id），可信 opposhop.cn 域才带。"""
+        mock_load_state.return_value = {}
+        mock_http = MagicMock()
+        mock_http_cls.return_value = mock_http
+        mock_http.jar = CookieJar()
+
+        tokensid = _make_fake_tokensid(int(time.time()) + 30 * 86400)
+        task = {
+            "taskId": "3333444455556666",
+            "taskName": "参与互动赢好物",
+            "taskType": 1,
+            "taskStatus": 1,
+            "attachConfigOne": {"browseTime": 0},
+            "attachConfigTwo": {"link": "https://evil.example.com/promo"},
+            "actionUrl": "https://evil.example.com/promo",
+            "awardAttachConfig": {"pointsNum": "1"},
+        }
+
+        def mock_request(method, url, **kwargs):
+            resp = MagicMock()
+            resp.code = 200
+            if "/bp/b371ce270f7509f0" in url:
+                resp.text = _SYNTHETIC_PAGE_HTML
+            elif "getSignInDetail" in url:
+                resp.json.return_value = {"code": 200, "data": {"cumulativeAwards": []}}
+            elif "cumulativeSignIn/signIn" in url:
+                resp.json.return_value = {"code": 200, "data": {"awardValue": "2"}}
+            elif "queryTaskList" in url:
+                resp.json.return_value = {"code": 200, "data": {"taskDTOList": [task]}}
+            elif "signInOrShareTask" in url:
+                resp.json.return_value = {"code": 200, "data": 200}
+            elif "receiveAward" in url:
+                resp.json.return_value = {"code": 200, "data": {"receiveStatus": 1}}
+            elif "queryMemberCreditInfo" in url:
+                resp.json.return_value = {"code": 200, "data": {"amount": 2, "userLevel": 51}}
+            else:
+                resp.json.return_value = {}
+            return resp
+
+        mock_http.request.side_effect = mock_request
+        ok, desc = oppo._run_account(f"TOKENSID={tokensid}", 1, 1)
+        self.assertTrue(ok)
+
+        # 第三方落地页请求存在，且不携带任何账号凭据头（hostname 精确解析，不做 URL 子串匹配）
+        def _host(url: str) -> str:
+            return (urllib.parse.urlsplit(url).hostname or "").lower()
+
+        third_party = [c for c in mock_http.request.call_args_list if _host(c.args[1]) == "evil.example.com"]
+        self.assertTrue(third_party)
+        for call in third_party:
+            headers = call.kwargs.get("headers") or {}
+            self.assertNotIn("Cookie", headers)
+            self.assertNotIn("constToken", headers)
+            self.assertNotIn("sa_distinct_id", headers)
+
+        # 可信域（本测试中的签到页 hd.opposhop.cn）请求仍携带凭据头
+        trusted = [c for c in mock_http.request.call_args_list if _host(c.args[1]) == "hd.opposhop.cn"]
+        self.assertTrue(trusted)
+        self.assertTrue(any("Cookie" in (c.kwargs.get("headers") or {}) for c in trusted))
+
+    @patch.object(oppo, "save_kv_state")
+    @patch.object(oppo, "load_kv_state")
+    @patch.object(oppo.time, "sleep")
+    @patch.object(oppo.time, "monotonic")
+    @patch.object(oppo, "Http")
+    def test_run_account_task_deadline_stops_remaining(self, mock_http_cls, mock_mono, mock_sleep, mock_load_state, mock_save_state):
+        """任务阶段硬时限到点后：跳过剩余任务与二次补领（保护状态落盘与后续账号）。"""
+        mock_load_state.return_value = {}
+        mock_http = MagicMock()
+        mock_http_cls.return_value = mock_http
+        mock_http.jar = CookieJar()
+
+        clock = {"t": 1000.0}
+        mono_calls = {"n": 0}
+
+        def fake_monotonic():
+            mono_calls["n"] += 1
+            if mono_calls["n"] > 1:
+                clock["t"] = 1200.0  # deadline 初始化（首次调用 1000+90）之后，循环检查前越过时限
+            return clock["t"]
+
+        mock_mono.side_effect = fake_monotonic
+
+        tokensid = _make_fake_tokensid(int(time.time()) + 30 * 86400)
+        task = {
+            "taskId": "7777888899990000",
+            "taskName": "浏览新品平板",
+            "taskType": 1,
+            "taskStatus": 1,
+            "attachConfigOne": {"browseTime": 5},
+            "attachConfigTwo": {"link": "https://hd.opposhop.cn/bp/anotherpage"},
+            "awardAttachConfig": {"pointsNum": "1"},
+        }
+
+        def mock_request(method, url, **kwargs):
+            resp = MagicMock()
+            resp.code = 200
+            if "/bp/b371ce270f7509f0" in url:
+                resp.text = _SYNTHETIC_PAGE_HTML
+            elif "getSignInDetail" in url:
+                resp.json.return_value = {"code": 200, "data": {"cumulativeAwards": []}}
+            elif "cumulativeSignIn/signIn" in url:
+                resp.json.return_value = {"code": 200, "data": {"awardValue": "2"}}
+            elif "queryTaskList" in url:
+                resp.json.return_value = {"code": 200, "data": {"taskDTOList": [task]}}
+            elif "queryMemberCreditInfo" in url:
+                resp.json.return_value = {"code": 200, "data": {"amount": 2, "userLevel": 51}}
+            else:
+                resp.json.return_value = {}
+            return resp
+
+        mock_http.request.side_effect = mock_request
+
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ok, desc = oppo._run_account(f"TOKENSID={tokensid}", 1, 1)
+        self.assertTrue(ok)
+        self.assertIn("刷完 0 个任务 (+0分)", desc)
+        self.assertIn("任务阶段时限已到", buf.getvalue())
+        urls = [c.args[1] for c in mock_http.request.call_args_list]
+        self.assertFalse(any("signInOrShareTask" in u for u in urls))  # 剩余任务不再上报
+        self.assertFalse(any("receiveAward" in u for u in urls))  # 领奖与二次补领均停止
+        # queryTaskList 仅首轮 1 次（二次补领被时限跳过）
+        self.assertEqual(sum(1 for u in urls if "queryTaskList" in u), 1)
+
+    # ---------- 多账号循环 / 退出码语义 ----------
+
+    @patch.dict(os.environ, {"OPPO_COOKIE_1": "TOKENSID=V1.0FAKE_cookie_one", "OPPO_COOKIE_2": "TOKENSID=V1.0FAKE_cookie_two"})
+    @patch.object(oppo.time, "sleep")
+    def test_main_any_account_failure_exits_nonzero(self, mock_sleep):
+        """任一账号失败即整体失败（对齐 ima 先例），且两账号均被处理、账号间错峰生效。"""
+        with patch.object(oppo, "_run_account", side_effect=[(True, "ok1"), (False, "bad")]) as m_run:
+            with self.assertRaises(SystemExit) as cm:
+                oppo.main()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertEqual(m_run.call_count, 2)
+        self.assertTrue(mock_sleep.called)  # 账号 2 前有随机错峰等待
+
+    @patch.dict(os.environ, {"OPPO_COOKIE_1": "TOKENSID=V1.0FAKE_cookie_one", "OPPO_COOKIE_2": "TOKENSID=V1.0FAKE_cookie_two"})
+    @patch.object(oppo.time, "sleep")
+    def test_main_all_success_exits_zero(self, mock_sleep):
+        with patch.object(oppo, "_run_account", side_effect=[(True, "ok1"), (True, "ok2")]):
+            oppo.main()  # 不抛 SystemExit 即成功
+
+    # ---------- 报告提取：实际积分口径 ----------
+
+    def test_report_fields_ex_oppo_actual_points(self):
+        output = """
+[1/1] 👤 用户: 139***2015
+  🎉 签到成功！获得 +2 积分
+  💰 账户积分余额: 12 (Lv.51)
+"""
+        res = extract_for("oppo.py", output)
+        self.assertTrue(any("签到成功 (+2 积分)" in line for line in res["lines"]))
+        self.assertIn(("积分", 2.0), res["gains"])
+        self.assertIn(("reward", "签到 +2 积分"), res["badges"])
+        self.assertIn(("积分", 12.0), res["assets"])
+
+    def test_report_fields_ex_oppo_multi_account_task_isolation(self):
+        """多账号：任务完成数/积分按账号块独立归集（回归：不得把账号1的量累计到账号2行）。"""
+        output = """
+[1/2] 👤 用户: 100***434（张***）
+  🎉 签到成功！获得 +20 积分
+    🎉 领奖成功: 逛逛11.11主会场 (+1 积分)
+    🎉 领奖成功: 浏览活动中心 (+2 积分)
+  💰 账户积分余额: 552 (Lv.54)
+
+⏳ 账号间随机错峰 21s ...
+
+[2/2] 👤 用户: 139***2015
+  🎉 签到成功！获得 +2 积分
+    🎉 领奖成功: 浏览新品平板 (+1 积分)
+  💰 账户积分余额: 14 (Lv.51)
+==================================================
+🏁 执行完毕: 成功 2/2 个账号
+==================================================
+"""
+        res = extract_for("oppo.py", output)
+        self.assertTrue(any("完成 2 项日常任务 (+3分)" in line for line in res["lines"]))
+        self.assertTrue(any("完成 1 项日常任务 (+1分)" in line for line in res["lines"]))
+        self.assertEqual(
+            [g for g in res["gains"] if g[0] == "积分"],
+            [("积分", 20.0), ("积分", 3.0), ("积分", 2.0), ("积分", 1.0)],
+        )
+
+    def test_report_fields_ex_oppo_sign_without_points_number(self):
+        output = """
+[1/1] 👤 用户: 139***2015
+  🎉 签到成功！
+  💰 账户积分余额: 5 (Lv.51)
+"""
+        res = extract_for("oppo.py", output)
+        self.assertTrue(any("签到成功" in line and "+2" not in line and "+10" not in line for line in res["lines"]))
+        point_gains = [g for g in res["gains"] if g[0] == "积分" and g[1] not in (5.0,)]
+        self.assertEqual(point_gains, [])
 
 
 if __name__ == "__main__":
