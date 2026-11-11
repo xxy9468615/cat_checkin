@@ -501,8 +501,10 @@ def _growth_sign(h: Http, sk: str) -> Tuple[str, bool]:
             dd = _resp_dict(r2)
             if isinstance(dd.get("data"), int):
                 day = str(dd["data"])
-        except Exception:
-            pass
+        except Exception as exc:
+            # 签到天数只是展示增量，失败不改变「已签到」结论；但仍留 [diag]
+            # 便于排查（规则 7：不得有静默失败）
+            print(f"    [diag] signInNewInfo 未取得签到天数：{_mask_net_text(exc)}", flush=True)
         return ("今日已签" + (f"（本周第 {day} 天）" if day else ""), True)
     # 绝不回显服务端文案 / HTTP 码：天翼的 message 可能含「失败/错误」等词，
     # 401/403 也会命中 report_fields 的 _ERROR_KW，把健康账号误显示成失败行。
