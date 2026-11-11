@@ -1206,6 +1206,61 @@ def ex_cloud189(output: str, res: Dict[str, Any]) -> None:
         if mm:
             cur.parts.append(mm.group(1))
             continue
+        # 绿色成长体系（等级/成长值属周期收益口径，只进 parts + badge，绝不进 assets）
+        mm = re.search(r"• 成长任务:\s*(.+)", ln)
+        if mm:
+            body = mm.group(1)
+            gm = re.search(r"完成 (\d+) 项 \(\+(\d+) 绿值\)", body)
+            hm = re.search(r"待手动 (\d+) 项", body)
+            seg: List[str] = []
+            if gm:
+                seg.append(f"成长 {gm.group(1)} 项 +{gm.group(2)} 绿值")
+                res["badges"].append(("reward", f"成长任务 {gm.group(1)} 项"))
+                res["gains"].append(("绿值", float(gm.group(2))))
+            if hm:
+                seg.append(f"待手动 {hm.group(1)} 项")
+            if "今日已签" in body and not seg:
+                seg.append("绿签已达成")
+            if "未开启" in body and not seg:
+                seg.append("成长体系未开启")
+            if "今日无需处理" in body and not seg:
+                seg.append("成长任务今日无需处理")
+            if not seg:
+                seg.append("成长 " + _clean(body, 30))
+            cur.parts.append(" ".join(seg))
+            continue
+        mm = re.search(r"• 绿色等级:\s*(.+)", ln)
+        if mm:
+            body = mm.group(1)
+            lm = re.search(r"^(LV\d+)\s*(\S*)", body)
+            if lm:
+                lvl = f"{lm.group(1)} {lm.group(2)}".strip()
+                cur.parts.append(_clean(body, 34))
+                res["badges"].append(("info", lvl))
+            elif "未解锁" in body:
+                cur.parts.append(_clean(body, 34))
+            else:
+                cur.parts.append(_clean(body, 34))
+            continue
+        mm = re.search(r"• 等级奖励:\s*(.+)", ln)
+        if mm:
+            body = mm.group(1)
+            rm = re.search(r"已领 (\d+) 项", body)
+            hm = re.search(r"待手动 (\d+) 项", body)
+            seg = []
+            if rm:
+                seg.append(f"等级奖励 {rm.group(1)} 项")
+                res["badges"].append(("reward", f"等级奖励 {rm.group(1)} 项"))
+            if hm:
+                seg.append(f"待手动 {hm.group(1)} 项")
+            if "无可领" in body and not seg:
+                seg.append("等级奖励无可领")
+            if "未开启" in body and not seg:
+                seg.append("等级奖励未开启")
+            if not seg:
+                seg.append("等级奖励 " + _clean(body, 26))
+            cur.parts.append(" ".join(seg))
+            continue
     if cur:
         cur.flush(res)
     _add_summary(res, output)

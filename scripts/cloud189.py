@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # cron: 0 9 * * *
 # new Env("天翼云盘 签到")
-"""天翼云盘（cloud.189.cn）每日签到、三次抽奖与个人/家庭容量统计。
+"""天翼云盘（cloud.189.cn）每日签到、三次抽奖、绿色成长体系与个人/家庭容量统计。
 
 功能：
 1. 账号密码盲登（encryptConf.do 取公钥 → unifyLoginForPC 取登录参数 →
@@ -11,7 +11,10 @@
    彻底解决境外 CI Runner 直连阻断/超时（>300s）问题。
 3. 每日签到（mkt/userSign.action + sessionKey，TELEANDROID 客户端头）
 4. 三次抽奖（drawPrizeMarketDetails：摇一摇/相册/流动空间）
-5. 个人/家庭容量统计（portal/getUserSpaceInfo.action）
+5. 绿色成长体系（m.cloud.189.cn/market/*，2025-03 上线）：
+   绿色签到 + AI/绿动/气泡任务自动上报 + 绿值与绿色达人等级查询
+   + 已解锁等级权益（drawGreenRight）自动领取
+6. 个人/家庭容量统计（portal/getUserSpaceInfo.action）
 
 环境变量（按账号二选一，密码模式最优，免抓包、每次运行自动重登）：
 - CLOUD189_USERNAME_1 / CLOUD189_PASSWORD_1 ...（手机号+密码盲登，推荐）
@@ -24,6 +27,20 @@
    均改用「手机号+密码」每次运行重新登录来绕过 Cookie 过期；默认请走密码模式。
 2. 网页 localStorage 的 accessToken 与客户端会话体系不通用
    （getSessionForPC 对各 appId 均报 UserInvalidOpenToken），勿再尝试。
+3. 绿色成长体系鉴权事实（2026-11-10 实测）：除 getGreenLevelList 外，
+   /market/* 一律要求 m 域 COOKIE_LOGIN_USER（Set-Cookie 的 Domain 是
+   m.cloud.189.cn，无前导点）＋ sessionKey query 参数。密码模式需先用
+   ssoLoginMerge.action 补齐 m 域 Cookie；Cookie 模式注入的 Domain=.189.cn
+   （前导点）天然覆盖全部 .189.cn 子域，无需额外请求。全套接口形态来自
+   天翼云盘官方 H5 bundle（zt/2024/green-task-system/js/*.js）逆向，
+   /market/* 不需要 api.cloud.189.cn 那套 HMAC 签名头。
+4. 新人专属任务（taskType=1：开启相册自动备份 / 开启消息通知）的完成条件是
+   客户端设置项，H5 需借助 App JS-SDK 判定后才能上报，脚本无法代做 ——
+   只查询并如实报告「待手动」，绝不伪造完成态。
+5. 联调备忘：activityId 兜底值为 GREEN_ACTIVITY_ID（2024 场次）。接口对未知
+   activityId 返回业务 code 而非 404，无法凭无效 key 探测有效性；若等级/任务
+   行持续显示「鉴权不全」，先用真实账号手动访问 GREEN_PAGE 抓取页面注入的
+   activityId 后再改常量。
 """
 from __future__ import annotations
 
@@ -66,6 +83,20 @@ UA_MOBILE = (
 )
 REFERER_SIGN = "https://m.cloud.189.cn/zhuanti/2016/sign/index.jsp?albumBackupOpened=1"
 LOTTERY_TASKS = ["TASK_SIGNIN", "TASK_SIGNIN_PHOTOS", "TASK_2022_FLDFS_KJ"]
+
+# ---------- 绿色成长体系（m.cloud.189.cn/market/*，2025-03 上线） ----------
+MKT_URL = "https://m.cloud.189.cn"
+# 活动号兜底值。天翼 H5 从页面 window._ux_defaultOpts.activityId 动态注入，
+# 接口本身对未知/过期 activityId 会返回业务 code 而非 404，故无法预探测有效性；
+# 真实有效性需一次带凭据联调确认（见文件末尾「联调备忘」）。
+GREEN_ACTIVITY_ID = "ACT2024cztx"
+GREEN_PAGE = f"{MKT_URL}/zt/2024/green-task-system/index.html"
+# 可自动上报的任务类型：2=AI任务、3=绿动任务、5=成长气泡任务。
+# 1=新人专属任务（开启相册自动备份 / 开启消息通知），完成条件是客户端设置项，
+# H5 需借助 App JS-SDK（isOpenPhotoBackup / isSetMessagePush）判定后才能上报，
+# 脚本无法代做 → 只查询、只如实报告待手动数量，绝不伪造完成态。
+GREEN_TASK_TYPES = (2, 3, 5)
+
 
 
 def _resp_dict(resp: Any) -> Dict[str, Any]:
@@ -370,6 +401,287 @@ def _space(h: Http) -> str:
     return " · ".join(parts) if parts else "获取失败"
 
 
+# ---------- 绿色成长体系（任务 / 绿值等级 / 等级权益领取） ----------
+#
+# 鉴权事实（2026-11-10 实测）：除 getGreenLevelList 外，/market/* 动作接口一律依赖
+# m 域 COOKIE_LOGIN_USER（Set-Cookie Domain=m.cloud.189.cn）+ sessionKey query 参数。
+# getGreenLevelList 只认 sessionKey，是鉴权不全时仍可汇报等级的最后保障。
+# 全套接口形态来自天翼云盘官方 H5 bundle（zt/2024/green-task-system/js/*.js）逆向，
+# /market/* 不需要 api.cloud.189.cn 那套 HMAC 签名头。
+
+def _green_headers() -> Dict[str, str]:
+    """m 域 H5 请求头（全 ASCII：common.Http 会按 latin-1 过滤 header 值）。"""
+    return {
+        "User-Agent": UA_MOBILE,
+        "Referer": GREEN_PAGE,
+        "Accept": "application/json, text/plain, */*",
+    }
+
+
+def _ensure_growth_auth(h: Http, sk: str) -> bool:
+    """确保 m 域 Cookie 就绪（密码模式需 ssoLoginMerge 补齐一次）。
+
+    返回 True 表示 /market/* 动作接口可用。Cookie 模式下 _inject_cookie 种下的
+    Domain=.189.cn（前导点）本就能覆盖全部 .189.cn 子域，无需额外请求——
+    那种情况下 sessionKey 也为空，直接判定为不可用（Cookie 模式由调用方另行处理）。
+    """
+    if not sk:
+        return False
+    # 已持有 m 域 Cookie（Cookie 模式注入的 .189.cn 域即覆盖）→ 直接可用
+    if any(c.domain in (".189.cn", "m.cloud.189.cn") for c in h.jar):
+        return True
+    try:
+        h.request(
+            "GET",
+            f"{MKT_URL}/ssoLoginMerge.action?sessionKey={quote(sk, safe='')}"
+            f"&redirectUrl={quote(GREEN_PAGE, safe='')}&rand=6947_{int(time.time())}",
+            headers=_green_headers(), timeout=15, retries=1,
+        )
+    except Exception:
+        return False
+    ok = any(c.domain in (".189.cn", "m.cloud.189.cn") for c in h.jar)
+    if not ok:
+        print("    [diag] ssoLoginMerge 未取得 m 域 Cookie，成长任务降级为仅查等级", flush=True)
+    return ok
+
+
+def _growth_sign(h: Http, sk: str) -> Tuple[str, bool]:
+    """signInNew 绿色签到。返回 (文案, 是否达成)。
+
+    幂等由服务端 data/result 决定，不做字符串启发式。已签到时天翼返回
+    的仍是成功语义（H5 用同一次调用既签到又查状态），故不单独区分。
+    """
+    resp = h.request(
+        "GET",
+        f"{MKT_URL}/market/signInNew.action?sessionKey={quote(sk, safe='')}"
+        f"&activityId={GREEN_ACTIVITY_ID}",
+        headers=_green_headers(), timeout=15,
+    )
+    d = _resp_dict(resp)
+    code = str(d.get("code", ""))
+    if resp.code == 200 and code == "0":
+        day = ""
+        try:
+            r2 = h.request(
+                "GET",
+                f"{MKT_URL}/market/signInNewInfo.action?sessionKey={quote(sk, safe='')}"
+                f"&activityId={GREEN_ACTIVITY_ID}",
+                headers=_green_headers(), timeout=15,
+            )
+            dd = _resp_dict(r2)
+            if isinstance(dd.get("data"), int):
+                day = str(dd["data"])
+        except Exception:
+            pass
+        return ("今日已签" + (f"（本周第 {day} 天）" if day else ""), True)
+    msg = str(d.get("message") or d.get("errorMsg") or resp.code)
+    return f"绿色签到未达成（{msg[:30]}）", False
+
+
+def _do_green_task(h: Http, sk: str, task_id: str) -> Tuple[bool, int]:
+    """doGreenTask POST 上报单个任务。返回 (是否入账, 该任务减碳量 g)。
+
+    成功判据严格为 data 是布尔 True（对齐 H5：`if (true !== r) toast.fail(...)`），
+    任何非 True 的 data（含字符串 "true" 之外的对象/null）都不计入完成数。
+    """
+    form = {
+        "activityId": GREEN_ACTIVITY_ID,
+        "sessionKey": sk,
+        "taskId": str(task_id),
+    }
+    resp = h.request(
+        "POST",
+        f"{MKT_URL}/market/doGreenTask.action",
+        headers=_green_headers(), form=form, timeout=15,
+    )
+    d = _resp_dict(resp)
+    if resp.code == 200 and str(d.get("code", "")) == "0" and d.get("data") is True:
+        return True, 0
+    return False, 0
+
+
+def _growth_tasks(h: Http, sk: str) -> Tuple[str, int, int, int]:
+    """遍历可自动化的任务类型并上报。返回 (文案, 完成数, 累计绿值g, 待手动量)。
+
+    减碳量以任务列表里的 rewardValue 为准（上报响应不回收数值，属周期收益口径）。
+    taskType=1（新人任务）只统计未完成项作为「待手动」，绝不调 doGreenTask——
+    这是不可逾越的硬约束：那类任务的完成条件（开启相册自动备份 / 开启消息通知）
+    是客户端设置项，脚本代做等于伪造完成态。
+
+    每个 taskType 独立去重，不做跨类型 taskId 黑名单：服务端按类型分列表返回，
+    同一 taskId 落在不同类型里的语义不同，跨类型屏蔽会漏掉可自动化的任务。
+    """
+    done = 0
+    score = 0
+    manual = 0
+
+    for task_type in GREEN_TASK_TYPES + (1,):
+        automatable = task_type != 1
+        try:
+            resp = h.request(
+                "GET",
+                f"{MKT_URL}/market/getGreenTaskList.action?sessionKey={quote(sk, safe='')}"
+                f"&activityId={GREEN_ACTIVITY_ID}&random={random.random()}&taskType={task_type}",
+                headers=_green_headers(), timeout=15,
+            )
+            d = _resp_dict(resp)
+            items = d.get("data")
+            if not isinstance(items, list):
+                continue
+        except Exception:
+            continue
+        seen_in_type: set = set()
+        for t in items:
+            if not isinstance(t, dict):
+                continue
+            tid = str(t.get("taskId") or "")
+            if not tid or tid in seen_in_type:
+                continue
+            seen_in_type.add(tid)
+            if t.get("status") is True:
+                continue          # 已完成
+            if not automatable:
+                manual += 1       # 只如实报告，绝不上报
+                continue
+            try:
+                reward = int(t.get("rewardValue") or 0)
+            except (TypeError, ValueError):
+                reward = 0
+            ok, _ = _do_green_task(h, sk, tid)
+            if ok:
+                done += 1
+                score += reward
+    if done and manual:
+        text = f"完成 {done} 项 (+{score} 绿值) · 待手动 {manual} 项（App 内完成）"
+    elif done:
+        text = f"完成 {done} 项 (+{score} 绿值)"
+    elif manual:
+        text = f"待手动 {manual} 项（App 内完成）"
+    else:
+        text = "今日无需处理"
+    return text, done, score, manual
+
+
+def _growth_level(h: Http, sk: str) -> Tuple[str, str]:
+    """getGreenLevelList：返回 (等级展示文案, 当前等级号)。
+
+    本接口只认 sessionKey，鉴权不全时仍可汇报。等级展示格式对齐 H5 的
+    `${levelNo} ${levelName}`；未解锁时 H5 显示 levelName="未解锁"，
+    但「是否解锁」一律以 drawState 为准，不因文案误判。
+    """
+    resp = h.request(
+        "GET",
+        f"{MKT_URL}/market/getGreenLevelList.action?sessionKey={quote(sk, safe='')}"
+        f"&activityId={GREEN_ACTIVITY_ID}",
+        headers=_green_headers(), timeout=15,
+    )
+    d = _resp_dict(resp)
+    if resp.code != 200 or str(d.get("code", "")) != "0" or not isinstance(d.get("data"), dict):
+        return "", ""
+    data = d["data"]
+    try:
+        score = int(data.get("userScore") or 0)
+    except (TypeError, ValueError):
+        score = 0
+    levels = data.get("greenLevelList")
+    levels = levels if isinstance(levels, list) else []
+
+    # 当前等级 = 列表中最后一个 drawState=True 的等级（已解锁的最高级）。
+    # H5 的 processGreenLevelInfo 同样取「最后一个已解锁等级」作为用户当前等级。
+    cur: Dict[str, Any] = {}
+    cur_idx = -1
+    for i, lv in enumerate(levels):
+        if isinstance(lv, dict) and lv.get("drawState") is True:
+            cur, cur_idx = lv, i
+
+    nxt_score = ""
+    if 0 <= cur_idx < len(levels) - 1 and isinstance(levels[cur_idx + 1], dict):
+        try:
+            nxt_score = str(int(levels[cur_idx + 1].get("levelScore") or 0))
+        except (TypeError, ValueError):
+            nxt_score = ""
+
+    if cur:
+        no = str(cur.get("levelNo") or "")
+        name = str(cur.get("levelName") or "")
+        label = f"{no} {name}".strip()
+    else:
+        # 未解锁任一等级：H5 以第一个未解锁等级作为参照（levelName="未解锁"）
+        first = next((lv for lv in levels if isinstance(lv, dict)), {})
+        label = f"{str(first.get('levelNo') or '').strip()} 未解锁".strip()
+        try:
+            nxt_score = nxt_score or str(int(first.get("levelScore") or 0))
+        except (TypeError, ValueError):
+            pass
+
+    detail = f"绿值 {score}g"
+    if nxt_score:
+        detail += f"（下一级 {nxt_score}g）"
+    return f"{label} · {detail}" if label else "", str(cur.get("levelNo") or "")
+
+
+def _level_rewards(h: Http, sk: str, level_no: str) -> Tuple[str, int, int]:
+    """getGreenLevelRight + drawGreenRight：领取已解锁等级的权益。
+
+    返回 (文案, 领取数, 待手动量)。跳过两类不可自动领取的项：
+      - 已领（drawState 为真 或 rightState === 3，H5 两个等价判据）
+      - actionType 非空（1/2/3 = 站内跳转/小程序/外链），需前置动作
+    """
+    if not level_no:
+        return "未开启（鉴权不全）", 0, 0
+    resp = h.request(
+        "GET",
+        f"{MKT_URL}/market/getGreenLevelRight.action?sessionKey={quote(sk, safe='')}"
+        f"&activityId={GREEN_ACTIVITY_ID}&levelNo={level_no}",
+        headers=_green_headers(), timeout=15,
+    )
+    d = _resp_dict(resp)
+    items = d.get("data")
+    if resp.code != 200 or str(d.get("code", "")) != "0" or not isinstance(items, list):
+        return "未开启（鉴权不全）", 0, 0
+
+    claimed = 0
+    manual = 0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        prize_id = str(it.get("prizeId") or "")
+        if not prize_id:
+            continue
+        # 已领：H5 的 isDisabled 用 drawState，列表过滤用 rightState===3
+        if it.get("drawState") is True or it.get("rightState") == 3:
+            claimed += 0
+            continue
+        # 需前置动作的权益：只报告，不盲发领取请求
+        if it.get("actionType"):
+            manual += 1
+            continue
+        form = {
+            "activityId": GREEN_ACTIVITY_ID,
+            "sessionKey": sk,
+            "prizeId": prize_id,
+            "greenLevel": level_no,
+        }
+        r = h.request(
+            "POST",
+            f"{MKT_URL}/market/drawGreenRight.action",
+            headers=_green_headers(), form=form, timeout=15,
+        )
+        rd = _resp_dict(r)
+        if r.code == 200 and str(rd.get("code", "")) == "0" and rd.get("data"):
+            claimed += 1
+
+    if claimed and manual:
+        text = f"已领 {claimed} 项权益 · 待手动 {manual} 项（需前置动作）"
+    elif claimed:
+        text = f"已领 {claimed} 项权益"
+    elif manual:
+        text = f"待手动 {manual} 项（需前置动作）"
+    else:
+        text = "无可领权益"
+    return text, claimed, manual
+
+
 def _run_one(idx: int, total: int, username: str, password: str,
              cookie: str = "") -> Tuple[bool, str]:
     if idx > 1:
@@ -426,6 +738,37 @@ def _run_one(idx: int, total: int, username: str, password: str,
     ok = ok and sign_ok
     lines.append(f"• 抽奖: {_lotteries(active_h, sk)}")
     lines.append(f"• 空间: {_space(active_h)}")
+
+    # 绿色成长体系（增益子功能）：任何异常/接口不可用都不得拖垮账号判定，
+    # ok 仍只由 _sign 决定（oppo 任务阶段同款语义）。规则 6：脚本内不重试、
+    # 不做退避 sleep；交 orchestrator / circuit_breaker 的跨运行重试梯子处理。
+    # 文案一律避开「失败/失效/异常/错误/超时/无法」与「签到失败/处理失败/登录失败」
+    # （前者会被 report_fields._finalize 误捞进 error_lines，后者会让解析器把
+    #  整行判成账号级失败并清空账号块），故统一用「未开启 / 待手动 / 未达成」。
+    try:
+        auth_ready = _ensure_growth_auth(active_h, sk)
+        # getGreenLevelList 只认 sessionKey、免 m 域 Cookie，是鉴权不全时
+        # 仍能汇报等级的最后保障——因此等级行必须无条件尝试并占位。
+        level_line, level_no = _growth_level(active_h, sk)
+        if auth_ready:
+            gsign, _gok = _growth_sign(active_h, sk)
+            task_line, _done, _score, _manual = _growth_tasks(active_h, sk)
+            # 签到态与任务态合成一行：绿色签到本身也是成长任务的一环，
+            # 拆两行会让 ex_cloud189 的正则只命中后者、丢掉签到信息。
+            lines.append(f"• 成长任务: {gsign} · {task_line}")
+            reward_line, _c, _m = _level_rewards(active_h, sk, level_no)
+            lines.append(f"• 等级奖励: {reward_line}")
+        else:
+            lines.append("• 成长任务: 未开启（鉴权不全）")
+            lines.append("• 等级奖励: 未开启（鉴权不全）")
+        lines.append(f"• 绿色等级: {level_line or '未开启（鉴权不全）'}")
+    except Exception as exc:  # noqa: BLE001
+        # 兜底：成长体系整体异常时只留痕，不影响账号成败
+        print(f"    [diag] 成长体系未处理: {str(exc)[:80]}", flush=True)
+        lines.append("• 成长任务: 未开启（鉴权不全）")
+        lines.append("• 等级奖励: 未开启（鉴权不全）")
+        lines.append("• 绿色等级: 未开启（鉴权不全）")
+
     for ln in lines:
         print(f"  {ln}", flush=True)
     return ok, "；".join(lines)

@@ -136,6 +136,19 @@ EXPECT = {
         and "抽奖 天翼云盘50M空间 · 谢谢参与 · 5G流量包" in r["lines"][0]
         and "个人20.15G/60.00G" in r["lines"][0].replace(" ", "")
         and "家庭5.20G/30.00G" in r["lines"][0].replace(" ", "")
+        # 绿色成长体系：成长任务 / 等级奖励 / 等级行都要进摘要行，
+        # 且不得产生失败行或错误行（规则 9a(2) 的文案安全）
+        and "成长 2 项 +40 绿值" in r["lines"][0]
+        and "待手动 1 项" in r["lines"][0]
+        and "等级奖励 1 项" in r["lines"][0]
+        and "LV3 绿色达人" in r["lines"][0]
+        and "绿值 1250g" in r["lines"][0]
+        and r["fail_lines"] == []
+        and r["error_lines"] == []
+        # 周期收益走 gains，绝不走 assets（规则 9a(6)）
+        and ("绿值", 40.0) in r["gains"]
+        and r["assets"] == []
+        and ("info", "LV3 绿色达人") in r["badges"]
     ),
     "workbuddy-account-1": lambda r: (
         len(r["lines"]) == 1 and "连登13天" in r["lines"][0].replace(" ", "") and "算力 1176" in r["lines"][0]
