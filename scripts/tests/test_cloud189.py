@@ -902,5 +902,42 @@ class TestCloud189Growth(unittest.TestCase):
         self.assertFalse(cloud189._growth_session_alive(h, SK_FAKE))
 
 
+    # ---- 10. 业务码字段不统一：signInNew 用 status，其余多用 code ----
+
+    def test_biz_code_prefers_status_then_code(self):
+        """CI 实测（2026-11-11）暴露：/market/* 一族的成功码字段并不统一。
+        signInNew / signInNewInfo 原生返回 `status`，drawGreenRight /
+        getGreenLevelRight 用 `code`。只认 code 会把 status:0 的成功响应判成
+        失败（CI 上正是如此：绿色签到恒显示「未达成」，而 code 字段根本不存在）。
+        """
+        self.assertEqual(cloud189._biz_code({"status": 0, "result": True}), "0")
+        self.assertEqual(cloud189._biz_code({"status": "0"}), "0")
+        self.assertEqual(cloud189._biz_code({"code": "0", "data": {}}), "0")
+        # status 优先（H5 拦截器会把 status 归一成 code，本地不假设字段名）
+        self.assertEqual(cloud189._biz_code({"status": 5, "code": "0"}), "5")
+        # 都没有 → 空串（调用方据此判失败，不会误放行）
+        self.assertEqual(cloud189._biz_code({}), "")
+        self.assertEqual(cloud189._biz_code({"result": True}), "")
+
+    def test_growth_sign_accepts_status_zero_without_code_field(self):
+        """signInNew 返回 status:0 且完全没有 code 字段 → 必须判为签到成功。"""
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+
+        def _req(method, url, **_kw):
+            if "signInNewInfo" in url:
+                return SimpleNamespace(code=200, text="x",
+                                      json=lambda *a: {"status": 0, "data": 3})
+            return SimpleNamespace(code=200, text="x",
+                                   json=lambda *a: {"status": 0, "result": True})
+
+        h = MagicMock()
+        h.request.side_effect = _req
+        text, ok = cloud189._growth_sign(h, SK_FAKE)
+        self.assertTrue(ok)
+        self.assertIn("今日已签", text)
+        self.assertIn("第 3 天", text)
+
+
 if __name__ == "__main__":
     unittest.main()

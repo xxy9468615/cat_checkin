@@ -502,11 +502,27 @@ def _ensure_growth_auth(h: Http, sk: str) -> bool:
     return ok
 
 
+def _biz_code(d: Dict[str, Any]) -> str:
+    """取绿色成长体系的业务码。
+
+    /market/* 这一族的成功码字段并不统一：signInNew / signInNewInfo 用 `status`，
+    drawGreenRight / getGreenLevelRight 用 `code`，getGreenTaskList /
+    getGreenLevelList 又各有差异（H5 拦截器 k() 会把 code/res_code/status/
+    errorCode 归一并归一化，故前端只见 code）。本地不能假设字段名，
+    逐个尝试——CI 实测（2026-11-11）就因只认 code 把成功的 signInNew 判成未达成
+    （响应是 `status: 0`，code 字段根本不存在）。
+    """
+    for key in ("status", "code", "res_code"):
+        if key in d:
+            return str(d[key])
+    return ""
+
+
 def _growth_sign(h: Http, sk: str) -> Tuple[str, bool]:
     """signInNew 绿色签到。返回 (文案, 是否达成)。
 
-    幂等由服务端 data/result 决定，不做字符串启发式。已签到时天翼返回
-    的仍是成功语义（H5 用同一次调用既签到又查状态），故不单独区分。
+    H5 判据（bundle 实证）：`status === 0` 且 `result` 为真即为签到成功；
+    已签到时返回的仍是成功语义（同一次调用既签到又查状态），故不单独区分。
     """
     resp = h.request(
         "GET",
@@ -515,7 +531,7 @@ def _growth_sign(h: Http, sk: str) -> Tuple[str, bool]:
         headers=_green_headers(), timeout=15,
     )
     d = _resp_dict(resp)
-    code = str(d.get("code", ""))
+    code = _biz_code(d)
     if resp.code == 200 and code == "0":
         day = ""
         try:
@@ -536,7 +552,8 @@ def _growth_sign(h: Http, sk: str) -> Tuple[str, bool]:
     # 绝不回显服务端文案 / HTTP 码：天翼的 message 可能含「失败/错误」等词，
     # 401/403 也会命中 report_fields 的 _ERROR_KW，把健康账号误显示成失败行。
     # 具体原因只进 [diag] 行（该前缀会被 _NOISE_RE 过滤，不进报告）。
-    print(f"    [diag] signInNew 未达成：HTTP {resp.code} code={code} "
+    print(f"    [diag] signInNew 未达成：HTTP {resp.code} code={code or '(空)'} "
+          f"result={d.get('result')!r} "
           f"msg={_mask_net_text(d.get('message') or d.get('errorMsg'))}", flush=True)
     return "绿色签到未达成（接口未确认）", False
 
@@ -558,7 +575,7 @@ def _do_green_task(h: Http, sk: str, task_id: str) -> Tuple[bool, int]:
         headers=_green_headers(), form=form, timeout=15,
     )
     d = _resp_dict(resp)
-    if resp.code == 200 and str(d.get("code", "")) == "0" and d.get("data") is True:
+    if resp.code == 200 and _biz_code(d) == "0" and d.get("data") is True:
         return True, 0
     return False, 0
 
@@ -639,7 +656,7 @@ def _growth_level(h: Http, sk: str) -> Tuple[str, str]:
         headers=_green_headers(), timeout=15,
     )
     d = _resp_dict(resp)
-    if resp.code != 200 or str(d.get("code", "")) != "0" or not isinstance(d.get("data"), dict):
+    if resp.code != 200 or _biz_code(d) != "0" or not isinstance(d.get("data"), dict):
         return "", ""
     data = d["data"]
     try:
@@ -703,7 +720,7 @@ def _level_rewards(h: Http, sk: str, level_no: str) -> Tuple[str, int, int]:
     )
     d = _resp_dict(resp)
     items = d.get("data")
-    if resp.code != 200 or str(d.get("code", "")) != "0" or not isinstance(items, list):
+    if resp.code != 200 or _biz_code(d) != "0" or not isinstance(items, list):
         return "未开启（鉴权不全）", 0, 0
 
     claimed = 0
@@ -734,7 +751,7 @@ def _level_rewards(h: Http, sk: str, level_no: str) -> Tuple[str, int, int]:
             headers=_green_headers(), form=form, timeout=15,
         )
         rd = _resp_dict(r)
-        if r.code == 200 and str(rd.get("code", "")) == "0" and rd.get("data"):
+        if r.code == 200 and _biz_code(rd) == "0" and rd.get("data"):
             claimed += 1
 
     if claimed and manual:
