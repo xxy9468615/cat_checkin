@@ -40,7 +40,9 @@
 5. 联调备忘：activityId 兜底值为 GREEN_ACTIVITY_ID（2024 场次）。接口对未知
    activityId 返回业务 code 而非 404，无法凭无效 key 探测有效性；若等级/任务
    行持续显示「鉴权不全」，先用真实账号手动访问 GREEN_PAGE 抓取页面注入的
-   activityId 后再改常量。
+   activityId 后再改常量。注意仓库 CI 同时注入了账号密码与 Cookie，而 _run_one
+   中密码模式优先，故线上主路径是「密码盲登 → ssoLoginMerge 补 m 域 Cookie」，
+   排查时应重点看 [diag] 行里 ssoLoginMerge 的结果。
 """
 from __future__ import annotations
 
@@ -443,15 +445,18 @@ def _mask_net_text(value: Any) -> str:
 
 
 def _ensure_growth_auth(h: Http, sk: str) -> bool:
-    """确保 m 域 Cookie 就绪（密码模式需 ssoLoginMerge 补齐一次）。
+    """确保 m 域 Cookie 就绪，返回 True 表示 /market/* 动作接口可用。
 
-    返回 True 表示 /market/* 动作接口可用。Cookie 模式下 _inject_cookie 种下的
-    Domain=.189.cn（前导点）本就能覆盖全部 .189.cn 子域，无需额外请求——
-    那种情况下 sessionKey 也为空，直接判定为不可用（Cookie 模式由调用方另行处理）。
+    仓库 CI 同时注入 CLOUD189_USERNAME/PASSWORD 与 CLOUD189_COOKIE，而 _run_one
+    里密码模式优先（username+password 判定在前），所以线上主路径是「密码盲登 →
+    sessionKey → ssoLoginMerge 补 m 域 Cookie」。Cookie 模式仅在未配密码时生效：
+    _inject_cookie 种下的是 Domain=.189.cn（前导点），经 CookieJar 实测可覆盖
+    m.cloud.189.cn 等全部子域，天然满足鉴权、无需额外请求。
     """
     if not sk:
         return False
-    # 已持有 m 域 Cookie（Cookie 模式注入的 .189.cn 域即覆盖）→ 直接可用
+    # 已持有 m 域 Cookie（Cookie 模式注入的 .189.cn 前导点域即覆盖全部子域）
+    # → 无需任何额外请求，直接判定可用。
     if any(c.domain in (".189.cn", "m.cloud.189.cn") for c in h.jar):
         return True
     try:
@@ -461,7 +466,8 @@ def _ensure_growth_auth(h: Http, sk: str) -> bool:
             f"&redirectUrl={quote(GREEN_PAGE, safe='')}&rand=6947_{int(time.time())}",
             headers=_green_headers(), timeout=15, retries=1,
         )
-    except Exception:
+    except Exception as exc:
+        print(f"    [diag] ssoLoginMerge 请求异常：{_mask_net_text(exc)}", flush=True)
         return False
     ok = any(c.domain in (".189.cn", "m.cloud.189.cn") for c in h.jar)
     if not ok:

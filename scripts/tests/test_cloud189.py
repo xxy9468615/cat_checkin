@@ -518,6 +518,43 @@ class TestCloud189Growth(unittest.TestCase):
             self.assertNotIn(kw, text, f"服务端 levelName 泄出了禁词 {kw!r}")
         self.assertIn("LV2", text)          # 等级号仍如实呈现
 
+    # ---- 5c. Cookie 模式（仅配 CLOUD189_COOKIE_*，无密码） ----
+
+    def test_growth_auth_cookie_mode_needs_no_sso_request(self):
+        """Cookie 模式：_inject_cookie 种下的 Domain=.189.cn 前导点域经 CookieJar
+        实测覆盖 m.cloud.189.cn，故成长体系鉴权不应再发 ssoLoginMerge 请求。
+
+        用户确认 GH 已存 CLOUD189_COOKIE_1，此路径是「未配密码」时的实际形态。
+        """
+        import time
+        from http.cookiejar import Cookie, CookieJar
+        from unittest.mock import MagicMock
+
+        calls = []
+
+        def _req(method, url, **_kw):
+            calls.append((method, url))
+            from types import SimpleNamespace
+            return SimpleNamespace(code=200, text="x", json=lambda *_a: {})
+
+        h = MagicMock()
+        h.request.side_effect = _req
+        # 必须用真实 CookieJar：MagicMock 的 .jar 不会真存 Cookie，
+        # 而 _ensure_growth_auth 判的是 jar 里的 domain 覆盖关系。
+        h.jar = CookieJar()
+        # 复刻 _inject_cookie 的落 jar 形态：Domain=.189.cn（前导点）
+        h.jar.set_cookie(Cookie(
+            version=0, name="COOKIE_LOGIN_USER", value="V1.0FAKE_COOKIE_VALUE",
+            port=None, port_specified=False, domain=".189.cn", domain_specified=True,
+            domain_initial_dot=True, path="/", path_specified=True, secure=False,
+            expires=int(time.time()) + 86400, discard=False, comment=None,
+            comment_url=None, rest={}, rfc2109=False,
+        ))
+        ok = cloud189._ensure_growth_auth(h, "V1.0FAKE_SESSION_KEY")
+        self.assertTrue(ok)
+        # 未发任何请求即判定可用
+        self.assertEqual(calls, [])
+
     # ---- 6. 文案安全（规则 9a(2) + 防解析器误判账号失败） ----
 
     _ERROR_KW = ("失败", "失效", "异常", "错误", "401", "403", "超时", "无法", "Traceback")
