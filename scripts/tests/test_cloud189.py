@@ -38,14 +38,14 @@ class TestCloud189(unittest.TestCase):
 
     def test_rsa_encrypt_format(self):
         """产出应为 128 字节（256 hex）的纯十六进制，符合 PKCS#1 v1.5。"""
-        out = cloud189._rsa_encrypt_hex(PUBKEY_1024, "13800138000")
+        out = cloud189._rsa_encrypt_hex(PUBKEY_1024, "V1.0FAKE_ACCOUNT")
         self.assertEqual(len(out), 256)
         self.assertRegex(out, r"^[0-9a-f]{256}$")
 
     def test_rsa_encrypt_differs_per_call(self):
         """随机填充下相同明文两次加密结果不同（确认 PKCS#1 v1.5 盲化生效）。"""
-        a = cloud189._rsa_encrypt_hex(PUBKEY_1024, "13800138000")
-        b = cloud189._rsa_encrypt_hex(PUBKEY_1024, "13800138000")
+        a = cloud189._rsa_encrypt_hex(PUBKEY_1024, "V1.0FAKE_ACCOUNT")
+        b = cloud189._rsa_encrypt_hex(PUBKEY_1024, "V1.0FAKE_ACCOUNT")
         self.assertNotEqual(a, b)
 
     def test_cloud189_reuses_cn_proxy(self):
@@ -89,7 +89,7 @@ class TestCloud189(unittest.TestCase):
         h.request.side_effect = fake_request
         with patch.object(cloud189, "_resp_dict", side_effect=lambda r: r.json.return_value):
             with self.assertRaises(RuntimeError) as ctx:
-                cloud189._login(h, "13800138000", "pw")
+                cloud189._login(h, "V1.0FAKE_ACCOUNT", "V1.0FAKE_PASS")
         msg = str(ctx.exception)
         self.assertIn("-1", msg)
         self.assertIn("网络层异常", msg)
@@ -127,7 +127,7 @@ class TestCloud189(unittest.TestCase):
              patch.object(cloud189, "_sign", return_value=("签到成功", True)), \
              patch.object(cloud189, "_lotteries", return_value="无"), \
              patch.object(cloud189, "_space", return_value="10G/100G"):
-            ok, _summary = cloud189._run_one(1, 1, "13800138000", "pw")
+            ok, _summary = cloud189._run_one(1, 1, "V1.0FAKE_ACCOUNT", "V1.0FAKE_PASS")
 
         self.assertTrue(ok)
         # 直连兜底被触达（两个代理都失败后轮换到了 None 候选）
@@ -673,7 +673,7 @@ class TestCloud189Growth(unittest.TestCase):
              patch.object(cloud189, "_sign", return_value=("【成功】+30M 空间", True)), \
              patch.object(cloud189, "_lotteries", return_value="无"), \
              patch.object(cloud189, "_space", return_value="10G/100G"):
-            ok, summary = cloud189._run_one(1, 1, "13800138000", "pw")
+            ok, summary = cloud189._run_one(1, 1, "V1.0FAKE_ACCOUNT", "V1.0FAKE_PASS")
 
         self.assertTrue(ok)
         self.assertIn("• 成长任务:", summary)
@@ -716,17 +716,20 @@ class TestCloud189Growth(unittest.TestCase):
              patch.object(cloud189, "_growth_tasks",
                           return_value=("完成 2 项 (+30 绿值)", 2, 30, 1)), \
              patch.object(cloud189, "_level_rewards", side_effect=boom):
-            ok, summary = cloud189._run_one(1, 1, "13800138000", "pw")
+            ok, summary = cloud189._run_one(1, 1, "V1.0FAKE_ACCOUNT", "V1.0FAKE_PASS")
 
         # 账号判定不受影响
         self.assertTrue(ok)
-        # 每个成长行只出现一次
+        # 每个成长行只出现一次（不重复、不矛盾）
         self.assertEqual(summary.count("• 成长任务:"), 1)
         self.assertEqual(summary.count("• 等级奖励:"), 1)
         self.assertEqual(summary.count("• 绿色等级:"), 1)
-        # 且结论一致：只保留占位行，不混入已成功的任务行
-        self.assertIn("成长任务: 未开启（鉴权不全）", summary)
-        self.assertNotIn("完成 2 项", summary)
+        # 已确认的成长任务结果必须保留（CodeRabbit Major：后续异常不得抹掉已得的绿值）
+        self.assertIn("完成 2 项 (+30 绿值)", summary)
+        self.assertIn("今日已签", summary)
+        # 仅未完成的步骤得占位行
+        self.assertIn("等级奖励: 未开启（鉴权不全）", summary)
+        self.assertIn("绿色等级: 未开启（鉴权不全）", summary)
 
 
     # ---- 9. _growth_sign 与 _ensure_growth_auth 的直接用例 ----
@@ -937,6 +940,32 @@ class TestCloud189Growth(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("今日已签", text)
         self.assertIn("第 3 天", text)
+
+
+    # ---- 11. 诊断行不得泄漏进报告（CodeRabbit #14：缩进 diag 仍可能命中 _ERROR_KW） ----
+
+    def test_diag_lines_are_not_parsed_as_failures(self):
+        """ex_cloud189 必须自行跳过 [diag] 行。
+
+        _finalize 的兜底扫描只认「行首即 [diag]」的行，而任务脚本的 diag 是
+        「    [diag] ...」带缩进；文案里一旦带 401/403 等字样，_ERROR_KW 依然
+        可能命中它，把健康账号显示成失败。专属解析器先排掉是最稳的一道闸。
+        """
+        from report_fields import extract_for
+        out = (
+            "    [diag] signInNew 未达成：HTTP 403 code=403 msg=Unauthorized\n"
+            "    [diag] m 域会话未就绪（jar: COOKIE_LOGIN_USER@.189.cn=88B）\n"
+            "[1/1] 👤 用户: 【1***4】\n"
+            "  • 签到: 【成功】+30M 空间\n"
+            "  • 成长任务: 今日已签（本周第 1 天） · 今日无需处理\n"
+            "  • 绿色等级: LV1 绿色达人 · 绿值 732g（下一级 1000g）\n"
+            "✅ 全部 1 个账号处理完成 (成功 1/1)\n"
+        )
+        res = extract_for("cloud189.py", out)
+        self.assertEqual(res["fail_lines"], [])
+        self.assertEqual(res["error_lines"], [])
+        self.assertEqual(len(res["lines"]), 1)
+        self.assertIn("LV1 绿色达人", res["lines"][0])
 
 
 if __name__ == "__main__":

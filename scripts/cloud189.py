@@ -551,10 +551,13 @@ def _growth_sign(h: Http, sk: str) -> Tuple[str, bool]:
         return ("今日已签" + (f"（本周第 {day} 天）" if day else ""), True)
     # 绝不回显服务端文案 / HTTP 码：天翼的 message 可能含「失败/错误」等词，
     # 401/403 也会命中 report_fields 的 _ERROR_KW，把健康账号误显示成失败行。
-    # 具体原因只进 [diag] 行（该前缀会被 _NOISE_RE 过滤，不进报告）。
-    print(f"    [diag] signInNew 未达成：HTTP {resp.code} code={code or '(空)'} "
-          f"result={d.get('result')!r} "
-          f"msg={_mask_net_text(d.get('message') or d.get('errorMsg'))}", flush=True)
+    # 具体原因只进 [diag] 行——但 [diag] 也不能放裸 HTTP 码：
+    # _finalize 的兜底扫描只按 _NOISE_RE 过滤「行首是 [diag]」的行，而这里
+    # 行首是缩进+[diag]，若文案里再带 403 仍会被 _ERROR_KW 命中
+    # （CodeRabbit #14 指出的真实路径）。故诊断码一律转成不可命中的写法。
+    print(f"    [diag] signInNew 未达成：biz_code={code or '(空)'} "
+          f"result={str(d.get('result'))[:12]} "
+          f"hint={_mask_net_text(d.get('message') or d.get('errorMsg'))}", flush=True)
     return "绿色签到未达成（接口未确认）", False
 
 
@@ -842,24 +845,32 @@ def _run_one(idx: int, total: int, username: str, password: str,
         # getGreenLevelList 只认 sessionKey、免 m 域 Cookie，是鉴权不全时
         # 仍能汇报等级的最后保障——因此等级行必须无条件尝试并占位。
         level_line, level_no = _growth_level(active_h, sk)
+        done_task = done_reward = False
         if auth_ready:
             gsign, _gok = _growth_sign(active_h, sk)
             task_line, _done, _score, _manual = _growth_tasks(active_h, sk)
             # 签到态与任务态合成一行：绿色签到本身也是成长任务的一环，
             # 拆两行会让 ex_cloud189 的正则只命中后者、丢掉签到信息。
             growth_lines.append(f"• 成长任务: {gsign} · {task_line}")
+            done_task = True
             reward_line, _c, _m = _level_rewards(active_h, sk, level_no)
             growth_lines.append(f"• 等级奖励: {reward_line}")
+            done_reward = True
         else:
             growth_lines.append("• 成长任务: 未开启（鉴权不全）")
             growth_lines.append("• 等级奖励: 未开启（鉴权不全）")
         growth_lines.append(f"• 绿色等级: {level_line or '未开启（鉴权不全）'}")
         lines.extend(growth_lines)
     except Exception as exc:  # noqa: BLE001
-        # 兜底：成长体系整体异常时只留痕，不影响账号成败
-        print(f"    [diag] 成长体系未处理：{_mask_net_text(exc)}", flush=True)
-        lines.append("• 成长任务: 未开启（鉴权不全）")
-        lines.append("• 等级奖励: 未开启（鉴权不全）")
+        # 兜底：只对**尚未完成**的步骤输出占位行，已确认的结果必须保留。
+        # 中途异常（如任务已上报、查权益时链路抖动）不等于整个体系不可用，
+        # 把已得的绿值和等级一并抹成「未开启」会丢失真实收益（CodeRabbit Major）。
+        print(f"    [diag] 成长体系部分未处理：{_mask_net_text(exc)}", flush=True)
+        lines.extend(growth_lines)          # 先落已确认的部分
+        if not done_task:
+            lines.append("• 成长任务: 未开启（鉴权不全）")
+        if not done_reward:
+            lines.append("• 等级奖励: 未开启（鉴权不全）")
         lines.append("• 绿色等级: 未开启（鉴权不全）")
 
     for ln in lines:

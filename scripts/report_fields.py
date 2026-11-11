@@ -1169,10 +1169,16 @@ def ex_modelscope(output: str, res: Dict[str, Any]) -> None:
 
 
 def ex_cloud189(output: str, res: Dict[str, Any]) -> None:
-    """天翼云盘：👤 用户: 【xx】 + • 签到 / 抽奖 / 空间 行。"""
+    """天翼云盘：👤 用户: 【xx】 + • 签到 / 抽奖 / 空间 / 成长体系 行。"""
     cur: Any = None
     for raw in output.splitlines():
         ln = raw.strip()
+        # 诊断行先跳过：_finalize 的兜底扫描只认「行首即 [diag]」，而任务脚本的
+        # diag 行是「    [diag] ...」（带缩进），strip 后虽以 [diag] 开头，但
+        # 文案里若带 401/403 等字样，_ERROR_KW 依然可能命中它。专属解析器自己
+        # 先排掉是最稳的一道闸（CodeRabbit #14 指出的真实路径）。
+        if ln.startswith("[diag]"):
+            continue
         m = re.search(r"👤 用户:\s*【(.+?)】", ln)
         if m:
             if cur:
