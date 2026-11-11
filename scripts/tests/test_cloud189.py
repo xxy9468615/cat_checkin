@@ -1311,5 +1311,51 @@ class TestCloud189Growth(unittest.TestCase):
         self.assertIn("领取未确认 1 项", text)
 
 
+    def test_growth_tasks_non_list_data_is_not_query_failure(self):
+            """不同 taskType 返回结构并不一致（如气泡任务走另一接口函数）。
+
+            data 非 list 只表示该类无任务，**不是**查询失败——真实 CI 实测就出现过
+            因此误报「列表未确认 1 类」。只有 HTTP 非 200 / 业务码非 0 才算未确认。
+            """
+            import urllib.parse as up
+            from unittest.mock import MagicMock
+            from types import SimpleNamespace
+
+            def _req(method, url, form=None, **_kw):
+                qs = up.parse_qs(up.urlsplit(url).query)
+                tt = (qs.get("taskType") or [""])[0]
+                if tt == "5":
+                    # 气泡任务返回对象结构（非 list）
+                    return SimpleNamespace(code=200, text="x",
+                                          json=lambda *_a: {"status": 0, "data": {}})
+                return SimpleNamespace(code=200, text="x",
+                                      json=lambda *_a: {"status": 0, "data": []})
+
+            h = MagicMock()
+            h.request.side_effect = _req
+            text, done, score, manual = cloud189._growth_tasks(h, SK_FAKE)
+            self.assertNotIn("列表未确认", text)
+            self.assertEqual(text, "今日无需处理")
+
+    def test_growth_tasks_list_query_failure_is_reported(self):
+        """HTTP 非 200 / 业务码非 0 才计为列表未确认，并禁止报「今日无需处理」。"""
+        import urllib.parse as up
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+
+        for mode in ("http500", "bizcode"):
+            def _req(method, url, form=None, **_kw):
+                if mode == "http500":
+                    return SimpleNamespace(code=500, text="", json=lambda *_a: {})
+                return SimpleNamespace(code=200, text="x",
+                                      json=lambda *_a: {"status": 9, "data": []})
+
+            h = MagicMock()
+            h.request.side_effect = _req
+            text, _d, _s, _m2 = cloud189._growth_tasks(h, SK_FAKE)
+            self.assertNotIn("今日无需处理", text, f"mode={mode}")
+            self.assertIn("列表未确认 4 类", text, f"mode={mode}")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -665,13 +665,20 @@ def _growth_tasks(h: Http, sk: str) -> Tuple[str, int, int, int]:
             continue
         d = _resp_dict(resp)
         items = d.get("data")
-        # 三条都成立才算「查询确认过」：HTTP 200 + 业务码 0 + data 是列表。
-        # 少任一条件就计入未确认——否则四次查询全 500 时函数会返回
-        # 「今日无需处理」，把「根本没查到」谎报成「确认无事可做」。
-        if resp.code != 200 or _biz_code(d) != "0" or not isinstance(items, list):
+        # 「查询确认过」= HTTP 200 + 业务码 0。两者任一不成立才算未确认——
+        # 否则四次全 500 时会返回「今日无需处理」，把「根本没查到」谎报成
+        # 「确认无事可做」。
+        #
+        # 注意不要把「data 不是 list」也算未确认：不同 taskType 的返回结构并不
+        # 一致（如成长气泡 taskType=5 走的是另一个接口函数），非 list 或空对象
+        # 表示该类没有可处理任务，不是查询失败。真实 CI 实测就出现过因此误报
+        # 「列表未确认 1 类」。
+        if resp.code != 200 or _biz_code(d) != "0":
             list_failed += 1
             continue
         list_ok += 1
+        if not isinstance(items, list):
+            continue            # 该类无任务（结构不同 ≠ 查询失败）
         seen_in_type: set = set()
         for t in items:
             if not isinstance(t, dict):
