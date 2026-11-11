@@ -1238,6 +1238,11 @@ def ex_cloud189(output: str, res: Dict[str, Any]) -> None:
                 seg.append("成长体系未开启")
             if "今日无需处理" in body and not seg:
                 seg.append("成长任务今日无需处理")
+            # 「上报未确认」是独立状态：不能因 not seg 兜底成「成长 xxx」，
+            # 更不能被误读成无事可做
+            um = re.search(r"上报未确认 (\d+) 项", body)
+            if um:
+                seg.append(f"上报未确认 {um.group(1)} 项")
             if not seg:
                 seg.append("成长 " + _clean(body, 30))
             cur.parts.append(" ".join(seg))

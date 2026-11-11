@@ -1085,5 +1085,66 @@ class TestCloud189Growth(unittest.TestCase):
         self.assertEqual(f("V1.0FAKE_LONG_STRING"), "other")
 
 
+    # ---- 13. 全部上报异常/被拒时不得报「今日无需处理」（假确认） ----
+
+    def test_growth_tasks_all_failed_reports_unconfirmed(self):
+        """所有上报都异常或被拒时，文案必须是「上报未确认 N 项」。
+
+        否则 done=manual=0 会落到「今日无需处理」，把未确认的任务说成无事可做
+        ——规则 9a(1) 禁止的假确认（CodeRabbit 指出的真实路径）。
+        """
+        import urllib.parse as up
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+
+        tasks = [
+            {"taskId": "V1.0FAKE_T1", "taskName": "a", "rewardValue": 10, "status": False},
+            {"taskId": "V1.0FAKE_T2", "taskName": "b", "rewardValue": 20, "status": False},
+        ]
+        by_type = {"2": tasks, "3": [], "5": [], "1": []}
+
+        for mode in ("raise", "reject"):
+            def _req(method, url, form=None, **_kw):
+                if "doGreenTask" in url:
+                    if mode == "raise":
+                        raise OSError("IncompleteRead")
+                    return SimpleNamespace(code=200, text="x",
+                                          json=lambda *_a: {"status": 1002, "data": None})
+                qs = up.parse_qs(up.urlsplit(url).query)
+                tt = (qs.get("taskType") or [""])[0]
+                return SimpleNamespace(
+                    code=200, text="x",
+                    json=lambda *_a, _d=by_type.get(tt, []): {"status": 0, "data": _d})
+
+            h = MagicMock()
+            h.request.side_effect = _req
+            text, done, score, manual = cloud189._growth_tasks(h, SK_FAKE)
+            self.assertNotIn("今日无需处理", text, f"mode={mode} 不得报无事可做")
+            self.assertIn("上报未确认 2 项", text, f"mode={mode}")
+            self.assertEqual((done, score, manual), (0, 0, 0))
+
+    def test_growth_tasks_no_unfinished_reports_nothing_to_do(self):
+        """全部 status=True 时才允许报「今日无需处理」。"""
+        import urllib.parse as up
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+
+        tasks = [{"taskId": "V1.0FAKE_T1", "taskName": "a",
+                  "rewardValue": 10, "status": True}]
+
+        def _req(method, url, form=None, **_kw):
+            qs = up.parse_qs(up.urlsplit(url).query)
+            tt = (qs.get("taskType") or [""])[0]
+            return SimpleNamespace(
+                code=200, text="x",
+                json=lambda *_a, _d=tasks if tt == "2" else []: {"status": 0, "data": _d})
+
+        h = MagicMock()
+        h.request.side_effect = _req
+        text, done, score, manual = cloud189._growth_tasks(h, SK_FAKE)
+        self.assertEqual(text, "今日无需处理")
+        self.assertEqual((done, score, manual), (0, 0, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

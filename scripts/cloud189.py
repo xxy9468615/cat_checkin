@@ -621,10 +621,15 @@ def _growth_tasks(h: Http, sk: str) -> Tuple[str, int, int, int]:
 
     每个 taskType 独立去重，不做跨类型 taskId 黑名单：服务端按类型分列表返回，
     同一 taskId 落在不同类型里的语义不同，跨类型屏蔽会漏掉可自动化的任务。
+
+    「上报未确认」是独立状态，绝不与 done/manual 混淆：若所有上报都异常或被拒，
+    文案为「上报未确认 N 项」而非「今日无需处理」——后者等于把未确认的任务说成
+    无事可做（规则 9a(1) 禁止的假确认）。
     """
     done = 0
     score = 0
     manual = 0
+    failed = 0        # 上报未确认（异常 + 服务端拒绝）——不得混入 done 或 manual
 
     for task_type in GREEN_TASK_TYPES + (1,):
         automatable = task_type != 1
@@ -663,18 +668,26 @@ def _growth_tasks(h: Http, sk: str) -> Tuple[str, int, int, int]:
             except Exception as exc:
                 # 单项上报中途异常（如 IncompleteRead）不得丢掉已确认的累计：
                 # done/score 在此之前已入账，此处只留痕并继续后续任务。
+                # 但要计数——否则"全部上报都异常"时 done=manual=0，
+                # 会落到「今日无需处理」，把未确认的任务说成无事可做（假确认）。
                 print(f"    [diag] doGreenTask 上报中断（taskId 已脱敏）：{_mask_net_text(exc)}",
                       flush=True)
+                failed += 1
                 continue
             if ok:
                 done += 1
                 score += reward
+            else:
+                # 服务端明确拒绝（含幂等/未达标）——不是异常，只计数便于对账
+                failed += 1
     if done and manual:
         text = f"完成 {done} 项 (+{score} 绿值) · 待手动 {manual} 项（App 内完成）"
     elif done:
         text = f"完成 {done} 项 (+{score} 绿值)"
     elif manual:
         text = f"待手动 {manual} 项（App 内完成）"
+    elif failed:
+        text = f"上报未确认 {failed} 项"
     else:
         text = "今日无需处理"
     return text, done, score, manual
