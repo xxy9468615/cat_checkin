@@ -1236,13 +1236,17 @@ def ex_cloud189(output: str, res: Dict[str, Any]) -> None:
                 seg.append("绿签已达成")
             if "未开启" in body and not seg:
                 seg.append("成长体系未开启")
-            if "今日无需处理" in body and not seg:
-                seg.append("成长任务今日无需处理")
-            # 「上报未确认」是独立状态：不能因 not seg 兜底成「成长 xxx」，
-            # 更不能被误读成无事可做
+            # 「今日无需处理」也是独立状态：有绿签态时同样要显示，
+            # 否则用户无法区分「任务已核查且无需处理」与「任务状态没展示」。
+            if "今日无需处理" in body:
+                seg.append("任务今日无需处理")
+            # 未确认类状态独立追加，不能被 not seg 兜底吞掉成「成长 xxx」
             um = re.search(r"上报未确认 (\d+) 项", body)
             if um:
                 seg.append(f"上报未确认 {um.group(1)} 项")
+            lm = re.search(r"列表未确认 (\d+) 类", body)
+            if lm:
+                seg.append(f"列表未确认 {lm.group(1)} 类")
             if not seg:
                 seg.append("成长 " + _clean(body, 30))
             cur.parts.append(" ".join(seg))
@@ -1265,12 +1269,15 @@ def ex_cloud189(output: str, res: Dict[str, Any]) -> None:
             body = mm.group(1)
             rm = re.search(r"已领 (\d+) 项", body)
             hm = re.search(r"待手动 (\d+) 项", body)
+            um = re.search(r"领取未确认 (\d+) 项", body)
             seg = []
             if rm:
                 seg.append(f"等级奖励 {rm.group(1)} 项")
                 res["badges"].append(("reward", f"等级奖励 {rm.group(1)} 项"))
             if hm:
                 seg.append(f"待手动 {hm.group(1)} 项")
+            if um:
+                seg.append(f"领取未确认 {um.group(1)} 项")
             if "无可领" in body and not seg:
                 seg.append("等级奖励无可领")
             if "未开启" in body and not seg:

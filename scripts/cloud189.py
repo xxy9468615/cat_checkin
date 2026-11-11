@@ -300,27 +300,43 @@ def _login(h: Http, username: str, password: str) -> str:
         raise RuntimeError(f"登录失败（{msg}）——可能触发验证码或密码错误")
 
     # 4. 换取 sessionKey 并种下 COOKIE_LOGIN_USER 会话票
-    # 注意：必须请求 api.cloud.189.cn 的 GET 接口（Client Open API 凭据消费端点）；
-    # 若请求 cloud.189.cn/api/portal/getSessionForPC.action（Web Portal 端点），
-    # 会因缺少先验 Web Cookie 而报 HTTP 400 cookieUserSession is null or invalid
-    print("    [diag] 正在换取移动端 sessionKey (api.cloud.189.cn/getSessionForPC.action)...", flush=True)
     to_url = res.get("toUrl") or RETURN_URL
+    print("    [diag] 正在换取移动端 sessionKey (api.cloud.189.cn/getSessionForPC.action)...", flush=True)
+    sk = _mint_session_key(h, to_url)
+    if not sk:
+        raise RuntimeError("会话交换失败（getSessionForPC 未返回 sessionKey）")
+    print("    [diag] 换取 sessionKey 成功", flush=True)
+    return sk
+
+
+def _mint_session_key(h: Http, to_url: str = "") -> str:
+    """用当前 CookieJar 里的会话票换 sessionKey（密码模式与 Cookie 模式共用）。
+
+    注意：必须请求 api.cloud.189.cn 的 GET 接口（Client Open API 凭据消费端点）；
+    若请求 cloud.189.cn/api/portal/getSessionForPC.action（Web Portal 端点），
+    会因缺少先验 Web Cookie 而报 HTTP 400 cookieUserSession is null or invalid。
+
+    Cookie 模式（只配 CLOUD189_COOKIE_*，无账号密码）同样需要它：
+    /market/* 除了 m 域 Cookie 还要求 sessionKey query 参数，缺了就只能降级。
+    """
     suffix = "clientType=TELEMAC&version=1.0.0&channelId=web_cloud.189.cn"
-    r = h.request(
-        "GET",
-        f"{API_URL}/getSessionForPC.action?{suffix}&redirectURL={quote(to_url, safe='')}",
-        headers={"User-Agent": UA_WEB, "Accept": "application/json;charset=UTF-8"},
-        timeout=10,
-        retries=1,
-    )
+    target = quote(to_url or RETURN_URL, safe="")
+    try:
+        r = h.request(
+            "GET",
+            f"{API_URL}/getSessionForPC.action?{suffix}&redirectURL={target}",
+            headers={"User-Agent": UA_WEB, "Accept": "application/json;charset=UTF-8"},
+            timeout=10,
+            retries=1,
+        )
+    except Exception as exc:
+        print(f"    [diag] getSessionForPC 请求异常：{_mask_net_text(exc)}", flush=True)
+        return ""
     sess = _resp_dict(r)
-    sk = str(sess.get("sessionKey", ""))
-    if sk:
-        print("    [diag] 换取 sessionKey 成功", flush=True)
-    else:
-        err_hint = str(sess.get("res_message") or sess.get("errorMsg") or sess.get("message") or "")
-        print(f"    [diag] getSessionForPC 未返回 sessionKey ({err_hint[:40]})", flush=True)
-        raise RuntimeError(f"会话交换失败（{err_hint or r.text[:80]}）")
+    sk = str(sess.get("sessionKey", "") or "")
+    if not sk:
+        hint = str(sess.get("res_message") or sess.get("errorMsg") or sess.get("message") or "")
+        print(f"    [diag] getSessionForPC 未返回 sessionKey（{_mask_net_text(hint)}）", flush=True)
     return sk
 
 
@@ -630,6 +646,8 @@ def _growth_tasks(h: Http, sk: str) -> Tuple[str, int, int, int]:
     score = 0
     manual = 0
     failed = 0        # 上报未确认（异常 + 服务端拒绝）——不得混入 done 或 manual
+    list_failed = 0   # 任务列表查询未确认（HTTP/业务码/结构任一不成立）
+    list_ok = 0       # 成功确认过的列表数（区分「查询失败」与「确实无任务」）
 
     for task_type in GREEN_TASK_TYPES + (1,):
         automatable = task_type != 1
@@ -640,12 +658,20 @@ def _growth_tasks(h: Http, sk: str) -> Tuple[str, int, int, int]:
                 f"&activityId={GREEN_ACTIVITY_ID}&random={random.random()}&taskType={task_type}",
                 headers=_green_headers(), timeout=15,
             )
-            d = _resp_dict(resp)
-            items = d.get("data")
-            if not isinstance(items, list):
-                continue
-        except Exception:
+        except Exception as exc:
+            print(f"    [diag] getGreenTaskList 请求异常（taskType={task_type}）："
+                  f"{_mask_net_text(exc)}", flush=True)
+            list_failed += 1
             continue
+        d = _resp_dict(resp)
+        items = d.get("data")
+        # 三条都成立才算「查询确认过」：HTTP 200 + 业务码 0 + data 是列表。
+        # 少任一条件就计入未确认——否则四次查询全 500 时函数会返回
+        # 「今日无需处理」，把「根本没查到」谎报成「确认无事可做」。
+        if resp.code != 200 or _biz_code(d) != "0" or not isinstance(items, list):
+            list_failed += 1
+            continue
+        list_ok += 1
         seen_in_type: set = set()
         for t in items:
             if not isinstance(t, dict):
@@ -680,15 +706,23 @@ def _growth_tasks(h: Http, sk: str) -> Tuple[str, int, int, int]:
             else:
                 # 服务端明确拒绝（含幂等/未达标）——不是异常，只计数便于对账
                 failed += 1
-    if done and manual:
-        text = f"完成 {done} 项 (+{score} 绿值) · 待手动 {manual} 项（App 内完成）"
-    elif done:
-        text = f"完成 {done} 项 (+{score} 绿值)"
-    elif manual:
-        text = f"待手动 {manual} 项（App 内完成）"
-    elif failed:
-        text = f"上报未确认 {failed} 项"
+    segs: List[str] = []
+    if done:
+        segs.append(f"完成 {done} 项 (+{score} 绿值)")
+    if manual:
+        segs.append(f"待手动 {manual} 项（App 内完成）")
+    # 未确认必须附加到**每个**分支：只报成功项会让用户看不到仍需核查的任务
+    if failed:
+        segs.append(f"上报未确认 {failed} 项")
+    if list_failed:
+        segs.append(f"列表未确认 {list_failed} 类")
+    if segs:
+        text = " · ".join(segs)
+    elif list_ok == 0:
+        # 一类列表都没查成功，不能宣称「今日无需处理」
+        text = "任务列表未确认"
     else:
+        # 至少有一类列表确认过、且全部 status=True → 确实无事可做
         text = "今日无需处理"
     return text, done, score, manual
 
@@ -763,12 +797,16 @@ def _level_rewards(h: Http, sk: str, level_no: str) -> Tuple[str, int, int]:
     """
     if not level_no:
         return "未开启（鉴权不全）", 0, 0
-    resp = h.request(
-        "GET",
-        f"{MKT_URL}/market/getGreenLevelRight.action?sessionKey={quote(sk, safe='')}"
-        f"&activityId={GREEN_ACTIVITY_ID}&levelNo={level_no}",
-        headers=_green_headers(), timeout=15,
-    )
+    try:
+        resp = h.request(
+            "GET",
+            f"{MKT_URL}/market/getGreenLevelRight.action?sessionKey={quote(sk, safe='')}"
+            f"&activityId={GREEN_ACTIVITY_ID}&levelNo={level_no}",
+            headers=_green_headers(), timeout=15,
+        )
+    except Exception as exc:
+        print(f"    [diag] getGreenLevelRight 请求异常：{_mask_net_text(exc)}", flush=True)
+        return "未开启（鉴权不全）", 0, 0
     d = _resp_dict(resp)
     items = d.get("data")
     if resp.code != 200 or _biz_code(d) != "0" or not isinstance(items, list):
@@ -776,6 +814,7 @@ def _level_rewards(h: Http, sk: str, level_no: str) -> Tuple[str, int, int]:
 
     claimed = 0
     manual = 0
+    unconfirmed = 0
     for it in items:
         if not isinstance(it, dict):
             continue
@@ -784,7 +823,6 @@ def _level_rewards(h: Http, sk: str, level_no: str) -> Tuple[str, int, int]:
             continue
         # 已领：H5 的 isDisabled 用 drawState，列表过滤用 rightState===3
         if it.get("drawState") is True or it.get("rightState") == 3:
-            claimed += 0
             continue
         # 需前置动作的权益：只报告，不盲发领取请求
         if it.get("actionType"):
@@ -796,23 +834,40 @@ def _level_rewards(h: Http, sk: str, level_no: str) -> Tuple[str, int, int]:
             "prizeId": prize_id,
             "greenLevel": level_no,
         }
-        r = h.request(
-            "POST",
-            f"{MKT_URL}/market/drawGreenRight.action",
-            headers=_green_headers(), form=form, timeout=15,
-        )
+        # 逐项隔离：单项请求异常不得中断其余权益的领取
+        try:
+            r = h.request(
+                "POST",
+                f"{MKT_URL}/market/drawGreenRight.action",
+                headers=_green_headers(), form=form, timeout=15,
+            )
+        except Exception as exc:
+            print(f"    [diag] drawGreenRight 请求异常（prizeId 已脱敏）："
+                  f"{_mask_net_text(exc)}", flush=True)
+            unconfirmed += 1
+            continue
         rd = _resp_dict(r)
-        if r.code == 200 and _biz_code(rd) == "0" and rd.get("data"):
+        # 严判成功：业务码 0 **且** data 是布尔 True。
+        # 不能只看 truthy —— {"code":"0","data":"false"} 与
+        # {"code":"0","data":{"success":false}} 都是字符串/对象（truthy），
+        # 按旧的 truthy 判据会被误记成「已领」（假成功）。
+        if r.code == 200 and _biz_code(rd) == "0" and rd.get("data") is True:
             claimed += 1
+        else:
+            unconfirmed += 1
 
-    if claimed and manual:
-        text = f"已领 {claimed} 项权益 · 待手动 {manual} 项（需前置动作）"
-    elif claimed:
-        text = f"已领 {claimed} 项权益"
-    elif manual:
-        text = f"待手动 {manual} 项（需前置动作）"
-    else:
+    segs: List[str] = []
+    if claimed:
+        segs.append(f"已领 {claimed} 项权益")
+    if manual:
+        segs.append(f"待手动 {manual} 项（需前置动作）")
+    if unconfirmed:
+        segs.append(f"领取未确认 {unconfirmed} 项")
+    if not segs:
+        # 列表里既无已领、无待手动、也无未确认 → 确实没有可领项
         text = "无可领权益"
+    else:
+        text = " · ".join(segs)
     return text, claimed, manual
 
 
@@ -852,6 +907,10 @@ def _run_one(idx: int, total: int, username: str, password: str,
                 sk = _login(h, username, password)
             elif cookie:
                 _inject_cookie(h, cookie)
+                # Cookie 模式也要 sessionKey：/market/* 除 m 域 Cookie 外还要求
+                # sessionKey query 参数。用注入的会话票换一次（失败不影响普通签到，
+                # 成长体系会如实降级为「未开启（鉴权不全）」）。
+                sk = _mint_session_key(h)
             active_h = h
             print(f"  ✅ CN 出口 [{p_name}] 会话建立就绪", flush=True)
             break
@@ -887,44 +946,53 @@ def _run_one(idx: int, total: int, username: str, password: str,
     #  整行判成账号级失败并清空账号块），故统一用「未开启 / 待手动 / 未达成」。
     # 成长行先收进局部列表：中途抛异常时整体丢弃，只留占位行。
     # 否则「成长任务已完成」与「成长任务未开启」会同时进摘要，报告自相矛盾。
+    # 每一步各自 try/except 隔离：等级查询失败不能阻断签到与任务、
+    # 签到失败不能阻断任务、任务失败不能阻断权益领取。任一步骤只影响自己那行。
+    # （CodeRabbit Major：单点异常不得让其余独立步骤整批跳过。）
     growth_lines: List[str] = []
-    # 完成标志必须在 try 之前初始化：否则 _ensure_growth_auth / _growth_level
-    # 抛异常时，except 分支读 done_task 会触发 UnboundLocalError，
-    # 而这会让「普通签到已成功」的账号反因成长子功能异常被 main() 判失败
-    # （CodeRabbit Major：成长体系绝不得影响账号判定）。
-    done_task = False
-    done_reward = False
+
+    auth_ready = False
     try:
         auth_ready = _ensure_growth_auth(active_h, sk)
-        # getGreenLevelList 只认 sessionKey、免 m 域 Cookie，是鉴权不全时
-        # 仍能汇报等级的最后保障——因此等级行必须无条件尝试并占位。
-        level_line, level_no = _growth_level(active_h, sk)
-        if auth_ready:
-            gsign, _gok = _growth_sign(active_h, sk)
-            task_line, _done, _score, _manual = _growth_tasks(active_h, sk)
-            # 签到态与任务态合成一行：绿色签到本身也是成长任务的一环，
-            # 拆两行会让 ex_cloud189 的正则只命中后者、丢掉签到信息。
-            growth_lines.append(f"• 成长任务: {gsign} · {task_line}")
-            done_task = True
-            reward_line, _c, _m = _level_rewards(active_h, sk, level_no)
-            growth_lines.append(f"• 等级奖励: {reward_line}")
-            done_reward = True
-        else:
-            growth_lines.append("• 成长任务: 未开启（鉴权不全）")
-            growth_lines.append("• 等级奖励: 未开启（鉴权不全）")
-        growth_lines.append(f"• 绿色等级: {level_line or '未开启（鉴权不全）'}")
-        lines.extend(growth_lines)
     except Exception as exc:  # noqa: BLE001
-        # 兜底：只对**尚未完成**的步骤输出占位行，已确认的结果必须保留。
-        # 中途异常（如任务已上报、查权益时链路抖动）不等于整个体系不可用，
-        # 把已得的绿值和等级一并抹成「未开启」会丢失真实收益（CodeRabbit Major）。
-        print(f"    [diag] 成长体系部分未处理：{_mask_net_text(exc)}", flush=True)
-        lines.extend(growth_lines)          # 先落已确认的部分
-        if not done_task:
-            lines.append("• 成长任务: 未开启（鉴权不全）")
-        if not done_reward:
-            lines.append("• 等级奖励: 未开启（鉴权不全）")
-        lines.append("• 绿色等级: 未开启（鉴权不全）")
+        print(f"    [diag] 成长鉴权未就绪：{_mask_net_text(exc)}", flush=True)
+
+    # getGreenLevelList 只认 sessionKey、免 m 域 Cookie，是鉴权不全时仍能汇报
+    # 等级的最后保障——因此等级行无条件尝试（失败只影响等级行本身）。
+    level_line = level_no = ""
+    try:
+        level_line, level_no = _growth_level(active_h, sk)
+    except Exception as exc:  # noqa: BLE001
+        print(f"    [diag] 等级查询未完成：{_mask_net_text(exc)}", flush=True)
+
+    task_line = ""
+    if auth_ready:
+        gsign = ""
+        try:
+            gsign, _gok = _growth_sign(active_h, sk)
+        except Exception as exc:  # noqa: BLE001
+            # 绿色签到失败不阻断任务上报
+            print(f"    [diag] 绿色签到未完成：{_mask_net_text(exc)}", flush=True)
+        try:
+            t_text, _done, _score, _manual = _growth_tasks(active_h, sk)
+            task_line = (f"{gsign} · " if gsign else "") + t_text
+        except Exception as exc:  # noqa: BLE001
+            print(f"    [diag] 成长任务未完成：{_mask_net_text(exc)}", flush=True)
+            task_line = gsign
+        growth_lines.append(f"• 成长任务: {task_line or '未开启（鉴权不全）'}")
+
+        try:
+            reward_line, _c, _m = _level_rewards(active_h, sk, level_no)
+        except Exception as exc:  # noqa: BLE001
+            print(f"    [diag] 等级权益未完成：{_mask_net_text(exc)}", flush=True)
+            reward_line = "未开启（鉴权不全）"
+        growth_lines.append(f"• 等级奖励: {reward_line}")
+    else:
+        growth_lines.append("• 成长任务: 未开启（鉴权不全）")
+        growth_lines.append("• 等级奖励: 未开启（鉴权不全）")
+
+    growth_lines.append(f"• 绿色等级: {level_line or '未开启（鉴权不全）'}")
+    lines.extend(growth_lines)
 
     for ln in lines:
         print(f"  {ln}", flush=True)

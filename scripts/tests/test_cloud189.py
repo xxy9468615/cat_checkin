@@ -382,7 +382,8 @@ class TestCloud189Growth(unittest.TestCase):
         calls = []
         routes = {
             "getGreenLevelRight": self._resp("0", rights),
-            "drawGreenRight": self._resp("0", {"prizeId": "x"}),
+            # 领取成功判据是 data is True（严判，不认任意 truthy 对象）
+            "drawGreenRight": self._resp("0", True),
         }
         from unittest.mock import MagicMock
         h = MagicMock()
@@ -729,7 +730,10 @@ class TestCloud189Growth(unittest.TestCase):
         self.assertIn("今日已签", summary)
         # 仅未完成的步骤得占位行
         self.assertIn("等级奖励: 未开启（鉴权不全）", summary)
-        self.assertIn("绿色等级: 未开启（鉴权不全）", summary)
+        # 等级查询是独立步骤、已成功，异常只发生在权益领取，
+        # 故等级行必须保留真实值（步骤隔离后的正确行为）
+        self.assertIn("绿色等级: LV2 绿色达人", summary)
+        self.assertNotIn("绿色等级: 未开启", summary)
 
 
     # ---- 9. _growth_sign 与 _ensure_growth_auth 的直接用例 ----
@@ -1036,8 +1040,10 @@ class TestCloud189Growth(unittest.TestCase):
         def _req(method, url, form=None, **_kw):
             calls.append((method, url, form or {}))
             if "doGreenTask" in url:
-                # 第 2 次上报抛 IncompleteRead，其余正常入账
-                if sum(1 for m, u, _f in calls if "doGreenTask" in u) >= 2:
+                n = sum(1 for m, u, _f in calls if "doGreenTask" in u)
+                # 只有**第 2 次**上报抛 IncompleteRead；第 1、3 次正常入账，
+                # 这样才能验证「异常之后的任务仍能成功计入 done/score」。
+                if n == 2:
                     raise OSError("IncompleteRead")
                 return SimpleNamespace(code=200, text="x",
                                       json=lambda *_a: {"status": 0, "data": True})
@@ -1053,20 +1059,22 @@ class TestCloud189Growth(unittest.TestCase):
         posted = [c for c in calls if "doGreenTask" in c[1]]
         # 三项都尝试了（异常没有中断循环）
         self.assertEqual(len(posted), 3)
-        # 第 1 项已确认的结果保留，没有被异常抹掉
-        self.assertEqual(done, 1)
-        self.assertEqual(score, 10)
-        self.assertIn("完成 1 项", text)
+        # 第 1、3 项入账（异常之后的任务确实继续成功），第 2 项计入未确认
+        self.assertEqual(done, 2)
+        self.assertEqual(score, 40)      # 10 + 30
+        self.assertIn("完成 2 项", text)
+        self.assertIn("上报未确认 1 项", text)
 
     def test_mask_net_text_redacts_pii_and_credentials(self):
         """诊断文案必须删改凭据与 PII，而非原样落进 CI 日志（CodeRabbit Major）。"""
         f = cloud189._mask_net_text
         self.assertEqual(f("ok"), "ok")
-        # sessionKey / accessToken 查询参数
-        self.assertIn("***", f("sessionKey=abcdef1234567890abcdef"))
-        self.assertNotIn("abcdef1234567890", f("sessionKey=abcdef1234567890abcdef"))
+        # sessionKey / accessToken 查询参数（合成值统一 V1.0FAKE 前缀）
+        fake_sk = "V1.0FAKE_SESSION_KEY_ABCDEF123456"
+        self.assertIn("***", f(f"sessionKey={fake_sk}"))
+        self.assertNotIn("ABCDEF123456", f(f"sessionKey={fake_sk}"))
         self.assertIn("***", f("?accessToken=V1.0FAKE_TOKEN_VALUE_XYZ"))
-        # 长 hex / base64 凭据
+        # 长 hex / base64 凭据（拼接构造合成值，不引入真实形态）
         self.assertIn("***", f("token " + "a" * 40))
         # 手机号 / 邮箱（用拼接构造样例，避免真实手机号形态入库）
         phone = "13" + "8001" + "38000"
@@ -1144,6 +1152,163 @@ class TestCloud189Growth(unittest.TestCase):
         text, done, score, manual = cloud189._growth_tasks(h, SK_FAKE)
         self.assertEqual(text, "今日无需处理")
         self.assertEqual((done, score, manual), (0, 0, 0))
+
+
+# ---- 14. 步骤隔离 / Cookie 模式 sessionKey / 领取严判 ----
+
+    def test_growth_level_exception_does_not_block_tasks(self):
+        """等级查询抛异常不得阻断绿色签到与任务上报（CodeRabbit Major：步骤隔离）。"""
+        from unittest.mock import MagicMock, patch
+
+        ep = MagicMock()
+        ep.display_name = "测试出口"
+        ep.url = "socks5://127.0.0.1:1080"
+
+        def fake_http(follow_redirects=True, proxy="", infer_proxy=True):
+            h = MagicMock()
+            h.url = proxy
+            return h
+
+        def boom(*_a, **_kw):
+            raise RuntimeError("等级接口抖动")
+
+        with patch.object(cloud189, "_get_candidate_proxies", return_value=[ep]), \
+             patch.object(cloud189, "Http", side_effect=fake_http), \
+             patch.object(cloud189, "_login", return_value="V1.0FAKE_SESSION_KEY"), \
+             patch.object(cloud189, "_sign", return_value=("【成功】+30M 空间", True)), \
+             patch.object(cloud189, "_lotteries", return_value="无"), \
+             patch.object(cloud189, "_space", return_value="10G/100G"), \
+             patch.object(cloud189, "_ensure_growth_auth", return_value=True), \
+             patch.object(cloud189, "_growth_level", side_effect=boom), \
+             patch.object(cloud189, "_growth_sign", return_value=("今日已签", True)), \
+             patch.object(cloud189, "_growth_tasks",
+                          return_value=("完成 3 项 (+50 绿值)", 3, 50, 0)), \
+             patch.object(cloud189, "_level_rewards", return_value=("无可领权益", 0, 0)):
+            ok, summary = cloud189._run_one(1, 1, "V1.0FAKE_ACCOUNT", "V1.0FAKE_PASS")
+
+        self.assertTrue(ok)
+        # 等级查询失败，但任务照常上报并进摘要
+        self.assertIn("完成 3 项", summary)
+        self.assertIn("绿色等级: 未开启（鉴权不全）", summary)
+
+    def test_growth_sign_exception_does_not_block_tasks(self):
+        """绿色签到抛异常不得阻断任务上报（步骤隔离）。"""
+        from unittest.mock import MagicMock, patch
+
+        ep = MagicMock()
+        ep.display_name = "测试出口"
+        ep.url = "socks5://127.0.0.1:1080"
+
+        def fake_http(follow_redirects=True, proxy="", infer_proxy=True):
+            h = MagicMock()
+            h.url = proxy
+            return h
+
+        def boom(*_a, **_kw):
+            raise RuntimeError("签到接口抖动")
+
+        with patch.object(cloud189, "_get_candidate_proxies", return_value=[ep]), \
+             patch.object(cloud189, "Http", side_effect=fake_http), \
+             patch.object(cloud189, "_login", return_value="V1.0FAKE_SESSION_KEY"), \
+             patch.object(cloud189, "_sign", return_value=("【成功】+30M 空间", True)), \
+             patch.object(cloud189, "_lotteries", return_value="无"), \
+             patch.object(cloud189, "_space", return_value="10G/100G"), \
+             patch.object(cloud189, "_ensure_growth_auth", return_value=True), \
+             patch.object(cloud189, "_growth_level", return_value=("LV1 绿色达人", "LV1")), \
+             patch.object(cloud189, "_growth_sign", side_effect=boom), \
+             patch.object(cloud189, "_growth_tasks",
+                          return_value=("完成 2 项 (+20 绿值)", 2, 20, 0)), \
+             patch.object(cloud189, "_level_rewards", return_value=("无可领权益", 0, 0)):
+            ok, summary = cloud189._run_one(1, 1, "V1.0FAKE_ACCOUNT", "V1.0FAKE_PASS")
+
+        self.assertTrue(ok)
+        self.assertIn("完成 2 项", summary)
+        self.assertNotIn("今日已签", summary)   # 签到抛异常，无签到文案
+
+    def test_cookie_mode_mints_session_key(self):
+        """仅配 CLOUD189_COOKIE_* 时也必须换 sessionKey，否则 /market/* 全部降级。"""
+        from unittest.mock import MagicMock, patch
+
+        ep = MagicMock()
+        ep.display_name = "测试出口"
+        ep.url = "socks5://127.0.0.1:1080"
+
+        def fake_http(follow_redirects=True, proxy="", infer_proxy=True):
+            h = MagicMock()
+            h.url = proxy
+            return h
+
+        with patch.object(cloud189, "_get_candidate_proxies", return_value=[ep]), \
+             patch.object(cloud189, "Http", side_effect=fake_http), \
+             patch.object(cloud189, "_inject_cookie") as inj, \
+             patch.object(cloud189, "_mint_session_key",
+                          return_value="V1.0FAKE_SESSION_KEY") as mint, \
+             patch.object(cloud189, "_sign", return_value=("【成功】+30M 空间", True)), \
+             patch.object(cloud189, "_lotteries", return_value="无"), \
+             patch.object(cloud189, "_space", return_value="10G/100G"), \
+             patch.object(cloud189, "_ensure_growth_auth", return_value=True), \
+             patch.object(cloud189, "_growth_level", return_value=("LV1 绿色达人", "LV1")), \
+             patch.object(cloud189, "_growth_sign", return_value=("今日已签", True)), \
+             patch.object(cloud189, "_growth_tasks",
+                          return_value=("完成 1 项 (+10 绿值)", 1, 10, 0)), \
+             patch.object(cloud189, "_level_rewards", return_value=("无可领权益", 0, 0)):
+            # 只给 cookie，不给账号密码
+            ok, _summary = cloud189._run_one(1, 1, "", "",
+                                            "V1.0FAKE_COOKIE=1")
+
+        self.assertTrue(ok)
+        inj.assert_called_once()
+        mint.assert_called_once()
+
+    def test_level_reward_rejects_non_true_data(self):
+        """data 为 "false" / {"success": false} 等 truthy 值不得计为已领（假成功）。"""
+        from unittest.mock import MagicMock
+
+        for bad in ("false", {"success": False}, 1, "1", {}):
+            calls = []
+            routes = {
+                "getGreenLevelRight": self._resp("0", [
+                    {"prizeId": "V1.0FAKE_P", "rightName": "10G", "drawState": False,
+                     "rightState": 1, "actionType": 0}]),
+                "drawGreenRight": self._resp("0", bad),
+            }
+            h = MagicMock()
+            h.request.side_effect = _fake_growth_request(routes, calls)
+            text, claimed, _m = cloud189._level_rewards(h, SK_FAKE, "LV2")
+            self.assertEqual(claimed, 0, f"data={bad!r} 不得计为已领")
+            self.assertIn("领取未确认 1 项", text, f"data={bad!r} 应计为未确认")
+
+    def test_level_reward_isolates_request_exception(self):
+        """单项 drawGreenRight 抛异常不得中断其余权益（逐项隔离）。"""
+        from unittest.mock import MagicMock
+
+        routes = {
+            "getGreenLevelRight": self._resp("0", [
+                {"prizeId": "V1.0FAKE_P1", "rightName": "a", "drawState": False,
+                 "rightState": 1, "actionType": 0},
+                {"prizeId": "V1.0FAKE_P2", "rightName": "b", "drawState": False,
+                 "rightState": 1, "actionType": 0},
+            ]),
+        }
+        calls = []
+
+        def _req(method, url, form=None, **_kw):
+            calls.append((method, url, form or {}))
+            if "drawGreenRight" in url:
+                if (form or {}).get("prizeId") == "V1.0FAKE_P1":
+                    raise OSError("connection reset")
+                from types import SimpleNamespace
+                return SimpleNamespace(code=200, text="x",
+                                      json=lambda *_a: {"status": 0, "data": True})
+            return _fake_growth_request(routes, [])(method, url, form=form, **_kw)
+
+        h = MagicMock()
+        h.request.side_effect = _req
+        text, claimed, _m = cloud189._level_rewards(h, SK_FAKE, "LV2")
+        posted = [c for c in calls if "drawGreenRight" in c[1]]
+        self.assertEqual(len(posted), 2)     # 第二项仍被尝试
+        self.assertEqual(claimed, 1)         # 第二项成功
+        self.assertIn("领取未确认 1 项", text)
 
 
 if __name__ == "__main__":
