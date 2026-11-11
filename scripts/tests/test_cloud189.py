@@ -520,11 +520,10 @@ class TestCloud189Growth(unittest.TestCase):
 
     # ---- 5c. Cookie 模式（仅配 CLOUD189_COOKIE_*，无密码） ----
 
-    def test_growth_auth_cookie_mode_needs_no_sso_request(self):
-        """Cookie 模式：_inject_cookie 种下的 Domain=.189.cn 前导点域经 CookieJar
-        实测覆盖 m.cloud.189.cn，故成长体系鉴权不应再发 ssoLoginMerge 请求。
-
-        用户确认 GH 已存 CLOUD189_COOKIE_1，此路径是「未配密码」时的实际形态。
+    def test_growth_auth_cookie_mode_still_needs_sso(self):
+        """Cookie 模式下 _inject_cookie 种下的同名 COOKIE_LOGIN_USER 也无法
+        让服务端直接认账（与云盘登录链落下的那张同名同族），故仍需 ssoLoginMerge。
+        该路径是「未配密码」时的实际形态。
         """
         import time
         from http.cookiejar import Cookie, CookieJar
@@ -539,10 +538,7 @@ class TestCloud189Growth(unittest.TestCase):
 
         h = MagicMock()
         h.request.side_effect = _req
-        # 必须用真实 CookieJar：MagicMock 的 .jar 不会真存 Cookie，
-        # 而 _ensure_growth_auth 判的是 jar 里的 domain 覆盖关系。
         h.jar = CookieJar()
-        # 复刻 _inject_cookie 的落 jar 形态：Domain=.189.cn（前导点）
         h.jar.set_cookie(Cookie(
             version=0, name="COOKIE_LOGIN_USER", value="V1.0FAKE_COOKIE_VALUE",
             port=None, port_specified=False, domain=".189.cn", domain_specified=True,
@@ -551,9 +547,9 @@ class TestCloud189Growth(unittest.TestCase):
             comment_url=None, rest={}, rfc2109=False,
         ))
         ok = cloud189._ensure_growth_auth(h, "V1.0FAKE_SESSION_KEY")
-        self.assertTrue(ok)
-        # 未发任何请求即判定可用
-        self.assertEqual(calls, [])
+        # ssoLoginMerge 与活性探测都发生了
+        self.assertTrue(any("ssoLoginMerge" in u for _, u in calls))
+        self.assertTrue(any("signInNewInfo" in u for _, u in calls))
 
     # ---- 6. 文案安全（规则 9a(2) + 防解析器误判账号失败） ----
 
@@ -777,27 +773,30 @@ class TestCloud189Growth(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(text, "绿色签到未达成（接口未确认）")
 
-    def _auth_http(self, jar, sso_cookie_domain=None):
-        """构造带真实 CookieJar 的 Http 替身；sso_cookie_domain 非空表示
-        ssoLoginMerge 之后会落一个该 Domain 的 Cookie。"""
-        import time
-        from http.cookiejar import Cookie, CookieJar
+    def _auth_http(self, jar, alive_after_sso=True):
+        """构造带真实 CookieJar 的 Http 替身。
+
+        alive_after_sso=True 表示 ssoLoginMerge 之后服务端活性探测会通过
+        （即拿到了真能用的 m 域会话）；False 模拟 CI 上实测到的
+        `cookieUserSession=null`——Cookie 种了但服务端不认。
+        """
         from unittest.mock import MagicMock
+        from types import SimpleNamespace
 
         calls = []
 
         def _req(method, url, **_kw):
             calls.append((method, url))
-            if sso_cookie_domain and "ssoLoginMerge" in url:
-                jar.set_cookie(Cookie(
-                    version=0, name="COOKIE_LOGIN_USER", value="V1.0FAKE_COOKIE",
-                    port=None, port_specified=False, domain=sso_cookie_domain,
-                    domain_specified=True, domain_initial_dot=sso_cookie_domain.startswith("."),
-                    path="/", path_specified=True, secure=False,
-                    expires=int(time.time()) + 3600, discard=False, comment=None,
-                    comment_url=None, rest={}, rfc2109=False,
-                ))
-            from types import SimpleNamespace
+            if "signInNewInfo" in url:
+                # ssoLoginMerge 之前一律不认（这是CI 实测现场：登录链的同名 Cookie 无效）
+                sso_done = any("ssoLoginMerge" in u for _, u in calls[:-1])
+                if sso_done and alive_after_sso:
+                    return SimpleNamespace(code=200, text="x",
+                                          json=lambda *a: {"code": "0", "data": 3})
+                payload = {"errorCode": "InvalidSessionKey",
+                           "errorMsg": "cookieUserSession is null or invalid, "
+                                      "cookieUserSession=null", "success": None}
+                return SimpleNamespace(code=400, text=repr(payload), json=lambda *a: payload)
             return SimpleNamespace(code=200, text="x", json=lambda *_a: {})
 
         h = MagicMock()
@@ -806,47 +805,101 @@ class TestCloud189Growth(unittest.TestCase):
         return h, calls
 
     def test_ensure_growth_auth_three_states(self):
-        """_ensure_growth_auth 三态：已有 Cookie / ssoLoginMerge 后取得 / 仍无。"""
+        """_ensure_growth_auth 三态：ssoLoginMerge 后会话可用 / 仍不可用 / 无 sessionKey。
+
+        注意：判据已从「jar 里有无 .189.cn 域 Cookie」改为**服务端活性探测**
+        （CI 实测：登录链落下的同名 Cookie 服务端不认，旧判据会导致
+        ssoLoginMerge 被整个跳过）。故不存在「已有 Cookie 就零请求」这一态了。
+        """
         from http.cookiejar import CookieJar
 
-        # ① 已有 m 域 Cookie → 零请求即可用
-        j1 = CookieJar()
-        h1, c1 = self._auth_http(j1)   # 先建 jar，再手工种
-        import time as _t
-        from http.cookiejar import Cookie as _C
-        j1.set_cookie(_C(version=0, name="COOKIE_LOGIN_USER", value="V1.0FAKE_X",
-                         port=None, port_specified=False, domain=".189.cn",
-                         domain_specified=True, domain_initial_dot=True, path="/",
-                         path_specified=True, secure=False,
-                         expires=int(_t.time()) + 3600, discard=False, comment=None,
-                         comment_url=None, rest={}, rfc2109=False))
+        # ① ssoLoginMerge 后服务端认账 → 可用，且 ssoLoginMerge + 活性探测各一次
+        h1, c1 = self._auth_http(CookieJar(), alive_after_sso=True)
         self.assertTrue(cloud189._ensure_growth_auth(h1, SK_FAKE))
-        self.assertEqual(c1, [])
+        urls = [u for _m, u in c1]
+        self.assertEqual(len(urls), 2)
+        self.assertTrue(any("ssoLoginMerge" in u for u in urls))
+        self.assertTrue(any("signInNewInfo" in u for u in urls))
 
-        # ② 无 Cookie，ssoLoginMerge 后取得 m 域 Cookie → 可用
-        j2 = CookieJar()
-        h2, c2 = self._auth_http(j2, sso_cookie_domain="m.cloud.189.cn")
-        self.assertTrue(cloud189._ensure_growth_auth(h2, SK_FAKE))
-        self.assertEqual(len(c2), 1)
-        self.assertIn("ssoLoginMerge", c2[0][1])
+        # ② ssoLoginMerge 后服务端仍不认 → 不可用（降级为仅查等级）
+        h2, c2 = self._auth_http(CookieJar(), alive_after_sso=False)
+        self.assertFalse(cloud189._ensure_growth_auth(h2, SK_FAKE))
 
-        # ③ 无 Cookie，ssoLoginMerge 后仍无 → 不可用（降级）
-        j3 = CookieJar()
-        h3, c3 = self._auth_http(j3, sso_cookie_domain=None)
-        self.assertFalse(cloud189._ensure_growth_auth(h3, SK_FAKE))
-        self.assertEqual(len(c3), 1)
-
-    def test_ensure_growth_auth_requires_session_key(self):
-        """无 sessionKey（纯 Cookie 模式且未注入）时直接判定不可用，不发请求。"""
-        from http.cookiejar import CookieJar
+        # ③ 无 sessionKey → 直接不可用，一个请求都不发
         from unittest.mock import MagicMock
 
         calls = []
-        h = MagicMock()
-        h.jar = CookieJar()
-        h.request.side_effect = lambda m, u, **k: calls.append((m, u))
-        self.assertFalse(cloud189._ensure_growth_auth(h, ""))
+        h3 = MagicMock()
+        h3.jar = CookieJar()
+        h3.request.side_effect = lambda m, u, **k: calls.append((m, u))
+        self.assertFalse(cloud189._ensure_growth_auth(h3, ""))
         self.assertEqual(calls, [])
+
+    def test_ensure_growth_auth_probes_server_not_jar(self):
+        """CI 真实验证暴露的缺陷：登录链在 cloud.189.cn / api.cloud.189.cn 上也会
+        落下同名 COOKIE_LOGIN_USER（.189.cn 家族），与 m 域那张同名同族，光看 jar
+        分不出服务端认哪张。判据必须落到服务端活性探测（signInNewInfo）上——
+        否则 ssoLoginMerge 被跳过，signInNew / getGreenLevelRight 恒返回
+        `cookieUserSession is null or invalid, cookieUserSession=null`。
+        """
+        from http.cookiejar import Cookie, CookieJar
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+
+        jar = CookieJar()
+        import time as _t
+        for dom in ("cloud.189.cn", "api.cloud.189.cn", ".189.cn"):
+            jar.set_cookie(Cookie(
+                version=0, name="COOKIE_LOGIN_USER", value="V1.0FAKE_OTHER_DOMAIN",
+                port=None, port_specified=False, domain=dom, domain_specified=True,
+                domain_initial_dot=dom.startswith("."), path="/", path_specified=True,
+                secure=False, expires=int(_t.time()) + 3600, discard=False,
+                comment=None, comment_url=None, rest={}, rfc2109=False,
+            ))
+
+        calls = []
+
+        def _req(method, url, **_kw):
+            calls.append((method, url))
+            # 场景 A：服务端仍不认 → 400 + errorCode
+            if "signInNewInfo" in url:
+                payload = {"errorCode": "InvalidSessionKey",
+                           "errorMsg": "cookieUserSession is null or invalid, "
+                                      "cookieUserSession=null", "success": None}
+                return SimpleNamespace(code=400, text=repr(payload), json=lambda *a: payload)
+            return SimpleNamespace(code=200, text="x", json=lambda *a: {})
+
+        h = MagicMock()
+        h.jar = jar
+        h.request.side_effect = _req
+
+        # ① 活性探测认得 InvalidSessionKey
+        self.assertFalse(cloud189._growth_session_alive(h, SK_FAKE))
+        # ② 于是判为未就绪（而不是被 jar 里的同名 Cookie 骗过）
+        self.assertFalse(cloud189._ensure_growth_auth(h, SK_FAKE))
+        # ③ ssoLoginMerge 与活性探测都确实发生了
+        self.assertTrue(any("ssoLoginMerge" in u for _, u in calls))
+        self.assertTrue(any("signInNewInfo" in u for _, u in calls))
+
+    def test_growth_session_alive_accepts_valid_session(self):
+        """服务端 200 且无 InvalidSessionKey → 判定会话可用。"""
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+
+        h = MagicMock()
+        h.request.side_effect = lambda *a, **k: SimpleNamespace(
+            code=200, text="x", json=lambda *x: {"code": "0", "data": 3})
+        self.assertTrue(cloud189._growth_session_alive(h, SK_FAKE))
+
+    def test_growth_session_alive_rejects_http_error(self):
+        """网络层 -1 亦判为不可用（不得误放行）。"""
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+
+        h = MagicMock()
+        h.request.side_effect = lambda *a, **k: SimpleNamespace(
+            code=-1, text="", json=lambda *x: {})
+        self.assertFalse(cloud189._growth_session_alive(h, SK_FAKE))
 
 
 if __name__ == "__main__":

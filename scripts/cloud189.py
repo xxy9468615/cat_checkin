@@ -444,34 +444,61 @@ def _mask_net_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())[:60]
 
 
+def _growth_session_alive(h: Http, sk: str) -> bool:
+    """用一个轻量只读接口探测 m 域会话是否真的可用。
+
+    为什么不能只看 jar：云盘登录链在 api.cloud.189.cn / cloud.189.cn 上也会落下
+    同名 `COOKIE_LOGIN_USER`（Domain=.189.cn 或对应子域），与 m 域那张**同名同族**，
+    光靠名字/域根本分不出服务端认哪张。CI 实测（2026-11-11）正是掉进这个坑：
+    判据宽泛 → ssoLoginMerge 被整个跳过 → signInNew / getGreenLevelRight 恒返回
+    `cookieUserSession is null or invalid, cookieUserSession=null`，而 getGreenLevelList
+    （免 Cookie）与任务上报（sessionKey query）却一切正常，表象极具误导性。
+
+    唯一可靠判据是服务端是否接受：signInNewInfo 是最轻的只读查询，无副作用。
+    """
+    try:
+        r = h.request(
+            "GET",
+            f"{MKT_URL}/market/signInNewInfo.action?sessionKey={quote(sk, safe='')}"
+            f"&activityId={GREEN_ACTIVITY_ID}",
+            headers=_green_headers(), timeout=15, retries=1,
+        )
+    except Exception:
+        return False
+    d = _resp_dict(r)
+    # 400 + errorCode=InvalidSessionKey 即鉴权未就绪（现金现值：cookieUserSession=null）
+    return r.code == 200 and d.get("errorCode") != "InvalidSessionKey"
+
+
 def _ensure_growth_auth(h: Http, sk: str) -> bool:
-    """确保 m 域 Cookie 就绪，返回 True 表示 /market/* 动作接口可用。
+    """确保 /market/* 动作接口的 m 域会话 Cookie 就绪。
 
     仓库 CI 同时注入 CLOUD189_USERNAME/PASSWORD 与 CLOUD189_COOKIE，而 _run_one
     里密码模式优先（username+password 判定在前），所以线上主路径是「密码盲登 →
-    sessionKey → ssoLoginMerge 补 m 域 Cookie」。Cookie 模式仅在未配密码时生效：
-    _inject_cookie 种下的是 Domain=.189.cn（前导点），经 CookieJar 实测可覆盖
-    m.cloud.189.cn 等全部子域，天然满足鉴权、无需额外请求。
+    sessionKey → ssoLoginMerge 补 m 域 Cookie」——**不能跳过这一步**：
+    登录链落下的同名 Cookie 服务端不认。
     """
     if not sk:
         return False
-    # 已持有 m 域 Cookie（Cookie 模式注入的 .189.cn 前导点域即覆盖全部子域）
-    # → 无需任何额外请求，直接判定可用。
-    if any(c.domain in (".189.cn", "m.cloud.189.cn") for c in h.jar):
-        return True
     try:
         h.request(
             "GET",
             f"{MKT_URL}/ssoLoginMerge.action?sessionKey={quote(sk, safe='')}"
-            f"&redirectUrl={quote(GREEN_PAGE, safe='')}&rand=6947_{int(time.time())}",
+            f"&sessionKeyFm=&redirectUrl={quote(GREEN_PAGE, safe='')}"
+            f"&rand=6947_{int(time.time())}",
             headers=_green_headers(), timeout=15, retries=1,
         )
     except Exception as exc:
         print(f"    [diag] ssoLoginMerge 请求异常：{_mask_net_text(exc)}", flush=True)
         return False
-    ok = any(c.domain in (".189.cn", "m.cloud.189.cn") for c in h.jar)
-    if not ok:
-        print("    [diag] ssoLoginMerge 未取得 m 域 Cookie，成长任务降级为仅查等级", flush=True)
+    ok = _growth_session_alive(h, sk)
+    if ok:
+        print("    [diag] ssoLoginMerge 已取得可用的 m 域会话", flush=True)
+    else:
+        # 打出 jar 实际内容：这是定位 cookieUserSession=null 的唯一依据
+        names = ",".join(f"{c.name}@{c.domain}={len(c.value or '')}B" for c in h.jar) or "空"
+        print(f"    [diag] m 域会话未就绪（jar: {names}），成长任务降级为仅查等级",
+              flush=True)
     return ok
 
 
