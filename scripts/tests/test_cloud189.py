@@ -578,11 +578,43 @@ class TestCloud189Growth(unittest.TestCase):
             for kw in self._ERROR_KW + self._FAIL_SUB:
                 self.assertNotIn(kw, level_text, f"等级文案含禁词 {kw!r}: {level_text}")
 
-        # 鉴权不全的降级文案
-        for text in ("未开启（鉴权不全）", "今日无需处理", "待手动 2 项（App 内完成）",
-                     "已领 1 项权益", "无可领权益", "待手动 2 项（需前置动作）"):
+        # 对三个函数的**真实返回值**做同样检查（不遍历硬编码字符串——
+        #   自证式断言即使生产文案回退成含「失败」也照样通过）。
+        # 任务列表 / 权益列表都用全空夹具，逼出各函数的失败分支文案。
+        hostile_sign = [
+            ({"code": "1", "message": "签到失败，请稍后重试"}, 200),
+            ({"code": "403", "message": "Forbidden"}, 403),
+        ]
+        for payload, http_code in hostile_sign:
+            h = MagicMock()
+            from types import SimpleNamespace
+            h.request.side_effect = lambda *_a, _p=payload, _c=http_code, **__k: SimpleNamespace(
+                code=_c, text=repr(_p), json=lambda *x: _p)
+            text, _ok = cloud189._growth_sign(h, SK_FAKE)
             for kw in self._ERROR_KW + self._FAIL_SUB:
-                self.assertNotIn(kw, text)
+                self.assertNotIn(kw, text, f"payload={payload} 泄出禁词 {kw!r}")
+
+        # _growth_tasks：列表拉取失败 / 上报失败路径
+        for routes in ({}, {"getGreenTaskList": {"code": "9", "data": None}},
+                      {"getGreenTaskList": _green_task_routes(),
+                       "doGreenTask": self._resp("1002", None)}):
+            h = MagicMock()
+            h.request.side_effect = _fake_growth_request(routes, [])
+            text, _d, _s, _m = cloud189._growth_tasks(h, SK_FAKE)
+            for kw in self._ERROR_KW + self._FAIL_SUB:
+                self.assertNotIn(kw, text, f"routes={list(routes)} 泄出禁词 {kw!r}")
+
+        # _level_rewards：权益列表拉取失败 / 领取失败路径
+        for routes in ({}, {"getGreenLevelRight": {"code": "9", "data": None}},
+                      {"getGreenLevelRight": self._resp("0", [
+                          {"prizeId": "V1.0FAKE_P", "rightName": "10G空间券",
+                           "drawState": False, "rightState": 1, "actionType": 0}]),
+                       "drawGreenRight": self._resp("9999", None)}):
+            h = MagicMock()
+            h.request.side_effect = _fake_growth_request(routes, [])
+            text, _c, _m = cloud189._level_rewards(h, SK_FAKE, "LV2")
+            for kw in self._ERROR_KW + self._FAIL_SUB:
+                self.assertNotIn(kw, text, f"routes={list(routes)} 泄出禁词 {kw!r}")
 
     def test_growth_texts_not_parsed_as_signin_failure(self):
         """端到端：成长行经 ex_cloud189 解析后不得进 fail_lines / error_lines。"""
@@ -616,7 +648,13 @@ class TestCloud189Growth(unittest.TestCase):
     # ---- 7. 成长体系异常不得拖垮账号判定 ----
 
     def test_growth_failure_does_not_fail_account(self):
-        """所有绿色接口 HTTP -1 时账号 ok 仍由 _sign 决定，且输出无禁词。"""
+        """auth_ready=False（无 m 域 Cookie）时账号 ok 仍由 _sign 决定，且输出无禁词。
+
+        注意此路径的真实覆盖面：MagicMock 的 h.jar 迭代为空，因此
+        _ensure_growth_auth 返回 False，本用例验证的是**鉴权降级分支**，
+        _growth_sign / _growth_tasks / _level_rewards 在此不执行——
+        它们的直接用例见 test_growth_sign_* 与 test_growth_tasks_*。
+        """
         from unittest.mock import MagicMock, patch
         from types import SimpleNamespace
 
@@ -647,6 +685,168 @@ class TestCloud189Growth(unittest.TestCase):
         self.assertIn("• 等级奖励:", summary)
         for kw in self._ERROR_KW + self._FAIL_SUB:
             self.assertNotIn(kw, summary, f"降级输出含禁词 {kw!r}")
+
+    # ---- 8. auth_ready=True 且后续抛异常：成长行不得重复/矛盾 ----
+
+    def test_growth_lines_not_duplicated_when_rewards_raise(self):
+        """_growth_tasks 成功后 _level_rewards 抛异常时，摘要里不得同时出现
+        「成长任务已完成」与「成长任务未开启」两行矛盾结论。
+
+        实现用局部列表收集，异常时整体丢弃只留占位行。
+        """
+        from unittest.mock import MagicMock, patch
+
+        ep = MagicMock()
+        ep.display_name = "测试出口"
+        ep.url = "socks5://127.0.0.1:1080"
+
+        def fake_http(follow_redirects=True, proxy="", infer_proxy=True):
+            h = MagicMock()
+            h.url = proxy
+            return h
+
+        def boom(*_a, **_kw):
+            raise RuntimeError("链接层抖动")
+
+        with patch.object(cloud189, "_get_candidate_proxies", return_value=[ep]), \
+             patch.object(cloud189, "Http", side_effect=fake_http), \
+             patch.object(cloud189, "_login", return_value="V1.0FAKE_SESSION_KEY"), \
+             patch.object(cloud189, "_sign", return_value=("【成功】+30M 空间", True)), \
+             patch.object(cloud189, "_lotteries", return_value="无"), \
+             patch.object(cloud189, "_space", return_value="10G/100G"), \
+             patch.object(cloud189, "_ensure_growth_auth", return_value=True), \
+             patch.object(cloud189, "_growth_level", return_value=("LV2 绿色达人", "LV2")), \
+             patch.object(cloud189, "_growth_sign", return_value=("今日已签", True)), \
+             patch.object(cloud189, "_growth_tasks",
+                          return_value=("完成 2 项 (+30 绿值)", 2, 30, 1)), \
+             patch.object(cloud189, "_level_rewards", side_effect=boom):
+            ok, summary = cloud189._run_one(1, 1, "13800138000", "pw")
+
+        # 账号判定不受影响
+        self.assertTrue(ok)
+        # 每个成长行只出现一次
+        self.assertEqual(summary.count("• 成长任务:"), 1)
+        self.assertEqual(summary.count("• 等级奖励:"), 1)
+        self.assertEqual(summary.count("• 绿色等级:"), 1)
+        # 且结论一致：只保留占位行，不混入已成功的任务行
+        self.assertIn("成长任务: 未开启（鉴权不全）", summary)
+        self.assertNotIn("完成 2 项", summary)
+
+
+    # ---- 9. _growth_sign 与 _ensure_growth_auth 的直接用例 ----
+
+    def test_growth_sign_success_reports_signed_day(self):
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+
+        def _req(method, url, **_kw):
+            if "signInNewInfo" in url:
+                return SimpleNamespace(code=200, text="x", json=lambda *_a: {"code": "0", "data": 5})
+            return SimpleNamespace(code=200, text="x", json=lambda *_a: {"code": "0", "data": {}})
+
+        h = MagicMock()
+        h.request.side_effect = _req
+        text, ok = cloud189._growth_sign(h, SK_FAKE)
+        self.assertTrue(ok)
+        self.assertIn("今日已签", text)
+        self.assertIn("第 5 天", text)
+
+    def test_growth_sign_success_without_day_info(self):
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+
+        def _req(method, url, **_kw):
+            if "signInNewInfo" in url:
+                return SimpleNamespace(code=-1, text="", json=lambda *_a: {})
+            return SimpleNamespace(code=200, text="x", json=lambda *_a: {"code": "0", "data": {}})
+
+        h = MagicMock()
+        h.request.side_effect = _req
+        text, ok = cloud189._growth_sign(h, SK_FAKE)
+        self.assertTrue(ok)
+        self.assertEqual(text, "今日已签")
+
+    def test_growth_sign_rejected_code_is_reported_fixed_wording(self):
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+
+        h = MagicMock()
+        h.request.side_effect = lambda *_a, **__k: SimpleNamespace(
+            code=200, text="x", json=lambda *_x: {"code": "1002", "data": None})
+        text, ok = cloud189._growth_sign(h, SK_FAKE)
+        self.assertFalse(ok)
+        self.assertEqual(text, "绿色签到未达成（接口未确认）")
+
+    def _auth_http(self, jar, sso_cookie_domain=None):
+        """构造带真实 CookieJar 的 Http 替身；sso_cookie_domain 非空表示
+        ssoLoginMerge 之后会落一个该 Domain 的 Cookie。"""
+        import time
+        from http.cookiejar import Cookie, CookieJar
+        from unittest.mock import MagicMock
+
+        calls = []
+
+        def _req(method, url, **_kw):
+            calls.append((method, url))
+            if sso_cookie_domain and "ssoLoginMerge" in url:
+                jar.set_cookie(Cookie(
+                    version=0, name="COOKIE_LOGIN_USER", value="V1.0FAKE_COOKIE",
+                    port=None, port_specified=False, domain=sso_cookie_domain,
+                    domain_specified=True, domain_initial_dot=sso_cookie_domain.startswith("."),
+                    path="/", path_specified=True, secure=False,
+                    expires=int(time.time()) + 3600, discard=False, comment=None,
+                    comment_url=None, rest={}, rfc2109=False,
+                ))
+            from types import SimpleNamespace
+            return SimpleNamespace(code=200, text="x", json=lambda *_a: {})
+
+        h = MagicMock()
+        h.jar = jar
+        h.request.side_effect = _req
+        return h, calls
+
+    def test_ensure_growth_auth_three_states(self):
+        """_ensure_growth_auth 三态：已有 Cookie / ssoLoginMerge 后取得 / 仍无。"""
+        from http.cookiejar import CookieJar
+
+        # ① 已有 m 域 Cookie → 零请求即可用
+        j1 = CookieJar()
+        h1, c1 = self._auth_http(j1)   # 先建 jar，再手工种
+        import time as _t
+        from http.cookiejar import Cookie as _C
+        j1.set_cookie(_C(version=0, name="COOKIE_LOGIN_USER", value="V1.0FAKE_X",
+                         port=None, port_specified=False, domain=".189.cn",
+                         domain_specified=True, domain_initial_dot=True, path="/",
+                         path_specified=True, secure=False,
+                         expires=int(_t.time()) + 3600, discard=False, comment=None,
+                         comment_url=None, rest={}, rfc2109=False))
+        self.assertTrue(cloud189._ensure_growth_auth(h1, SK_FAKE))
+        self.assertEqual(c1, [])
+
+        # ② 无 Cookie，ssoLoginMerge 后取得 m 域 Cookie → 可用
+        j2 = CookieJar()
+        h2, c2 = self._auth_http(j2, sso_cookie_domain="m.cloud.189.cn")
+        self.assertTrue(cloud189._ensure_growth_auth(h2, SK_FAKE))
+        self.assertEqual(len(c2), 1)
+        self.assertIn("ssoLoginMerge", c2[0][1])
+
+        # ③ 无 Cookie，ssoLoginMerge 后仍无 → 不可用（降级）
+        j3 = CookieJar()
+        h3, c3 = self._auth_http(j3, sso_cookie_domain=None)
+        self.assertFalse(cloud189._ensure_growth_auth(h3, SK_FAKE))
+        self.assertEqual(len(c3), 1)
+
+    def test_ensure_growth_auth_requires_session_key(self):
+        """无 sessionKey（纯 Cookie 模式且未注入）时直接判定不可用，不发请求。"""
+        from http.cookiejar import CookieJar
+        from unittest.mock import MagicMock
+
+        calls = []
+        h = MagicMock()
+        h.jar = CookieJar()
+        h.request.side_effect = lambda m, u, **k: calls.append((m, u))
+        self.assertFalse(cloud189._ensure_growth_auth(h, ""))
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":

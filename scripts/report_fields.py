@@ -102,6 +102,7 @@ class _Block:
 
 
 def _acc_line(name: str, parts: List[str]) -> str:
+    """把账号名与各段摘要拼成一行（用 " · " 连接，空段丢弃）。"""
     segs = [p for p in (s.strip() for s in parts) if p]
     return (f"{name}  " if name else "") + " · ".join(segs)
 
@@ -117,6 +118,7 @@ def _finalize(res: Dict[str, Any]) -> None:
 
 
 def _add_summary(res: Dict[str, Any], output: str) -> None:
+    """从输出里抓最后的「成功 X/Y」作为汇总；单账号（Y=1）不设 summary。"""
     m = re.findall(r"成功\s+(\d+)\s*/\s*(\d+)", output)
     if m:
         ok, total = m[-1]
@@ -130,6 +132,7 @@ def _add_summary(res: Dict[str, Any], output: str) -> None:
 # =====================================================================
 
 def _keepalive_badge(output: str, res: Dict[str, Any]) -> None:
+    """把 keepalive 保活结果转成一个 info 徽标（换新带到期日 / 失败）。"""
     if "[keepalive] ✅" in output:
         m = re.search(r"\[keepalive\] ✅ token 已换新并持久化，新 access_token 到期 ([\d-]+)", output)
         res["badges"].append(("info", f"Token已换新{('，到期 ' + m.group(1)) if m else ''}"))
@@ -1219,6 +1222,10 @@ def ex_cloud189(output: str, res: Dict[str, Any]) -> None:
                 res["gains"].append(("绿值", float(gm.group(2))))
             if hm:
                 seg.append(f"待手动 {hm.group(1)} 项")
+            # 绿色签到未达成是独立状态，不能依赖 not seg 分支——
+            # 否则它会被下面的「今日无需处理」分支吞掉，报告看不到签到没达成。
+            if "绿色签到未达成" in body:
+                seg.append("绿签未达成")
             if "今日已签" in body and not seg:
                 seg.append("绿签已达成")
             if "未开启" in body and not seg:

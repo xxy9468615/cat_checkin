@@ -788,6 +788,9 @@ def _run_one(idx: int, total: int, username: str, password: str,
     # 文案一律避开「失败/失效/异常/错误/超时/无法」与「签到失败/处理失败/登录失败」
     # （前者会被 report_fields._finalize 误捞进 error_lines，后者会让解析器把
     #  整行判成账号级失败并清空账号块），故统一用「未开启 / 待手动 / 未达成」。
+    # 成长行先收进局部列表：中途抛异常时整体丢弃，只留占位行。
+    # 否则「成长任务已完成」与「成长任务未开启」会同时进摘要，报告自相矛盾。
+    growth_lines: List[str] = []
     try:
         auth_ready = _ensure_growth_auth(active_h, sk)
         # getGreenLevelList 只认 sessionKey、免 m 域 Cookie，是鉴权不全时
@@ -798,16 +801,17 @@ def _run_one(idx: int, total: int, username: str, password: str,
             task_line, _done, _score, _manual = _growth_tasks(active_h, sk)
             # 签到态与任务态合成一行：绿色签到本身也是成长任务的一环，
             # 拆两行会让 ex_cloud189 的正则只命中后者、丢掉签到信息。
-            lines.append(f"• 成长任务: {gsign} · {task_line}")
+            growth_lines.append(f"• 成长任务: {gsign} · {task_line}")
             reward_line, _c, _m = _level_rewards(active_h, sk, level_no)
-            lines.append(f"• 等级奖励: {reward_line}")
+            growth_lines.append(f"• 等级奖励: {reward_line}")
         else:
-            lines.append("• 成长任务: 未开启（鉴权不全）")
-            lines.append("• 等级奖励: 未开启（鉴权不全）")
-        lines.append(f"• 绿色等级: {level_line or '未开启（鉴权不全）'}")
+            growth_lines.append("• 成长任务: 未开启（鉴权不全）")
+            growth_lines.append("• 等级奖励: 未开启（鉴权不全）")
+        growth_lines.append(f"• 绿色等级: {level_line or '未开启（鉴权不全）'}")
+        lines.extend(growth_lines)
     except Exception as exc:  # noqa: BLE001
         # 兜底：成长体系整体异常时只留痕，不影响账号成败
-        print(f"    [diag] 成长体系未处理: {str(exc)[:80]}", flush=True)
+        print(f"    [diag] 成长体系未处理：{_mask_net_text(exc)}", flush=True)
         lines.append("• 成长任务: 未开启（鉴权不全）")
         lines.append("• 等级奖励: 未开启（鉴权不全）")
         lines.append("• 绿色等级: 未开启（鉴权不全）")
