@@ -440,8 +440,24 @@ def _report_safe(text: str) -> str:
 
 
 def _mask_net_text(value: Any) -> str:
-    """仅供 [diag] 行使用：压白并截断（_NOISE_RE 会过滤 [diag] 前缀，不进报告）。"""
-    return re.sub(r"\s+", " ", str(value or "").strip())[:60]
+    """仅供 [diag] 行使用：压白、脱敏、截断。
+
+    服务端 message / 网络异常文案不可控，可能夹带手机号、邮箱或带 sessionKey 的
+    URL。这些值一旦落到 [diag] 就等于落进了 CI 日志与任务结果 JSON，
+    属凭据/PII 泄漏（路径规范：凭据/手机号/邮箱必须经 common.mask_str 系脱敏）。
+    这里只做「删改」而不只是压白：直接抹掉敏感片段，绝不做部分保留。
+    """
+    s = re.sub(r"\s+", " ", str(value or "").strip())
+    if not s:
+        return ""
+    # sessionKey 等长 hex/base64 凭据（含常见查询参数形态）
+    s = re.sub(r"(?i)\b(session(?:key|secret|id)|accesstoken|cookie_login_user)="
+               r"[A-Za-z0-9%+/=._-]{6,}", r"\1=***", s)
+    s = re.sub(r"\b[A-Fa-f0-9]{32,}\b", "***", s)
+    # 手机号 / 邮箱
+    s = re.sub(r"\b1[3-9]\d{9}\b", "***", s)
+    s = re.sub(r"[\w.+-]+@[\w-]+\.[\w.]+", "***", s)
+    return s[:60]
 
 
 def _growth_session_alive(h: Http, sk: str) -> bool:
@@ -532,7 +548,10 @@ def _growth_sign(h: Http, sk: str) -> Tuple[str, bool]:
     )
     d = _resp_dict(resp)
     code = _biz_code(d)
-    if resp.code == 200 and code == "0":
+    # H5 判据（bundle 实证）：`status === 0` **且** `result` 为真才算签到成功。
+    # 只查业务码会把 `{status:0, result:false}`（已签/未获确认）误报成今日已签
+    # ——规则 9a(1) 绝不允许假成功，故两个条件都要查。
+    if resp.code == 200 and code == "0" and d.get("result") is True:
         day = ""
         try:
             r2 = h.request(
@@ -556,9 +575,18 @@ def _growth_sign(h: Http, sk: str) -> Tuple[str, bool]:
     # 行首是缩进+[diag]，若文案里再带 403 仍会被 _ERROR_KW 命中
     # （CodeRabbit #14 指出的真实路径）。故诊断码一律转成不可命中的写法。
     print(f"    [diag] signInNew 未达成：biz_code={code or '(空)'} "
-          f"result={str(d.get('result'))[:12]} "
+          f"result={_diag_bool(d.get('result'))} "
           f"hint={_mask_net_text(d.get('message') or d.get('errorMsg'))}", flush=True)
     return "绿色签到未达成（接口未确认）", False
+
+
+def _diag_bool(value: Any) -> str:
+    """把任意响应字段收窄成 true/false/other 三个字面量，绝不做自由文本回显。
+
+    response 里的字段值可能是任意类型（含夹带 PII 的长串），诊断只需要知道
+    它「是不是 True」。白名单式输出比任何脱敏都可靠。
+    """
+    return "true" if value is True else ("false" if value is False else "other")
 
 
 def _do_green_task(h: Http, sk: str, task_id: str) -> Tuple[bool, int]:
@@ -630,7 +658,14 @@ def _growth_tasks(h: Http, sk: str) -> Tuple[str, int, int, int]:
                 reward = int(t.get("rewardValue") or 0)
             except (TypeError, ValueError):
                 reward = 0
-            ok, _ = _do_green_task(h, sk, tid)
+            try:
+                ok, _ = _do_green_task(h, sk, tid)
+            except Exception as exc:
+                # 单项上报中途异常（如 IncompleteRead）不得丢掉已确认的累计：
+                # done/score 在此之前已入账，此处只留痕并继续后续任务。
+                print(f"    [diag] doGreenTask 上报中断（taskId 已脱敏）：{_mask_net_text(exc)}",
+                      flush=True)
+                continue
             if ok:
                 done += 1
                 score += reward
@@ -840,12 +875,17 @@ def _run_one(idx: int, total: int, username: str, password: str,
     # 成长行先收进局部列表：中途抛异常时整体丢弃，只留占位行。
     # 否则「成长任务已完成」与「成长任务未开启」会同时进摘要，报告自相矛盾。
     growth_lines: List[str] = []
+    # 完成标志必须在 try 之前初始化：否则 _ensure_growth_auth / _growth_level
+    # 抛异常时，except 分支读 done_task 会触发 UnboundLocalError，
+    # 而这会让「普通签到已成功」的账号反因成长子功能异常被 main() 判失败
+    # （CodeRabbit Major：成长体系绝不得影响账号判定）。
+    done_task = False
+    done_reward = False
     try:
         auth_ready = _ensure_growth_auth(active_h, sk)
         # getGreenLevelList 只认 sessionKey、免 m 域 Cookie，是鉴权不全时
         # 仍能汇报等级的最后保障——因此等级行必须无条件尝试并占位。
         level_line, level_no = _growth_level(active_h, sk)
-        done_task = done_reward = False
         if auth_ready:
             gsign, _gok = _growth_sign(active_h, sk)
             task_line, _done, _score, _manual = _growth_tasks(active_h, sk)

@@ -740,8 +740,9 @@ class TestCloud189Growth(unittest.TestCase):
 
         def _req(method, url, **_kw):
             if "signInNewInfo" in url:
-                return SimpleNamespace(code=200, text="x", json=lambda *_a: {"code": "0", "data": 5})
-            return SimpleNamespace(code=200, text="x", json=lambda *_a: {"code": "0", "data": {}})
+                return SimpleNamespace(code=200, text="x", json=lambda *_a: {"status": 0, "data": 5})
+            return SimpleNamespace(code=200, text="x",
+                                  json=lambda *_a: {"status": 0, "result": True})
 
         h = MagicMock()
         h.request.side_effect = _req
@@ -757,7 +758,8 @@ class TestCloud189Growth(unittest.TestCase):
         def _req(method, url, **_kw):
             if "signInNewInfo" in url:
                 return SimpleNamespace(code=-1, text="", json=lambda *_a: {})
-            return SimpleNamespace(code=200, text="x", json=lambda *_a: {"code": "0", "data": {}})
+            return SimpleNamespace(code=200, text="x",
+                                  json=lambda *_a: {"status": 0, "result": True})
 
         h = MagicMock()
         h.request.side_effect = _req
@@ -966,6 +968,121 @@ class TestCloud189Growth(unittest.TestCase):
         self.assertEqual(res["error_lines"], [])
         self.assertEqual(len(res["lines"]), 1)
         self.assertIn("LV1 绿色达人", res["lines"][0])
+
+
+    # ---- 12. result 判定 / done 标志初始化 / 单项异常 / 诊断脱敏 ----
+
+    def test_growth_sign_requires_result_true(self):
+        """业务码为 0 但 result 非 True（已签/未获服务端确认）不得报成功
+        ——规则 9a(1) 绝不允许假成功（CodeRabbit Major）。"""
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+
+        for bad in (False, None, {}, "true", 1):
+            h = MagicMock()
+            h.request.side_effect = lambda *_a, _r=bad, **__k: SimpleNamespace(
+                code=200, text="x", json=lambda *x: {"status": 0, "result": _r})
+            text, ok = cloud189._growth_sign(h, SK_FAKE)
+            self.assertFalse(ok, f"result={bad!r} 不得判为签到成功")
+            self.assertEqual(text, "绿色签到未达成（接口未确认）")
+
+    def test_growth_done_flags_initialized_before_try(self):
+        """_ensure_growth_auth 抛异常时，except 分支读 done_task 不得触发
+        UnboundLocalError —— 否则普通签到已成功的账号会被判失败（CodeRabbit Major，
+        直接违反「成长体系绝不得影响账号判定」）。"""
+        from unittest.mock import MagicMock, patch
+
+        ep = MagicMock()
+        ep.display_name = "测试出口"
+        ep.url = "socks5://127.0.0.1:1080"
+
+        def fake_http(follow_redirects=True, proxy="", infer_proxy=True):
+            h = MagicMock()
+            h.url = proxy
+            return h
+
+        def boom(*_a, **_kw):
+            raise RuntimeError("鉴权链路抖动")
+
+        with patch.object(cloud189, "_get_candidate_proxies", return_value=[ep]), \
+             patch.object(cloud189, "Http", side_effect=fake_http), \
+             patch.object(cloud189, "_login", return_value="V1.0FAKE_SESSION_KEY"), \
+             patch.object(cloud189, "_sign", return_value=("【成功】+30M 空间", True)), \
+             patch.object(cloud189, "_lotteries", return_value="无"), \
+             patch.object(cloud189, "_space", return_value="10G/100G"), \
+             patch.object(cloud189, "_ensure_growth_auth", side_effect=boom):
+            ok, summary = cloud189._run_one(1, 1, "V1.0FAKE_ACCOUNT", "V1.0FAKE_PASS")
+
+        self.assertTrue(ok)
+        self.assertIn("• 成长任务: 未开启（鉴权不全）", summary)
+        self.assertIn("• 等级奖励: 未开启（鉴权不全）", summary)
+
+    def test_growth_task_midway_exception_keeps_confirmed(self):
+        """_do_green_task 中途抛异常（如 IncompleteRead）不得丢掉已确认的
+        done/score，且后续任务仍要继续处理。"""
+        import urllib.parse as up
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+
+        tasks = [
+            {"taskId": "V1.0FAKE_T1", "taskName": "a", "rewardValue": 10, "status": False},
+            {"taskId": "V1.0FAKE_T2", "taskName": "b", "rewardValue": 20, "status": False},
+            {"taskId": "V1.0FAKE_T3", "taskName": "c", "rewardValue": 30, "status": False},
+        ]
+        # 服务端按 taskType 分列表：三项任务只挂在 taskType=2 下，其余类型返回空
+        by_type = {"2": tasks, "3": [], "5": [], "1": []}
+        calls = []
+
+        def _req(method, url, form=None, **_kw):
+            calls.append((method, url, form or {}))
+            if "doGreenTask" in url:
+                # 第 2 次上报抛 IncompleteRead，其余正常入账
+                if sum(1 for m, u, _f in calls if "doGreenTask" in u) >= 2:
+                    raise OSError("IncompleteRead")
+                return SimpleNamespace(code=200, text="x",
+                                      json=lambda *_a: {"status": 0, "data": True})
+            qs = up.parse_qs(up.urlsplit(url).query)
+            tt = (qs.get("taskType") or [""])[0]
+            return SimpleNamespace(code=200, text="x",
+                                  json=lambda *_a, _d=by_type.get(tt, []):
+                                  {"status": 0, "data": _d})
+
+        h = MagicMock()
+        h.request.side_effect = _req
+        text, done, score, _m = cloud189._growth_tasks(h, SK_FAKE)
+        posted = [c for c in calls if "doGreenTask" in c[1]]
+        # 三项都尝试了（异常没有中断循环）
+        self.assertEqual(len(posted), 3)
+        # 第 1 项已确认的结果保留，没有被异常抹掉
+        self.assertEqual(done, 1)
+        self.assertEqual(score, 10)
+        self.assertIn("完成 1 项", text)
+
+    def test_mask_net_text_redacts_pii_and_credentials(self):
+        """诊断文案必须删改凭据与 PII，而非原样落进 CI 日志（CodeRabbit Major）。"""
+        f = cloud189._mask_net_text
+        self.assertEqual(f("ok"), "ok")
+        # sessionKey / accessToken 查询参数
+        self.assertIn("***", f("sessionKey=abcdef1234567890abcdef"))
+        self.assertNotIn("abcdef1234567890", f("sessionKey=abcdef1234567890abcdef"))
+        self.assertIn("***", f("?accessToken=V1.0FAKE_TOKEN_VALUE_XYZ"))
+        # 长 hex / base64 凭据
+        self.assertIn("***", f("token " + "a" * 40))
+        # 手机号 / 邮箱（用拼接构造样例，避免真实手机号形态入库）
+        phone = "13" + "8001" + "38000"
+        self.assertIn("***", f(f"用户 {phone} 登录失败"))
+        self.assertIn("***", f("邮箱 user@example.com 校验失败"))
+        # 不产生自由文本回显：一律截断
+        self.assertLessEqual(len(f("x" * 500)), 60)
+
+    def test_diag_bool_whitelist(self):
+        """诊断里的布尔字段只输出 true/false/other，绝不做自由文本回显。"""
+        f = cloud189._diag_bool
+        self.assertEqual(f(True), "true")
+        self.assertEqual(f(False), "false")
+        self.assertEqual(f(None), "other")
+        self.assertEqual(f({"secret": "V1.0FAKE"}), "other")
+        self.assertEqual(f("V1.0FAKE_LONG_STRING"), "other")
 
 
 if __name__ == "__main__":

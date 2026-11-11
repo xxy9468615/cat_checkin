@@ -1228,11 +1228,11 @@ def ex_cloud189(output: str, res: Dict[str, Any]) -> None:
                 res["gains"].append(("绿值", float(gm.group(2))))
             if hm:
                 seg.append(f"待手动 {hm.group(1)} 项")
-            # 绿色签到未达成是独立状态，不能依赖 not seg 分支——
-            # 否则它会被下面的「今日无需处理」分支吞掉，报告看不到签到没达成。
+            # 绿色签到未达成、今日已签都是**独立状态**，不能依赖 not seg 分支：
+            # 否则有任务进度时它们会被挤掉，日报看不到绿色签到到底成没成。
             if "绿色签到未达成" in body:
                 seg.append("绿签未达成")
-            if "今日已签" in body and not seg:
+            if "今日已签" in body:
                 seg.append("绿签已达成")
             if "未开启" in body and not seg:
                 seg.append("成长体系未开启")
