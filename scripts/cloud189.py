@@ -100,6 +100,7 @@ GREEN_TASK_TYPES = (2, 3, 5)
 
 
 def _resp_dict(resp: Any) -> Dict[str, Any]:
+    """把响应体安全解析成 dict：非 JSON / 非对象 / 网络层 -1 一律降级为空 dict。"""
     try:
         j = resp.json({})
     except Exception:
@@ -418,6 +419,29 @@ def _green_headers() -> Dict[str, str]:
     }
 
 
+# 报告层的关键词黑名单：命中任一即会被 report_fields 误判成失败/错误行。
+# 见 report_fields._ERROR_KW 与 ex_cloud189 的失败子串匹配。
+_REPORT_BANNED_WORDS = ("失败", "失效", "异常", "错误", "401", "403", "超时", "无法",
+                        "Traceback", "签到失败", "处理失败", "登录失败")
+
+
+def _report_safe(text: str) -> str:
+    """把服务端回显文案洗成报告安全串：命中黑名单即整段丢弃并降级为固定兜底。
+
+    服务端 message/levelName 等字段内容不受控，一旦含上述字样，
+    健康账号会被日报显示成失败行（ex_cloud189 的失败行匹配 + _finalize 兜底扫描）。
+    """
+    s = re.sub(r"\s+", " ", str(text or "").strip())
+    if not s or any(w in s for w in _REPORT_BANNED_WORDS):
+        return ""
+    return s[:24]
+
+
+def _mask_net_text(value: Any) -> str:
+    """仅供 [diag] 行使用：压白并截断（_NOISE_RE 会过滤 [diag] 前缀，不进报告）。"""
+    return re.sub(r"\s+", " ", str(value or "").strip())[:60]
+
+
 def _ensure_growth_auth(h: Http, sk: str) -> bool:
     """确保 m 域 Cookie 就绪（密码模式需 ssoLoginMerge 补齐一次）。
 
@@ -474,8 +498,12 @@ def _growth_sign(h: Http, sk: str) -> Tuple[str, bool]:
         except Exception:
             pass
         return ("今日已签" + (f"（本周第 {day} 天）" if day else ""), True)
-    msg = str(d.get("message") or d.get("errorMsg") or resp.code)
-    return f"绿色签到未达成（{msg[:30]}）", False
+    # 绝不回显服务端文案 / HTTP 码：天翼的 message 可能含「失败/错误」等词，
+    # 401/403 也会命中 report_fields 的 _ERROR_KW，把健康账号误显示成失败行。
+    # 具体原因只进 [diag] 行（该前缀会被 _NOISE_RE 过滤，不进报告）。
+    print(f"    [diag] signInNew 未达成：HTTP {resp.code} code={code} "
+          f"msg={_mask_net_text(d.get('message') or d.get('errorMsg'))}", flush=True)
+    return "绿色签到未达成（接口未确认）", False
 
 
 def _do_green_task(h: Http, sk: str, task_id: str) -> Tuple[bool, int]:
@@ -603,12 +631,15 @@ def _growth_level(h: Http, sk: str) -> Tuple[str, str]:
 
     if cur:
         no = str(cur.get("levelNo") or "")
-        name = str(cur.get("levelName") or "")
+        # levelName 是服务端字段，须经报告安全清洗后才可进入报告行
+        name = _report_safe(cur.get("levelName"))
         label = f"{no} {name}".strip()
     else:
-        # 未解锁任一等级：H5 以第一个未解锁等级作为参照（levelName="未解锁"）
+        # 未解锁任一等级：按 H5 语义固定显示「未解锁」（那是用户的当前状态，
+        # 而不是该等级自身的名字），等级号取第一个未解锁等级作为参照。
         first = next((lv for lv in levels if isinstance(lv, dict)), {})
-        label = f"{str(first.get('levelNo') or '').strip()} 未解锁".strip()
+        no = str(first.get("levelNo") or "").strip()
+        label = f"{no} 未解锁".strip()
         try:
             nxt_score = nxt_score or str(int(first.get("levelScore") or 0))
         except (TypeError, ValueError):
@@ -684,6 +715,12 @@ def _level_rewards(h: Http, sk: str, level_no: str) -> Tuple[str, int, int]:
 
 def _run_one(idx: int, total: int, username: str, password: str,
              cookie: str = "") -> Tuple[bool, str]:
+    """单账号完整流程：CN 代理候选轮换 → 登录 → 签到/抽奖/空间/成长体系。
+
+    返回 (账号是否达成, 分号连接的结果文案)。账号成败**只**由 `_sign` 的布尔决定：
+    抽奖、空间与整个绿色成长体系都是增益子功能，失败只如实报告、不影响判定
+    （oppo 任务阶段同款语义），并由 orchestrator / circuit_breaker 负责跨运行重试。
+    """
     if idx > 1:
         time.sleep(random.uniform(2, 5))
 
@@ -775,6 +812,7 @@ def _run_one(idx: int, total: int, username: str, password: str,
 
 
 def main() -> None:
+    """多账号入口：逐个执行，缺凭据时按约定文案退出（供 alert_levels 判为未配置）。"""
     usernames = env_seq("CLOUD189_", "username", required=False, default=[])
     passwords = env_seq("CLOUD189_", "password", required=False, default=[])
     cookies = env_seq("CLOUD189_", "cookie", required=False, default=[])

@@ -449,6 +449,75 @@ class TestCloud189Growth(unittest.TestCase):
         # 不得发起任何请求
         self.assertEqual(calls, [])
 
+    # ---- 5b. 服务端回显必须被拦住（CodeRabbit Major：健康账号被误显示成失败） ----
+
+    def test_growth_sign_never_echoes_server_text(self):
+        """signInNew 失败时绝不回显服务端 message / HTTP 码。
+
+        CodeRabbit #14 Major：原实现把 d.get('message') 原样拼进报告行，天翼的
+        文案含「失败/错误」或 code 为 401/403 时，会命中 ex_cloud189 的失败子串
+        与 _ERROR_KW，把 ok=True 的健康账号显示成失败行。
+        """
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+        hostile = [
+            ({"code": "1", "message": "签到失败，请稍后重试"}, 200),
+            ({"code": "1", "errorMsg": "系统异常"}, 200),
+            ({"code": "401", "message": "Unauthorized"}, 401),
+            ({"code": "403", "message": "Forbidden"}, 403),
+            ({}, 500),
+        ]
+        for payload, http_code in hostile:
+            h = MagicMock()
+            h.request.side_effect = lambda *_a, _p=payload, _c=http_code, **__k: SimpleNamespace(
+                code=_c, text=repr(_p), json=lambda *x: _p)
+            text, ok = cloud189._growth_sign(h, SK_FAKE)
+            self.assertFalse(ok)
+            # 固定文案，且不含任何服务端回显
+            self.assertEqual(text, "绿色签到未达成（接口未确认）")
+            for kw in self._ERROR_KW + self._FAIL_SUB:
+                self.assertNotIn(kw, text, f"payload={payload} 泄出了禁词 {kw!r}")
+
+    def test_growth_sign_failure_line_is_not_parsed_as_failure(self):
+        """端到端：该固定文案经 ex_cloud189 解析后不得进 fail_lines / error_lines。"""
+        from report_fields import extract_for
+        out = (
+            "[1/1] 👤 用户: 【1***4】\n"
+            "  • 签到: 【成功】+30M 空间\n"
+            "  • 成长任务: 绿色签到未达成（接口未确认） · 今日无需处理\n"
+            "  • 等级奖励: 已领 1 项权益\n"
+            "  • 绿色等级: LV2 绿色达人 · 绿值 620g\n"
+            "✅ 全部 1 个账号处理完成 (成功 1/1)\n"
+        )
+        res = extract_for("cloud189.py", out)
+        self.assertEqual(res["fail_lines"], [])
+        self.assertEqual(res["error_lines"], [])
+        self.assertEqual(len(res["lines"]), 1)   # 账号块未被清空
+
+    def test_report_safe_drops_banned_words(self):
+        """_report_safe：服务端字段命中黑名单即整段丢弃（返回空串）。"""
+        self.assertEqual(cloud189._report_safe("绿色达人"), "绿色达人")
+        self.assertEqual(cloud189._report_safe("  绿色达人  "), "绿色达人")
+        for bad in ("签到失败", "系统错误", "Unauthorized 401", "状态异常", "无法领取",
+                    "超时", "处理失败", "Traceback", ""):
+            self.assertEqual(cloud189._report_safe(bad), "", f"{bad!r} 应被丢弃")
+
+    def test_growth_level_sanitizes_server_level_name(self):
+        """levelName 是服务端字段：命中黑名单时不得泄漏进报告行。"""
+        from unittest.mock import MagicMock
+        hostile_levels = [
+            {"levelNo": "LV2", "levelName": "绿色等级签到失败", "levelScore": 1500,
+             "drawState": True},
+        ]
+        routes = {"getGreenLevelList": self._resp("0", {"userScore": 1250,
+                                                        "greenLevelList": hostile_levels})}
+        h = MagicMock()
+        h.request.side_effect = _fake_growth_request(routes, [])
+        text, level_no = cloud189._growth_level(h, SK_FAKE)
+        for kw in self._ERROR_KW + self._FAIL_SUB:
+            self.assertNotIn(kw, text, f"服务端 levelName 泄出了禁词 {kw!r}")
+        self.assertIn("LV2", text)          # 等级号仍如实呈现
+
     # ---- 6. 文案安全（规则 9a(2) + 防解析器误判账号失败） ----
 
     _ERROR_KW = ("失败", "失效", "异常", "错误", "401", "403", "超时", "无法", "Traceback")
