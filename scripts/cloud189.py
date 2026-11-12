@@ -674,6 +674,12 @@ def _growth_tasks(h: Http, sk: str) -> Tuple[str, int, int, int]:
         # 表示该类没有可处理任务，不是查询失败。真实 CI 实测就出现过因此误报
         # 「列表未确认 1 类」。
         if resp.code != 200 or _biz_code(d) != "0":
+            # 留痕到 taskType 粒度：否则现场只看到「列表未确认 1 类」，
+            # 无法判断是哪一类、是 HTTP 问题还是业务码问题
+            print(f"    [diag] getGreenTaskList 未确认（taskType={task_type}）："
+                  f"http={resp.code} biz_code={_biz_code(d) or '(空)'} "
+                  f"hint={_mask_net_text(d.get('message') or d.get('errorMsg'))}",
+                  flush=True)
             list_failed += 1
             continue
         list_ok += 1
