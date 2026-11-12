@@ -1071,8 +1071,11 @@ class TestCloud189Growth(unittest.TestCase):
         self.assertIn("***", f(f"sessionKey={fake_sk}"))
         self.assertNotIn("ABCDEF123456", f(f"sessionKey={fake_sk}"))
         self.assertIn("***", f("?accessToken=V1.0FAKE_TOKEN_VALUE_XYZ"))
-        # 长 hex / base64 凭据（拼接构造合成值，不引入真实形态）
-        self.assertIn("***", f("token " + "a" * 40))
+        # 长 hex 凭据：纯 hex 无法带 V1.0FAKE 前缀，用重复段动态构造（不落真实 token）
+        long_hex = "a" * 40
+        redacted = f(f"token {long_hex}")
+        self.assertIn("***", redacted)
+        self.assertNotIn(long_hex, redacted)
         # 手机号 / 邮箱（用拼接构造样例，避免真实手机号形态入库）
         phone = "13" + "8001" + "38000"
         self.assertIn("***", f(f"用户 {phone} 登录失败"))
@@ -1321,8 +1324,10 @@ class TestCloud189Growth(unittest.TestCase):
             def _req(method, url, form=None, **_kw):
                 qs = up.parse_qs(up.urlsplit(url).query)
                 tt = (qs.get("taskType") or [""])[0]
-                if tt == "5":
-                    # 气泡任务返回对象结构（非 list）
+                # 在**实际会请求**的类型上返回非 list 结构（taskType=2）。
+                # 原实现用 tt=="5"，而 GREEN_TASK_TYPES 已不含 5，该分支永假，
+                # 测试实际只跑了空列表，没验证到声称的非列表行为（CodeRabbit）。
+                if tt == "2":
                     return SimpleNamespace(code=200, text="x",
                                           json=lambda *_a: {"status": 0, "data": {}})
                 return SimpleNamespace(code=200, text="x",
@@ -1353,6 +1358,108 @@ class TestCloud189Growth(unittest.TestCase):
             self.assertNotIn("今日无需处理", text, f"mode={mode}")
             # 可自动化类型 2 类 + 新人任务 1 类 = 3 类（气泡 taskType=5 已剔除）
             self.assertIn("列表未确认 3 类", text, f"mode={mode}")
+
+
+# ---- 15. 等级查询时机 / 无效绿值 / 会话判据 ----
+
+    def test_growth_level_queried_after_tasks(self):
+        """等级必须在签到与任务**之后**查询：本轮升级后领奖要用新等级。
+
+        原实现先查等级再跑任务，首次解锁时 level_no 为空 → 直接跳过本轮领取。
+        """
+        from unittest.mock import MagicMock, patch
+
+        ep = MagicMock()
+        ep.display_name = "测试出口"
+        ep.url = "socks5://127.0.0.1:1080"
+        order = []
+
+        def fake_http(follow_redirects=True, proxy="", infer_proxy=True):
+            h = MagicMock()
+            h.url = proxy
+            return h
+
+        def mark_level(*_a, **_kw):
+            order.append("level")
+            return "LV3 绿色先锋", "LV3"
+
+        def mark_tasks(*_a, **_kw):
+            order.append("tasks")
+            return "完成 5 项 (+100 绿值)", 5, 100, 0
+
+        def mark_rewards(_h, _sk, level_no):
+            order.append(f"rewards:{level_no}")
+            return "已领 1 项权益", 1, 0
+
+        with patch.object(cloud189, "_get_candidate_proxies", return_value=[ep]), \
+             patch.object(cloud189, "Http", side_effect=fake_http), \
+             patch.object(cloud189, "_login", return_value="V1.0FAKE_SESSION_KEY"), \
+             patch.object(cloud189, "_sign", return_value=("【成功】+30M 空间", True)), \
+             patch.object(cloud189, "_lotteries", return_value="无"), \
+             patch.object(cloud189, "_space", return_value="10G/100G"), \
+             patch.object(cloud189, "_ensure_growth_auth", return_value=True), \
+             patch.object(cloud189, "_growth_sign", return_value=("今日已签", True)), \
+             patch.object(cloud189, "_growth_tasks", side_effect=mark_tasks), \
+             patch.object(cloud189, "_growth_level", side_effect=mark_level), \
+             patch.object(cloud189, "_level_rewards", side_effect=mark_rewards):
+            ok, summary = cloud189._run_one(1, 1, "V1.0FAKE_ACCOUNT", "V1.0FAKE_PASS")
+
+        self.assertTrue(ok)
+        # 顺序：任务先于等级查询；领奖用升级后的等级
+        self.assertLess(order.index("tasks"), order.index("level"))
+        self.assertIn("rewards:LV3", order)
+        # 摘要展示的是升级后的等级
+        self.assertIn("LV3 绿色先锋", summary)
+
+    def test_growth_level_invalid_score_is_not_zero(self):
+        """userScore 上报了但无法解析时，应标「绿值未确认」而非静默显示 0g。"""
+        from unittest.mock import MagicMock
+        routes = {"getGreenLevelList": self._resp("0", {
+            "userScore": "invalid",
+            "greenLevelList": [
+                {"levelNo": "LV2", "levelName": "绿色行者", "levelScore": 1000,
+                 "drawState": True},
+            ]})}
+        h = MagicMock()
+        h.request.side_effect = _fake_growth_request(routes, [])
+        text, level_no = cloud189._growth_level(h, SK_FAKE)
+        self.assertEqual(level_no, "LV2")          # 有效等级必须保留
+        self.assertIn("绿值未确认", text)
+        self.assertNotIn("绿值 0g", text)
+
+    def test_growth_level_missing_score_defaults_zero(self):
+        """字段确实缺失（未上报）时按 0 处理，与「上报但无效」区分开。"""
+        from unittest.mock import MagicMock
+        routes = {"getGreenLevelList": self._resp("0", {
+            "greenLevelList": [
+                {"levelNo": "LV2", "levelName": "绿色行者", "levelScore": 1000,
+                 "drawState": True},
+            ]})}
+        h = MagicMock()
+        h.request.side_effect = _fake_growth_request(routes, [])
+        text, _lv = cloud189._growth_level(h, SK_FAKE)
+        self.assertIn("绿值 0g", text)
+        self.assertNotIn("未确认", text)
+
+    def test_growth_session_alive_requires_business_code(self):
+        """HTTP 200 但空 JSON / 非零业务码不得判为会话就绪（防假诊断）。"""
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+
+        for body in ({}, {"status": 1}, {"data": 3}):
+            h = MagicMock()
+            h.request.side_effect = lambda *_a, _b=body, **__k: SimpleNamespace(
+                code=200, text="x", json=lambda *x: _b)
+            self.assertFalse(cloud189._growth_session_alive(h, SK_FAKE), f"body={body}")
+
+    def test_growth_session_alive_accepts_status_zero(self):
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+
+        h = MagicMock()
+        h.request.side_effect = lambda *_a, **__k: SimpleNamespace(
+            code=200, text="x", json=lambda *x: {"status": 0, "data": 3})
+        self.assertTrue(cloud189._growth_session_alive(h, SK_FAKE))
 
 
 if __name__ == "__main__":

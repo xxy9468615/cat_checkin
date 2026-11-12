@@ -502,8 +502,13 @@ def _growth_session_alive(h: Http, sk: str) -> bool:
     except Exception:
         return False
     d = _resp_dict(r)
-    # 400 + errorCode=InvalidSessionKey 即鉴权未就绪（现金现值：cookieUserSession=null）
-    return r.code == 200 and d.get("errorCode") != "InvalidSessionKey"
+    # 必须**正面确认**鉴权通过，而不是「没看到 InvalidSessionKey 就算过」：
+    # HTTP 200 但返回 {} 或 {"status":1} 时，只排除一个错误码会误判成就绪，
+    # 进而打出「已取得可用的 m 域会话」的假诊断（CodeRabbit 指出）。
+    # 判定式：HTTP 200 + 业务码为 0 + 明确没有 InvalidSessionKey。
+    if r.code != 200 or _biz_code(d) != "0":
+        return False
+    return d.get("errorCode") != "InvalidSessionKey"
 
 
 def _ensure_growth_auth(h: Http, sk: str) -> bool:
@@ -761,10 +766,20 @@ def _growth_level(h: Http, sk: str) -> Tuple[str, str]:
     if resp.code != 200 or _biz_code(d) != "0" or not isinstance(d.get("data"), dict):
         return "", ""
     data = d["data"]
-    try:
-        score = int(data.get("userScore") or 0)
-    except (TypeError, ValueError):
+    # 区分三种情况（CodeRabbit：字段未上报 ≠ 上报了但无效 ≠ 真的是 0）：
+    #   - 字段缺失 / None  → 按 0 处理（服务端确实没给）
+    #   - 给了但解析不了（如 "invalid"）→ 标为未确认，绝不静默归零
+    #   - 正常数值 → 直接用
+    raw_score = data.get("userScore")
+    score_unknown = False
+    if raw_score is None:
         score = 0
+    else:
+        try:
+            score = int(raw_score)
+        except (TypeError, ValueError):
+            score = 0
+            score_unknown = True
     levels = data.get("greenLevelList")
     levels = levels if isinstance(levels, list) else []
 
@@ -799,7 +814,7 @@ def _growth_level(h: Http, sk: str) -> Tuple[str, str]:
         except (TypeError, ValueError):
             pass
 
-    detail = f"绿值 {score}g"
+    detail = "绿值未确认" if score_unknown else f"绿值 {score}g"
     if nxt_score:
         detail += f"（下一级 {nxt_score}g）"
     return f"{label} · {detail}" if label else "", str(cur.get("levelNo") or "")
@@ -974,14 +989,6 @@ def _run_one(idx: int, total: int, username: str, password: str,
     except Exception as exc:  # noqa: BLE001
         print(f"    [diag] 成长鉴权未就绪：{_mask_net_text(exc)}", flush=True)
 
-    # getGreenLevelList 只认 sessionKey、免 m 域 Cookie，是鉴权不全时仍能汇报
-    # 等级的最后保障——因此等级行无条件尝试（失败只影响等级行本身）。
-    level_line = level_no = ""
-    try:
-        level_line, level_no = _growth_level(active_h, sk)
-    except Exception as exc:  # noqa: BLE001
-        print(f"    [diag] 等级查询未完成：{_mask_net_text(exc)}", flush=True)
-
     task_line = ""
     if auth_ready:
         gsign = ""
@@ -997,7 +1004,20 @@ def _run_one(idx: int, total: int, username: str, password: str,
             print(f"    [diag] 成长任务未完成：{_mask_net_text(exc)}", flush=True)
             task_line = gsign
         growth_lines.append(f"• 成长任务: {task_line or '未开启（鉴权不全）'}")
+    else:
+        growth_lines.append("• 成长任务: 未开启（鉴权不全）")
 
+    # 等级查询放在签到与任务**之后**：本轮操作可能加绿值甚至升级，
+    # 先查会拿到旧等级——领奖用旧等级、摘要显示旧绿值；首次解锁时旧
+    # level_no 还是空串，会直接跳过本轮领取（CodeRabbit 指出的真实缺陷）。
+    # 鉴权不全时它仍是唯一可用的接口（免 Cookie），所以这条查询无条件执行。
+    level_line = level_no = ""
+    try:
+        level_line, level_no = _growth_level(active_h, sk)
+    except Exception as exc:  # noqa: BLE001
+        print(f"    [diag] 等级查询未完成：{_mask_net_text(exc)}", flush=True)
+
+    if auth_ready:
         try:
             reward_line, _c, _m = _level_rewards(active_h, sk, level_no)
         except Exception as exc:  # noqa: BLE001
@@ -1005,7 +1025,7 @@ def _run_one(idx: int, total: int, username: str, password: str,
             reward_line = "未开启（鉴权不全）"
         growth_lines.append(f"• 等级奖励: {reward_line}")
     else:
-        growth_lines.append("• 成长任务: 未开启（鉴权不全）")
+        # 鉴权不全时「成长任务」行已在上面任务块外补过占位，这里只补权益行
         growth_lines.append("• 等级奖励: 未开启（鉴权不全）")
 
     growth_lines.append(f"• 绿色等级: {level_line or '未开启（鉴权不全）'}")
