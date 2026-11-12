@@ -436,6 +436,29 @@ class TestCloud189Growth(unittest.TestCase):
         _text, claimed, _m = cloud189._level_rewards(h, SK_FAKE, "LV2")
         self.assertEqual(claimed, 0)
 
+    def test_level_reward_draw_disables_framework_retry(self):
+        """发奖写操作不得被 @retry 自动重发（服务端未承诺 prizeId 幂等）。"""
+        from unittest.mock import MagicMock
+        routes = {
+            "getGreenLevelRight": self._resp("0", [
+                {"prizeId": "V1.0FAKE_P1", "rightName": "a", "drawState": False,
+                 "rightState": 1, "actionType": 0},
+            ]),
+        }
+        seen = {}
+        base = _fake_growth_request(routes, [])
+
+        def _req(method, url, form=None, **kw):
+            if "drawGreenRight" in url:
+                seen.update(kw)
+            return base(method, url, form=form, **kw)
+
+        h = MagicMock()
+        h.request.side_effect = _req
+        _text, claimed, _m = cloud189._level_rewards(h, SK_FAKE, "LV2")
+        self.assertEqual(claimed, 0)          # routes 未注册 → 404，不算已领
+        self.assertEqual(seen.get("retries"), 1)
+
     def test_level_reward_no_level_returns_degraded(self):
         from unittest.mock import MagicMock
         calls = []
@@ -767,6 +790,28 @@ class TestCloud189Growth(unittest.TestCase):
         text, ok = cloud189._growth_sign(h, SK_FAKE)
         self.assertTrue(ok)
         self.assertEqual(text, "今日已签")
+
+    def test_growth_sign_ignores_day_when_info_code_not_confirmed(self):
+        """signInNewInfo 未双确认（HTTP/业务码）时不得采信 data 里的整数天数。"""
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+
+        for code, payload in (
+            (500, {"status": 0, "data": 9}),
+            (200, {"status": 5, "data": 9}),
+        ):
+            def _req(method, url, _c=code, _p=payload, **_kw):
+                if "signInNewInfo" in url:
+                    return SimpleNamespace(code=_c, text="x", json=lambda *_a: _p)
+                return SimpleNamespace(code=200, text="x",
+                                      json=lambda *_a: {"status": 0, "result": True})
+
+            h = MagicMock()
+            h.request.side_effect = _req
+            text, ok = cloud189._growth_sign(h, SK_FAKE)
+            self.assertTrue(ok)
+            self.assertNotIn("第 9 天", text, f"code={code} payload={payload}")
+            self.assertEqual(text, "今日已签")
 
     def test_growth_sign_rejected_code_is_reported_fixed_wording(self):
         from unittest.mock import MagicMock
@@ -1224,6 +1269,8 @@ class TestCloud189Growth(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("完成 2 项", summary)
         self.assertNotIn("今日已签", summary)   # 签到抛异常，无签到文案
+        # 异常分支必须落固定占位，不得让签到状态从摘要里消失
+        self.assertIn("绿色签到未达成（接口未确认）", summary)
 
     def test_cookie_mode_mints_session_key(self):
         """仅配 CLOUD189_COOKIE_* 时也必须换 sessionKey，否则 /market/* 全部降级。"""

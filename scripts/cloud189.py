@@ -586,7 +586,10 @@ def _growth_sign(h: Http, sk: str) -> Tuple[str, bool]:
                 headers=_green_headers(), timeout=15,
             )
             dd = _resp_dict(r2)
-            if isinstance(dd.get("data"), int):
+            # 天数只是展示增量：必须 HTTP 200 + 业务码 0 双确认才可采信。
+            # 否则 500 / 非零业务码但 data 恰为整数时会把错误响应当成「第 N 天」
+            # （规则 9a：对外部响应的判定必须依据真实 code/字段）。
+            if r2.code == 200 and _biz_code(dd) == "0" and isinstance(dd.get("data"), int):
                 day = str(dd["data"])
         except Exception as exc:
             # 签到天数只是展示增量，失败不改变「已签到」结论；但仍留 [diag]
@@ -868,10 +871,16 @@ def _level_rewards(h: Http, sk: str, level_no: str) -> Tuple[str, int, int]:
         }
         # 逐项隔离：单项请求异常不得中断其余权益的领取
         try:
+            # retries=1：领取权益是发奖写操作，服务端未承诺同一 prizeId 的
+            # 重复提交幂等。默认 @retry() 会在超时/5xx 时自动重发同一表单，
+            # 若首次已被服务端处理，重发可能重复发奖或把「已发放」误判成
+            # 「领取未确认」。这里禁用框架级重试，网络异常按未确认如实上报
+            # ——权益若仍可领，下一轮 drawState 仍为假会自然重试（规则 6：
+            # 脚本内不自行重试，交给框架跨运行梯子）。
             r = h.request(
                 "POST",
                 f"{MKT_URL}/market/drawGreenRight.action",
-                headers=_green_headers(), form=form, timeout=15,
+                headers=_green_headers(), form=form, timeout=15, retries=1,
             )
         except Exception as exc:
             print(f"    [diag] drawGreenRight 请求异常（prizeId 已脱敏）："
@@ -995,8 +1004,12 @@ def _run_one(idx: int, total: int, username: str, password: str,
         try:
             gsign, _gok = _growth_sign(active_h, sk)
         except Exception as exc:  # noqa: BLE001
-            # 绿色签到失败不阻断任务上报
+            # 绿色签到失败不阻断任务上报。必须落固定占位文案：否则 gsign
+            # 为空串，后续任务成功时摘要只剩「今日无需处理」，签到状态整个
+            # 消失（步骤隔离不能变成隐藏未确认状态）。该文案与 _growth_sign
+            # 的失败返回值一致，且不含 report_fields 的失败关键词。
             print(f"    [diag] 绿色签到未完成：{_mask_net_text(exc)}", flush=True)
+            gsign = "绿色签到未达成（接口未确认）"
         try:
             t_text, _done, _score, _manual = _growth_tasks(active_h, sk)
             task_line = (f"{gsign} · " if gsign else "") + t_text
