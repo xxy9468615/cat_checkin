@@ -206,7 +206,9 @@ def _fake_growth_request(routes, calls):
     return _req
 
 
-# 服务端按 taskType 分列表：1=新人任务（需 App 操作）、2=AI任务、3=绿动任务、5=气泡任务
+# 服务端按 taskType 分列表：1=新人任务（需 App 操作）、2=AI任务、3=绿动任务。
+# 气泡任务（5）不在本接口：真实 CI 实测 getGreenTaskList?taskType=5 返回
+# biz_code=10006 参数无效，H5 里它走另一个接口函数。
 GREEN_TASKS_BY_TYPE = {
     "1": [
         {"taskId": "V1.0FAKE_TASK_NEWBIE", "taskName": "开启照片自动备份",
@@ -219,10 +221,6 @@ GREEN_TASKS_BY_TYPE = {
     "3": [
         {"taskId": "V1.0FAKE_TASK_GREEN", "taskName": "上传文件",
          "rewardValue": 10, "status": False},
-    ],
-    "5": [
-        {"taskId": "V1.0FAKE_TASK_BUBBLE", "taskName": "成长气泡",
-         "rewardValue": 5, "status": False},
     ],
 }
 
@@ -256,17 +254,16 @@ class TestCloud189Growth(unittest.TestCase):
         h.request.side_effect = _fake_growth_request(routes, calls)
         text, done, score, manual = cloud189._growth_tasks(h, SK_FAKE)
         posted = [c for c in calls if c[0] == "POST" and "doGreenTask" in c[1]]
-        # 三类可自动化任务各 POST 一次；taskType=1 新人任务绝不 POST
-        self.assertEqual(len(posted), 3)
+        # 两类可自动化任务各 POST 一次；taskType=1 新人任务绝不 POST
+        self.assertEqual(len(posted), 2)
         got = sorted(c[2].get("taskId") for c in posted)
-        self.assertEqual(got, ["V1.0FAKE_TASK_AI", "V1.0FAKE_TASK_BUBBLE",
-                               "V1.0FAKE_TASK_GREEN"])
+        self.assertEqual(got, ["V1.0FAKE_TASK_AI", "V1.0FAKE_TASK_GREEN"])
         for _m, _u, body in posted:
             self.assertNotEqual(body.get("taskId"), "V1.0FAKE_TASK_NEWBIE")
-        self.assertEqual(done, 3)
-        self.assertEqual(score, 35)              # 20 + 10 + 5
+        self.assertEqual(done, 2)
+        self.assertEqual(score, 30)              # 20 + 10
         self.assertEqual(manual, 1)              # 新人任务只进待手动
-        self.assertIn("完成 3 项", text)
+        self.assertIn("完成 2 项", text)
         self.assertIn("待手动 1 项", text)
 
     # ---- 2. doGreenTask 成功判据必须是 data is True（规则 9a(1)） ----
@@ -296,8 +293,8 @@ class TestCloud189Growth(unittest.TestCase):
         h = MagicMock()
         h.request.side_effect = _fake_growth_request(routes, calls)
         _text, done, score, _m = cloud189._growth_tasks(h, SK_FAKE)
-        self.assertEqual(done, 3)
-        self.assertEqual(score, 35)
+        self.assertEqual(done, 2)
+        self.assertEqual(score, 30)
 
     def test_growth_do_task_rejects_nonzero_code(self):
         from unittest.mock import MagicMock
@@ -1354,7 +1351,8 @@ class TestCloud189Growth(unittest.TestCase):
             h.request.side_effect = _req
             text, _d, _s, _m2 = cloud189._growth_tasks(h, SK_FAKE)
             self.assertNotIn("今日无需处理", text, f"mode={mode}")
-            self.assertIn("列表未确认 4 类", text, f"mode={mode}")
+            # 可自动化类型 2 类 + 新人任务 1 类 = 3 类（气泡 taskType=5 已剔除）
+            self.assertIn("列表未确认 3 类", text, f"mode={mode}")
 
 
 if __name__ == "__main__":

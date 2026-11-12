@@ -93,11 +93,15 @@ MKT_URL = "https://m.cloud.189.cn"
 # 真实有效性需一次带凭据联调确认（见文件末尾「联调备忘」）。
 GREEN_ACTIVITY_ID = "ACT2024cztx"
 GREEN_PAGE = f"{MKT_URL}/zt/2024/green-task-system/index.html"
-# 可自动上报的任务类型：2=AI任务、3=绿动任务、5=成长气泡任务。
+# 可自动上报的任务类型：2=AI任务、3=绿动任务。
 # 1=新人专属任务（开启相册自动备份 / 开启消息通知），完成条件是客户端设置项，
 # H5 需借助 App JS-SDK（isOpenPhotoBackup / isSetMessagePush）判定后才能上报，
 # 脚本无法代做 → 只查询、只如实报告待手动数量，绝不伪造完成态。
-GREEN_TASK_TYPES = (2, 3, 5)
+#
+# 曾经把 5（成长气泡）也放进来，但真实 CI 实测该类型不被本接口接受：
+#   getGreenTaskList?taskType=5 → http=200, biz_code=10006, hint=参数无效
+# bundle 里气泡任务走的是另一个接口函数，不是 getGreenTaskList。故剔除。
+GREEN_TASK_TYPES = (2, 3)
 
 
 
