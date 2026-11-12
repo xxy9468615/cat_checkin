@@ -102,6 +102,7 @@ class _Block:
 
 
 def _acc_line(name: str, parts: List[str]) -> str:
+    """把账号名与各段摘要拼成一行（用 " · " 连接，空段丢弃）。"""
     segs = [p for p in (s.strip() for s in parts) if p]
     return (f"{name}  " if name else "") + " · ".join(segs)
 
@@ -117,6 +118,7 @@ def _finalize(res: Dict[str, Any]) -> None:
 
 
 def _add_summary(res: Dict[str, Any], output: str) -> None:
+    """从输出里抓最后的「成功 X/Y」作为汇总；单账号（Y=1）不设 summary。"""
     m = re.findall(r"成功\s+(\d+)\s*/\s*(\d+)", output)
     if m:
         ok, total = m[-1]
@@ -130,6 +132,7 @@ def _add_summary(res: Dict[str, Any], output: str) -> None:
 # =====================================================================
 
 def _keepalive_badge(output: str, res: Dict[str, Any]) -> None:
+    """把 keepalive 保活结果转成一个 info 徽标（换新带到期日 / 失败）。"""
     if "[keepalive] ✅" in output:
         m = re.search(r"\[keepalive\] ✅ token 已换新并持久化，新 access_token 到期 ([\d-]+)", output)
         res["badges"].append(("info", f"Token已换新{('，到期 ' + m.group(1)) if m else ''}"))
@@ -1166,10 +1169,16 @@ def ex_modelscope(output: str, res: Dict[str, Any]) -> None:
 
 
 def ex_cloud189(output: str, res: Dict[str, Any]) -> None:
-    """天翼云盘：👤 用户: 【xx】 + • 签到 / 抽奖 / 空间 行。"""
+    """天翼云盘：👤 用户: 【xx】 + • 签到 / 抽奖 / 空间 / 成长体系 行。"""
     cur: Any = None
     for raw in output.splitlines():
         ln = raw.strip()
+        # 诊断行先跳过：_finalize 的兜底扫描只认「行首即 [diag]」，而任务脚本的
+        # diag 行是「    [diag] ...」（带缩进），strip 后虽以 [diag] 开头，但
+        # 文案里若带 401/403 等字样，_ERROR_KW 依然可能命中它。专属解析器自己
+        # 先排掉是最稳的一道闸（CodeRabbit #14 指出的真实路径）。
+        if ln.startswith("[diag]"):
+            continue
         m = re.search(r"👤 用户:\s*【(.+?)】", ln)
         if m:
             if cur:
@@ -1205,6 +1214,77 @@ def ex_cloud189(output: str, res: Dict[str, Any]) -> None:
         mm = re.search(r"• 空间:\s*(.+)", ln)
         if mm:
             cur.parts.append(mm.group(1))
+            continue
+        # 绿色成长体系（等级/成长值属周期收益口径，只进 parts + badge，绝不进 assets）
+        mm = re.search(r"• 成长任务:\s*(.+)", ln)
+        if mm:
+            body = mm.group(1)
+            gm = re.search(r"完成 (\d+) 项 \(\+(\d+) 绿值\)", body)
+            hm = re.search(r"待手动 (\d+) 项", body)
+            seg: List[str] = []
+            if gm:
+                seg.append(f"成长 {gm.group(1)} 项 +{gm.group(2)} 绿值")
+                res["badges"].append(("reward", f"成长任务 {gm.group(1)} 项"))
+                res["gains"].append(("绿值", float(gm.group(2))))
+            if hm:
+                seg.append(f"待手动 {hm.group(1)} 项")
+            # 绿色签到未达成、今日已签都是**独立状态**，不能依赖 not seg 分支：
+            # 否则有任务进度时它们会被挤掉，日报看不到绿色签到到底成没成。
+            if "绿色签到未达成" in body:
+                seg.append("绿签未达成")
+            if "今日已签" in body:
+                seg.append("绿签已达成")
+            if "未开启" in body and not seg:
+                seg.append("成长体系未开启")
+            # 「今日无需处理」也是独立状态：有绿签态时同样要显示，
+            # 否则用户无法区分「任务已核查且无需处理」与「任务状态没展示」。
+            if "今日无需处理" in body:
+                seg.append("任务今日无需处理")
+            # 未确认类状态独立追加，不能被 not seg 兜底吞掉成「成长 xxx」
+            um = re.search(r"上报未确认 (\d+) 项", body)
+            if um:
+                seg.append(f"上报未确认 {um.group(1)} 项")
+            lm = re.search(r"列表未确认 (\d+) 类", body)
+            if lm:
+                seg.append(f"列表未确认 {lm.group(1)} 类")
+            if not seg:
+                seg.append("成长 " + _clean(body, 30))
+            cur.parts.append(" ".join(seg))
+            continue
+        mm = re.search(r"• 绿色等级:\s*(.+)", ln)
+        if mm:
+            body = mm.group(1)
+            lm = re.search(r"^(LV\d+)\s*(\S*)", body)
+            if lm:
+                lvl = f"{lm.group(1)} {lm.group(2)}".strip()
+                cur.parts.append(_clean(body, 34))
+                res["badges"].append(("info", lvl))
+            elif "未解锁" in body:
+                cur.parts.append(_clean(body, 34))
+            else:
+                cur.parts.append(_clean(body, 34))
+            continue
+        mm = re.search(r"• 等级奖励:\s*(.+)", ln)
+        if mm:
+            body = mm.group(1)
+            rm = re.search(r"已领 (\d+) 项", body)
+            hm = re.search(r"待手动 (\d+) 项", body)
+            um = re.search(r"领取未确认 (\d+) 项", body)
+            seg = []
+            if rm:
+                seg.append(f"等级奖励 {rm.group(1)} 项")
+                res["badges"].append(("reward", f"等级奖励 {rm.group(1)} 项"))
+            if hm:
+                seg.append(f"待手动 {hm.group(1)} 项")
+            if um:
+                seg.append(f"领取未确认 {um.group(1)} 项")
+            if "无可领" in body and not seg:
+                seg.append("等级奖励无可领")
+            if "未开启" in body and not seg:
+                seg.append("等级奖励未开启")
+            if not seg:
+                seg.append("等级奖励 " + _clean(body, 26))
+            cur.parts.append(" ".join(seg))
             continue
     if cur:
         cur.flush(res)

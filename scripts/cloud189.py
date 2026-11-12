@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # cron: 0 9 * * *
 # new Env("天翼云盘 签到")
-"""天翼云盘（cloud.189.cn）每日签到、三次抽奖与个人/家庭容量统计。
+"""天翼云盘（cloud.189.cn）每日签到、三次抽奖、绿色成长体系与个人/家庭容量统计。
 
 功能：
 1. 账号密码盲登（encryptConf.do 取公钥 → unifyLoginForPC 取登录参数 →
@@ -11,7 +11,10 @@
    彻底解决境外 CI Runner 直连阻断/超时（>300s）问题。
 3. 每日签到（mkt/userSign.action + sessionKey，TELEANDROID 客户端头）
 4. 三次抽奖（drawPrizeMarketDetails：摇一摇/相册/流动空间）
-5. 个人/家庭容量统计（portal/getUserSpaceInfo.action）
+5. 绿色成长体系（m.cloud.189.cn/market/*，2025-03 上线）：
+   绿色签到 + AI/绿动/气泡任务自动上报 + 绿值与绿色达人等级查询
+   + 已解锁等级权益（drawGreenRight）自动领取
+6. 个人/家庭容量统计（portal/getUserSpaceInfo.action）
 
 环境变量（按账号二选一，密码模式最优，免抓包、每次运行自动重登）：
 - CLOUD189_USERNAME_1 / CLOUD189_PASSWORD_1 ...（手机号+密码盲登，推荐）
@@ -24,6 +27,22 @@
    均改用「手机号+密码」每次运行重新登录来绕过 Cookie 过期；默认请走密码模式。
 2. 网页 localStorage 的 accessToken 与客户端会话体系不通用
    （getSessionForPC 对各 appId 均报 UserInvalidOpenToken），勿再尝试。
+3. 绿色成长体系鉴权事实（2026-11-10 实测）：除 getGreenLevelList 外，
+   /market/* 一律要求 m 域 COOKIE_LOGIN_USER（Set-Cookie 的 Domain 是
+   m.cloud.189.cn，无前导点）＋ sessionKey query 参数。密码模式需先用
+   ssoLoginMerge.action 补齐 m 域 Cookie；Cookie 模式注入的 Domain=.189.cn
+   （前导点）天然覆盖全部 .189.cn 子域，无需额外请求。全套接口形态来自
+   天翼云盘官方 H5 bundle（zt/2024/green-task-system/js/*.js）逆向，
+   /market/* 不需要 api.cloud.189.cn 那套 HMAC 签名头。
+4. 新人专属任务（taskType=1：开启相册自动备份 / 开启消息通知）的完成条件是
+   客户端设置项，H5 需借助 App JS-SDK 判定后才能上报，脚本无法代做 ——
+   只查询并如实报告「待手动」，绝不伪造完成态。
+5. 联调备忘：activityId 兜底值为 GREEN_ACTIVITY_ID（2024 场次）。接口对未知
+   activityId 返回业务 code 而非 404，无法凭无效 key 探测有效性；若等级/任务
+   行持续显示「鉴权不全」，先用真实账号手动访问 GREEN_PAGE 抓取页面注入的
+   activityId 后再改常量。注意仓库 CI 同时注入了账号密码与 Cookie，而 _run_one
+   中密码模式优先，故线上主路径是「密码盲登 → ssoLoginMerge 补 m 域 Cookie」，
+   排查时应重点看 [diag] 行里 ssoLoginMerge 的结果。
 """
 from __future__ import annotations
 
@@ -67,8 +86,27 @@ UA_MOBILE = (
 REFERER_SIGN = "https://m.cloud.189.cn/zhuanti/2016/sign/index.jsp?albumBackupOpened=1"
 LOTTERY_TASKS = ["TASK_SIGNIN", "TASK_SIGNIN_PHOTOS", "TASK_2022_FLDFS_KJ"]
 
+# ---------- 绿色成长体系（m.cloud.189.cn/market/*，2025-03 上线） ----------
+MKT_URL = "https://m.cloud.189.cn"
+# 活动号兜底值。天翼 H5 从页面 window._ux_defaultOpts.activityId 动态注入，
+# 接口本身对未知/过期 activityId 会返回业务 code 而非 404，故无法预探测有效性；
+# 真实有效性需一次带凭据联调确认（见文件末尾「联调备忘」）。
+GREEN_ACTIVITY_ID = "ACT2024cztx"
+GREEN_PAGE = f"{MKT_URL}/zt/2024/green-task-system/index.html"
+# 可自动上报的任务类型：2=AI任务、3=绿动任务。
+# 1=新人专属任务（开启相册自动备份 / 开启消息通知），完成条件是客户端设置项，
+# H5 需借助 App JS-SDK（isOpenPhotoBackup / isSetMessagePush）判定后才能上报，
+# 脚本无法代做 → 只查询、只如实报告待手动数量，绝不伪造完成态。
+#
+# 曾经把 5（成长气泡）也放进来，但真实 CI 实测该类型不被本接口接受：
+#   getGreenTaskList?taskType=5 → http=200, biz_code=10006, hint=参数无效
+# bundle 里气泡任务走的是另一个接口函数，不是 getGreenTaskList。故剔除。
+GREEN_TASK_TYPES = (2, 3)
+
+
 
 def _resp_dict(resp: Any) -> Dict[str, Any]:
+    """把响应体安全解析成 dict：非 JSON / 非对象 / 网络层 -1 一律降级为空 dict。"""
     try:
         j = resp.json({})
     except Exception:
@@ -266,27 +304,43 @@ def _login(h: Http, username: str, password: str) -> str:
         raise RuntimeError(f"登录失败（{msg}）——可能触发验证码或密码错误")
 
     # 4. 换取 sessionKey 并种下 COOKIE_LOGIN_USER 会话票
-    # 注意：必须请求 api.cloud.189.cn 的 GET 接口（Client Open API 凭据消费端点）；
-    # 若请求 cloud.189.cn/api/portal/getSessionForPC.action（Web Portal 端点），
-    # 会因缺少先验 Web Cookie 而报 HTTP 400 cookieUserSession is null or invalid
-    print("    [diag] 正在换取移动端 sessionKey (api.cloud.189.cn/getSessionForPC.action)...", flush=True)
     to_url = res.get("toUrl") or RETURN_URL
+    print("    [diag] 正在换取移动端 sessionKey (api.cloud.189.cn/getSessionForPC.action)...", flush=True)
+    sk = _mint_session_key(h, to_url)
+    if not sk:
+        raise RuntimeError("会话交换失败（getSessionForPC 未返回 sessionKey）")
+    print("    [diag] 换取 sessionKey 成功", flush=True)
+    return sk
+
+
+def _mint_session_key(h: Http, to_url: str = "") -> str:
+    """用当前 CookieJar 里的会话票换 sessionKey（密码模式与 Cookie 模式共用）。
+
+    注意：必须请求 api.cloud.189.cn 的 GET 接口（Client Open API 凭据消费端点）；
+    若请求 cloud.189.cn/api/portal/getSessionForPC.action（Web Portal 端点），
+    会因缺少先验 Web Cookie 而报 HTTP 400 cookieUserSession is null or invalid。
+
+    Cookie 模式（只配 CLOUD189_COOKIE_*，无账号密码）同样需要它：
+    /market/* 除了 m 域 Cookie 还要求 sessionKey query 参数，缺了就只能降级。
+    """
     suffix = "clientType=TELEMAC&version=1.0.0&channelId=web_cloud.189.cn"
-    r = h.request(
-        "GET",
-        f"{API_URL}/getSessionForPC.action?{suffix}&redirectURL={quote(to_url, safe='')}",
-        headers={"User-Agent": UA_WEB, "Accept": "application/json;charset=UTF-8"},
-        timeout=10,
-        retries=1,
-    )
+    target = quote(to_url or RETURN_URL, safe="")
+    try:
+        r = h.request(
+            "GET",
+            f"{API_URL}/getSessionForPC.action?{suffix}&redirectURL={target}",
+            headers={"User-Agent": UA_WEB, "Accept": "application/json;charset=UTF-8"},
+            timeout=10,
+            retries=1,
+        )
+    except Exception as exc:
+        print(f"    [diag] getSessionForPC 请求异常：{_mask_net_text(exc)}", flush=True)
+        return ""
     sess = _resp_dict(r)
-    sk = str(sess.get("sessionKey", ""))
-    if sk:
-        print("    [diag] 换取 sessionKey 成功", flush=True)
-    else:
-        err_hint = str(sess.get("res_message") or sess.get("errorMsg") or sess.get("message") or "")
-        print(f"    [diag] getSessionForPC 未返回 sessionKey ({err_hint[:40]})", flush=True)
-        raise RuntimeError(f"会话交换失败（{err_hint or r.text[:80]}）")
+    sk = str(sess.get("sessionKey", "") or "")
+    if not sk:
+        hint = str(sess.get("res_message") or sess.get("errorMsg") or sess.get("message") or "")
+        print(f"    [diag] getSessionForPC 未返回 sessionKey（{_mask_net_text(hint)}）", flush=True)
     return sk
 
 
@@ -370,8 +424,502 @@ def _space(h: Http) -> str:
     return " · ".join(parts) if parts else "获取失败"
 
 
+# ---------- 绿色成长体系（任务 / 绿值等级 / 等级权益领取） ----------
+#
+# 鉴权事实（2026-11-10 实测）：除 getGreenLevelList 外，/market/* 动作接口一律依赖
+# m 域 COOKIE_LOGIN_USER（Set-Cookie Domain=m.cloud.189.cn）+ sessionKey query 参数。
+# getGreenLevelList 只认 sessionKey，是鉴权不全时仍可汇报等级的最后保障。
+# 全套接口形态来自天翼云盘官方 H5 bundle（zt/2024/green-task-system/js/*.js）逆向，
+# /market/* 不需要 api.cloud.189.cn 那套 HMAC 签名头。
+
+def _green_headers() -> Dict[str, str]:
+    """m 域 H5 请求头（全 ASCII：common.Http 会按 latin-1 过滤 header 值）。"""
+    return {
+        "User-Agent": UA_MOBILE,
+        "Referer": GREEN_PAGE,
+        "Accept": "application/json, text/plain, */*",
+    }
+
+
+# 报告层的关键词黑名单：命中任一即会被 report_fields 误判成失败/错误行。
+# 见 report_fields._ERROR_KW 与 ex_cloud189 的失败子串匹配。
+_REPORT_BANNED_WORDS = ("失败", "失效", "异常", "错误", "401", "403", "超时", "无法",
+                        "Traceback", "签到失败", "处理失败", "登录失败")
+
+
+def _report_safe(text: str) -> str:
+    """把服务端回显文案洗成报告安全串：命中黑名单即整段丢弃并降级为固定兜底。
+
+    服务端 message/levelName 等字段内容不受控，一旦含上述字样，
+    健康账号会被日报显示成失败行（ex_cloud189 的失败行匹配 + _finalize 兜底扫描）。
+    """
+    s = re.sub(r"\s+", " ", str(text or "").strip())
+    if not s or any(w in s for w in _REPORT_BANNED_WORDS):
+        return ""
+    return s[:24]
+
+
+def _mask_net_text(value: Any) -> str:
+    """仅供 [diag] 行使用：压白、脱敏、截断。
+
+    服务端 message / 网络异常文案不可控，可能夹带手机号、邮箱或带 sessionKey 的
+    URL。这些值一旦落到 [diag] 就等于落进了 CI 日志与任务结果 JSON，
+    属凭据/PII 泄漏（路径规范：凭据/手机号/邮箱必须经 common.mask_str 系脱敏）。
+    这里只做「删改」而不只是压白：直接抹掉敏感片段，绝不做部分保留。
+    """
+    s = re.sub(r"\s+", " ", str(value or "").strip())
+    if not s:
+        return ""
+    # sessionKey 等长 hex/base64 凭据（含常见查询参数形态）
+    s = re.sub(r"(?i)\b(session(?:key|secret|id)|accesstoken|cookie_login_user)="
+               r"[A-Za-z0-9%+/=._-]{6,}", r"\1=***", s)
+    s = re.sub(r"\b[A-Fa-f0-9]{32,}\b", "***", s)
+    # 手机号 / 邮箱
+    s = re.sub(r"\b1[3-9]\d{9}\b", "***", s)
+    s = re.sub(r"[\w.+-]+@[\w-]+\.[\w.]+", "***", s)
+    return s[:60]
+
+
+def _growth_session_alive(h: Http, sk: str) -> bool:
+    """用一个轻量只读接口探测 m 域会话是否真的可用。
+
+    为什么不能只看 jar：云盘登录链在 api.cloud.189.cn / cloud.189.cn 上也会落下
+    同名 `COOKIE_LOGIN_USER`（Domain=.189.cn 或对应子域），与 m 域那张**同名同族**，
+    光靠名字/域根本分不出服务端认哪张。CI 实测（2026-11-11）正是掉进这个坑：
+    判据宽泛 → ssoLoginMerge 被整个跳过 → signInNew / getGreenLevelRight 恒返回
+    `cookieUserSession is null or invalid, cookieUserSession=null`，而 getGreenLevelList
+    （免 Cookie）与任务上报（sessionKey query）却一切正常，表象极具误导性。
+
+    唯一可靠判据是服务端是否接受：signInNewInfo 是最轻的只读查询，无副作用。
+    """
+    try:
+        r = h.request(
+            "GET",
+            f"{MKT_URL}/market/signInNewInfo.action?sessionKey={quote(sk, safe='')}"
+            f"&activityId={GREEN_ACTIVITY_ID}",
+            headers=_green_headers(), timeout=15, retries=1,
+        )
+    except Exception:
+        return False
+    d = _resp_dict(r)
+    # 必须**正面确认**鉴权通过，而不是「没看到 InvalidSessionKey 就算过」：
+    # HTTP 200 但返回 {} 或 {"status":1} 时，只排除一个错误码会误判成就绪，
+    # 进而打出「已取得可用的 m 域会话」的假诊断（CodeRabbit 指出）。
+    # 判定式：HTTP 200 + 业务码为 0 + 明确没有 InvalidSessionKey。
+    if r.code != 200 or _biz_code(d) != "0":
+        return False
+    return d.get("errorCode") != "InvalidSessionKey"
+
+
+def _ensure_growth_auth(h: Http, sk: str) -> bool:
+    """确保 /market/* 动作接口的 m 域会话 Cookie 就绪。
+
+    仓库 CI 同时注入 CLOUD189_USERNAME/PASSWORD 与 CLOUD189_COOKIE，而 _run_one
+    里密码模式优先（username+password 判定在前），所以线上主路径是「密码盲登 →
+    sessionKey → ssoLoginMerge 补 m 域 Cookie」——**不能跳过这一步**：
+    登录链落下的同名 Cookie 服务端不认。
+    """
+    if not sk:
+        return False
+    try:
+        h.request(
+            "GET",
+            f"{MKT_URL}/ssoLoginMerge.action?sessionKey={quote(sk, safe='')}"
+            f"&sessionKeyFm=&redirectUrl={quote(GREEN_PAGE, safe='')}"
+            f"&rand=6947_{int(time.time())}",
+            headers=_green_headers(), timeout=15, retries=1,
+        )
+    except Exception as exc:
+        print(f"    [diag] ssoLoginMerge 请求异常：{_mask_net_text(exc)}", flush=True)
+        return False
+    ok = _growth_session_alive(h, sk)
+    if ok:
+        print("    [diag] ssoLoginMerge 已取得可用的 m 域会话", flush=True)
+    else:
+        # 打出 jar 实际内容：这是定位 cookieUserSession=null 的唯一依据
+        names = ",".join(f"{c.name}@{c.domain}={len(c.value or '')}B" for c in h.jar) or "空"
+        print(f"    [diag] m 域会话未就绪（jar: {names}），成长任务降级为仅查等级",
+              flush=True)
+    return ok
+
+
+def _biz_code(d: Dict[str, Any]) -> str:
+    """取绿色成长体系的业务码。
+
+    /market/* 这一族的成功码字段并不统一：signInNew / signInNewInfo 用 `status`，
+    drawGreenRight / getGreenLevelRight 用 `code`，getGreenTaskList /
+    getGreenLevelList 又各有差异（H5 拦截器 k() 会把 code/res_code/status/
+    errorCode 归一并归一化，故前端只见 code）。本地不能假设字段名，
+    逐个尝试——CI 实测（2026-11-11）就因只认 code 把成功的 signInNew 判成未达成
+    （响应是 `status: 0`，code 字段根本不存在）。
+    """
+    for key in ("status", "code", "res_code"):
+        if key in d:
+            return str(d[key])
+    return ""
+
+
+def _growth_sign(h: Http, sk: str) -> Tuple[str, bool]:
+    """signInNew 绿色签到。返回 (文案, 是否达成)。
+
+    H5 判据（bundle 实证）：`status === 0` 且 `result` 为真即为签到成功；
+    已签到时返回的仍是成功语义（同一次调用既签到又查状态），故不单独区分。
+    """
+    resp = h.request(
+        "GET",
+        f"{MKT_URL}/market/signInNew.action?sessionKey={quote(sk, safe='')}"
+        f"&activityId={GREEN_ACTIVITY_ID}",
+        headers=_green_headers(), timeout=15,
+    )
+    d = _resp_dict(resp)
+    code = _biz_code(d)
+    # H5 判据（bundle 实证）：`status === 0` **且** `result` 为真才算签到成功。
+    # 只查业务码会把 `{status:0, result:false}`（已签/未获确认）误报成今日已签
+    # ——规则 9a(1) 绝不允许假成功，故两个条件都要查。
+    if resp.code == 200 and code == "0" and d.get("result") is True:
+        day = ""
+        try:
+            r2 = h.request(
+                "GET",
+                f"{MKT_URL}/market/signInNewInfo.action?sessionKey={quote(sk, safe='')}"
+                f"&activityId={GREEN_ACTIVITY_ID}",
+                headers=_green_headers(), timeout=15,
+            )
+            dd = _resp_dict(r2)
+            # 天数只是展示增量：必须 HTTP 200 + 业务码 0 双确认才可采信。
+            # 否则 500 / 非零业务码但 data 恰为整数时会把错误响应当成「第 N 天」
+            # （规则 9a：对外部响应的判定必须依据真实 code/字段）。
+            if r2.code == 200 and _biz_code(dd) == "0" and isinstance(dd.get("data"), int):
+                day = str(dd["data"])
+        except Exception as exc:
+            # 签到天数只是展示增量，失败不改变「已签到」结论；但仍留 [diag]
+            # 便于排查（规则 7：不得有静默失败）
+            print(f"    [diag] signInNewInfo 未取得签到天数：{_mask_net_text(exc)}", flush=True)
+        return ("今日已签" + (f"（本周第 {day} 天）" if day else ""), True)
+    # 绝不回显服务端文案 / HTTP 码：天翼的 message 可能含「失败/错误」等词，
+    # 401/403 也会命中 report_fields 的 _ERROR_KW，把健康账号误显示成失败行。
+    # 具体原因只进 [diag] 行——但 [diag] 也不能放裸 HTTP 码：
+    # _finalize 的兜底扫描只按 _NOISE_RE 过滤「行首是 [diag]」的行，而这里
+    # 行首是缩进+[diag]，若文案里再带 403 仍会被 _ERROR_KW 命中
+    # （CodeRabbit #14 指出的真实路径）。故诊断码一律转成不可命中的写法。
+    print(f"    [diag] signInNew 未达成：biz_code={code or '(空)'} "
+          f"result={_diag_bool(d.get('result'))} "
+          f"hint={_mask_net_text(d.get('message') or d.get('errorMsg'))}", flush=True)
+    return "绿色签到未达成（接口未确认）", False
+
+
+def _diag_bool(value: Any) -> str:
+    """把任意响应字段收窄成 true/false/other 三个字面量，绝不做自由文本回显。
+
+    response 里的字段值可能是任意类型（含夹带 PII 的长串），诊断只需要知道
+    它「是不是 True」。白名单式输出比任何脱敏都可靠。
+    """
+    return "true" if value is True else ("false" if value is False else "other")
+
+
+def _do_green_task(h: Http, sk: str, task_id: str) -> Tuple[bool, int]:
+    """doGreenTask POST 上报单个任务。返回 (是否入账, 该任务减碳量 g)。
+
+    成功判据严格为 data 是布尔 True（对齐 H5：`if (true !== r) toast.fail(...)`），
+    任何非 True 的 data（含字符串 "true" 之外的对象/null）都不计入完成数。
+    """
+    form = {
+        "activityId": GREEN_ACTIVITY_ID,
+        "sessionKey": sk,
+        "taskId": str(task_id),
+    }
+    resp = h.request(
+        "POST",
+        f"{MKT_URL}/market/doGreenTask.action",
+        headers=_green_headers(), form=form, timeout=15,
+    )
+    d = _resp_dict(resp)
+    if resp.code == 200 and _biz_code(d) == "0" and d.get("data") is True:
+        return True, 0
+    return False, 0
+
+
+def _growth_tasks(h: Http, sk: str) -> Tuple[str, int, int, int]:
+    """遍历可自动化的任务类型并上报。返回 (文案, 完成数, 累计绿值g, 待手动量)。
+
+    减碳量以任务列表里的 rewardValue 为准（上报响应不回收数值，属周期收益口径）。
+    taskType=1（新人任务）只统计未完成项作为「待手动」，绝不调 doGreenTask——
+    这是不可逾越的硬约束：那类任务的完成条件（开启相册自动备份 / 开启消息通知）
+    是客户端设置项，脚本代做等于伪造完成态。
+
+    每个 taskType 独立去重，不做跨类型 taskId 黑名单：服务端按类型分列表返回，
+    同一 taskId 落在不同类型里的语义不同，跨类型屏蔽会漏掉可自动化的任务。
+
+    「上报未确认」是独立状态，绝不与 done/manual 混淆：若所有上报都异常或被拒，
+    文案为「上报未确认 N 项」而非「今日无需处理」——后者等于把未确认的任务说成
+    无事可做（规则 9a(1) 禁止的假确认）。
+    """
+    done = 0
+    score = 0
+    manual = 0
+    failed = 0        # 上报未确认（异常 + 服务端拒绝）——不得混入 done 或 manual
+    list_failed = 0   # 任务列表查询未确认（HTTP/业务码/结构任一不成立）
+    list_ok = 0       # 成功确认过的列表数（区分「查询失败」与「确实无任务」）
+
+    for task_type in GREEN_TASK_TYPES + (1,):
+        automatable = task_type != 1
+        try:
+            resp = h.request(
+                "GET",
+                f"{MKT_URL}/market/getGreenTaskList.action?sessionKey={quote(sk, safe='')}"
+                f"&activityId={GREEN_ACTIVITY_ID}&random={random.random()}&taskType={task_type}",
+                headers=_green_headers(), timeout=15,
+            )
+        except Exception as exc:
+            print(f"    [diag] getGreenTaskList 请求异常（taskType={task_type}）："
+                  f"{_mask_net_text(exc)}", flush=True)
+            list_failed += 1
+            continue
+        d = _resp_dict(resp)
+        items = d.get("data")
+        # 「查询确认过」= HTTP 200 + 业务码 0。两者任一不成立才算未确认——
+        # 否则四次全 500 时会返回「今日无需处理」，把「根本没查到」谎报成
+        # 「确认无事可做」。
+        #
+        # 注意不要把「data 不是 list」也算未确认：不同 taskType 的返回结构并不
+        # 一致（如成长气泡 taskType=5 走的是另一个接口函数），非 list 或空对象
+        # 表示该类没有可处理任务，不是查询失败。真实 CI 实测就出现过因此误报
+        # 「列表未确认 1 类」。
+        if resp.code != 200 or _biz_code(d) != "0":
+            # 留痕到 taskType 粒度：否则现场只看到「列表未确认 1 类」，
+            # 无法判断是哪一类、是 HTTP 问题还是业务码问题
+            print(f"    [diag] getGreenTaskList 未确认（taskType={task_type}）："
+                  f"http={resp.code} biz_code={_biz_code(d) or '(空)'} "
+                  f"hint={_mask_net_text(d.get('message') or d.get('errorMsg'))}",
+                  flush=True)
+            list_failed += 1
+            continue
+        list_ok += 1
+        if not isinstance(items, list):
+            continue            # 该类无任务（结构不同 ≠ 查询失败）
+        seen_in_type: set = set()
+        for t in items:
+            if not isinstance(t, dict):
+                continue
+            tid = str(t.get("taskId") or "")
+            if not tid or tid in seen_in_type:
+                continue
+            seen_in_type.add(tid)
+            if t.get("status") is True:
+                continue          # 已完成
+            if not automatable:
+                manual += 1       # 只如实报告，绝不上报
+                continue
+            try:
+                reward = int(t.get("rewardValue") or 0)
+            except (TypeError, ValueError):
+                reward = 0
+            try:
+                ok, _ = _do_green_task(h, sk, tid)
+            except Exception as exc:
+                # 单项上报中途异常（如 IncompleteRead）不得丢掉已确认的累计：
+                # done/score 在此之前已入账，此处只留痕并继续后续任务。
+                # 但要计数——否则"全部上报都异常"时 done=manual=0，
+                # 会落到「今日无需处理」，把未确认的任务说成无事可做（假确认）。
+                print(f"    [diag] doGreenTask 上报中断（taskId 已脱敏）：{_mask_net_text(exc)}",
+                      flush=True)
+                failed += 1
+                continue
+            if ok:
+                done += 1
+                score += reward
+            else:
+                # 服务端明确拒绝（含幂等/未达标）——不是异常，只计数便于对账
+                failed += 1
+    segs: List[str] = []
+    if done:
+        segs.append(f"完成 {done} 项 (+{score} 绿值)")
+    if manual:
+        segs.append(f"待手动 {manual} 项（App 内完成）")
+    # 未确认必须附加到**每个**分支：只报成功项会让用户看不到仍需核查的任务
+    if failed:
+        segs.append(f"上报未确认 {failed} 项")
+    if list_failed:
+        segs.append(f"列表未确认 {list_failed} 类")
+    if segs:
+        text = " · ".join(segs)
+    elif list_ok == 0:
+        # 一类列表都没查成功，不能宣称「今日无需处理」
+        text = "任务列表未确认"
+    else:
+        # 至少有一类列表确认过、且全部 status=True → 确实无事可做
+        text = "今日无需处理"
+    return text, done, score, manual
+
+
+def _growth_level(h: Http, sk: str) -> Tuple[str, str]:
+    """getGreenLevelList：返回 (等级展示文案, 当前等级号)。
+
+    本接口只认 sessionKey，鉴权不全时仍可汇报。等级展示格式对齐 H5 的
+    `${levelNo} ${levelName}`；未解锁时 H5 显示 levelName="未解锁"，
+    但「是否解锁」一律以 drawState 为准，不因文案误判。
+    """
+    resp = h.request(
+        "GET",
+        f"{MKT_URL}/market/getGreenLevelList.action?sessionKey={quote(sk, safe='')}"
+        f"&activityId={GREEN_ACTIVITY_ID}",
+        headers=_green_headers(), timeout=15,
+    )
+    d = _resp_dict(resp)
+    if resp.code != 200 or _biz_code(d) != "0" or not isinstance(d.get("data"), dict):
+        return "", ""
+    data = d["data"]
+    # 区分三种情况（CodeRabbit：字段未上报 ≠ 上报了但无效 ≠ 真的是 0）：
+    #   - 字段缺失 / None  → 按 0 处理（服务端确实没给）
+    #   - 给了但解析不了（如 "invalid"）→ 标为未确认，绝不静默归零
+    #   - 正常数值 → 直接用
+    raw_score = data.get("userScore")
+    score_unknown = False
+    if raw_score is None:
+        score = 0
+    else:
+        try:
+            score = int(raw_score)
+        except (TypeError, ValueError):
+            score = 0
+            score_unknown = True
+    levels = data.get("greenLevelList")
+    levels = levels if isinstance(levels, list) else []
+
+    # 当前等级 = 列表中最后一个 drawState=True 的等级（已解锁的最高级）。
+    # H5 的 processGreenLevelInfo 同样取「最后一个已解锁等级」作为用户当前等级。
+    cur: Dict[str, Any] = {}
+    cur_idx = -1
+    for i, lv in enumerate(levels):
+        if isinstance(lv, dict) and lv.get("drawState") is True:
+            cur, cur_idx = lv, i
+
+    nxt_score = ""
+    if 0 <= cur_idx < len(levels) - 1 and isinstance(levels[cur_idx + 1], dict):
+        try:
+            nxt_score = str(int(levels[cur_idx + 1].get("levelScore") or 0))
+        except (TypeError, ValueError):
+            nxt_score = ""
+
+    if cur:
+        no = str(cur.get("levelNo") or "")
+        # levelName 是服务端字段，须经报告安全清洗后才可进入报告行
+        name = _report_safe(cur.get("levelName"))
+        label = f"{no} {name}".strip()
+    else:
+        # 未解锁任一等级：按 H5 语义固定显示「未解锁」（那是用户的当前状态，
+        # 而不是该等级自身的名字），等级号取第一个未解锁等级作为参照。
+        first = next((lv for lv in levels if isinstance(lv, dict)), {})
+        no = str(first.get("levelNo") or "").strip()
+        label = f"{no} 未解锁".strip()
+        try:
+            nxt_score = nxt_score or str(int(first.get("levelScore") or 0))
+        except (TypeError, ValueError):
+            pass
+
+    detail = "绿值未确认" if score_unknown else f"绿值 {score}g"
+    if nxt_score:
+        detail += f"（下一级 {nxt_score}g）"
+    return f"{label} · {detail}" if label else "", str(cur.get("levelNo") or "")
+
+
+def _level_rewards(h: Http, sk: str, level_no: str) -> Tuple[str, int, int]:
+    """getGreenLevelRight + drawGreenRight：领取已解锁等级的权益。
+
+    返回 (文案, 领取数, 待手动量)。跳过两类不可自动领取的项：
+      - 已领（drawState 为真 或 rightState === 3，H5 两个等价判据）
+      - actionType 非空（1/2/3 = 站内跳转/小程序/外链），需前置动作
+    """
+    if not level_no:
+        return "未开启（鉴权不全）", 0, 0
+    try:
+        resp = h.request(
+            "GET",
+            f"{MKT_URL}/market/getGreenLevelRight.action?sessionKey={quote(sk, safe='')}"
+            f"&activityId={GREEN_ACTIVITY_ID}&levelNo={level_no}",
+            headers=_green_headers(), timeout=15,
+        )
+    except Exception as exc:
+        print(f"    [diag] getGreenLevelRight 请求异常：{_mask_net_text(exc)}", flush=True)
+        return "未开启（鉴权不全）", 0, 0
+    d = _resp_dict(resp)
+    items = d.get("data")
+    if resp.code != 200 or _biz_code(d) != "0" or not isinstance(items, list):
+        return "未开启（鉴权不全）", 0, 0
+
+    claimed = 0
+    manual = 0
+    unconfirmed = 0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        prize_id = str(it.get("prizeId") or "")
+        if not prize_id:
+            continue
+        # 已领：H5 的 isDisabled 用 drawState，列表过滤用 rightState===3
+        if it.get("drawState") is True or it.get("rightState") == 3:
+            continue
+        # 需前置动作的权益：只报告，不盲发领取请求
+        if it.get("actionType"):
+            manual += 1
+            continue
+        form = {
+            "activityId": GREEN_ACTIVITY_ID,
+            "sessionKey": sk,
+            "prizeId": prize_id,
+            "greenLevel": level_no,
+        }
+        # 逐项隔离：单项请求异常不得中断其余权益的领取
+        try:
+            # retries=1：领取权益是发奖写操作，服务端未承诺同一 prizeId 的
+            # 重复提交幂等。默认 @retry() 会在超时/5xx 时自动重发同一表单，
+            # 若首次已被服务端处理，重发可能重复发奖或把「已发放」误判成
+            # 「领取未确认」。这里禁用框架级重试，网络异常按未确认如实上报
+            # ——权益若仍可领，下一轮 drawState 仍为假会自然重试（规则 6：
+            # 脚本内不自行重试，交给框架跨运行梯子）。
+            r = h.request(
+                "POST",
+                f"{MKT_URL}/market/drawGreenRight.action",
+                headers=_green_headers(), form=form, timeout=15, retries=1,
+            )
+        except Exception as exc:
+            print(f"    [diag] drawGreenRight 请求异常（prizeId 已脱敏）："
+                  f"{_mask_net_text(exc)}", flush=True)
+            unconfirmed += 1
+            continue
+        rd = _resp_dict(r)
+        # 严判成功：业务码 0 **且** data 是布尔 True。
+        # 不能只看 truthy —— {"code":"0","data":"false"} 与
+        # {"code":"0","data":{"success":false}} 都是字符串/对象（truthy），
+        # 按旧的 truthy 判据会被误记成「已领」（假成功）。
+        if r.code == 200 and _biz_code(rd) == "0" and rd.get("data") is True:
+            claimed += 1
+        else:
+            unconfirmed += 1
+
+    segs: List[str] = []
+    if claimed:
+        segs.append(f"已领 {claimed} 项权益")
+    if manual:
+        segs.append(f"待手动 {manual} 项（需前置动作）")
+    if unconfirmed:
+        segs.append(f"领取未确认 {unconfirmed} 项")
+    if not segs:
+        # 列表里既无已领、无待手动、也无未确认 → 确实没有可领项
+        text = "无可领权益"
+    else:
+        text = " · ".join(segs)
+    return text, claimed, manual
+
+
 def _run_one(idx: int, total: int, username: str, password: str,
              cookie: str = "") -> Tuple[bool, str]:
+    """单账号完整流程：CN 代理候选轮换 → 登录 → 签到/抽奖/空间/成长体系。
+
+    返回 (账号是否达成, 分号连接的结果文案)。账号成败**只**由 `_sign` 的布尔决定：
+    抽奖、空间与整个绿色成长体系都是增益子功能，失败只如实报告、不影响判定
+    （oppo 任务阶段同款语义），并由 orchestrator / circuit_breaker 负责跨运行重试。
+    """
     if idx > 1:
         time.sleep(random.uniform(2, 5))
 
@@ -400,6 +948,10 @@ def _run_one(idx: int, total: int, username: str, password: str,
                 sk = _login(h, username, password)
             elif cookie:
                 _inject_cookie(h, cookie)
+                # Cookie 模式也要 sessionKey：/market/* 除 m 域 Cookie 外还要求
+                # sessionKey query 参数。用注入的会话票换一次（失败不影响普通签到，
+                # 成长体系会如实降级为「未开启（鉴权不全）」）。
+                sk = _mint_session_key(h)
             active_h = h
             print(f"  ✅ CN 出口 [{p_name}] 会话建立就绪", flush=True)
             break
@@ -426,12 +978,79 @@ def _run_one(idx: int, total: int, username: str, password: str,
     ok = ok and sign_ok
     lines.append(f"• 抽奖: {_lotteries(active_h, sk)}")
     lines.append(f"• 空间: {_space(active_h)}")
+
+    # 绿色成长体系（增益子功能）：任何异常/接口不可用都不得拖垮账号判定，
+    # ok 仍只由 _sign 决定（oppo 任务阶段同款语义）。规则 6：脚本内不重试、
+    # 不做退避 sleep；交 orchestrator / circuit_breaker 的跨运行重试梯子处理。
+    # 文案一律避开「失败/失效/异常/错误/超时/无法」与「签到失败/处理失败/登录失败」
+    # （前者会被 report_fields._finalize 误捞进 error_lines，后者会让解析器把
+    #  整行判成账号级失败并清空账号块），故统一用「未开启 / 待手动 / 未达成」。
+    # 成长行先收进局部列表：中途抛异常时整体丢弃，只留占位行。
+    # 否则「成长任务已完成」与「成长任务未开启」会同时进摘要，报告自相矛盾。
+    # 每一步各自 try/except 隔离：等级查询失败不能阻断签到与任务、
+    # 签到失败不能阻断任务、任务失败不能阻断权益领取。任一步骤只影响自己那行。
+    # （CodeRabbit Major：单点异常不得让其余独立步骤整批跳过。）
+    growth_lines: List[str] = []
+
+    auth_ready = False
+    try:
+        auth_ready = _ensure_growth_auth(active_h, sk)
+    except Exception as exc:  # noqa: BLE001
+        print(f"    [diag] 成长鉴权未就绪：{_mask_net_text(exc)}", flush=True)
+
+    task_line = ""
+    if auth_ready:
+        gsign = ""
+        try:
+            gsign, _gok = _growth_sign(active_h, sk)
+        except Exception as exc:  # noqa: BLE001
+            # 绿色签到失败不阻断任务上报。必须落固定占位文案：否则 gsign
+            # 为空串，后续任务成功时摘要只剩「今日无需处理」，签到状态整个
+            # 消失（步骤隔离不能变成隐藏未确认状态）。该文案与 _growth_sign
+            # 的失败返回值一致，且不含 report_fields 的失败关键词。
+            print(f"    [diag] 绿色签到未完成：{_mask_net_text(exc)}", flush=True)
+            gsign = "绿色签到未达成（接口未确认）"
+        try:
+            t_text, _done, _score, _manual = _growth_tasks(active_h, sk)
+            task_line = (f"{gsign} · " if gsign else "") + t_text
+        except Exception as exc:  # noqa: BLE001
+            print(f"    [diag] 成长任务未完成：{_mask_net_text(exc)}", flush=True)
+            task_line = gsign
+        growth_lines.append(f"• 成长任务: {task_line or '未开启（鉴权不全）'}")
+    else:
+        growth_lines.append("• 成长任务: 未开启（鉴权不全）")
+
+    # 等级查询放在签到与任务**之后**：本轮操作可能加绿值甚至升级，
+    # 先查会拿到旧等级——领奖用旧等级、摘要显示旧绿值；首次解锁时旧
+    # level_no 还是空串，会直接跳过本轮领取（CodeRabbit 指出的真实缺陷）。
+    # 鉴权不全时它仍是唯一可用的接口（免 Cookie），所以这条查询无条件执行。
+    level_line = level_no = ""
+    try:
+        level_line, level_no = _growth_level(active_h, sk)
+    except Exception as exc:  # noqa: BLE001
+        print(f"    [diag] 等级查询未完成：{_mask_net_text(exc)}", flush=True)
+
+    if auth_ready:
+        try:
+            reward_line, _c, _m = _level_rewards(active_h, sk, level_no)
+        except Exception as exc:  # noqa: BLE001
+            print(f"    [diag] 等级权益未完成：{_mask_net_text(exc)}", flush=True)
+            reward_line = "未开启（鉴权不全）"
+        growth_lines.append(f"• 等级奖励: {reward_line}")
+    else:
+        # 鉴权不全时「成长任务」行已在上面任务块外补过占位，这里只补权益行
+        growth_lines.append("• 等级奖励: 未开启（鉴权不全）")
+
+    growth_lines.append(f"• 绿色等级: {level_line or '未开启（鉴权不全）'}")
+    lines.extend(growth_lines)
+
     for ln in lines:
         print(f"  {ln}", flush=True)
     return ok, "；".join(lines)
 
 
 def main() -> None:
+    """多账号入口：逐个执行，缺凭据时按约定文案退出（供 alert_levels 判为未配置）。"""
     usernames = env_seq("CLOUD189_", "username", required=False, default=[])
     passwords = env_seq("CLOUD189_", "password", required=False, default=[])
     cookies = env_seq("CLOUD189_", "cookie", required=False, default=[])
