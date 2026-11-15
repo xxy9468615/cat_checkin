@@ -17,6 +17,8 @@ ONEID authorize prompt=login + failCode=10074 双重堵死）。但插件 OAuth 
 from __future__ import annotations
 
 import json
+import os
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -30,7 +32,7 @@ UPSTREAM = "https://copilot.tencent.com"
 EP_AUTH_STATE = f"{UPSTREAM}/v2/plugin/auth/state?platform=CLI"
 EP_AUTH_TOKEN = f"{UPSTREAM}/v2/plugin/auth/token?state="
 EP_LOGIN_ACCT = f"{UPSTREAM}/v2/plugin/login/account?state="
-STATE_FILE = Path(tempfile.gettempdir()) / "workbuddy_login_state.json"
+STATE_FILE = Path.home() / ".workbuddy-device-login" / "state.json"
 
 HEADERS = {
     "Content-Type": "application/json",
@@ -49,13 +51,49 @@ def _envelope_data(resp):
     return j.get("data") or {}
 
 
+def _check_state_directory() -> None:
+    directory = STATE_FILE.parent
+    directory.mkdir(mode=0o700, exist_ok=True)
+    info = directory.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700):
+        raise SystemExit(f"Unsafe login state directory: {directory} (requires owner-only mode 0700)")
+
+
+def _save_state(state: str) -> None:
+    _check_state_directory()
+    # mkstemp creates exclusively with mode 0600; replace never follows an
+    # existing destination symlink and keeps interrupted writes out of poll.
+    fd, name = tempfile.mkstemp(dir=STATE_FILE.parent, prefix=".state-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump({"state": state}, stream)
+        os.replace(name, STATE_FILE)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def _load_state() -> str:
+    _check_state_directory()
+    try:
+        fd = os.open(STATE_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        raise SystemExit("未找到 state（先运行 url 子命令）") from None
+    with os.fdopen(fd, "r", encoding="utf-8") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+            raise SystemExit(f"Unsafe login state file: {STATE_FILE} (requires owner-only mode 0600)")
+        return json.load(stream).get("state") or ""
+
+
 def cmd_url() -> None:
     h = Http()
     data = _envelope_data(h.request("POST", EP_AUTH_STATE, headers=HEADERS, data=b"{}", timeout=30))
     state, auth_url = data.get("state") or "", data.get("authUrl") or ""
     if not (state and auth_url):
         raise SystemExit(f"auth state 缺字段: {list(data.keys())}")
-    STATE_FILE.write_text(json.dumps({"state": state}), encoding="utf-8")
+    _save_state(state)
     print(f"state 已暂存 {STATE_FILE}")
     print("\n请在浏览器打开以下链接并完成登录：\n")
     print(f"  {auth_url}\n")
@@ -63,9 +101,7 @@ def cmd_url() -> None:
 
 
 def cmd_poll() -> None:
-    if not STATE_FILE.exists():
-        raise SystemExit("未找到 state（先运行 url 子命令）")
-    state = (json.loads(STATE_FILE.read_text(encoding="utf-8"))).get("state") or ""
+    state = _load_state()
     h = Http()
     r = h.request("GET", EP_AUTH_TOKEN + state, headers=HEADERS, timeout=30)
     j = r.json()
