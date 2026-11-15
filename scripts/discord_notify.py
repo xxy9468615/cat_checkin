@@ -82,12 +82,18 @@ def _bounded_output(text: Any, limit: int = NOTIFY_OUTPUT_MAX) -> str:
             break
         kept_head.append(line)
         total += add
+    # 尾部扫描从最后一行向前推进；当扫到已经被头段保留的最后一行时立即停止。
+    # 越过该边界会把同一行再收集一次，两段拼起来后重复出现，report_fields 的
+    # 资产解析器（如 ex_glados）按次追加资产，通知就显示两份相同积分
+    # （CodeRabbit F3，2026-11-15）。
+    head_end_index = len(kept_head)
     # 末行自身超预算时只取一小段尾部锚点，不能吃掉整个尾预算——否则它后面
     # （即更早）的失败行会被整段挤掉，正是本函数要防的证据丢失。
     _TAIL_ANCHOR = 256
     kept_tail: List[str] = []
     total = 0
-    for line in reversed(lines):
+    for idx in range(len(lines) - 1, head_end_index - 1, -1):
+        line = lines[idx]
         add = len(line) + 1
         if total + add > tail_keep:
             if not kept_tail and len(line) > tail_keep:

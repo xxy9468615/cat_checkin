@@ -90,6 +90,17 @@ assert n._failed_accounts('', {'fail_lines': ['a' * 100000]})
         self.assertIn(fail, bounded)
         self.assertIn("#2 b***2", notify._failed_accounts(bounded))
 
+    def test_truncation_does_not_duplicate_head_lines_into_tail(self):
+        # 头部已保留的行必须被排除在尾段扫描之外，否则它们会再出现一次。
+        # report_fields 的资产解析器（ex_glados）按次追加资产，重复行会让
+        # 通知显示两份相同积分（CodeRabbit F3，2026-11-15）。
+        head = "📧 账号: a***1\n💰 当前积分: 100 积分\n"
+        output = head + "x" * 70000
+        bounded = notify._bounded_output(output)
+        self.assertLessEqual(len(bounded), notify.NOTIFY_OUTPUT_MAX + 1)
+        self.assertEqual(bounded.count("💰 当前积分: 100 积分"), 1)
+        self.assertEqual(bounded.count("📧 账号: a***1"), 1)
+
     def test_bounded_output_shortcuts_short_input(self):
         self.assertEqual(notify._bounded_output(""), "")
         self.assertEqual(notify._bounded_output("a\nb"), "a\nb")

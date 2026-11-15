@@ -815,7 +815,7 @@ def sanitize_snippet(text: str, limit: int = 300) -> str:
 # 长 docid），因此不是无差别替换。
 _PII_EMAIL_RE = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _PII_EMAIL_FALLBACK_RE = re.compile(r"[^\s@]{1,64}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-_PII_INTL_PHONE_RE = re.compile(r"(?<![\d+])(\+(?:86)?\d{11})(?!\d)")
+_PII_INTL_PHONE_RE = re.compile(r"(?<![\d+])(\+(?:86)?)(\d{11})(?!\d)")
 _PII_PHONE_RE = re.compile(r"(?<!\d)\d{11}(?!\d)")
 
 
@@ -840,7 +840,7 @@ def redact_pii(text: Any, mask_char: str = "*") -> str:
         lambda m: f"{mask_char * 3}@{mask_char * 3}", s
     )
     s = _PII_INTL_PHONE_RE.sub(
-        lambda m: m.group(1)[:3] + mask_phone(m.group(1)[3:], mask_char=mask_char), s
+        lambda m: m.group(1) + mask_phone(m.group(2), mask_char=mask_char), s
     )
     return _PII_PHONE_RE.sub(lambda m: mask_phone(m.group(0), mask_char=mask_char), s)
 
