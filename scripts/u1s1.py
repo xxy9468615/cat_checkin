@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
 # cron: 0 9 * * *
 # new Env("u1s1.io 签到")
-import base64
 import hashlib
-import json
-import os
-import re
-import shutil
-import subprocess
 import sys
-import tempfile
 import time
-import zlib
 from common import Http, ensure, env_seq, is_already_signed, load_kv_state, main_guard, mask_str, save_kv_state
 import cookie_validity as cv
 
@@ -92,66 +84,10 @@ def _solve_rsw(payload: dict) -> str:
     return format(y, "x")
 
 
-def _run_instr(blob: str) -> dict:
-    """执行 instrumentation 挑战：blob 为 base64(deflate(JS))。
-
-    JS 内的 anti-bot 检查只决定通过/超时；回传的 state 是一段与浏览器无关的
-    确定性算术（位运算 + DOM 算术），用 Node + 迷你 DOM 垫片真实执行。
-    返回 {i, state, ts}（与服务端期望的 postMessage result 结构一致）。
-    需要 Node.js（GitHub Actions runner 自带）。
-    """
-    node = shutil.which("node")
-    ensure(bool(node), "instrumentation 挑战需要 Node.js 但未安装")
-    js = zlib.decompress(base64.b64decode(blob), wbits=-15).decode("utf-8")
-
-    # 提取算术段：最后一个 blocked 早退之后 → 成功 postMessage 之前
-    blocked = js.rfind("'*');return;}")
-    post = js.rfind("parent.postMessage({type: 'cap:instr'")
-    ensure(blocked != -1 and post != -1 and blocked < post, "instrumentation JS 结构与预期不符，无法提取算术段")
-    seg = js[blocked + len("'*');return;}"):post]
-    m = re.search(r"return (\w+);\}\)\(\);", seg)
-    ensure(bool(m), "instrumentation JS 未找到 state 返回语句")
-    seg = seg[: m.start() + len(f"return {m.group(1)};")]
-    m_id = re.search(r'result:\{i:"([0-9a-f]+)"', js)
-    ensure(bool(m_id), "instrumentation JS 未找到内嵌挑战 id")
-
-    harness = "\n".join([
-        'const navigator = {userAgent: ' + json.dumps(UA) + '};',
-        'class Div { constructor(){ this.parentNode=null; this._kids=[]; this._text=""; this.style={}; }',
-        '  appendChild(c){ this._kids.push(c); c.parentNode=this; return c; }',
-        '  removeChild(c){ const i=this._kids.indexOf(c); if(i>=0) this._kids.splice(i,1); return c; }',
-        '  get children(){ return this._kids; }',
-        '  get lastElementChild(){ return this._kids.length ? this._kids[this._kids.length-1] : null; }',
-        '  set innerText(v){ this._text = String(v); }',
-        '  get innerText(){ return this._text; }',
-        '}',
-        'const document = { createElement: () => new Div(), body: new Div() };',
-        '(async () => {',
-        seg,
-        '})().then(s => console.log("STATE:" + JSON.stringify(s)))'
-        '.catch(e => { console.error("ERR:" + e.message); process.exit(1); });',
-    ])
-    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as f:
-        f.write(harness)
-        path = f.name
-    try:
-        # 安全（2026-09-06 审计）：挑战 JS 来自远端服务端，执行环境最小化——
-        # 仅透传 PATH，避免恶意/被投毒的 JS 读取 runner 环境中的全部凭据。
-        node_env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")}
-        out = subprocess.run([node, path], capture_output=True, text=True, timeout=60,
-                             env=node_env)
-    finally:
-        os.unlink(path)
-    ensure(out.returncode == 0 and "STATE:" in out.stdout,
-           f"instrumentation 算术执行失败: {(out.stderr or out.stdout)[:200]}")
-    state = json.loads(out.stdout.split("STATE:", 1)[1])
-    return {"i": m_id.group(1), "state": state, "ts": int(time.time() * 1000)}
-
-
 def fetch_cap_token(h: Http, site_key: str = CAPCAT_SITE_KEY) -> str:
     """自动完成 CapCat 人机验证求解，换取 cap-token。
 
-    format 2（challenges 列表）：逐项求解 rsw / instrumentation / sha256-pow，
+    format 2（challenges 列表）：逐项求解 rsw / sha256-pow，拒绝远端 JS，
     solutions 数组与 challenges 顺序一一对应（与前端 cap.js 行为一致）。
     format 1（challenge {c,s,d}）：保留原 prng PoW 求解路径。
     """
@@ -181,7 +117,8 @@ def fetch_cap_token(h: Http, site_key: str = CAPCAT_SITE_KEY) -> str:
             if proto == "rsw":
                 solutions.append({"y": _solve_rsw(ch["payload"])})
             elif proto == "instrumentation":
-                solutions.append({"instr": _run_instr(ch["payload"]["blob"])})
+                # 远端 JS 即使清空环境变量仍可访问宿主文件和进程，禁止执行。
+                raise RuntimeError("CapCat instrumentation 挑战需要执行远端代码，已拒绝")
             elif proto == "sha256-pow":
                 nonce = _solve_sha256_pow(data["token"], ch["payload"])
                 solutions.append({"nonce": nonce})
