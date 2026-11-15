@@ -61,6 +61,52 @@ class TestSanitizeSnippet(unittest.TestCase):
         self.assertEqual(common.sanitize_snippet(None), "")
 
 
+class TestRedactPii(unittest.TestCase):
+    """common.redact_pii 按出现形态脱敏裸 PII（代理标签等无字段名的服务端文案）。
+
+    典型泄漏面：用户把节点命名成自己的邮箱时，公开仓库的 Actions 日志、Discord
+    卡片与邮件日报长期暴露该地址，直接招来钓鱼邮件（2026-11-15 用户反馈）。
+    """
+
+    def test_ascii_email_masked(self):
+        self.assertEqual(common.redact_pii("fixture_user@gmail.com"), "***user@***")
+        self.assertEqual(
+            common.redact_pii("fixture_user13800138000@example.com"), "***8000@***"
+        )
+        # 引号包裹的本地部分走兜底：整段保守遮盖，不留可识别前缀
+        self.assertEqual(common.redact_pii('"quoted"@example.com'), "***@***")
+
+    def test_idn_email_masked(self):
+        # 中文域名此前两个邮箱模式都不匹配，完整地址会进入 display_name 与日志
+        self.assertEqual(common.redact_pii("alice@例子.中国"), "***lice@***")
+        self.assertEqual(common.redact_pii("user123@香港.example"), "***r123@***")
+
+    def test_phone_shapes_masked(self):
+        self.assertEqual(common.redact_pii("13800138000"), "*******8000")
+        self.assertEqual(common.redact_pii("+8613800138000"), "+86*******8000")
+        # 无 86 的国际号码不得保留前两位
+        self.assertEqual(common.redact_pii("+13800138000"), "+*******8000")
+        # 常见分隔符写法只留末 4 位
+        self.assertEqual(common.redact_pii("138-0013-8000"), "1**-****-8000")
+        self.assertEqual(common.redact_pii("138 0013 8000"), "1**-****-8000")
+
+    def test_non_collateral_preserved(self):
+        # 前后邻接数字的 11 位段不命中：13 位毫秒时间戳 / 16 位 GUID / 长 docid
+        self.assertEqual(common.redact_pii("1763200000000"), "1763200000000")
+        self.assertEqual(common.redact_pii("1234567890123456"), "1234567890123456")
+        # 非邮箱/手机号形态保持原样，避免过度遮盖破坏可用信息
+        self.assertEqual(common.redact_pii("a@b"), "a@b")
+        self.assertEqual(common.redact_pii("香港-01"), "香港-01")
+        self.assertEqual(common.redact_pii("socks5://u:p@1.2.3.4:1080"),
+                         "socks5://u:p@1.2.3.4:1080")
+        # 版本号式连字符数字串不是手机号
+        self.assertEqual(common.redact_pii("v1.2.3-4567-8901"), "v1.2.3-4567-8901")
+
+    def test_empty_input(self):
+        self.assertEqual(common.redact_pii(""), "")
+        self.assertEqual(common.redact_pii(None), "")
+
+
 class TestMustMatchUsesSanitize(unittest.TestCase):
     def test_failure_message_is_sanitized(self):
         page = '<html>Set-Cookie: sessionid=supersecret123; Path=/</html>'
