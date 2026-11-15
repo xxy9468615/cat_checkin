@@ -16,6 +16,10 @@ from common import Http, ensure, env_seq, is_already_signed, load_kv_state, main
 import cookie_validity as cv
 
 PREFIX = "U1S1_"
+# Local resource budgets for remote instrumentation challenges.
+INSTR_MAX_COMPRESSED_BYTES = 1024 * 1024
+INSTR_MAX_ENCODED_CHARS = 4 * ((INSTR_MAX_COMPRESSED_BYTES + 2) // 3)
+INSTR_MAX_JS_BYTES = 4 * 1024 * 1024
 CAPCAT_SITE_KEY = "f8ad0853ed20b00d"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
@@ -92,6 +96,22 @@ def _solve_rsw(payload: dict) -> str:
     return format(y, "x")
 
 
+def _decode_instr_blob(blob: str) -> str:
+    """Decode raw DEFLATE with bounded input and output before parsing JS."""
+    ensure(isinstance(blob, str) and len(blob) <= INSTR_MAX_ENCODED_CHARS,
+           "instrumentation 编码数据过大或类型无效")
+    compressed = base64.b64decode(blob)
+    ensure(len(compressed) <= INSTR_MAX_COMPRESSED_BYTES,
+           "instrumentation 压缩数据过大")
+    inflater = zlib.decompressobj(wbits=-15)
+    # max_length bounds allocation inside zlib; one extra byte detects overflow.
+    # Never flush or consume the remaining input after the budget is exceeded.
+    expanded = inflater.decompress(compressed, INSTR_MAX_JS_BYTES + 1)
+    ensure(len(expanded) <= INSTR_MAX_JS_BYTES, "instrumentation JS 数据过大")
+    ensure(inflater.eof, "instrumentation 压缩数据不完整")
+    return expanded.decode("utf-8")
+
+
 def _run_instr(blob: str) -> dict:
     """执行 instrumentation 挑战：blob 为 base64(deflate(JS))。
 
@@ -102,7 +122,7 @@ def _run_instr(blob: str) -> dict:
     """
     node = shutil.which("node")
     ensure(bool(node), "instrumentation 挑战需要 Node.js 但未安装")
-    js = zlib.decompress(base64.b64decode(blob), wbits=-15).decode("utf-8")
+    js = _decode_instr_blob(blob)
 
     # 提取算术段：最后一个 blocked 早退之后 → 成功 postMessage 之前
     blocked = js.rfind("'*');return;}")
