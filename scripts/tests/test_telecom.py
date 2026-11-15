@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import http.client
 import json
 import os
 import subprocess
@@ -19,6 +20,39 @@ from report_fields import extract_for
 
 
 class TestTelecom(unittest.TestCase):
+    def test_request_exception_does_not_expose_credentials(self):
+        secret = "synthetic-private-ticket"
+        url = f"https://user:synthetic-password@wappark.189.cn/jt-sign/ssoHomLogin?ticket={secret}#private-fragment"
+        for debug in ("", "1"):
+            with self.subTest(debug=debug):
+                transport = MagicMock()
+                transport.request.side_effect = ValueError(f"failed {url} Cookie: private-cookie")
+                client = telecom.TelecomClient(telecom.TelecomAccount(index=1), transport)
+                with patch.dict(os.environ, {"DEBUG": debug}), patch("sys.stdout", new_callable=io.StringIO) as out:
+                    result = client._req("GET", url)
+                self.assertEqual(result, {"code": -1, "msg": "ValueError", "_http_error": True})
+                if debug:
+                    self.assertIn("https://wappark.189.cn/jt-sign/ssoHomLogin: ValueError", out.getvalue())
+                else:
+                    self.assertEqual(out.getvalue(), "")
+                for value in (secret, "synthetic-password", "private-fragment", "private-cookie"):
+                    self.assertNotIn(value, out.getvalue() + json.dumps(result))
+
+    def test_exchange_ticket_urllib_read_failure_is_safe(self):
+        # IncompleteRead escapes Http's OSError handling in the urllib backend.
+        secret = "synthetic-private-ticket"
+        transport = telecom.Http()
+        transport.impersonate = None
+        response = transport.opener.open = MagicMock()
+        response.return_value.__enter__.return_value.read.side_effect = http.client.IncompleteRead(b"partial", 10)
+        client = telecom.TelecomClient(telecom.TelecomAccount(index=1, ticket=secret), transport)
+        for debug in ("", "1"):
+            with self.subTest(debug=debug), patch.dict(os.environ, {"DEBUG": debug}), patch("sys.stdout", new_callable=io.StringIO) as out:
+                self.assertFalse(client.exchange_ticket())
+                self.assertNotIn(secret, out.getvalue())
+                self.assertIn("IncompleteRead", out.getvalue())
+        self.assertIn(f"ticket={secret}", response.call_args.args[0].full_url)
+
     def test_parse_account_key_value(self):
         """键值格式抓包串解析。"""
         raw = "phone=18912345678; sign=a1b2c3d4e5f67890a1b2c3d4e5f67890; authorization=Bearer test_jwt_token"

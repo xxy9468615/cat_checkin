@@ -580,9 +580,19 @@ class TelecomClient:
                 data_dict["_http_status"] = resp.code
             return data_dict
         except Exception as err:
+            # Exception messages may echo URLs, headers or response bodies containing
+            # credentials. Callers also print msg, so expose only the error type.
+            error_name = type(err).__name__
             if os.getenv("DEBUG"):
-                print(f"    [DEBUG] 请求异常 {url}: {err}", flush=True)
-            return {"code": -1, "msg": str(err), "_http_error": True}
+                try:
+                    parts = urllib.parse.urlsplit(url)
+                    endpoint = urllib.parse.urlunsplit((
+                        parts.scheme, parts.netloc.rsplit("@", 1)[-1], parts.path, "", "",
+                    ))
+                except ValueError:
+                    endpoint = "<invalid URL>"
+                print(f"    [DEBUG] 请求异常 {endpoint}: {error_name}", flush=True)
+            return {"code": -1, "msg": error_name, "_http_error": True}
 
     def restore_cached_session(self) -> bool:
         """从 Upstash Redis 或本地状态恢复会话缓存。"""
