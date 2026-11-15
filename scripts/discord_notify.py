@@ -49,12 +49,15 @@ COLOR_CIRCUIT_BROKEN = 0x991B1B  # 深红（熔断停用告警：单日达 8 次
 
 # Discord embed 限制：description ≤ 4096、总 payload ≤ 6000
 FAIL_TEXT_MAX = 160
+# Bound work before notification parsers inspect remotely controlled task output.
+NOTIFY_OUTPUT_MAX = 64 * 1024
 
 BJT = datetime.timezone(datetime.timedelta(hours=8))
 _WEEKDAY_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
 # 脱敏账号标识：各脚本统一经 common.mask_str 输出，特征是含 ** 掩码的短 token
-_MASKED_TOKEN_RE = re.compile(r"[A-Za-z0-9_+\-.@]*[A-Za-z0-9_+\-.]\*{2,}[A-Za-z0-9_+\-.@]*")
+_TOKEN_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_+-.@")
+_TOKEN_BEFORE_MASK = _TOKEN_CHARS - {"@"}
 # 账号标识行标记（命中优先从这些行取账号）
 _ACCOUNT_MARKERS = ("用户", "账号", "用户名", "会员", "uid", "email", "邮箱", "昵称", "nickname")
 # 凭证类行不参与账号提取（掩码后的 Token/令牌不是账号名）
@@ -143,6 +146,26 @@ def _extract_fields(output: str) -> Dict[str, str]:
         return {}
 
 
+def _first_masked_token(line: str) -> str:
+    """Find the first masked token in linear time, starting at literal mask runs."""
+    pos = 0
+    while True:
+        mask = line.find("**", pos)
+        if mask < 0:
+            return ""
+        end = mask + 2
+        while end < len(line) and line[end] == "*":
+            end += 1
+        if mask > 0 and line[mask - 1] in _TOKEN_BEFORE_MASK:
+            start = mask - 1
+            while start > 0 and line[start - 1] in _TOKEN_CHARS:
+                start -= 1
+            while end < len(line) and line[end] in _TOKEN_CHARS:
+                end += 1
+            return line[start:end]
+        pos = end
+
+
 def _extract_accounts(output: str) -> str:
     """提取脱敏账号标识。优先取带 用户/账号/UID 等标记的行，多账号显示第一个 + 总数。
 
@@ -152,14 +175,14 @@ def _extract_accounts(output: str) -> str:
     marker_hits: List[str] = []
     other_hits: List[str] = []
     seen: set[str] = set()
-    for line in (output or "").splitlines():
+    for line in (output or "")[:NOTIFY_OUTPUT_MAX].splitlines():
         low = line.lower()
         if any(k in low for k in _CREDENTIAL_LINE_KEYWORDS):
             continue
-        m = _MASKED_TOKEN_RE.search(line)
-        if not m:
+        token = _first_masked_token(line)
+        if not token:
             continue
-        tok = m.group(0).strip("._-")
+        tok = token.strip("._-")
         if len(tok) < 2 or tok in seen:
             continue
         seen.add(tok)
@@ -272,16 +295,16 @@ def _failed_accounts(output: str, info: Optional[Dict[str, Any]] = None) -> str:
     tags: List[str] = []
     if info and info.get("fail_lines"):
         for ln in info["fail_lines"][:4]:
-            m = _MASKED_TOKEN_RE.search(ln)
-            label = f"{m.group(0).strip('._-')}" if m else _FAIL_LINE_NOISE_RE.sub("", ln).strip()[:18]
+            token = _first_masked_token(ln[:NOTIFY_OUTPUT_MAX])
+            label = token.strip("._-") if token else _FAIL_LINE_NOISE_RE.sub("", ln).strip()[:18]
             label = label.strip()
             if label and label not in tags:
                 tags.append(label)
         if tags:
             return "、".join(tags[:4])
-    for tag, text in _failure_items(output, max_items=6):
-        m = _MASKED_TOKEN_RE.search(text)
-        label = f"{tag} {m.group(0).strip('._-')}" if m else tag
+    for tag, text in _failure_items((output or "")[:NOTIFY_OUTPUT_MAX], max_items=6):
+        token = _first_masked_token(text)
+        label = f"{tag} {token.strip('._-')}" if token else tag
         label = label.strip()
         if label and label not in tags:
             tags.append(label)
@@ -421,6 +444,7 @@ def notify_circuit_breaker(
     当任务单日累计尝试达 8 次失败上限触发熔断时调用。
     同一任务同日仅推送一次熔断告警，避免刷屏。
     """
+    output = (output or "")[:NOTIFY_OUTPUT_MAX]
     state = _load_notify_state(task_id) if persist else {}
     today = _bjt_today()
 
@@ -505,6 +529,7 @@ def notify_task_result(
     persist=False 时不读写通知状态（--test 自测用，避免污染真实 task_id 的记录）。
     返回值：失败卡/提示卡是否发送成功（纯成功不推送恒返回 True，方便调用方记日志）。
     """
+    output = (output or "")[:NOTIFY_OUTPUT_MAX]
     state = _load_notify_state(task_id) if persist else {}
     prev_ok_date = str(state.get("last_ok_date") or "").strip()
     try:
@@ -647,6 +672,7 @@ def notify_unconfigured(
     无意义自动重跑收场。现只推一张黄色「未配置」提示卡（同任务同日仅一次），
     附证据行与配置指引，提醒尽快配置凭据。
     """
+    output = (output or "")[:NOTIFY_OUTPUT_MAX]
     state = _load_notify_state(task_id) if persist else {}
     today = _bjt_today()
     # 保留既有状态字段（last_ok_date / fail_streak / ok_streak / attempts），
