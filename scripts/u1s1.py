@@ -17,6 +17,11 @@ import cookie_validity as cv
 
 PREFIX = "U1S1_"
 CAPCAT_SITE_KEY = "f8ad0853ed20b00d"
+# Local resource policy, independent of provider-supplied challenge parameters.
+RSW_MAX_T = 1_000_000
+RSW_MAX_BITS = 4096
+RSW_TIMEOUT = 120
+
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 
@@ -83,12 +88,40 @@ def _solve_sha256_pow(token: str, payload: dict) -> int:
 
 def _solve_rsw(payload: dict) -> str:
     """RSW 时间锁谜题：y = x^(2^t) mod N（与前端 t 次连续平方等价），返回 hex。"""
-    n = int(payload["N"], 16)
-    x = int(payload["x"], 16)
-    t = int(payload["t"])
-    t0 = time.time()
-    y = pow(x, 1 << t, n)
-    print(f"  🧩 RSW 时间锁求解完成 (t={t}, 耗时 {time.time() - t0:.2f}s)")
+    # Check encoded lengths before int(): hexadecimal conversion has no Python
+    # digit limit. Bounded residues also bound every multiplication's allocation.
+    operands = []
+    for key in ("N", "x"):
+        value = payload[key]
+        if (not isinstance(value, str) or len(value) > RSW_MAX_BITS // 4 + 2
+                or re.fullmatch(r"(?:0[xX])?[0-9a-fA-F]+", value) is None):
+            raise ValueError("RSW 操作数格式错误或超出资源限制")
+        operand = int(value, 16)
+        if operand.bit_length() > RSW_MAX_BITS:
+            raise ValueError("RSW 操作数超出资源限制")
+        operands.append(operand)
+    n, x = operands
+    raw_t = payload["t"]
+    if isinstance(raw_t, str):
+        if len(raw_t) > len(str(RSW_MAX_T)) or re.fullmatch(r"[0-9]+", raw_t) is None:
+            raise ValueError("RSW t 格式错误或超出资源限制")
+        t = int(raw_t)
+    elif type(raw_t) is int:
+        t = raw_t
+    else:
+        raise ValueError("RSW t 必须是整数")
+    if n <= 0 or not 0 <= t <= RSW_MAX_T:
+        raise ValueError("RSW 参数无效或超出资源限制")
+
+    t0 = time.monotonic()
+    deadline = t0 + RSW_TIMEOUT
+    y = x % n
+    # x^(2^t) mod N, without allocating the exponentially large exponent.
+    for _ in range(t):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("RSW 求解超时，放弃求解")
+        y = (y * y) % n
+    print(f"  🧩 RSW 时间锁求解完成 (t={t}, 耗时 {time.monotonic() - t0:.2f}s)")
     return format(y, "x")
 
 
