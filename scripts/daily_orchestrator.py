@@ -8,10 +8,12 @@ import heapq
 import json
 import os
 import re
+import secrets
 import signal
 import subprocess
 import sys
 import time
+import unicodedata
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait as wait_futures
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +39,28 @@ from circuit_breaker import (
 )
 
 TRAVEL_EVENT_RE = re.compile(r"TRAVEL_EVENT\s+state=(\w+)\s+arrive_at=(\d+)")
+
+
+def _print_task_output(tid: str, out: str) -> None:
+    """Display child diagnostics without allowing log or workflow-command injection."""
+    def escape_controls(text: str) -> str:
+        return "".join(
+            json.dumps(char)[1:-1]
+            if unicodedata.category(char) in {"Cc", "Cf", "Zl", "Zp"} else char
+            for char in text
+        )
+
+    # Commands may be recognized even after a line prefix. Use a fresh token
+    # generated after capture so a remote response cannot predict the resume command.
+    token = secrets.token_hex(32) if os.getenv("GITHUB_ACTIONS") == "true" else None
+    if token:
+        print(f"::stop-commands::{token}", flush=True)
+    try:
+        for line in out.split("\n"):
+            print(f"[{escape_controls(tid)}] | {escape_controls(line)}")
+    finally:
+        if token:
+            print(f"::{token}::", flush=True)
 
 
 def _merge_result(prev: Any, ok: bool, unconf: bool, suspended: bool = False) -> Any:
@@ -252,7 +276,7 @@ class Orchestrator:
         tag = "OK" if ok else ("SKIP" if unconf else ("SUSPENDED" if suspended else "FAIL"))
         print(f"\n{'='*60}\n[{tag}] [{tid}] done (ok={ok})\n{'-'*60}")
         if out:
-            print(out)
+            _print_task_output(tid, out)
         print(f"{'='*60}")
         if unconf:
             print(f"  ⚪ 凭据未配置，按跳过处理")

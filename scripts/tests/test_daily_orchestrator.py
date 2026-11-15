@@ -26,6 +26,46 @@ from daily_orchestrator import Orchestrator, plan_due_tasks
 CFG = {"id": "workbuddy-account-1", "name": "WorkBuddy 账号1", "script": "workbuddy.py"}
 
 
+class OutputSecurityTests(unittest.TestCase):
+    def test_child_lines_are_attributed_and_controls_escaped(self):
+        payload = "签到失败\n[OK] [other] done\r\x1b[2K\x00\x85\u2028\u202e"
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "false"}), \
+             patch("sys.stdout", new_callable=io.StringIO) as buf:
+            orch_mod._print_task_output("glados", payload)
+        self.assertEqual(buf.getvalue(),
+                         "[glados] | 签到失败\n"
+                         "[glados] | [OK] [other] done\\r\\u001b[2K\\u0000\\u0085\\u2028\\u202e\n")
+
+    def test_actions_commands_are_disabled_around_child_output(self):
+        payload = "::error::forged\n::warning::forged\n::guessed-token::\n::add-mask::hidden"
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), \
+             patch("sys.stdout", new_callable=io.StringIO) as buf:
+            orch_mod._print_task_output("glados", payload)
+            orch_mod._print_task_output("glados", "ordinary output")
+        lines = buf.getvalue().splitlines()
+        token = lines[0].removeprefix("::stop-commands::")
+        self.assertEqual(len(token), 64)
+        self.assertEqual(lines[1:5], [f"[glados] | {line}" for line in payload.splitlines()])
+        self.assertEqual(lines[5], f"::{token}::")
+        self.assertNotEqual(lines[6], lines[0])
+        self.assertEqual(lines[8], f"::{lines[6].removeprefix('::stop-commands::')}::")
+
+    def test_completion_keeps_original_output_for_consumers(self):
+        out = "签到失败\n::error::forged\r\x1b[2K"
+        orch = Orchestrator()
+        try:
+            with patch.object(orch_mod, "record_task_outcome", return_value=({}, False)) as record, \
+                 patch.object(orch_mod, "notify_task_result") as notify, \
+                 patch.object(orch_mod, "_print_task_output") as display, \
+                 patch("sys.stdout", new_callable=io.StringIO):
+                orch._on_task_done(CFG, False, out)
+            display.assert_called_once_with(CFG["id"], out)
+            self.assertEqual(record.call_args.kwargs["output"], out)
+            self.assertEqual(notify.call_args.kwargs["output"], out)
+        finally:
+            orch.executor.shutdown(wait=False, cancel_futures=True)
+
+
 class NoWaitTests(unittest.TestCase):
     """编排器不得为任何未来事件（重试/领奖回程）在进程内排队驻留。"""
 
