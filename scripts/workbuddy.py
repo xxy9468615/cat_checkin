@@ -160,15 +160,19 @@ def _refresh_access_token(h: Http, refresh_token: str) -> Tuple[str, str]:
     return str(data["accessToken"]), str(data.get("refreshToken") or refresh_token)
 
 
+def _credential_account_idx(idx: int) -> int:
+    """将 worker 内账号序号映射为凭据存储使用的原始账号序号。"""
+    real = (os.getenv("WORKBUDDY_ACCOUNT_IDX") or "").strip()
+    return int(real) if real.isdigit() else idx
+
+
 def _redis_refresh_key(idx: int) -> str:
     """Redis 滚动票键。per-account dispatch（orchestrator 注入 WORKBUDDY_ACCOUNT_IDX）
     时子进程内账号重编号为 1，键必须映射真实账号号，否则两个账号的独立 dispatch
     会共用 _1 键互相覆盖、串用对方票据（张冠李戴）。
     v2：首版 _1 键在修复前已被账号2 的 dispatch 写入过，直接作废改用 v2 命名，
     免清理；新键带 14 天 TTL，链路长期停摆时自动过期回退 Secret 票。"""
-    real = (os.getenv("WORKBUDDY_ACCOUNT_IDX") or "").strip()
-    if real.isdigit():
-        idx = int(real)
+    idx = _credential_account_idx(idx)
     prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
     return f"{prefix}:state:workbuddy_refresh_token_v2_{idx}"
 
@@ -207,6 +211,7 @@ def _persist_refresh_token(idx: int, new_token: str) -> str:
     Keycloak offline token 默认允许重复使用，回写失败不致命（旧票 90 天内仍可刷），
     但长期不回写会让滚动链退化为同一张票刷到死，由 secret_age 凭据年龄预警兜底。
     """
+    idx = _credential_account_idx(idx)
     if new_token == _load_refresh_token_redis(idx) and new_token == (env(PREFIX, "refresh_token", required=False) or ""):
         return ""
     if _save_refresh_token_redis(idx, new_token):
@@ -221,6 +226,7 @@ def _persist_refresh_token(idx: int, new_token: str) -> str:
 
 def _persist_refresh_token_secret(idx: int, new_token: str) -> bool:
     """GitHub Secret 回写（best-effort，需 GH_PAT 有 Secrets 写权限）。"""
+    idx = _credential_account_idx(idx)
     repo = os.getenv("GITHUB_REPO") or os.getenv("GITHUB_REPOSITORY") or ""
     pat = os.getenv("GH_PAT") or os.getenv("GH_TOKEN") or ""
     if not (repo and pat and shutil.which("gh")):

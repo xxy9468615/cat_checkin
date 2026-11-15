@@ -8,7 +8,7 @@
 裸 .get() 崩——全端点已加 _resp_dict/_data_dict 类型守卫。
 """
 import sys
-from unittest import mock
+from unittest import TestCase, mock
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
@@ -16,6 +16,42 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
 import workbuddy as wb
+
+class CredentialPersistenceTests(TestCase):
+    def test_refreshed_token_keeps_original_account_destination(self):
+        for account, local_idx, expected in (("2", 1, 2), ("1", 1, 1), ("", 2, 2)):
+            for redis_ok in (True, False):
+                with self.subTest(account=account, redis_ok=redis_ok), \
+                     mock.patch.dict("os.environ", {
+                         "WORKBUDDY_ACCOUNT_IDX": account,
+                         "CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:",
+                         "GITHUB_REPOSITORY": "example/repo",
+                         "GH_PAT": "synthetic-pat",
+                     }, clear=True), \
+                     mock.patch.object(wb, "upstash_redis_command") as redis, \
+                     mock.patch.object(wb.shutil, "which", return_value="/usr/bin/gh"), \
+                     mock.patch.object(wb.subprocess, "run") as run:
+                    redis.side_effect = [(True, {"result": None}),
+                                         (True, {"result": None}), (redis_ok, {})]
+                    run.return_value.returncode = 0
+                    cred, notes = wb._resolve_credential(
+                        _http({"code": 0, "data": {
+                            "accessToken": "synthetic-access",
+                            "refreshToken": "synthetic-rotated",
+                        }}), local_idx, "synthetic-old", "")
+                    self.assertEqual(cred, "synthetic-access")
+                    key = f"cat_checkin:state:workbuddy_refresh_token_v2_{expected}"
+                    self.assertEqual([call.args[0][1] for call in redis.call_args_list],
+                                     [key, key, key])
+                    run.assert_called_once()
+                    self.assertEqual(run.call_args.args[0], [
+                        "gh", "secret", "set", f"WORKBUDDY_REFRESH_TOKEN_{expected}",
+                        "--repo", "example/repo",
+                    ])
+                    self.assertEqual(run.call_args.kwargs["input"], "synthetic-rotated")
+                    if not redis_ok:
+                        self.assertIn(f"WORKBUDDY_REFRESH_TOKEN_{expected}", notes[0])
+
 
 failures = []
 
