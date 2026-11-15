@@ -20,6 +20,14 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
+def _safe_proxy_name(name: str) -> str:
+    """Discard URL-like labels, including truncated URLs containing userinfo."""
+    clean = name.strip()
+    if "://" in clean or re.search(r"[^\s:]+:[^\s]*@", clean):
+        return "代理节点"
+    return clean
+
+
 @dataclass
 class ProxyEndpoint:
     """代理节点描述结构。"""
@@ -42,7 +50,7 @@ class ProxyEndpoint:
     @property
     def display_name(self) -> str:
         """友好的安全显示名称：严格仅显示节点名称，绝不附带真实 IP 与端口。"""
-        clean = self.name.strip()
+        clean = _safe_proxy_name(self.name)
         if (clean.startswith("【") and clean.endswith("】")) or (
             clean.startswith("[") and clean.endswith("]")
         ):
@@ -51,7 +59,7 @@ class ProxyEndpoint:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "name": self.name,
+            "name": _safe_proxy_name(self.name),
             "url": self.safe_url,
             "protocol": self.protocol,
             "display_name": self.display_name,
@@ -144,13 +152,14 @@ def parse_proxy_line(
     if bracket_match:
         extracted_name = bracket_match.group(1).strip()
         proxy_part = bracket_match.group(2).strip()
-    else:
+    elif not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", line):
+        # Complete URLs must bypass label syntax: userinfo can contain '='.
         # 2. 语法匹配：键值对 "名称 = url" 或 "名称: url"
         # 必须满足: 等号连接，或者冒号连接但值必须包含协议头或斜杠，避免把 1.2.3.4:1080 误判为键值对
-        if "=" in line:
-            parts = line.split("=", 1)
-            extracted_name = parts[0].strip()
-            proxy_part = parts[1].strip()
+        assignment = re.match(r"^(.+?)=(.+)$", line)
+        if assignment and "://" not in assignment.group(1):
+            extracted_name = assignment.group(1).strip()
+            proxy_part = assignment.group(2).strip()
         elif ":" in line:
             m = re.match(r"^([a-zA-Z0-9_一-龥\-\s]+)\s*:\s*(.+)$", line)
             if m:
@@ -233,7 +242,7 @@ def parse_proxy_line(
     safe_url = mask_proxy_url(std_url)
 
     return ProxyEndpoint(
-        name=extracted_name,
+        name=_safe_proxy_name(extracted_name),
         url=std_url,
         safe_url=safe_url,
         protocol=protocol,
