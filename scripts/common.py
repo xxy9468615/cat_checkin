@@ -807,11 +807,16 @@ def sanitize_snippet(text: str, limit: int = 300) -> str:
         s = pat.sub(repl, s)
     return s.replace("\n", " ")[:limit]
 
-# 裸 PII 形态（不依赖字段名）：11 位孤立数字段 = 手机号/其他号码；
-# 邮箱 = RFC 常见子集（本地部分允许 .%+-，域名要求至少一个点 + >=2 位 TLD）。
-# 用于服务端文案/代理标签等无字段语义的文本，配合 mask_str 系脱敏。
+# 裸 PII 形态（不依赖字段名）：
+# - 邮箱：本地部分按 RFC 5322 atext（含 .!#$%&'*+-/=?^_`{|}~），域名要求至少
+#   一个点 + >=2 位 TLD。引号等 atext 之外字符包裹的本地部分走兜底规则整段遮盖。
+# - 手机号：11 位孤立数字段；带国家码形态（+86xxxxxxxxxxx）单独识别。
+# 前后邻接数字的 11 位段不命中（避免误伤 13 位毫秒时间戳 / 16 位 GUID /
+# 长 docid），因此不是无差别替换。
+_PII_EMAIL_RE = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_PII_EMAIL_FALLBACK_RE = re.compile(r"[^\s@]{1,64}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_PII_INTL_PHONE_RE = re.compile(r"(?<![\d+])(\+(?:86)?\d{11})(?!\d)")
 _PII_PHONE_RE = re.compile(r"(?<!\d)\d{11}(?!\d)")
-_PII_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
 def redact_pii(text: Any, mask_char: str = "*") -> str:
@@ -822,14 +827,22 @@ def redact_pii(text: Any, mask_char: str = "*") -> str:
     自己的邮箱时，该标签会经 display_name/to_dict 明文流到公开仓库的 Actions
     日志与日报，进而成为钓鱼邮件的目标（用户明确反馈过这一危害）。
 
-    前后邻接数字的 11 位段不命中（避免误伤 13 位毫秒时间戳 / 16 位 GUID /
-    长 docid），因此不是无差别替换。
+    顺序是硬要求：先邮箱后手机号。反序会把 `user13800138000@example.com` 的
+    本地部分当成手机号打码，破坏邮箱形态后域名就不再被识别，反而裸奔。
+    邮箱兜底规则覆盖 atext 之外的引号包裹本地部分（如 `"user"@example.com`），
+    此时整段保守遮盖，不留可识别前缀。
     """
     s = str(text or "")
     if not s:
         return s
-    s = _PII_PHONE_RE.sub(lambda m: mask_phone(m.group(0), mask_char=mask_char), s)
-    return _PII_EMAIL_RE.sub(lambda m: mask_email(m.group(0), mask_char=mask_char), s)
+    s = _PII_EMAIL_RE.sub(lambda m: mask_email(m.group(0), mask_char=mask_char), s)
+    s = _PII_EMAIL_FALLBACK_RE.sub(
+        lambda m: f"{mask_char * 3}@{mask_char * 3}", s
+    )
+    s = _PII_INTL_PHONE_RE.sub(
+        lambda m: m.group(1)[:3] + mask_phone(m.group(1)[3:], mask_char=mask_char), s
+    )
+    return _PII_PHONE_RE.sub(lambda m: mask_phone(m.group(0), mask_char=mask_char), s)
 
 def must_match(pattern: str, text: str, label: str, flags: int = 0) -> str:
     m = re.search(pattern, text, flags)
