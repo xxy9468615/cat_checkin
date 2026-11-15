@@ -21,11 +21,22 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 def _safe_proxy_name(name: str) -> str:
-    """Discard URL-like labels, including truncated URLs containing userinfo."""
+    """Discard URL-like labels and mask bare PII (email/phone) in node labels.
+
+    标签会经 display_name / to_dict() 明文流到公开仓库的 Actions 日志、
+    Discord 卡片与邮件日报。URL-like（含截断 userinfo）整体丢弃；邮箱/手机号
+    形态的裸 PII 走 common.redact_pii——用户把节点命名成自己邮箱时，公开仓库
+    长期暴露该地址并招来钓鱼邮件（2026-11-15 用户反馈）。
+    """
     clean = name.strip()
     if "://" in clean or re.search(r"[^\s:]+:[^\s]*@", clean):
         return "代理节点"
-    return clean
+    try:
+        from common import redact_pii
+        return redact_pii(clean)
+    except Exception:
+        # 脱敏工具不可用时退化为最保守策略：不输出任何可识别内容
+        return "代理节点" if clean else clean
 
 
 @dataclass
@@ -49,7 +60,11 @@ class ProxyEndpoint:
 
     @property
     def display_name(self) -> str:
-        """友好的安全显示名称：严格仅显示节点名称，绝不附带真实 IP 与端口。"""
+        """友好的安全显示名称：严格仅显示节点名称，绝不附带真实 IP 与端口。
+
+        名称在构造时已过 _safe_proxy_name；此处兜底处理外部直接改 name 的场景
+        （ep.name = raw），确保任何输出边界都不会漏出裸 PII。
+        """
         clean = _safe_proxy_name(self.name)
         if (clean.startswith("【") and clean.endswith("】")) or (
             clean.startswith("[") and clean.endswith("]")
