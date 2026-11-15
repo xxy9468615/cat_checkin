@@ -27,11 +27,26 @@ def _fnv1a(seed: str) -> int:
     return h
 
 
-def _prng(seed: str, length: int) -> str:
+# Local resource policy for legacy challenges (not advertised protocol maxima).
+LEGACY_MAX_SOLUTIONS = 1024
+LEGACY_MAX_SALT_LENGTH = 4096
+LEGACY_MAX_GENERATED_BYTES = 1024 * 1024
+
+
+def _check_legacy_deadline(deadline: float) -> None:
+    if time.monotonic() >= deadline:
+        raise RuntimeError("PoW 验证码求解超时，放弃求解")
+
+
+def _prng(seed: str, length: int, deadline: float | None = None) -> str:
     """Cap / CapCat 的 xorshift32 伪随机串生成，与前端 wasm 一致。"""
+    if deadline is not None:
+        _check_legacy_deadline(deadline)
     state = _fnv1a(seed)
     out = []
     while len(out) * 8 < length:
+        if deadline is not None:
+            _check_legacy_deadline(deadline)
         state ^= (state << 13) & 0xFFFFFFFF
         state ^= state >> 17
         state ^= (state << 5) & 0xFFFFFFFF
@@ -46,25 +61,53 @@ def solve_challenge(token: str, challenge: dict | list) -> list[int]:
     兼容两种挑战结构：单个 {c,s,d} 规格 dict，或规格列表（逐项求解、
     全局序号连续，salt 种子派生方式与前端 wasm 一致）。
     """
-    specs = [challenge] if isinstance(challenge, dict) else list(challenge)
+    deadline = time.monotonic() + 120
+    ensure(isinstance(challenge, (dict, list)), "CapCat 挑战结构异常")
+    specs = [challenge] if isinstance(challenge, dict) else challenge
+    ensure(len(specs) <= LEGACY_MAX_SOLUTIONS, "CapCat 挑战规格数量超限")
+    validated = []
+    total_count = total_bytes = 0
+    # Validate every spec before generating anything; limits apply across the list.
+    for spec in specs:
+        _check_legacy_deadline(deadline)
+        ensure(isinstance(spec, dict), "CapCat 挑战规格异常")
+        dimensions = []
+        for key, maximum in (("c", LEGACY_MAX_SOLUTIONS),
+                             ("s", LEGACY_MAX_SALT_LENGTH), ("d", 64)):
+            value = spec.get(key)
+            ensure(type(value) is int or
+                   (isinstance(value, str) and len(value) <= 10 and
+                    value.isascii() and value.isdecimal()),
+                   f"CapCat 挑战参数 {key} 必须是非负整数")
+            value = int(value)
+            ensure(0 <= value <= maximum, f"CapCat 挑战参数 {key} 超限")
+            dimensions.append(value)
+        count, salt_len, difficulty = dimensions
+        total_count += count
+        total_bytes += count * (salt_len + difficulty)
+        ensure(total_count <= LEGACY_MAX_SOLUTIONS, "CapCat 子挑战总数超限")
+        ensure(total_bytes <= LEGACY_MAX_GENERATED_BYTES, "CapCat 生成数据总量超限")
+        validated.append((count, salt_len, difficulty))
+
     solutions: list[int] = []
     idx = 0
-    deadline = time.monotonic() + 120
-
-    for spec in specs:
-        count = int(spec["c"])
-        salt_len = int(spec["s"])
-        difficulty = int(spec["d"])
+    for count, salt_len, difficulty in validated:
+        _check_legacy_deadline(deadline)
         for _ in range(count):
+            _check_legacy_deadline(deadline)
             idx += 1
-            salt = _prng(f"{token}{idx}", salt_len).encode()
-            target = _prng(f"{token}{idx}d", difficulty)
+            salt = _prng(f"{token}{idx}", salt_len, deadline).encode()
+            target = _prng(f"{token}{idx}d", difficulty, deadline)
             nonce = 0
-            while not hashlib.sha256(salt + str(nonce).encode()).hexdigest().startswith(target):
+            while True:
+                if nonce % 1024 == 0:
+                    _check_legacy_deadline(deadline)
+                if hashlib.sha256(salt + str(nonce).encode()).hexdigest().startswith(target):
+                    break
                 nonce += 1
-                if nonce % 100000 == 0 and time.monotonic() > deadline:
-                    raise RuntimeError(f"PoW 验证码求解超时（第 {idx} 个子挑战），放弃求解")
+            _check_legacy_deadline(deadline)
             solutions.append(nonce)
+    _check_legacy_deadline(deadline)
     return solutions
 
 
