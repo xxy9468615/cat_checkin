@@ -103,21 +103,32 @@ class TestProxyManager(unittest.TestCase):
         # 用户把节点命名成自己的邮箱/手机号时，公开仓库日志会长期暴露该地址并
         # 招来钓鱼邮件（2026-11-15 用户反馈）。构造期与直接改 name 都要脱敏。
         url = "http://192.0.2.1:8080"
-        for label in ("fixture_user@gmail.com", "13800138000"):
+        cases = (
+            ("fixture_user@gmail.com", "***user@***"),
+            ("fixture_user13800138000@example.com", "***8000@***"),
+            ("13800138000", "*******8000"),
+            ("+8613800138000", "+86*******8000"),
+        )
+        for label, expected in cases:
             for text in (f"[{label}] {url}", f"{url}#{label}"):
                 with self.subTest(text=text):
                     ep = parse_proxy_line(text)
-                    self.assertNotIn("fixture_", ep.name)
-                    self.assertNotIn("fixture_", ep.display_name)
-                    self.assertNotIn("fixture_", str(ep.to_dict()))
-                    self.assertNotIn("fixture_", format_dead_proxy_alert(ep))
+                    self.assertEqual(ep.name, expected)
+                    self.assertEqual(ep.display_name, f"【{expected}】")
+                    self.assertEqual(ep.to_dict()["name"], expected)
+                    alert = format_dead_proxy_alert(ep)
+                    self.assertIn(expected, alert)
+                    # 完整号码/邮箱不得出现在任何输出边界
+                    self.assertNotIn(label, ep.name)
+                    self.assertNotIn(label, ep.display_name)
+                    self.assertNotIn(label, str(ep.to_dict()))
+                    self.assertNotIn(label, alert)
             ep = parse_proxy_line(url, explicit_name=label)
-            self.assertNotIn("fixture_", ep.display_name)
+            self.assertEqual(ep.display_name, f"【{expected}】")
+            # 外部直接改 name 的兜底路径同样脱敏
             ep.name = label
-            self.assertNotIn("fixture_", ep.display_name)
-            self.assertNotIn("fixture_", format_dead_proxy_alert(ep))
-            # 正常标签不被误伤
-            self.assertTrue(ep.display_name.startswith("【"))
+            self.assertEqual(ep.display_name, f"【{expected}】")
+            self.assertNotIn(label, format_dead_proxy_alert(ep))
 
     def test_parse_multiline_with_comments(self):
         text = """

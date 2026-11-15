@@ -79,6 +79,17 @@ assert n._failed_accounts('', {'fail_lines': ['a' * 100000]})
         self.assertEqual(items[0], ("#2", "b***2 打卡失败: HTTP 401"))
         self.assertIn("凭据剩余 1 天", items[1][1])
 
+    def test_truncation_survives_oversized_last_line(self):
+        # 末行本身超尾预算时，降级保留该行尾部并继续向前扫描，
+        # 否则更早的失败行会被整段丢掉（F2 的降级路径）。
+        long_line = "x" * (notify.NOTIFY_TAIL_KEEP + 500)
+        fail = "❌ [2/3] b***2 打卡失败: HTTP 401"
+        output = "a" * notify.NOTIFY_OUTPUT_MAX + "\n" + fail + "\n" + long_line
+        bounded = notify._bounded_output(output)
+        self.assertLessEqual(len(bounded), notify.NOTIFY_OUTPUT_MAX + 1)
+        self.assertIn(fail, bounded)
+        self.assertIn("#2 b***2", notify._failed_accounts(bounded))
+
     def test_bounded_output_shortcuts_short_input(self):
         self.assertEqual(notify._bounded_output(""), "")
         self.assertEqual(notify._bounded_output("a\nb"), "a\nb")

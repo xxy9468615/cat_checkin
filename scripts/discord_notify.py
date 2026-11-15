@@ -82,12 +82,19 @@ def _bounded_output(text: Any, limit: int = NOTIFY_OUTPUT_MAX) -> str:
             break
         kept_head.append(line)
         total += add
+    # 末行自身超预算时只取一小段尾部锚点，不能吃掉整个尾预算——否则它后面
+    # （即更早）的失败行会被整段挤掉，正是本函数要防的证据丢失。
+    _TAIL_ANCHOR = 256
     kept_tail: List[str] = []
     total = 0
     for line in reversed(lines):
         add = len(line) + 1
         if total + add > tail_keep:
-            break
+            if not kept_tail and len(line) > tail_keep:
+                kept_tail.append(line[-_TAIL_ANCHOR:])
+                total += _TAIL_ANCHOR + 1
+            # 继续向前扫描：更早的失败行仍可能在剩余预算内。
+            continue
         kept_tail.append(line)
         total += add
     kept_tail.reverse()
