@@ -66,6 +66,39 @@ class TestProxyManager(unittest.TestCase):
         self.assertIn("8.***.***.8", ep.safe_url)
         self.assertNotIn("1080", ep.safe_url)
 
+    def test_equals_in_url_userinfo_preserves_url_and_safe_name(self):
+        for scheme in ("http", "https", "socks5", "socks5h"):
+            url = f"{scheme}://fixture_user:fixture_prefix=tail@192.0.2.1:8080"
+            for template, name in (("{}", None), ("出口 = {}", "出口"),
+                                   ("出口: {}", "出口"), ("[出口] {}", "出口"),
+                                   ("{}#出口", "出口")):
+                with self.subTest(scheme=scheme, template=template):
+                    ep = parse_proxy_line(template.format(url))
+                    self.assertIsNotNone(ep)
+                    self.assertEqual(ep.url, url.replace("socks5h://", "socks5://"))
+                    if name:
+                        self.assertEqual(ep.name, name)
+                    self.assertNotIn("fixture_user", str(ep.to_dict()))
+                    self.assertNotIn("fixture_prefix", format_dead_proxy_alert(ep))
+
+    def test_url_like_labels_are_safe_at_all_output_boundaries(self):
+        url = "http://192.0.2.1:8080"
+        for label in ("http://fixture_user:fixture_prefix=tail@192.0.2.2:8080",
+                      "http://fixture_user:fixture_prefix",  # truncated userinfo
+                      "fixture_user:fixture_prefix@192.0.2.2"):
+            for text in (f"[{label}] {url}", f"{url}#{label}"):
+                with self.subTest(text=text):
+                    ep = parse_proxy_line(text)
+                    self.assertEqual(ep.name, "代理节点")
+                    self.assertNotIn("fixture_", str(ep.to_dict()))
+            ep = parse_proxy_line(url, explicit_name=label)
+            self.assertEqual(ep.name, "代理节点")
+            # A directly constructed or subsequently changed endpoint is safe too.
+            ep.name = label
+            self.assertNotIn("fixture_", ep.display_name)
+            self.assertNotIn("fixture_", str(ep.to_dict()))
+            self.assertNotIn("fixture_", format_dead_proxy_alert(ep))
+
     def test_parse_multiline_with_comments(self):
         text = """
         # 自建-广州家宽出口
