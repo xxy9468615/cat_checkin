@@ -1,26 +1,20 @@
 #!/usr/bin/env python3
 # cron: 0 9 * * *
 # new Env("u1s1.io 签到")
-import base64
 import hashlib
-import json
-import os
 import re
-import shutil
-import subprocess
 import sys
-import tempfile
 import time
-import zlib
 from common import Http, ensure, env_seq, is_already_signed, load_kv_state, main_guard, mask_str, save_kv_state
 import cookie_validity as cv
 
 PREFIX = "U1S1_"
-# Local resource budgets for remote instrumentation challenges.
-INSTR_MAX_COMPRESSED_BYTES = 1024 * 1024
-INSTR_MAX_ENCODED_CHARS = 4 * ((INSTR_MAX_COMPRESSED_BYTES + 2) // 3)
-INSTR_MAX_JS_BYTES = 4 * 1024 * 1024
 CAPCAT_SITE_KEY = "f8ad0853ed20b00d"
+# Local resource policy, independent of provider-supplied challenge parameters.
+RSW_MAX_T = 1_000_000
+RSW_MAX_BITS = 4096
+RSW_TIMEOUT = 120
+
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 
@@ -31,11 +25,26 @@ def _fnv1a(seed: str) -> int:
     return h
 
 
-def _prng(seed: str, length: int) -> str:
+# Local resource policy for legacy challenges (not advertised protocol maxima).
+LEGACY_MAX_SOLUTIONS = 1024
+LEGACY_MAX_SALT_LENGTH = 4096
+LEGACY_MAX_GENERATED_BYTES = 1024 * 1024
+
+
+def _check_legacy_deadline(deadline: float) -> None:
+    if time.monotonic() >= deadline:
+        raise RuntimeError("PoW 验证码求解超时，放弃求解")
+
+
+def _prng(seed: str, length: int, deadline: float | None = None) -> str:
     """Cap / CapCat 的 xorshift32 伪随机串生成，与前端 wasm 一致。"""
+    if deadline is not None:
+        _check_legacy_deadline(deadline)
     state = _fnv1a(seed)
     out = []
     while len(out) * 8 < length:
+        if deadline is not None:
+            _check_legacy_deadline(deadline)
         state ^= (state << 13) & 0xFFFFFFFF
         state ^= state >> 17
         state ^= (state << 5) & 0xFFFFFFFF
@@ -50,25 +59,53 @@ def solve_challenge(token: str, challenge: dict | list) -> list[int]:
     兼容两种挑战结构：单个 {c,s,d} 规格 dict，或规格列表（逐项求解、
     全局序号连续，salt 种子派生方式与前端 wasm 一致）。
     """
-    specs = [challenge] if isinstance(challenge, dict) else list(challenge)
+    deadline = time.monotonic() + 120
+    ensure(isinstance(challenge, (dict, list)), "CapCat 挑战结构异常")
+    specs = [challenge] if isinstance(challenge, dict) else challenge
+    ensure(len(specs) <= LEGACY_MAX_SOLUTIONS, "CapCat 挑战规格数量超限")
+    validated = []
+    total_count = total_bytes = 0
+    # Validate every spec before generating anything; limits apply across the list.
+    for spec in specs:
+        _check_legacy_deadline(deadline)
+        ensure(isinstance(spec, dict), "CapCat 挑战规格异常")
+        dimensions = []
+        for key, maximum in (("c", LEGACY_MAX_SOLUTIONS),
+                             ("s", LEGACY_MAX_SALT_LENGTH), ("d", 64)):
+            value = spec.get(key)
+            ensure(type(value) is int or
+                   (isinstance(value, str) and len(value) <= 10 and
+                    value.isascii() and value.isdecimal()),
+                   f"CapCat 挑战参数 {key} 必须是非负整数")
+            value = int(value)
+            ensure(0 <= value <= maximum, f"CapCat 挑战参数 {key} 超限")
+            dimensions.append(value)
+        count, salt_len, difficulty = dimensions
+        total_count += count
+        total_bytes += count * (salt_len + difficulty)
+        ensure(total_count <= LEGACY_MAX_SOLUTIONS, "CapCat 子挑战总数超限")
+        ensure(total_bytes <= LEGACY_MAX_GENERATED_BYTES, "CapCat 生成数据总量超限")
+        validated.append((count, salt_len, difficulty))
+
     solutions: list[int] = []
     idx = 0
-    deadline = time.monotonic() + 120
-
-    for spec in specs:
-        count = int(spec["c"])
-        salt_len = int(spec["s"])
-        difficulty = int(spec["d"])
+    for count, salt_len, difficulty in validated:
+        _check_legacy_deadline(deadline)
         for _ in range(count):
+            _check_legacy_deadline(deadline)
             idx += 1
-            salt = _prng(f"{token}{idx}", salt_len).encode()
-            target = _prng(f"{token}{idx}d", difficulty)
+            salt = _prng(f"{token}{idx}", salt_len, deadline).encode()
+            target = _prng(f"{token}{idx}d", difficulty, deadline)
             nonce = 0
-            while not hashlib.sha256(salt + str(nonce).encode()).hexdigest().startswith(target):
+            while True:
+                if nonce % 1024 == 0:
+                    _check_legacy_deadline(deadline)
+                if hashlib.sha256(salt + str(nonce).encode()).hexdigest().startswith(target):
+                    break
                 nonce += 1
-                if nonce % 100000 == 0 and time.monotonic() > deadline:
-                    raise RuntimeError(f"PoW 验证码求解超时（第 {idx} 个子挑战），放弃求解")
+            _check_legacy_deadline(deadline)
             solutions.append(nonce)
+    _check_legacy_deadline(deadline)
     return solutions
 
 
@@ -87,91 +124,47 @@ def _solve_sha256_pow(token: str, payload: dict) -> int:
 
 def _solve_rsw(payload: dict) -> str:
     """RSW 时间锁谜题：y = x^(2^t) mod N（与前端 t 次连续平方等价），返回 hex。"""
-    n = int(payload["N"], 16)
-    x = int(payload["x"], 16)
-    t = int(payload["t"])
-    t0 = time.time()
-    y = pow(x, 1 << t, n)
-    print(f"  🧩 RSW 时间锁求解完成 (t={t}, 耗时 {time.time() - t0:.2f}s)")
+    # Check encoded lengths before int(): hexadecimal conversion has no Python
+    # digit limit. Bounded residues also bound every multiplication's allocation.
+    operands = []
+    for key in ("N", "x"):
+        value = payload[key]
+        if (not isinstance(value, str) or len(value) > RSW_MAX_BITS // 4 + 2
+                or re.fullmatch(r"(?:0[xX])?[0-9a-fA-F]+", value) is None):
+            raise ValueError("RSW 操作数格式错误或超出资源限制")
+        operand = int(value, 16)
+        if operand.bit_length() > RSW_MAX_BITS:
+            raise ValueError("RSW 操作数超出资源限制")
+        operands.append(operand)
+    n, x = operands
+    raw_t = payload["t"]
+    if isinstance(raw_t, str):
+        if len(raw_t) > len(str(RSW_MAX_T)) or re.fullmatch(r"[0-9]+", raw_t) is None:
+            raise ValueError("RSW t 格式错误或超出资源限制")
+        t = int(raw_t)
+    elif type(raw_t) is int:
+        t = raw_t
+    else:
+        raise ValueError("RSW t 必须是整数")
+    if n <= 0 or not 0 <= t <= RSW_MAX_T:
+        raise ValueError("RSW 参数无效或超出资源限制")
+
+    t0 = time.monotonic()
+    deadline = t0 + RSW_TIMEOUT
+    y = x % n
+    # x^(2^t) mod N, without allocating the exponentially large exponent.
+    for _ in range(t):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("RSW 求解超时，放弃求解")
+        y = (y * y) % n
+    print(f"  🧩 RSW 时间锁求解完成 (t={t}, 耗时 {time.monotonic() - t0:.2f}s)")
     return format(y, "x")
-
-
-def _decode_instr_blob(blob: str) -> str:
-    """Decode raw DEFLATE with bounded input and output before parsing JS."""
-    ensure(isinstance(blob, str) and len(blob) <= INSTR_MAX_ENCODED_CHARS,
-           "instrumentation 编码数据过大或类型无效")
-    compressed = base64.b64decode(blob)
-    ensure(len(compressed) <= INSTR_MAX_COMPRESSED_BYTES,
-           "instrumentation 压缩数据过大")
-    inflater = zlib.decompressobj(wbits=-15)
-    # max_length bounds allocation inside zlib; one extra byte detects overflow.
-    # Never flush or consume the remaining input after the budget is exceeded.
-    expanded = inflater.decompress(compressed, INSTR_MAX_JS_BYTES + 1)
-    ensure(len(expanded) <= INSTR_MAX_JS_BYTES, "instrumentation JS 数据过大")
-    ensure(inflater.eof, "instrumentation 压缩数据不完整")
-    return expanded.decode("utf-8")
-
-
-def _run_instr(blob: str) -> dict:
-    """执行 instrumentation 挑战：blob 为 base64(deflate(JS))。
-
-    JS 内的 anti-bot 检查只决定通过/超时；回传的 state 是一段与浏览器无关的
-    确定性算术（位运算 + DOM 算术），用 Node + 迷你 DOM 垫片真实执行。
-    返回 {i, state, ts}（与服务端期望的 postMessage result 结构一致）。
-    需要 Node.js（GitHub Actions runner 自带）。
-    """
-    node = shutil.which("node")
-    ensure(bool(node), "instrumentation 挑战需要 Node.js 但未安装")
-    js = _decode_instr_blob(blob)
-
-    # 提取算术段：最后一个 blocked 早退之后 → 成功 postMessage 之前
-    blocked = js.rfind("'*');return;}")
-    post = js.rfind("parent.postMessage({type: 'cap:instr'")
-    ensure(blocked != -1 and post != -1 and blocked < post, "instrumentation JS 结构与预期不符，无法提取算术段")
-    seg = js[blocked + len("'*');return;}"):post]
-    m = re.search(r"return (\w+);\}\)\(\);", seg)
-    ensure(bool(m), "instrumentation JS 未找到 state 返回语句")
-    seg = seg[: m.start() + len(f"return {m.group(1)};")]
-    m_id = re.search(r'result:\{i:"([0-9a-f]+)"', js)
-    ensure(bool(m_id), "instrumentation JS 未找到内嵌挑战 id")
-
-    harness = "\n".join([
-        'const navigator = {userAgent: ' + json.dumps(UA) + '};',
-        'class Div { constructor(){ this.parentNode=null; this._kids=[]; this._text=""; this.style={}; }',
-        '  appendChild(c){ this._kids.push(c); c.parentNode=this; return c; }',
-        '  removeChild(c){ const i=this._kids.indexOf(c); if(i>=0) this._kids.splice(i,1); return c; }',
-        '  get children(){ return this._kids; }',
-        '  get lastElementChild(){ return this._kids.length ? this._kids[this._kids.length-1] : null; }',
-        '  set innerText(v){ this._text = String(v); }',
-        '  get innerText(){ return this._text; }',
-        '}',
-        'const document = { createElement: () => new Div(), body: new Div() };',
-        '(async () => {',
-        seg,
-        '})().then(s => console.log("STATE:" + JSON.stringify(s)))'
-        '.catch(e => { console.error("ERR:" + e.message); process.exit(1); });',
-    ])
-    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as f:
-        f.write(harness)
-        path = f.name
-    try:
-        # 安全（2026-09-06 审计）：挑战 JS 来自远端服务端，执行环境最小化——
-        # 仅透传 PATH，避免恶意/被投毒的 JS 读取 runner 环境中的全部凭据。
-        node_env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")}
-        out = subprocess.run([node, path], capture_output=True, text=True, timeout=60,
-                             env=node_env)
-    finally:
-        os.unlink(path)
-    ensure(out.returncode == 0 and "STATE:" in out.stdout,
-           f"instrumentation 算术执行失败: {(out.stderr or out.stdout)[:200]}")
-    state = json.loads(out.stdout.split("STATE:", 1)[1])
-    return {"i": m_id.group(1), "state": state, "ts": int(time.time() * 1000)}
 
 
 def fetch_cap_token(h: Http, site_key: str = CAPCAT_SITE_KEY) -> str:
     """自动完成 CapCat 人机验证求解，换取 cap-token。
 
-    format 2（challenges 列表）：逐项求解 rsw / instrumentation / sha256-pow，
+    format 2（challenges 列表）：逐项求解 rsw / sha256-pow，拒绝远端 JS，
     solutions 数组与 challenges 顺序一一对应（与前端 cap.js 行为一致）。
     format 1（challenge {c,s,d}）：保留原 prng PoW 求解路径。
     """
@@ -201,7 +194,8 @@ def fetch_cap_token(h: Http, site_key: str = CAPCAT_SITE_KEY) -> str:
             if proto == "rsw":
                 solutions.append({"y": _solve_rsw(ch["payload"])})
             elif proto == "instrumentation":
-                solutions.append({"instr": _run_instr(ch["payload"]["blob"])})
+                # 远端 JS 即使清空环境变量仍可访问宿主文件和进程，禁止执行。
+                raise RuntimeError("CapCat instrumentation 挑战需要执行远端代码，已拒绝")
             elif proto == "sha256-pow":
                 nonce = _solve_sha256_pow(data["token"], ch["payload"])
                 solutions.append({"nonce": nonce})
