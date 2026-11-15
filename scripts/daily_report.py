@@ -23,6 +23,7 @@ import json as _json
 import os
 import re
 import smtplib
+import ssl
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -699,15 +700,16 @@ def send_email(subject: str, report: str, results: List[Tuple[bool, Path, str, f
         msg.attach(email.mime.text.MIMEText(report, "plain", "utf-8"))
         msg.attach(email.mime.text.MIMEText(html_body, "html", "utf-8"))
 
+        context = ssl.create_default_context()
         if use_ssl:
-            server = smtplib.SMTP_SSL(host, port, timeout=60)
+            server = smtplib.SMTP_SSL(host, port, timeout=60, context=context)
         else:
             server = smtplib.SMTP(host, port, timeout=60)
-            server.ehlo()
-            if port in (587, 25):
-                server.starttls()
-                server.ehlo()
         with server:
+            if not use_ssl:
+                server.ehlo()
+                server.starttls(context=context)
+                server.ehlo()
             server.login(user, password)
             server.sendmail(sender, recipients, msg.as_string())
         print(f"✅ 邮件推送完成（{len(recipients)} 位收件人）")
