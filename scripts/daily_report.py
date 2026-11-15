@@ -296,7 +296,8 @@ def _extract_fields(output: str) -> Dict[str, str]:
     reward_keywords = ["获得", "今日获得", "签到奖励", "新增", "领取", "奖励", "获取"]
     rewards: list[str] = []
     for kw in reward_keywords:
-        m = re.search(re.escape(kw) + r"\s*[:：]?\s*([0-9.,]+[^\n，。]*)", out)
+        # 冒号后的空白仅在冒号存在时匹配，避免无冒号时两段 \s* 二次回溯。
+        m = re.search(re.escape(kw) + r"\s*(?:[:：]\s*)?([0-9.,]+[^\n，。]*)", out)
         if m:
             val = m.group(1).strip()
             if val and val not in rewards:
