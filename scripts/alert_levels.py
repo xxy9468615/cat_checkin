@@ -110,8 +110,8 @@ _UNCONF_PATTERNS = (
     r"未配置凭据",
     r"secret 未配置或为空",
     r"未配置 [A-Za-z0-9_]+",
-    r"未配置.*(凭[证据]|[Cc]ookie|[Tt]oken|环境变量)",
 )
+_UNCONF_CREDENTIAL_WORDS = re.compile(r"凭[证据]|[Cc]ookie|[Tt]oken|环境变量")
 _UNCONF_EXCLUDE = ("已过期", "失效")
 
 _LEVELS = ("ok", "warn", "fail", "unconfigured")
@@ -128,7 +128,10 @@ def detect_unconfigured(output: str) -> Optional[str]:
             continue
         if any(x in ln for x in _UNCONF_EXCLUDE):
             continue
-        if any(re.search(p, ln) for p in _UNCONF_PATTERNS):
+        # 从首个标记之后扫描一次，避免重复「未配置」导致重叠后缀的二次方回溯。
+        marker = ln.find("未配置")
+        has_credentials = marker >= 0 and _UNCONF_CREDENTIAL_WORDS.search(ln, marker + 3)
+        if has_credentials or any(re.search(p, ln) for p in _UNCONF_PATTERNS):
             return ln if len(ln) <= 120 else ln[:119] + "…"
     return None
 
