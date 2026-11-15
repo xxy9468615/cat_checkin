@@ -191,26 +191,18 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Restore unified states
+      # Actions caches are readable by PR jobs. Authentication state must stay in
+      # Upstash Redis; cache only notification and scheduling metadata.
+      # Never restore legacy unified-states / ai-router-state / agentrouter-state caches.
+      - name: Restore operational states
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0（SHA 固定，node24）
         with:
           path: |
-            .ai_router_state.json
-            .agentrouter_state.json
-            .cloudstudio_state*.json
-            .modelscope_*.json
-            .juejin_state*.json
-            .alipan_state*.json
-            .smzdm_state*.json
-            .52pojie_state*.json
-            .ima_state*.json
             .notify_state_*.json
             .rolling_state_*.json
-          key: unified-states-${{ github.run_id }}
+          key: operational-states-v1-${{ github.run_id }}
           restore-keys: |
-            unified-states-
-            ai-router-state-
-            agentrouter-state-
+            operational-states-v1-
 
       # ── 到期前置判定与自愈调度 ─────────────────────────
       - name: Precheck due tasks (idle runs exit here)
@@ -653,23 +645,14 @@ jobs:
             echo "分时段重试：任务重试计划已记录到 Upstash Redis/状态缓存中，将由定时心跳轮询到期自动拾取，避免原地等待浪费 runner 额度。"
           fi
 
-      - name: Save unified states
+      - name: Save operational states
         if: always()
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0（SHA 固定，node24）
         with:
           path: |
-            .ai_router_state.json
-            .agentrouter_state.json
-            .cloudstudio_state*.json
-            .modelscope_*.json
-            .juejin_state*.json
-            .alipan_state*.json
-            .smzdm_state*.json
-            .52pojie_state*.json
-            .ima_state*.json
             .notify_state_*.json
             .rolling_state_*.json
-          key: unified-states-${{ github.run_id }}
+          key: operational-states-v1-${{ github.run_id }}
 
       - name: Cleanup sing-box tunnel
         if: always()
