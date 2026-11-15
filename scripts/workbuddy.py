@@ -293,11 +293,11 @@ def _format_beijing_time(ts: int) -> str:
 
 
 def _safe_session_dump(session_data: Dict[str, Any]) -> str:
-    """脱敏打印 session 配置，避免泄露 token/secret。"""
+    """脱敏打印 session 配置，避免泄露 token/secret 或作为凭据的连接 URL。"""
     sensitive = ("cookie", "token", "accesstoken", "access_token", "secret", "authorization", "apikey", "api_key", "password")
     redacted = {}
     for k, v in session_data.items():
-        if any(s in k.lower() for s in sensitive):
+        if k.lower() in ("link", "e2bendpoint") or any(s in k.lower() for s in sensitive):
             redacted[k] = "<redacted>"
         else:
             redacted[k] = v
@@ -452,7 +452,7 @@ def _acp_connect(h: Http, acp_url: str, stop_event: "threading.Event", token: st
             return "", None, []
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
-            _dbg(f"[workbuddy] ACP GET /acp 连接失败: {exc}")
+            _dbg(f"[workbuddy] ACP GET /acp 连接失败: {type(exc).__name__}")
             return "", None, []
 
         conn_id = resp.headers.get("acp-connection-id", "")
@@ -529,7 +529,7 @@ def _acp_call(h: Http, acp_url: str, conn_id: str, method: str, params: Dict[str
         except _urllib_err.HTTPError as e:
             return e.code
         except Exception as exc:  # noqa: BLE001
-            _dbg(f"[workbuddy] ACP {method} 调用异常: {exc}")
+            _dbg(f"[workbuddy] ACP {method} 调用异常: {type(exc).__name__}")
             return -1
 
     # 同步拿到状态码即可（响应体后台排空）
@@ -619,7 +619,7 @@ def _run_conversation_and_wait(h: Http, cred: str, timeout_seconds: int = 240) -
         _flush_dbg()
         return f"对话已创建 (ID:{conv_id}) 但无法获取 ACP endpoint，签到面板可能无法激活", False
 
-    _dbg(f"[workbuddy] ACP endpoint: {e2b_endpoint}，session_id: {session_id}")
+    _dbg(f"[workbuddy] ACP endpoint 已获取，session_id: {session_id}")
     _dbg(f"[workbuddy] session 配置(脱敏): {_safe_session_dump(session_data)}")
 
     # ACP 实际地址优先用 link（sandbox 直连 /acp），回退到 e2bEndpoint+/acp；
