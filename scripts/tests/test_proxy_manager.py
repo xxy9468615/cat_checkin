@@ -99,6 +99,26 @@ class TestProxyManager(unittest.TestCase):
             self.assertNotIn("fixture_", str(ep.to_dict()))
             self.assertNotIn("fixture_", format_dead_proxy_alert(ep))
 
+    def test_pii_labels_are_masked_at_all_output_boundaries(self):
+        # 用户把节点命名成自己的邮箱/手机号时，公开仓库日志会长期暴露该地址并
+        # 招来钓鱼邮件（2026-11-15 用户反馈）。构造期与直接改 name 都要脱敏。
+        url = "http://192.0.2.1:8080"
+        for label in ("fixture_user@gmail.com", "13800138000"):
+            for text in (f"[{label}] {url}", f"{url}#{label}"):
+                with self.subTest(text=text):
+                    ep = parse_proxy_line(text)
+                    self.assertNotIn("fixture_", ep.name)
+                    self.assertNotIn("fixture_", ep.display_name)
+                    self.assertNotIn("fixture_", str(ep.to_dict()))
+                    self.assertNotIn("fixture_", format_dead_proxy_alert(ep))
+            ep = parse_proxy_line(url, explicit_name=label)
+            self.assertNotIn("fixture_", ep.display_name)
+            ep.name = label
+            self.assertNotIn("fixture_", ep.display_name)
+            self.assertNotIn("fixture_", format_dead_proxy_alert(ep))
+            # 正常标签不被误伤
+            self.assertTrue(ep.display_name.startswith("【"))
+
     def test_parse_multiline_with_comments(self):
         text = """
         # 自建-广州家宽出口

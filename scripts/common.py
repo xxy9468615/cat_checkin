@@ -807,6 +807,30 @@ def sanitize_snippet(text: str, limit: int = 300) -> str:
         s = pat.sub(repl, s)
     return s.replace("\n", " ")[:limit]
 
+# 裸 PII 形态（不依赖字段名）：11 位孤立数字段 = 手机号/其他号码；
+# 邮箱 = RFC 常见子集（本地部分允许 .%+-，域名要求至少一个点 + >=2 位 TLD）。
+# 用于服务端文案/代理标签等无字段语义的文本，配合 mask_str 系脱敏。
+_PII_PHONE_RE = re.compile(r"(?<!\d)\d{11}(?!\d)")
+_PII_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def redact_pii(text: Any, mask_char: str = "*") -> str:
+    """对任意文本中的裸手机号/邮箱脱敏（保留原文结构与其余内容）。
+
+    与 sanitize_snippet 的区别：本函数按「出现形态」而非字段名匹配，专治
+    服务端原始文案里不带 key 的裸 PII。典型泄漏面是代理标签——用户把节点命名成
+    自己的邮箱时，该标签会经 display_name/to_dict 明文流到公开仓库的 Actions
+    日志与日报，进而成为钓鱼邮件的目标（用户明确反馈过这一危害）。
+
+    前后邻接数字的 11 位段不命中（避免误伤 13 位毫秒时间戳 / 16 位 GUID /
+    长 docid），因此不是无差别替换。
+    """
+    s = str(text or "")
+    if not s:
+        return s
+    s = _PII_PHONE_RE.sub(lambda m: mask_phone(m.group(0), mask_char=mask_char), s)
+    return _PII_EMAIL_RE.sub(lambda m: mask_email(m.group(0), mask_char=mask_char), s)
+
 def must_match(pattern: str, text: str, label: str, flags: int = 0) -> str:
     m = re.search(pattern, text, flags)
     if not m:

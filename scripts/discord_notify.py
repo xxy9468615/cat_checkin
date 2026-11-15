@@ -51,9 +51,48 @@ COLOR_CIRCUIT_BROKEN = 0x991B1B  # 深红（熔断停用告警：单日达 8 次
 FAIL_TEXT_MAX = 160
 # Bound work before notification parsers inspect remotely controlled task output.
 NOTIFY_OUTPUT_MAX = 64 * 1024
+# 尾部保留预算：失败证据（❌/⚠️ 行）通常出现在任务输出末尾，头部截断会把它们整体丢掉。
+# 前段保 NOTIFY_OUTPUT_MAX - NOTIFY_TAIL_KEEP，后段保 NOTIFY_TAIL_KEEP。
+NOTIFY_TAIL_KEEP = 8 * 1024
+_TRUNC_MARKER = "\n…[输出过长，已省略中段]…\n"
 
 BJT = datetime.timezone(datetime.timedelta(hours=8))
 _WEEKDAY_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
+def _bounded_output(text: Any, limit: int = NOTIFY_OUTPUT_MAX) -> str:
+    """按行界做有界截断：超长时保留头尾，仅丢弃中段。
+
+    只取前 64KiB 会在「进程打印大量前缀噪音 + 末尾才是失败行」时静默丢证据——
+    失败卡随后显示「进程非零退出但无失败输出」，丢失失败账号与 HTTP 状态码
+    （CodeRabbit F2，2026-11-15）。按行切分而非按字符切分，避免把一行从中间切断。
+    """
+    s = text or ""
+    if len(s) <= limit:
+        return s
+    tail_keep = min(NOTIFY_TAIL_KEEP, max(0, limit // 4))
+    head_keep = limit - tail_keep
+    lines = s.splitlines()
+    # 逐行累加，保证不切断单行且总长不超 limit
+    kept_head: List[str] = []
+    total = 0
+    for line in lines:
+        add = len(line) + 1
+        if total + add > head_keep:
+            break
+        kept_head.append(line)
+        total += add
+    kept_tail: List[str] = []
+    total = 0
+    for line in reversed(lines):
+        add = len(line) + 1
+        if total + add > tail_keep:
+            break
+        kept_tail.append(line)
+        total += add
+    kept_tail.reverse()
+    return "\n".join(kept_head + [_TRUNC_MARKER.strip("\n")] + kept_tail)
+
 
 # 脱敏账号标识：各脚本统一经 common.mask_str 输出，特征是含 ** 掩码的短 token
 _TOKEN_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_+-.@")
@@ -175,7 +214,7 @@ def _extract_accounts(output: str) -> str:
     marker_hits: List[str] = []
     other_hits: List[str] = []
     seen: set[str] = set()
-    for line in (output or "")[:NOTIFY_OUTPUT_MAX].splitlines():
+    for line in _bounded_output(output).splitlines():
         low = line.lower()
         if any(k in low for k in _CREDENTIAL_LINE_KEYWORDS):
             continue
@@ -295,14 +334,14 @@ def _failed_accounts(output: str, info: Optional[Dict[str, Any]] = None) -> str:
     tags: List[str] = []
     if info and info.get("fail_lines"):
         for ln in info["fail_lines"][:4]:
-            token = _first_masked_token(ln[:NOTIFY_OUTPUT_MAX])
+            token = _first_masked_token(_bounded_output(ln))
             label = token.strip("._-") if token else _FAIL_LINE_NOISE_RE.sub("", ln).strip()[:18]
             label = label.strip()
             if label and label not in tags:
                 tags.append(label)
         if tags:
             return "、".join(tags[:4])
-    for tag, text in _failure_items((output or "")[:NOTIFY_OUTPUT_MAX], max_items=6):
+    for tag, text in _failure_items(_bounded_output(output), max_items=6):
         token = _first_masked_token(text)
         label = f"{tag} {token.strip('._-')}" if token else tag
         label = label.strip()
@@ -444,7 +483,7 @@ def notify_circuit_breaker(
     当任务单日累计尝试达 8 次失败上限触发熔断时调用。
     同一任务同日仅推送一次熔断告警，避免刷屏。
     """
-    output = (output or "")[:NOTIFY_OUTPUT_MAX]
+    output = _bounded_output(output)
     state = _load_notify_state(task_id) if persist else {}
     today = _bjt_today()
 
@@ -529,7 +568,7 @@ def notify_task_result(
     persist=False 时不读写通知状态（--test 自测用，避免污染真实 task_id 的记录）。
     返回值：失败卡/提示卡是否发送成功（纯成功不推送恒返回 True，方便调用方记日志）。
     """
-    output = (output or "")[:NOTIFY_OUTPUT_MAX]
+    output = _bounded_output(output)
     state = _load_notify_state(task_id) if persist else {}
     prev_ok_date = str(state.get("last_ok_date") or "").strip()
     try:
@@ -672,7 +711,7 @@ def notify_unconfigured(
     无意义自动重跑收场。现只推一张黄色「未配置」提示卡（同任务同日仅一次），
     附证据行与配置指引，提醒尽快配置凭据。
     """
-    output = (output or "")[:NOTIFY_OUTPUT_MAX]
+    output = _bounded_output(output)
     state = _load_notify_state(task_id) if persist else {}
     today = _bjt_today()
     # 保留既有状态字段（last_ok_date / fail_streak / ok_streak / attempts），

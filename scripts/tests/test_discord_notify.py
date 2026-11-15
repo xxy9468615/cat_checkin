@@ -40,10 +40,12 @@ class AccountExtractionTests(unittest.TestCase):
 for text in ('a' * 100000, 'a@** ' * 20000, '*' * 100000):
     assert n._first_masked_token(text) == ''
 assert n._first_masked_token('a' * 100000 + '**') == 'a' * 100000 + '**'
-assert n._extract_accounts('a' * 100000 + '\\n用户 late***1') == '—'
+assert n._extract_accounts('a' * 100000 + '\\n用户 late***1') == 'late***1'
 assert n._failed_accounts('', {'fail_lines': ['a' * 100000]})
 '''
-        subprocess.run([sys.executable, "-c", code], cwd=BASE, check=True, timeout=5)
+        # 不重推一次：_extract_accounts 现在保留尾部预算，超长前缀后的账号行
+        # 正是要救回的证据（F2 修复），原断言的「必然读不到」语义已反转。
+        subprocess.run([sys.executable, "-c", code], cwd=BASE, check=True, timeout=20)
 
     def test_limit_before_notification_parsing(self):
         output = "a" * notify.NOTIFY_OUTPUT_MAX + "\n用户 late***1"
@@ -56,11 +58,31 @@ assert n._failed_accounts('', {'fail_lines': ['a' * 100000]})
                  patch.object(notify, "_post_webhook", return_value=True):
                 self.assertTrue(entry(task_id="test", name="Test", script="glados.py",
                                       output=output, persist=False, **kwargs))
-                self.assertEqual(extract.call_args.args[1], output[:notify.NOTIFY_OUTPUT_MAX])
+                self.assertEqual(extract.call_args.args[1],
+                                 notify._bounded_output(output))
         with patch("alert_levels.detect_unconfigured", return_value="missing") as detect, \
              patch.object(notify, "_post_webhook", return_value=True):
             notify.notify_unconfigured("test", "Test", "glados.py", output, persist=False)
-            self.assertEqual(detect.call_args.args[0], output[:notify.NOTIFY_OUTPUT_MAX])
+            self.assertEqual(detect.call_args.args[0], notify._bounded_output(output))
+
+    def test_truncation_keeps_tail_failure_evidence(self):
+        # 头部截断会把末尾的失败证据整体丢掉（CodeRabbit F2）。
+        tail = "❌ [2/3] b***2 打卡失败: HTTP 401\n⚠️ 凭据剩余 1 天"
+        output = "a" * (notify.NOTIFY_OUTPUT_MAX + 4096) + "\n" + tail
+        bounded = notify._bounded_output(output)
+        self.assertLessEqual(len(bounded), notify.NOTIFY_OUTPUT_MAX)
+        for line in tail.splitlines():
+            self.assertIn(line, bounded)
+        self.assertIn("#2 b***2", notify._failed_accounts(bounded))
+        items = notify._failure_items(bounded, max_items=6)
+        self.assertTrue(items)
+        self.assertEqual(items[0], ("#2", "b***2 打卡失败: HTTP 401"))
+        self.assertIn("凭据剩余 1 天", items[1][1])
+
+    def test_bounded_output_shortcuts_short_input(self):
+        self.assertEqual(notify._bounded_output(""), "")
+        self.assertEqual(notify._bounded_output("a\nb"), "a\nb")
+        self.assertEqual(notify._bounded_output(None), "")
 
 
 if __name__ == "__main__":
