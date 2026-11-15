@@ -284,6 +284,22 @@ _ERROR_HINTS = [
 ]
 
 
+def _redact_failure_line(text: str) -> str:
+    """失败行展示前的统一脱敏出口。
+
+    失败行由任务脚本直接打印，可能含裸邮箱/手机号（如站点回显的登录账号）。
+    这些行一旦经尾部保留进入通知卡片就是公开 PII，因此无论走 _failure_items
+    还是 _failed_accounts 的启发式路径，都必须先过 common.redact_pii。
+    """
+    try:
+        from common import redact_pii
+        redacted = redact_pii(text)
+        # 通知卡按行展示，脱敏阶段不能引入换行把一行拆成多行
+        return redacted.replace("\n", " ")
+    except Exception:
+        return text
+
+
 def _failure_items(output: str, max_items: int = 3) -> List[Tuple[str, str]]:
     """逐账号失败明细：扫描输出中的真实失败行（❌ 行优先，⚠️ 警告行兜底）。
 
@@ -293,7 +309,7 @@ def _failure_items(output: str, max_items: int = 3) -> List[Tuple[str, str]]:
     primary: List[str] = []
     backup: List[str] = []
     for raw in (output or "").splitlines():
-        line = raw.strip()
+        line = _redact_failure_line(raw.strip())
         if not line or _SUMMARY_LINE_RE.search(line):
             continue
         if "⚠️" in line:
@@ -347,7 +363,8 @@ def _failed_accounts(output: str, info: Optional[Dict[str, Any]] = None) -> str:
     tags: List[str] = []
     if info and info.get("fail_lines"):
         for ln in info["fail_lines"][:4]:
-            token = _first_masked_token(_bounded_output(ln))
+            ln = _redact_failure_line(_bounded_output(ln))
+            token = _first_masked_token(ln)
             label = token.strip("._-") if token else _FAIL_LINE_NOISE_RE.sub("", ln).strip()[:18]
             label = label.strip()
             if label and label not in tags:
@@ -356,7 +373,7 @@ def _failed_accounts(output: str, info: Optional[Dict[str, Any]] = None) -> str:
             return "、".join(tags[:4])
     for tag, text in _failure_items(_bounded_output(output), max_items=6):
         token = _first_masked_token(text)
-        label = f"{tag} {token.strip('._-')}" if token else tag
+        label = f"{tag} {_redact_failure_line(token.strip('._-'))}" if token else tag
         label = label.strip()
         if label and label not in tags:
             tags.append(label)

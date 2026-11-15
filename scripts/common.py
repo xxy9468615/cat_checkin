@@ -809,13 +809,25 @@ def sanitize_snippet(text: str, limit: int = 300) -> str:
 
 # 裸 PII 形态（不依赖字段名）：
 # - 邮箱：本地部分按 RFC 5322 atext（含 .!#$%&'*+-/=?^_`{|}~），域名要求至少
-#   一个点 + >=2 位 TLD。引号等 atext 之外字符包裹的本地部分走兜底规则整段遮盖。
-# - 手机号：11 位孤立数字段；带国家码形态（+86xxxxxxxxxxx）单独识别。
-# 前后邻接数字的 11 位段不命中（避免误伤 13 位毫秒时间戳 / 16 位 GUID /
-# 长 docid），因此不是无差别替换。
-_PII_EMAIL_RE = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-_PII_EMAIL_FALLBACK_RE = re.compile(r"[^\s@]{1,64}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+#   一个点 + >=2 位 TLD；标签内允许非 ASCII（中文域名如 例子.中国、拼音域名），
+#   但排除空白与 @，避免把自然语言里的 @ 当成邮箱起点而过度遮盖。
+#   引号等 atext 之外字符包裹的本地部分走兜底规则整段遮盖。
+# - 手机号：11 位孤立数字段；带空格/连字符分隔的常见写法（138-0013-8000 /
+#   138 0013 8000）单独识别，只保留末 4 位；带国家码形态（+86xxxxxxxxxxx）
+#   单独识别。前后邻接数字的 11 位段不命中（避免误伤 13 位毫秒时间戳 /
+#   16 位 GUID / 长 docid），因此不是无差别替换。
+_PII_DOMAIN_LABEL = r"[^\s@]+"
+_PII_EMAIL_RE = re.compile(
+    rf"[A-Za-z0-9.!#$%&'*+/=?^_`{{|}}~-]+@"
+    rf"(?:{_PII_DOMAIN_LABEL}\.)+[A-Za-z0-9一-鿿]{{2,}}"
+)
+_PII_EMAIL_FALLBACK_RE = re.compile(
+    rf"[^\s@]{{1,64}}@(?:{_PII_DOMAIN_LABEL}\.)+[A-Za-z0-9一-鿿]{{2,}}"
+)
 _PII_INTL_PHONE_RE = re.compile(r"(?<![\d+])(\+(?:86)?)(\d{11})(?!\d)")
+# 分隔符写法必须让分隔符两侧都是数字，且整段恰好 11 位——否则版本号、端口、
+# 日期区间这类带连字符/空格的数字串会被误判成手机号。
+_PII_SEP_PHONE_RE = re.compile(r"(?<!\d)(\d{3})[- ](\d{4})[- ](\d{4})(?!\d)")
 _PII_PHONE_RE = re.compile(r"(?<!\d)\d{11}(?!\d)")
 
 
@@ -841,6 +853,11 @@ def redact_pii(text: Any, mask_char: str = "*") -> str:
     )
     s = _PII_INTL_PHONE_RE.sub(
         lambda m: m.group(1) + mask_phone(m.group(2), mask_char=mask_char), s
+    )
+    # 分隔符写法先于裸号处理：否则 138-0013-8000 里的 00138000 等子串会被裸号规则命中，
+    # 产生不符合「只留末 4」的残留。保留分隔符结构（不泄漏原始分组），只留末 4 位。
+    s = _PII_SEP_PHONE_RE.sub(
+        lambda m: f"{m.group(1)[0]}{mask_char * 2}-{mask_char * 4}-{m.group(3)}", s
     )
     return _PII_PHONE_RE.sub(lambda m: mask_phone(m.group(0), mask_char=mask_char), s)
 

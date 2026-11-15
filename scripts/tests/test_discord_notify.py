@@ -10,6 +10,7 @@ from unittest.mock import patch
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 import discord_notify as notify
+import proxy_manager
 
 
 class AccountExtractionTests(unittest.TestCase):
@@ -100,6 +101,37 @@ assert n._failed_accounts('', {'fail_lines': ['a' * 100000]})
         self.assertLessEqual(len(bounded), notify.NOTIFY_OUTPUT_MAX + 1)
         self.assertEqual(bounded.count("💰 当前积分: 100 积分"), 1)
         self.assertEqual(bounded.count("📧 账号: a***1"), 1)
+
+    def test_failure_lines_are_redacted_before_display(self):
+        # 尾部保留的失败行若含裸邮箱，会经通知卡片公开（CodeRabbit round-3）。
+        tail = "❌ [2/3] alice@example.com 失败 HTTP 401"
+        output = "a" * (notify.NOTIFY_OUTPUT_MAX + 4096) + "\n" + tail
+        bounded = notify._bounded_output(output)
+        self.assertIn("alice@example.com", bounded)  # 截断层不动内容，脱敏在展示层
+        items = notify._failure_items(bounded, max_items=3)
+        self.assertTrue(items)
+        text = items[0][1]
+        self.assertNotIn("alice@example.com", text)
+        self.assertIn("***lice@***", text)
+        # 结构化 fail_lines 路径同样脱敏
+        label = notify._failed_accounts("", {"fail_lines": [tail]})
+        self.assertNotIn("alice@example.com", label)
+
+    def test_idn_email_and_separated_phone_labels_are_masked(self):
+        # 中文域名邮箱与带分隔符的手机号此前不匹配，会明文进入日志/日报。
+        url = "http://192.0.2.1:8080"
+        cases = (
+            ("alice@example.中国", "***lice@***"),
+            ("138-0013-8000", "1**-****-8000"),
+            ("138 0013 8000", "1**-****-8000"),
+        )
+        for label, expected in cases:
+            for text in (f"[{label}] {url}", f"{url}#{label}"):
+                with self.subTest(text=text):
+                    ep = proxy_manager.parse_proxy_line(text)
+                    self.assertEqual(ep.name, expected)
+                    self.assertEqual(ep.display_name, f"【{expected}】")
+                    self.assertNotIn(label, str(ep.to_dict()))
 
     def test_bounded_output_shortcuts_short_input(self):
         self.assertEqual(notify._bounded_output(""), "")
