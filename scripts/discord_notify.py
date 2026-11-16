@@ -60,6 +60,39 @@ BJT = datetime.timezone(datetime.timedelta(hours=8))
 _WEEKDAY_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
 
+def _redact_failure_line(text: str) -> str:
+    """失败行展示前的统一脱敏出口。
+
+    失败行由任务脚本直接打印，可能含裸邮箱/手机号（如站点回显的登录账号）
+    与 token/Cookie 形态内容。这些行一旦经尾部保留进入通知卡片就是公开 PII，
+    因此无论走 _failure_items 还是 _failed_accounts 的启发式路径，都必须先过
+    redact_pii + sanitize_snippet，再截断到展示上限。
+
+    顺序是硬要求：先脱敏再截断。反序会让超长条目只留末尾 256 字符锚点，
+    片段从手机号中间开始时残留数字不再被识别（CodeRabbit round-4）。
+    脱敏异常时返回固定占位文本，绝不返回 s 的任何片段——宁可丢一行，也不能
+    把未遮盖的凭据行放出去。
+
+    本函数只做脱敏，不做展示截断：FAIL_TEXT_MAX 由调用方在「未截断的安全文本」
+    上执行，这样超长条目末尾的 HTTP 状态码仍参与失败筛选（CodeRabbit round-5/6）。
+    """
+    s = text or ""
+    try:
+        from common import redact_pii, sanitize_snippet
+    except Exception:
+        # common 不可用：无法证明已脱敏，固定占位，不放任何原始片段
+        return "<脱敏不可用>"
+    # sanitize_snippet 自带默认 limit=300，会把文本在分类前就截断——末尾的
+    # HTTP 状态码丢失后 _failure_items 直接丢弃该行，失败卡退化成「无失败输出」。
+    # 脱敏阶段必须拿到完整文本：展示上限由调用方施加。
+    try:
+        out = sanitize_snippet(redact_pii(s), limit=len(s) + 1)
+    except Exception:
+        return "<脱敏失败>"
+    # 通知卡按行展示，脱敏阶段不能引入换行把一行拆成多行
+    return out.replace("\n", " ")
+
+
 def _bounded_output(text: Any, limit: int = NOTIFY_OUTPUT_MAX) -> str:
     """按行界做有界截断：超长时保留头尾，仅丢弃中段。
 
@@ -95,8 +128,14 @@ def _bounded_output(text: Any, limit: int = NOTIFY_OUTPUT_MAX) -> str:
     for idx in range(len(lines) - 1, head_end_index - 1, -1):
         line = lines[idx]
         add = len(line) + 1
+        # 先脱敏再决定去留与截取：反序会先丢掉 Authorization: Bearer 之类前缀，
+        # 残留片段过短或不含数字时兜底规则不命中，凭据值会进失败卡；且未脱敏的
+        # 中间表示一旦被按行重扫就会读到明文（CodeRabbit round-6）。
+        line = _redact_failure_line(line)
+        add = len(line) + 1
         if total + add > tail_keep:
             if not kept_tail and len(line) > tail_keep:
+                # 锚点固定 256，不能吃掉整个尾预算——否则更早的失败行会被挤掉
                 kept_tail.append(line[-_TAIL_ANCHOR:])
                 total += _TAIL_ANCHOR + 1
             # 继续向前扫描：更早的失败行仍可能在剩余预算内。
@@ -282,39 +321,6 @@ _ERROR_HINTS = [
     (r"代理|proxy|socks", "代理通道不可用：请检查 AGENTROUTER_SINGBOX_CONFIG / 自建代理 或备用代理配置",
      True, "修复代理后重跑"),
 ]
-
-
-def _redact_failure_line(text: str) -> str:
-    """失败行展示前的统一脱敏出口。
-
-    失败行由任务脚本直接打印，可能含裸邮箱/手机号（如站点回显的登录账号）
-    与 token/Cookie 形态内容。这些行一旦经尾部保留进入通知卡片就是公开 PII，
-    因此无论走 _failure_items 还是 _failed_accounts 的启发式路径，都必须先过
-    redact_pii + sanitize_snippet，再截断到展示上限。
-
-    顺序是硬要求：先脱敏再截断。反序会让超长条目只留末尾 256 字符锚点，
-    片段从手机号中间开始时残留数字不再被识别（CodeRabbit round-4）。
-    脱敏异常时返回固定占位文本，绝不返回 s 的任何片段——宁可丢一行，也不能
-    把未遮盖的凭据行放出去。
-
-    本函数只做脱敏，不做展示截断：FAIL_TEXT_MAX 由调用方在「未截断的安全文本」
-    上执行，这样超长条目末尾的 HTTP 状态码仍参与失败筛选（CodeRabbit round-5/6）。
-    """
-    s = text or ""
-    try:
-        from common import redact_pii, sanitize_snippet
-    except Exception:
-        # common 不可用：无法证明已脱敏，固定占位，不放任何原始片段
-        return "<脱敏不可用>"
-    # sanitize_snippet 自带默认 limit=300，会把文本在分类前就截断——末尾的
-    # HTTP 状态码丢失后 _failure_items 直接丢弃该行，失败卡退化成「无失败输出」。
-    # 脱敏阶段必须拿到完整文本：展示上限由调用方施加。
-    try:
-        out = sanitize_snippet(redact_pii(s), limit=len(s) + 1)
-    except Exception:
-        return "<脱敏失败>"
-    # 通知卡按行展示，脱敏阶段不能引入换行把一行拆成多行
-    return out.replace("\n", " ")
 
 
 def _failure_items(output: str, max_items: int = 3) -> List[Tuple[str, str]]:
