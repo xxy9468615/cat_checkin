@@ -86,9 +86,9 @@ class TestRedactPii(unittest.TestCase):
         self.assertEqual(common.redact_pii("+8613800138000"), "+86*******8000")
         # 无 86 的国际号码不得保留前两位
         self.assertEqual(common.redact_pii("+13800138000"), "+*******8000")
-        # 常见分隔符写法只留末 4 位
-        self.assertEqual(common.redact_pii("138-0013-8000"), "1**-****-8000")
-        self.assertEqual(common.redact_pii("138 0013 8000"), "1**-****-8000")
+        # 常见分隔符写法只留末 4 位（号码拼接后统一遮盖，不保留首位数字）
+        self.assertEqual(common.redact_pii("138-0013-8000"), "*******8000")
+        self.assertEqual(common.redact_pii("138 0013 8000"), "*******8000")
 
     def test_non_collateral_preserved(self):
         # 前后邻接数字的 11 位段不命中：13 位毫秒时间戳 / 16 位 GUID / 长 docid
@@ -101,6 +101,20 @@ class TestRedactPii(unittest.TestCase):
                          "socks5://u:p@1.2.3.4:1080")
         # 版本号式连字符数字串不是手机号
         self.assertEqual(common.redact_pii("v1.2.3-4567-8901"), "v1.2.3-4567-8901")
+
+    def test_domain_label_excludes_dot_to_avoid_backtracking(self):
+        # 标签含 `.` 时连续点号可被切成多种组合，匹配失败即无界回溯：
+        # "x@" + "a."*20 + "!" 实测 0.1s、28 组 3s 未返回。redact_pii 处理任意
+        # 输出行，必须在线性时间内返回。
+        import time
+
+        hostile = "x@" + "a." * 40 + "!"
+        t0 = time.monotonic()
+        out = common.redact_pii(hostile)
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 1.0, f"redact_pii 疑似指数回溯，耗时 {elapsed:.3f}s")
+        # 连续点号的畸形域名不再被识别为邮箱（保守放弃，不泄漏裸文本即可）
+        self.assertIsInstance(out, str)
 
     def test_empty_input(self):
         self.assertEqual(common.redact_pii(""), "")

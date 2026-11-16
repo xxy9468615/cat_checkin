@@ -284,20 +284,31 @@ _ERROR_HINTS = [
 ]
 
 
-def _redact_failure_line(text: str) -> str:
+def _redact_failure_line(text: str, limit: int = FAIL_TEXT_MAX) -> str:
     """失败行展示前的统一脱敏出口。
 
-    失败行由任务脚本直接打印，可能含裸邮箱/手机号（如站点回显的登录账号）。
-    这些行一旦经尾部保留进入通知卡片就是公开 PII，因此无论走 _failure_items
-    还是 _failed_accounts 的启发式路径，都必须先过 common.redact_pii。
+    失败行由任务脚本直接打印，可能含裸邮箱/手机号（如站点回显的登录账号）
+    与 token/Cookie 形态内容。这些行一旦经尾部保留进入通知卡片就是公开 PII，
+    因此无论走 _failure_items 还是 _failed_accounts 的启发式路径，都必须先过
+    redact_pii + sanitize_snippet，再截断到展示上限。
+
+    顺序是硬要求：先脱敏再截断。反序会让超长条目只留末尾 256 字符锚点，
+    片段从手机号中间开始时残留数字不再被识别（CodeRabbit round-4）。
+    脱敏异常时退化为纯截断——宁可短，也不能把未遮盖的凭据行放出去。
     """
+    s = text or ""
+    failed = False
     try:
-        from common import redact_pii
-        redacted = redact_pii(text)
-        # 通知卡按行展示，脱敏阶段不能引入换行把一行拆成多行
-        return redacted.replace("\n", " ")
+        from common import redact_pii, sanitize_snippet
+        s = sanitize_snippet(redact_pii(s), limit=limit)
     except Exception:
-        return text
+        # 脱敏工具不可用时不得原样放出：至少做纯截断，避免整条凭据外泄
+        failed = True
+    # 通知卡按行展示，脱敏阶段不能引入换行把一行拆成多行
+    s = s.replace("\n", " ")
+    if failed:
+        return s[:limit]
+    return s
 
 
 def _failure_items(output: str, max_items: int = 3) -> List[Tuple[str, str]]:
@@ -362,8 +373,11 @@ def _failed_accounts(output: str, info: Optional[Dict[str, Any]] = None) -> str:
     """
     tags: List[str] = []
     if info and info.get("fail_lines"):
-        for ln in info["fail_lines"][:4]:
-            ln = _redact_failure_line(_bounded_output(ln))
+        for raw_ln in info["fail_lines"][:4]:
+            # 先脱敏再截断：反序会先丢掉条目头部，残留片段从手机号中间开始，
+            # redact_pii 无法识别残留数字，账号标签随后截前 18 字符就会露出
+            # 三位原始数字（CodeRabbit round-4）。
+            ln = _redact_failure_line(raw_ln)
             token = _first_masked_token(ln)
             label = token.strip("._-") if token else _FAIL_LINE_NOISE_RE.sub("", ln).strip()[:18]
             label = label.strip()
