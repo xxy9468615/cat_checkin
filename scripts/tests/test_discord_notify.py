@@ -141,11 +141,33 @@ assert n._failed_accounts('', {'fail_lines': ['a' * 100000]})
         self.assertNotIn("0013", label)
 
     def test_failure_line_sanitizes_credentials(self):
-        # token/Cookie 形态内容同样不得出现在通知卡片上
-        raw = "❌ [2/3] a***1 失败 Authorization: Bearer abcdef1234567890abcdef"
+        # token/Cookie 形态内容同样不得出现在通知卡片上；合成凭据一律
+        # V1.0FAKE 前缀（test.yml 凭据扫描豁免约定，规则 3/10）
+        secret = "V1.0FAKE" + "a" * 24
+        raw = f"❌ [2/3] a***1 失败 Authorization: Bearer {secret}"
         text = notify._failure_items(raw, max_items=3)[0][1]
-        self.assertNotIn("abcdef1234567890abcdef", text)
+        self.assertNotIn(secret, text)
         self.assertIn("<masked>", text)  # 凭据被替换为占位符，而非保留原值
+
+    def test_failure_line_redaction_failure_returns_placeholder(self):
+        # 脱敏工具不可用时必须返回固定占位文本：任何原始片段都不能放行，
+        # 否则失败行里的凭据会直接进公开日志（CodeRabbit round-5）
+        raw = "❌ [2/3] a***1 失败 Authorization: Bearer " + "V1.0FAKE" + "b" * 24
+        with patch("common.redact_pii", side_effect=RuntimeError("boom")):
+            out = notify._redact_failure_line(raw)
+        self.assertEqual(out, "<脱敏失败>")
+        self.assertNotIn("V1.0FAKE", out)
+        self.assertNotIn("a***1", out)
+
+    def test_failure_line_never_truncates_before_classification(self):
+        # 截断必须在脱敏之后作用于完整文本：先截会让长条目末尾的 HTTP 状态码
+        # 丢失，展示层拿不到根因（CodeRabbit round-5）
+        raw = "❌ [2/3] " + "z" * (notify.FAIL_TEXT_MAX + 20) + " HTTP 401"
+        text = notify._failure_items(raw, max_items=3)[0][1]
+        self.assertTrue(text.endswith("…"))
+        # 完整文本在脱敏阶段保留，状态码仍可被错误建议逻辑看到
+        ln = notify._redact_failure_line(raw)
+        self.assertIn("HTTP 401", ln)
 
     def test_idn_email_and_separated_phone_labels_are_masked(self):
         # 中文域名邮箱与带分隔符的手机号此前不匹配，会明文进入日志/日报。

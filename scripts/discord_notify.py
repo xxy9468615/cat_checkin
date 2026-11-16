@@ -284,7 +284,7 @@ _ERROR_HINTS = [
 ]
 
 
-def _redact_failure_line(text: str, limit: int = FAIL_TEXT_MAX) -> str:
+def _redact_failure_line(text: str) -> str:
     """失败行展示前的统一脱敏出口。
 
     失败行由任务脚本直接打印，可能含裸邮箱/手机号（如站点回显的登录账号）
@@ -294,21 +294,24 @@ def _redact_failure_line(text: str, limit: int = FAIL_TEXT_MAX) -> str:
 
     顺序是硬要求：先脱敏再截断。反序会让超长条目只留末尾 256 字符锚点，
     片段从手机号中间开始时残留数字不再被识别（CodeRabbit round-4）。
-    脱敏异常时退化为纯截断——宁可短，也不能把未遮盖的凭据行放出去。
+    脱敏异常时返回固定占位文本，绝不返回 s 的任何片段——宁可丢一行，也不能
+    把未遮盖的凭据行放出去。
+
+    本函数只做脱敏，不做展示截断：FAIL_TEXT_MAX 由调用方在「未截断的安全文本」
+    上执行，这样超长条目末尾的 HTTP 状态码仍参与失败筛选（CodeRabbit round-5）。
     """
     s = text or ""
-    failed = False
     try:
         from common import redact_pii, sanitize_snippet
-        s = sanitize_snippet(redact_pii(s), limit=limit)
     except Exception:
-        # 脱敏工具不可用时不得原样放出：至少做纯截断，避免整条凭据外泄
-        failed = True
+        # common 不可用：无法证明已脱敏，固定占位，不放任何原始片段
+        return "<脱敏不可用>"
+    try:
+        out = sanitize_snippet(redact_pii(s))
+    except Exception:
+        return "<脱敏失败>"
     # 通知卡按行展示，脱敏阶段不能引入换行把一行拆成多行
-    s = s.replace("\n", " ")
-    if failed:
-        return s[:limit]
-    return s
+    return out.replace("\n", " ")
 
 
 def _failure_items(output: str, max_items: int = 3) -> List[Tuple[str, str]]:
@@ -332,6 +335,8 @@ def _failure_items(output: str, max_items: int = 3) -> List[Tuple[str, str]]:
     for line in primary + backup:
         m = _FAIL_INDEX_RE.search(line)
         tag = f"#{m.group(1)}" if m else ""
+        # 截断发生在脱敏之后，且作用于完整（未截断）文本：先截会让长条目末尾的
+        # 状态码丢失，文本看着干净但根因已被切掉（CodeRabbit round-5）
         text = _FAIL_LINE_NOISE_RE.sub("", line).strip()
         if len(text) > FAIL_TEXT_MAX:
             text = text[:FAIL_TEXT_MAX] + "…"
@@ -379,6 +384,7 @@ def _failed_accounts(output: str, info: Optional[Dict[str, Any]] = None) -> str:
             # 三位原始数字（CodeRabbit round-4）。
             ln = _redact_failure_line(raw_ln)
             token = _first_masked_token(ln)
+            # 截断同样在脱敏后的新全文上执行（不再是先 _bounded_output 再脱敏）
             label = token.strip("._-") if token else _FAIL_LINE_NOISE_RE.sub("", ln).strip()[:18]
             label = label.strip()
             if label and label not in tags:
