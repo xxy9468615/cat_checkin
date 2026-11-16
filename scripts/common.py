@@ -784,12 +784,19 @@ _SNIPPET_SENSITIVE_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
     # Set-Cookie / Cookie 头：响应回显中最直接的凭据载体
     (re.compile(r"(?i)(set-cookie\s*:\s*)[^\r\n;]+"), r"\1<masked>"),
     (re.compile(r"(?i)(cookie\s*:\s*)[^\r\n]+"), r"\1<masked>"),
-    # Authorization 头：方案关键字（Bearer/Basic/Token/...）与其后的凭据值一并
-    # 遮盖。只匹配 `\S+` 会把 `Basic` 当成凭据值吃掉，真正的 base64 凭据反而留在
-    # 明文里（CodeRabbit round-8）；关键字排除 `[A-Za-z]+\s` 这类普通句子接冒号的
-    # 叙述文本（如 "Authorization: 未配置"），避免整句被吞。
+    # Authorization 头：整条字段值遮盖到行尾。
+    # - 只匹配一个 `\S+` 会把 `Basic` 当成凭据值吃掉，真正的 base64 凭据反而留在
+    #   明文里（CodeRabbit round-8）；
+    # - 即便按方案关键字取下一个 token，Digest 形态的真凭据仍藏在逗号分隔的
+    #   `response=` 参数里——匹配会在 `username="u",` 处停下，realm/nonce/response
+    #   全部裸奔（CodeRabbit round-9）；
+    # - 枚举方案白名单还会漏掉自定义方案（`Sso-Key` 等）与直接携带的裸凭据。
+    # 反应头值本就是单行，行尾即字段边界，因此整段遮盖既覆盖全部形态又不越界。
+    # 但状态码常与头部同行出现在其后（`… HTTP 401`），一并吞掉会让
+    # `_ERROR_HINTS` 的 `HTTP\s?40[13]` 失效、凭证失效提示降级成「可重跑排查」。
+    # 用懒匹配在行尾或状态码前收尾，两者兼得。
     (re.compile(
-        r"(?i)(authorization\s*:\s*)(?:bearer|basic|token|apikey|digest)\b[ \t]*\S+"
+        r"(?i)(authorization[ \t]*:[ \t]*)(?=\S)[^\r\n]*?(?=[ \t]*HTTP[ \t]?\d{3}|[\r\n]|$)"
     ), r"\1<masked>"),
     # 上下文兜底：无字段名时 `Basic <base64>` 仍以裸凭据形态出现（响应体回显、
     # 诊断片段）。要求 `Basic` 为独立单词且其后至少 4 位 base64 字符，避免把
@@ -853,10 +860,40 @@ _PII_EMAIL_FALLBACK_RE = re.compile(
     rf"(?:{_PII_DOMAIN_LABEL}\.)+[A-Za-z0-9一-鿿]{{2,}}"
 )
 _PII_INTL_PHONE_RE = re.compile(r"(?<![\d+])(\+(?:86)?)(\d{11})(?!\d)")
+# 带国家码且带分隔符的国际号码（`+1 202-555-0123` / `+44 20 7946 0958`）。原规则
+# 只认 `+86` + 连续 11 位，其余国家码与分隔写法整条漏过（CodeRabbit round-9）。
+# 要求国家码后至少 9 位数字：`+1 2020-01-01`（8 位）这类日期写法因此不命中。
+# 重复次数有界（E.164 最长 15 位），避免在超长数字串上无界回溯。
+_PII_INTL_SEP_PHONE_RE = re.compile(r"(?<![\d+])(\+\d{1,3})((?:[ -]?\d){9,20})(?!\d)")
+# 日期/时间写法不是号码：`+1 2020-01-01 12:00` 的位数足以落入上面的重复范围，
+# 必须显式排除，否则报告里的版本号+时间戳会被整段打码，诊断信息全丢。
+_PII_DATE_LIKE_RE = re.compile(r"^[\s-]*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}")
 # 分隔符写法必须让分隔符两侧都是数字，且整段恰好 11 位——否则版本号、端口、
 # 日期区间这类带连字符/空格的数字串会被误判成手机号。
 _PII_SEP_PHONE_RE = re.compile(r"(?<!\d)(\d{3})[- ](\d{4})[- ](\d{4})(?!\d)")
 _PII_PHONE_RE = re.compile(r"(?<!\d)\d{11}(?!\d)")
+
+
+def _mask_intl_sep_phone(m: "re.Match", mask_char: str = "*") -> str:
+    """带国家码的分隔号码脱敏；日期/时间形态整段放行，避免误伤时间戳。"""
+    body = m.group(2)
+    if _PII_DATE_LIKE_RE.match(body):
+        return m.group(0)
+    return m.group(1) + _mask_digits_keep_last4(body, mask_char=mask_char)
+
+
+def _mask_digits_keep_last4(text: str, mask_char: str = "*") -> str:
+    """保留末 4 位数字，其余数字逐位替换为掩码符，分隔符与结构原样保留。
+
+    用于 `+1 202-555-0123` 这类带国家码的分隔写法：整段抹掉会丢失号码形态，
+    只留末 4 位既符合仓库脱敏口径，又保持可读的 `+cc ***-***-0123` 结构。
+    """
+    idx = [i for i, ch in enumerate(text) if ch.isdecimal()]
+    drop = len(idx) - 4
+    if drop <= 0:
+        return text
+    cut = set(idx[:drop])
+    return "".join(mask_char if i in cut else ch for i, ch in enumerate(text))
 
 
 def redact_pii(text: Any, mask_char: str = "*") -> str:
@@ -881,6 +918,11 @@ def redact_pii(text: Any, mask_char: str = "*") -> str:
     )
     s = _PII_INTL_PHONE_RE.sub(
         lambda m: m.group(1) + mask_phone(m.group(2), mask_char=mask_char), s
+    )
+    # 带国家码的分隔写法紧随其后：`+86 138 0013 8000` 由上一条的连续写法匹配不到，
+    # 必须在这里补上；只留末 4 位数字、分隔符原样保留（CodeRabbit round-9）。
+    s = _PII_INTL_SEP_PHONE_RE.sub(
+        lambda m: _mask_intl_sep_phone(m, mask_char=mask_char), s
     )
     # 分隔符写法先于裸号处理：否则 138-0013-8000 里的 00138000 等子串会被裸号规则命中，
     # 产生不符合「只留末 4」的残留。号码拼接后统一交 mask_phone，绝不保留首位数字；

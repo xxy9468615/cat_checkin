@@ -52,9 +52,34 @@ class TestSanitizeSnippet(unittest.TestCase):
             common.sanitize_snippet("回显 Basic c2VjcmV0MTIzNDU2Nzg5"),
             "回显 <masked>",
         )
-        # 叙述文本不得被整句吞掉
-        self.assertEqual(common.sanitize_snippet("Authorization: 未配置"), "Authorization: 未配置")
+        # 反应头值整体遮盖：`Authorization: 未配置` 这类叙述文本一并被遮盖，
+        # 诊断价值让位于不泄漏（round-9 起按行尾即字段边界处理）
+        self.assertEqual(common.sanitize_snippet("Authorization: 未配置"), "Authorization: <masked>")
+        # 不带字段名的普通叙述不在此列，保持原样
         self.assertEqual(common.sanitize_snippet("Basic 认证未配置"), "Basic 认证未配置")
+
+    def test_authorization_unknown_scheme_and_bare_value_masked(self):
+        # 枚举方案白名单会漏掉自定义方案与直接携带的裸凭据（CodeRabbit round-9）
+        self.assertEqual(
+            common.sanitize_snippet("Authorization: Sso-Key V1.0FAKEshort"),
+            "Authorization: <masked>",
+        )
+        self.assertEqual(
+            common.sanitize_snippet("Authorization: dXNlcjpwYXNzd29yZA=="),
+            "Authorization: <masked>",
+        )
+        self.assertEqual(common.sanitize_snippet("Authorization: abc"), "Authorization: <masked>")
+
+    def test_digest_authorization_masks_whole_parameter_list(self):
+        # Digest 的真凭据在 response= 里；只吃一个 token 会在 username="u", 处停下
+        # （CodeRabbit round-9）
+        out = common.sanitize_snippet(
+            'Authorization: Digest username="u", realm="r", nonce="n", '
+            'uri="/x", response="deadbeef"'
+        )
+        self.assertEqual(out, "Authorization: <masked>")
+        for fragment in ("realm", "nonce", "response", "deadbeef"):
+            self.assertNotIn(fragment, out)
 
     def test_sanitize_limit_none_disables_truncation(self):
         # 脱敏是扩张替换（值 → 定长占位符），按原文长度设上限会在替换后切掉尾部
@@ -114,6 +139,18 @@ class TestRedactPii(unittest.TestCase):
         # 常见分隔符写法只留末 4 位（号码拼接后统一遮盖，不保留首位数字）
         self.assertEqual(common.redact_pii("138-0013-8000"), "*******8000")
         self.assertEqual(common.redact_pii("138 0013 8000"), "*******8000")
+
+    def test_intl_phone_with_separators_masked(self):
+        # 原规则只认 `+86` + 连续 11 位，其余国家码与分隔写法整条漏过
+        # （CodeRabbit round-9）：完整号码会经 _safe_proxy_name 进 display_name
+        self.assertEqual(common.redact_pii("+1 202-555-0123"), "+1 ***-***-0123")
+        self.assertEqual(common.redact_pii("+44 20 7946 0958"), "+44 ** **** 0958")
+        self.assertEqual(common.redact_pii("+86 138 0013 8000"), "+86 *** **** 8000")
+        # 分隔符保留、只留末 4 位数字
+        out = common.redact_pii("+1 202-555-0123")
+        self.assertEqual(out.replace("+1", "").replace(" ", "").replace("-", "")[-4:], "0123")
+        # 日期/时间写法不是号码，不得被误伤
+        self.assertEqual(common.redact_pii("+1 2020-01-01 12:00"), "+1 2020-01-01 12:00")
 
     def test_non_collateral_preserved(self):
         # 前后邻接数字的 11 位段不命中：13 位毫秒时间戳 / 16 位 GUID / 长 docid

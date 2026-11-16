@@ -152,6 +152,30 @@ assert n._failed_accounts('', {'fail_lines': ['a' * 100000]})
         self.assertNotIn(secret, text)
         self.assertIn("<masked>", text)  # 凭据被替换为占位符，而非保留原值
 
+    def test_digest_authorization_keeps_status_code_for_hint(self):
+        # Digest 的真凭据在 response= 里；整段遮盖的同时必须保住同行末尾的
+        # HTTP 状态码，否则 _ERROR_HINTS 的 HTTP\s?40[13] 失效，凭证失效提示
+        # 会降级成「可手动重跑排查」（CodeRabbit round-9）
+        raw = '❌ [2/3] a***1 失败 Authorization: Digest username="u", response="deadbeef" HTTP 401'
+        line = notify._redact_failure_line(raw)
+        self.assertIn("HTTP 401", line)
+        self.assertNotIn("deadbeef", line)
+        self.assertNotIn("username", line)
+        items = notify._failure_items(raw, max_items=3)
+        self.assertIn("登录凭证疑似失效", notify._error_hint(items))
+        self.assertEqual(notify._retry_advice(items), (True, "更新凭证后重跑"))
+
+    def test_intl_phone_with_separators_masked_in_card(self):
+        # 带国家码的分隔号码此前整条漏过，会经 display_name / 失败卡公开
+        # （CodeRabbit round-9）
+        raw = "❌ [2/3] a***1 失败 绑定号码 +1 202-555-0123 无效 HTTP 401"
+        line = notify._redact_failure_line(raw)
+        self.assertNotIn("202-555-0123", line)
+        self.assertIn("***-***-0123", line)
+        self.assertIn("HTTP 401", line)
+        label = notify._failed_accounts("", {"fail_lines": [raw]})
+        self.assertNotIn("2025550123", label)
+
     def test_failure_line_redaction_failure_returns_placeholder(self):
         # 脱敏工具不可用时必须返回固定占位文本：任何原始片段都不能放行，
         # 否则失败行里的凭据会直接进公开日志（CodeRabbit round-5）
