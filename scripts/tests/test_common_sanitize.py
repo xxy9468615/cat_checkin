@@ -40,6 +40,31 @@ class TestSanitizeSnippet(unittest.TestCase):
         self.assertNotIn("aB3dEf7hIj9kLm1Np3qRs5tU", out)
         self.assertIn("expires_in", out)
 
+    def test_basic_authorization_masked(self):
+        # `(?:bearer\s+)?` 只认 Bearer 时，`Basic` 被当成凭据值吃掉，真正的
+        # base64 凭据反而留在明文里（CodeRabbit round-8）
+        self.assertEqual(
+            common.sanitize_snippet("Authorization: Basic dXNlcjpwYXNzd29yZA=="),
+            "Authorization: <masked>",
+        )
+        # 无字段名的裸 Basic 形态同样要遮盖
+        self.assertEqual(
+            common.sanitize_snippet("回显 Basic c2VjcmV0MTIzNDU2Nzg5"),
+            "回显 <masked>",
+        )
+        # 叙述文本不得被整句吞掉
+        self.assertEqual(common.sanitize_snippet("Authorization: 未配置"), "Authorization: 未配置")
+        self.assertEqual(common.sanitize_snippet("Basic 认证未配置"), "Basic 认证未配置")
+
+    def test_sanitize_limit_none_disables_truncation(self):
+        # 脱敏是扩张替换（值 → 定长占位符），按原文长度设上限会在替换后切掉尾部
+        raw = "token=ab " * 50 + "z" * 400 + " HTTP 401"
+        out = common.sanitize_snippet(raw, limit=None)
+        self.assertIn("HTTP 401", out)
+        self.assertNotIn("token=ab", out)
+        # 显式 limit 仍按语义截断
+        self.assertEqual(len(common.sanitize_snippet(raw, limit=300)), 300)
+
     def test_long_high_entropy_string_masked(self):
         out = common.sanitize_snippet("ok sig=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 done")
         self.assertNotIn("9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", out)
