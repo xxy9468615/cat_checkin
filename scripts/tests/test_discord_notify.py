@@ -172,6 +172,30 @@ assert n._failed_accounts('', {'fail_lines': ['a' * 100000]})
         ln = notify._redact_failure_line(raw)
         self.assertIn("HTTP 401", ln)
 
+    def test_failure_line_survives_redaction_expansion(self):
+        # 脱敏是扩张替换：50 次 `token=vN` → `<masked>` 把 548 字符扩到 808，
+        # 按原文长度设 limit 会把末尾的 HTTP 401 切掉，_failure_items 随即丢行
+        # （CodeRabbit round-8）
+        raw = "❌ [2/3] " + " ".join(f"token=v{i} " for i in range(50)) + " HTTP 401"
+        ln = notify._redact_failure_line(raw)
+        self.assertIn("HTTP 401", ln)
+        self.assertGreater(len(ln), len(raw))
+        tag, text = notify._failure_items(raw, max_items=3)[0]
+        self.assertEqual(tag, "#2")
+        self.assertTrue(text.endswith("…"))
+
+    def test_failure_line_masks_basic_authorization(self):
+        # 合成凭据一律 V1.0FAKE 前缀（规则 3/10）
+        secret = "V1.0FAKE" + "cGFzc3dvcmQ=" + "x" * 8
+        raw = f"❌ [2/3] a***1 失败 Authorization: Basic {secret}"
+        text = notify._failure_items(raw, max_items=3)[0][1]
+        self.assertNotIn(secret, text)
+        self.assertNotIn("cGFzc3dvcmQ", text)
+        self.assertIn("<masked>", text)
+        # 无字段名的裸 Basic 凭据同样不得进卡片
+        bare = f"❌ [2/3] a***1 失败 Basic {secret}"
+        self.assertNotIn(secret, notify._failure_items(bare, max_items=3)[0][1])
+
     def test_redact_uses_full_text_beyond_sanitize_default_limit(self):
         # sanitize_snippet 默认 limit=300 会在分类前截断：状态码落在 300 字符
         # 之外时 _failure_items 直接丢行（CodeRabbit round-6）

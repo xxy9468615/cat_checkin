@@ -82,11 +82,14 @@ def _redact_failure_line(text: str) -> str:
     except Exception:
         # common 不可用：无法证明已脱敏，固定占位，不放任何原始片段
         return "<脱敏不可用>"
-    # sanitize_snippet 自带默认 limit=300，会把文本在分类前就截断——末尾的
-    # HTTP 状态码丢失后 _failure_items 直接丢弃该行，失败卡退化成「无失败输出」。
-    # 脱敏阶段必须拿到完整文本：展示上限由调用方施加。
+    # 脱敏阶段必须拿到完整文本：`sanitize_snippet` 的默认 limit=300 会在分类前
+    # 就截断，末尾的 HTTP 状态码丢失后 _failure_items 直接丢弃该行，失败卡退化成
+    # 「无失败输出」。但 `limit=len(s)+1` 同样不够——脱敏是**扩张**替换
+    # （`ab` → `<masked>`，实测 5000 次替换把 45k 扩到 75k），按原文长度设上限
+    # 仍会把末尾状态码切掉（CodeRabbit round-8）。这里显式关闭截断，展示上限
+    # 由调用方在「未截断的安全文本」上施加。
     try:
-        out = sanitize_snippet(redact_pii(s), limit=len(s) + 1)
+        out = sanitize_snippet(redact_pii(s), limit=None)
     except Exception:
         return "<脱敏失败>"
     # 通知卡按行展示，脱敏阶段不能引入换行把一行拆成多行

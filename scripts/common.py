@@ -784,8 +784,17 @@ _SNIPPET_SENSITIVE_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
     # Set-Cookie / Cookie 头：响应回显中最直接的凭据载体
     (re.compile(r"(?i)(set-cookie\s*:\s*)[^\r\n;]+"), r"\1<masked>"),
     (re.compile(r"(?i)(cookie\s*:\s*)[^\r\n]+"), r"\1<masked>"),
-    # Authorization / Bearer 头
-    (re.compile(r"(?i)(authorization\s*:\s*(?:bearer\s+)?)\S+"), r"\1<masked>"),
+    # Authorization 头：方案关键字（Bearer/Basic/Token/...）与其后的凭据值一并
+    # 遮盖。只匹配 `\S+` 会把 `Basic` 当成凭据值吃掉，真正的 base64 凭据反而留在
+    # 明文里（CodeRabbit round-8）；关键字排除 `[A-Za-z]+\s` 这类普通句子接冒号的
+    # 叙述文本（如 "Authorization: 未配置"），避免整句被吞。
+    (re.compile(
+        r"(?i)(authorization\s*:\s*)(?:bearer|basic|token|apikey|digest)\b[ \t]*\S+"
+    ), r"\1<masked>"),
+    # 上下文兜底：无字段名时 `Basic <base64>` 仍以裸凭据形态出现（响应体回显、
+    # 诊断片段）。要求 `Basic` 为独立单词且其后至少 4 位 base64 字符，避免把
+    # 「Basic 认证」之类叙述误杀；该模式线性、无回溯风险（实测 2.5M 字符 0.05s）。
+    (re.compile(r"(?i)\bbasic\s+[A-Za-z0-9_\-+/=.]{4,}"), "<masked>"),
     # token/apikey 类键值对（JSON 或 query 形态）。键名一旦出现即视为凭据载体，
     # 值不设最小长度：短值同样可能是有效凭据（短 session id / 一次性 code），
     # 且键名后紧跟的值在诊断片段里没有保留价值。要求值非空且以键名字符类开头，
@@ -800,16 +809,23 @@ _SNIPPET_SENSITIVE_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"\b(?=[A-Za-z0-9+/=_\-]*\d)[A-Za-z0-9+/=_\-]{20,}\b"), "<masked>"),
 )
 
-def sanitize_snippet(text: str, limit: int = 300) -> str:
+def sanitize_snippet(text: str, limit: Optional[int] = 300) -> str:
     """失败诊断片段脱敏：抹除 Cookie/token 形态内容后去换行截断。
 
     异常消息会经 run_task 输出进入公开 Actions 日志、Discord 卡片与邮件日报，
     任何携带服务端原始响应的文本必须先过这里。
+
+    `limit=None` 关闭截断：脱敏是扩张替换（值 → 定长占位符），按原文长度设上限
+    会在替换后把尾部内容切掉。调用方若需要「未截断的安全全文」应显式传 None，
+    自行承担长度责任（CodeRabbit round-8）。
     """
     s = text or ""
     for pat, repl in _SNIPPET_SENSITIVE_PATTERNS:
         s = pat.sub(repl, s)
-    return s.replace("\n", " ")[:limit]
+    s = s.replace("\n", " ")
+    if limit is None:
+        return s
+    return s[:limit]
 
 # 裸 PII 形态（不依赖字段名）：
 # - 邮箱：本地部分按 RFC 5322 atext（含 .!#$%&'*+-/=?^_`{|}~），域名要求至少
