@@ -298,7 +298,7 @@ def _redact_failure_line(text: str) -> str:
     把未遮盖的凭据行放出去。
 
     本函数只做脱敏，不做展示截断：FAIL_TEXT_MAX 由调用方在「未截断的安全文本」
-    上执行，这样超长条目末尾的 HTTP 状态码仍参与失败筛选（CodeRabbit round-5）。
+    上执行，这样超长条目末尾的 HTTP 状态码仍参与失败筛选（CodeRabbit round-5/6）。
     """
     s = text or ""
     try:
@@ -306,8 +306,11 @@ def _redact_failure_line(text: str) -> str:
     except Exception:
         # common 不可用：无法证明已脱敏，固定占位，不放任何原始片段
         return "<脱敏不可用>"
+    # sanitize_snippet 自带默认 limit=300，会把文本在分类前就截断——末尾的
+    # HTTP 状态码丢失后 _failure_items 直接丢弃该行，失败卡退化成「无失败输出」。
+    # 脱敏阶段必须拿到完整文本：展示上限由调用方施加。
     try:
-        out = sanitize_snippet(redact_pii(s))
+        out = sanitize_snippet(redact_pii(s), limit=len(s) + 1)
     except Exception:
         return "<脱敏失败>"
     # 通知卡按行展示，脱敏阶段不能引入换行把一行拆成多行
