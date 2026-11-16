@@ -117,13 +117,43 @@ assert n._failed_accounts('', {'fail_lines': ['a' * 100000]})
         label = notify._failed_accounts("", {"fail_lines": [tail]})
         self.assertNotIn("alice@example.com", label)
 
+    def test_redact_before_truncate_leaves_no_split_phone_fragment(self):
+        # 反序（先截断后脱敏）会把超长条目切成「从手机号中间开始」的片段，
+        # 例如残留 `8-0013-8000`：redact_pii 无法识别这段数字，标签随即露出
+        # 原始数字。正序下完整号码先被遮盖，截断只会切到掩码串，无残留。
+        raw = "❌ [2/3] " + "x" * 200 + " 138-0013-8000 失败"
+        text = notify._failure_items(raw, max_items=3)[0][1]
+        self.assertNotIn("138", text)
+        self.assertNotIn("0013", text)
+        # 号码的任一分组都不得作为残留片段出现（头部截断切到的是掩码前的噪音，
+        # 号码本身落在 FAIL_TEXT_MAX 窗口之外，只验证「无原始数字残留」）
+        self.assertNotRegex(text, r"\d{4,}")
+        # 号码落在展示窗口内时必须完整遮盖，绝不保留首位数字
+        near = "❌ [2/3] x 138-0013-8000 失败"
+        self.assertIn("*******8000", notify._failure_items(near, max_items=3)[0][1])
+
+    def test_fail_lines_long_entry_is_redacted_then_bounded(self):
+        # fail_lines 路径同样先脱敏再截断；长条目不残留可识别的号码片段
+        raw = "❌ [2/3] " + "y" * (notify.FAIL_TEXT_MAX + 50) + " 13800138000 失败"
+        label = notify._failed_accounts("", {"fail_lines": [raw]})
+        self.assertNotIn("13800138000", label)
+        self.assertNotIn("138", label)
+        self.assertNotIn("0013", label)
+
+    def test_failure_line_sanitizes_credentials(self):
+        # token/Cookie 形态内容同样不得出现在通知卡片上
+        raw = "❌ [2/3] a***1 失败 Authorization: Bearer abcdef1234567890abcdef"
+        text = notify._failure_items(raw, max_items=3)[0][1]
+        self.assertNotIn("abcdef1234567890abcdef", text)
+        self.assertIn("<masked>", text)  # 凭据被替换为占位符，而非保留原值
+
     def test_idn_email_and_separated_phone_labels_are_masked(self):
         # 中文域名邮箱与带分隔符的手机号此前不匹配，会明文进入日志/日报。
         url = "http://192.0.2.1:8080"
         cases = (
             ("alice@example.中国", "***lice@***"),
-            ("138-0013-8000", "1**-****-8000"),
-            ("138 0013 8000", "1**-****-8000"),
+            ("138-0013-8000", "*******8000"),
+            ("138 0013 8000", "*******8000"),
         )
         for label, expected in cases:
             for text in (f"[{label}] {url}", f"{url}#{label}"):

@@ -816,7 +816,10 @@ def sanitize_snippet(text: str, limit: int = 300) -> str:
 #   138 0013 8000）单独识别，只保留末 4 位；带国家码形态（+86xxxxxxxxxxx）
 #   单独识别。前后邻接数字的 11 位段不命中（避免误伤 13 位毫秒时间戳 /
 #   16 位 GUID / 长 docid），因此不是无差别替换。
-_PII_DOMAIN_LABEL = r"[^\s@]+"
+# 标签必须排除 `.`：否则域名里连续的点号可被切成多种标签组合，匹配失败时正则
+# 引擎逐一枚举，`"x@" + "a." * 20 + "!"` 实测 0.1s、28 组 3s 未返回（无界回溯），
+# 而 redact_pii 处理的是任意输出行，会直接卡死通知路径。
+_PII_DOMAIN_LABEL = r"[^\s@.]+"
 _PII_EMAIL_RE = re.compile(
     rf"[A-Za-z0-9.!#$%&'*+/=?^_`{{|}}~-]+@"
     rf"(?:{_PII_DOMAIN_LABEL}\.)+[A-Za-z0-9一-鿿]{{2,}}"
@@ -855,9 +858,11 @@ def redact_pii(text: Any, mask_char: str = "*") -> str:
         lambda m: m.group(1) + mask_phone(m.group(2), mask_char=mask_char), s
     )
     # 分隔符写法先于裸号处理：否则 138-0013-8000 里的 00138000 等子串会被裸号规则命中，
-    # 产生不符合「只留末 4」的残留。保留分隔符结构（不泄漏原始分组），只留末 4 位。
+    # 产生不符合「只留末 4」的残留。号码拼接后统一交 mask_phone，绝不保留首位数字；
+    # 仅在遮盖完成后重新插入原分隔符，保持可读结构而不泄漏分组内容。
     s = _PII_SEP_PHONE_RE.sub(
-        lambda m: f"{m.group(1)[0]}{mask_char * 2}-{mask_char * 4}-{m.group(3)}", s
+        lambda m: mask_phone(m.group(1) + m.group(2) + m.group(3), mask_char=mask_char),
+        s,
     )
     return _PII_PHONE_RE.sub(lambda m: mask_phone(m.group(0), mask_char=mask_char), s)
 
