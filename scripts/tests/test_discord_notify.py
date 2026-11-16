@@ -169,6 +169,17 @@ assert n._failed_accounts('', {'fail_lines': ['a' * 100000]})
         ln = notify._redact_failure_line(raw)
         self.assertIn("HTTP 401", ln)
 
+    def test_redact_uses_full_text_beyond_sanitize_default_limit(self):
+        # sanitize_snippet 默认 limit=300 会在分类前截断：状态码落在 300 字符
+        # 之外时 _failure_items 直接丢行（CodeRabbit round-6）
+        raw = "❌ [2/3] " + "z" * 400 + " HTTP 401"
+        ln = notify._redact_failure_line(raw)
+        self.assertGreater(len(ln), 400)
+        self.assertIn("HTTP 401", ln)
+        self.assertIn("#2", notify._failed_accounts(raw))
+        # 脱敏不因取消截断而失效
+        self.assertIn("*******8000", notify._redact_failure_line("❌ [2/3] 13800138000 失败"))
+
     def test_idn_email_and_separated_phone_labels_are_masked(self):
         # 中文域名邮箱与带分隔符的手机号此前不匹配，会明文进入日志/日报。
         url = "http://192.0.2.1:8080"
