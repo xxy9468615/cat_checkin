@@ -786,10 +786,14 @@ _SNIPPET_SENSITIVE_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"(?i)(cookie\s*:\s*)[^\r\n]+"), r"\1<masked>"),
     # Authorization / Bearer 头
     (re.compile(r"(?i)(authorization\s*:\s*(?:bearer\s+)?)\S+"), r"\1<masked>"),
-    # token/apikey 类键值对（JSON 或 query 形态）
+    # token/apikey 类键值对（JSON 或 query 形态）。键名一旦出现即视为凭据载体，
+    # 值不设最小长度：短值同样可能是有效凭据（短 session id / 一次性 code），
+    # 且键名后紧跟的值在诊断片段里没有保留价值。要求值非空且以键名字符类开头，
+    # 避免把 `token` 这类普通单词后接冒号的叙述文本整段吃掉。
     (re.compile(
         r"(?i)((?:access[_-]?token|refresh[_-]?token|api[_-]?key|session[_-]?id|"
-        r"csrf[_-]?token|token|sign(?:ature)?)['\"]?\s*[:=]\s*['\"]?)[A-Za-z0-9_\-+/=.]{8,}"
+        r"csrf[_-]?token|token|sign(?:ature)?)['\"]?\s*[:=]\s*['\"]?)"
+        r"[A-Za-z0-9_\-+/=.]+"
     ), r"\1<masked>"),
     # 兜底：>=20 位且含数字的高熵串（hex/base64 形态，大概率是 token/签名/密文；
     # 要求含数字以避免误杀普通长单词/URL 路径）
@@ -816,16 +820,21 @@ def sanitize_snippet(text: str, limit: int = 300) -> str:
 #   138 0013 8000）单独识别，只保留末 4 位；带国家码形态（+86xxxxxxxxxxx）
 #   单独识别。前后邻接数字的 11 位段不命中（避免误伤 13 位毫秒时间戳 /
 #   16 位 GUID / 长 docid），因此不是无差别替换。
-# 标签必须排除 `.`：否则域名里连续的点号可被切成多种标签组合，匹配失败时正则
-# 引擎逐一枚举，`"x@" + "a." * 20 + "!"` 实测 0.1s、28 组 3s 未返回（无界回溯），
-# 而 redact_pii 处理的是任意输出行，会直接卡死通知路径。
+# 本地部分必须限长（1~64），并在其前加 `(?=[\s\S]{0,64}@)` 前瞻：无 `@` 的
+# 长串上，引擎本会在每个起点重试「本地部分 + 域名重复」，100k 字符实测 ~11s/次
+# （无界回溯）；前瞻把起点收敛到 `@` 前 64 字符内，同样的输入降到 ~0.04s。
+# 域名标签仍排除 `.`：否则连续点号可被切成多种标签组合，匹配失败时逐一枚举，
+# `"x@" + "a." * 20 + "!"` 实测 0.1s、28 组 3s 未返回，会直接卡死通知路径。
 _PII_DOMAIN_LABEL = r"[^\s@.]+"
+_PII_EMAIL_LOCAL_MAX = 64
 _PII_EMAIL_RE = re.compile(
-    rf"[A-Za-z0-9.!#$%&'*+/=?^_`{{|}}~-]+@"
+    rf"(?=[\s\S]{{0,{_PII_EMAIL_LOCAL_MAX}}}@)"
+    rf"[A-Za-z0-9.!#$%&'*+/=?^_`{{|}}~-]{{1,{_PII_EMAIL_LOCAL_MAX}}}@"
     rf"(?:{_PII_DOMAIN_LABEL}\.)+[A-Za-z0-9一-鿿]{{2,}}"
 )
 _PII_EMAIL_FALLBACK_RE = re.compile(
-    rf"[^\s@]{{1,64}}@(?:{_PII_DOMAIN_LABEL}\.)+[A-Za-z0-9一-鿿]{{2,}}"
+    rf"[^\s@]{{1,{_PII_EMAIL_LOCAL_MAX}}}@"
+    rf"(?:{_PII_DOMAIN_LABEL}\.)+[A-Za-z0-9一-鿿]{{2,}}"
 )
 _PII_INTL_PHONE_RE = re.compile(r"(?<![\d+])(\+(?:86)?)(\d{11})(?!\d)")
 # 分隔符写法必须让分隔符两侧都是数字，且整段恰好 11 位——否则版本号、端口、

@@ -107,7 +107,10 @@ assert n._failed_accounts('', {'fail_lines': ['a' * 100000]})
         tail = "❌ [2/3] alice@example.com 失败 HTTP 401"
         output = "a" * (notify.NOTIFY_OUTPUT_MAX + 4096) + "\n" + tail
         bounded = notify._bounded_output(output)
-        self.assertIn("alice@example.com", bounded)  # 截断层不动内容，脱敏在展示层
+        # 截断层自身已在尾段逐行脱敏（round-6）：中间表示不得残留裸邮箱，
+        # 否则任何按行重扫的下游都会读到明文
+        self.assertNotIn("alice@example.com", bounded)
+        self.assertIn("***lice@***", bounded)
         items = notify._failure_items(bounded, max_items=3)
         self.assertTrue(items)
         text = items[0][1]
