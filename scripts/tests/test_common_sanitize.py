@@ -224,6 +224,21 @@ class TestRedactPii(unittest.TestCase):
         # 已识别 +86 的形态保持原样
         self.assertEqual(common.redact_pii("+8613800138000"), "+86*******8000")
 
+    def test_mixed_grouping_intl_phone_keeps_only_last4(self):
+        # 分组不规整（`+44` 后没有分隔符、号码中途才有空格）时，连续规则只吃
+        # 前半段会把后半段 `0958` 单独放行，国家码贪婪又吃掉号码首位——两种
+        # 都会泄漏超过末 4 位（CodeRabbit round-13）
+        for raw in ("+44207946 0958", "+442079460958"):
+            out = common.redact_pii(raw)
+            visible = out.replace("+", "").replace(" ", "").replace("*", "")
+            self.assertEqual(visible, "0958", f"{raw} -> {out}")
+            self.assertNotIn("7946", out)
+            self.assertNotIn("20794", out)
+        # 国家码后紧跟分隔符的形态不受影响，仍保留国家码
+        self.assertEqual(common.redact_pii("+44 20 7946 0958"), "+44 ** **** 0958")
+        # 日期形态在这条兜底路径上同样不被误伤
+        self.assertEqual(common.redact_pii("+1 2020-01-01 12:00"), "+1 2020-01-01 12:00")
+
     def test_non_collateral_preserved(self):
         # 前后邻接数字的 11 位段不命中：13 位毫秒时间戳 / 16 位 GUID / 长 docid
         self.assertEqual(common.redact_pii("1763200000000"), "1763200000000")

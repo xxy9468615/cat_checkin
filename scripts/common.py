@@ -924,11 +924,15 @@ _PII_INTL_PHONE_RE = re.compile(r"(?<![\d+])(\+(?:86)?)(\d{11})(?!\d)")
 # 只认 `+86` + 连续 11 位，其余国家码与分隔写法整条漏过（CodeRabbit round-9）。
 # 要求国家码后至少 9 位数字：`+1 2020-01-01`（8 位）这类日期写法因此不命中。
 # 重复次数有界（E.164 最长 15 位），避免在超长数字串上无界回溯。
-_PII_INTL_SEP_PHONE_RE = re.compile(r"(?<![\d+])(\+\d{1,3})((?:[ -]?\d){9,20})(?!\d)")
-# 无分隔符的连续国际号码：国家码与号码主体无法可靠切分——`+442079460958` 的
-# 实际国家码是 +44，贪婪取 3 位会把号码首位 `2` 留在「国家码」组里原样输出。
-# 没有可靠的国家码解析就不猜，整串数字只留末 4 位（CodeRabbit round-12）。
-_PII_INTL_CONT_PHONE_RE = re.compile(r"(?<![\d+])\+(\d{8,20})(?!\d)")
+_PII_INTL_SEP_PHONE_RE = re.compile(
+    r"(?<![\d+])(\+\d{1,3})([ -])((?:[ -]?\d){9,20})(?!\d)"
+)
+# 其余国际号码：国家码与号码主体无法可靠切分。`+442079460958` 的实际国家码是
+# +44；`+44207946 0958` 的分组也不规整。贪婪取 3 位会把号码首位算进「国家码」
+# 而留在明文，只取连续段又会把后半截 `0958` 单独放行——两种都会泄漏超过末 4 位。
+# 没有可靠的国家码解析就不猜：整串数字（允许夹杂分隔符）只留末 4 位
+# （CodeRabbit round-12 / 13）。
+_PII_INTL_ANY_PHONE_RE = re.compile(r"(?<![\d+])\+(\d(?:[ -]?\d){7,20})(?!\d)")
 # 日期/时间写法不是号码：`+1 2020-01-01 12:00` 的位数足以落入上面的重复范围，
 # 必须显式排除，否则报告里的版本号+时间戳会被整段打码，诊断信息全丢。
 # 只有**完整**日期且边界干净时才放行：`2020-01-0188` 这类「日期前缀 + 多余数字」
@@ -936,6 +940,9 @@ _PII_INTL_CONT_PHONE_RE = re.compile(r"(?<![\d+])\+(\d{8,20})(?!\d)")
 _PII_DATE_LIKE_RE = re.compile(
     r"^[ \t-]*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?!\d)(?=$|[\s,:])"
 )
+# 国家码未知的兜底规则里，日期可能出现在「`+1` + 空格」之后，位置比上面深一格：
+# 只有整段就是「1 位国家码 + 空格 + 完整日期」时才放行，避免把时间戳打码。
+_PII_DATE_AFTER_CC_RE = re.compile(r"^\d[ ]\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?!\d)")
 # 分隔符写法必须让分隔符两侧都是数字，且整段恰好 11 位——否则版本号、端口、
 # 日期区间这类带连字符/空格的数字串会被误判成手机号。
 _PII_SEP_PHONE_RE = re.compile(r"(?<!\d)(\d{3})[- ](\d{4})[- ](\d{4})(?!\d)")
@@ -943,11 +950,19 @@ _PII_PHONE_RE = re.compile(r"(?<!\d)\d{11}(?!\d)")
 
 
 def _mask_intl_sep_phone(m: "re.Match", mask_char: str = "*") -> str:
-    """带国家码的分隔号码脱敏；日期/时间形态整段放行，避免误伤时间戳。"""
-    body = m.group(2)
+    """国家码边界明确（紧跟分隔符）的号码：保留国家码，主体只留末 4 位。"""
+    body = m.group(3)
     if _PII_DATE_LIKE_RE.match(body):
         return m.group(0)
-    return m.group(1) + _mask_digits_keep_last4(body, mask_char=mask_char)
+    return m.group(1) + m.group(2) + _mask_digits_keep_last4(body, mask_char=mask_char)
+
+
+def _mask_intl_any_phone(m: "re.Match", mask_char: str = "*") -> str:
+    """国家码无法确定的号码：整串数字只留末 4 位，绝不保留「国家码」前缀。"""
+    run = m.group(1)
+    if _PII_DATE_AFTER_CC_RE.match(run):
+        return m.group(0)
+    return "+" + _mask_digits_keep_last4(run, mask_char=mask_char)
 
 
 def _mask_digits_keep_last4(text: str, mask_char: str = "*") -> str:
@@ -987,15 +1002,15 @@ def redact_pii(text: Any, mask_char: str = "*") -> str:
     s = _PII_INTL_PHONE_RE.sub(
         lambda m: m.group(1) + mask_phone(m.group(2), mask_char=mask_char), s
     )
-    # 无分隔符的连续国际号码紧随其后（`+442079460958`）：国家码无法可靠切分时
-    # 不做猜测，整串只留末 4 位，避免把号码首位当成国家码留在明文。
-    s = _PII_INTL_CONT_PHONE_RE.sub(
-        lambda m: "+" + _mask_digits_keep_last4(m.group(1), mask_char=mask_char), s
-    )
-    # 带国家码的分隔写法：`+86 138 0013 8000` 由上一条的连续写法匹配不到，
-    # 必须在这里补上；只留末 4 位数字、分隔符原样保留（CodeRabbit round-9）。
+    # 国家码边界明确（紧跟分隔符）的形态先处理：`+44 20 7946 0958` /
+    # `+1 202-555-0123` / `+86 138 0013 8000`，保留国家码、只留末 4 位数字。
     s = _PII_INTL_SEP_PHONE_RE.sub(
         lambda m: _mask_intl_sep_phone(m, mask_char=mask_char), s
+    )
+    # 其余兜底：国家码无法可靠切分（连续写法 `+442079460958`、分组不规整的
+    # `+44207946 0958`），整串只留末 4 位，绝不保留任何「国家码」前缀。
+    s = _PII_INTL_ANY_PHONE_RE.sub(
+        lambda m: _mask_intl_any_phone(m, mask_char=mask_char), s
     )
     # 分隔符写法先于裸号处理：否则 138-0013-8000 里的 00138000 等子串会被裸号规则命中，
     # 产生不符合「只留末 4」的残留。号码拼接后统一交 mask_phone，绝不保留首位数字；
