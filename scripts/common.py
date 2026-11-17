@@ -780,24 +780,68 @@ def env_seq(prefix: str, name: str, default: list[str] | None = None, required: 
         raise RuntimeError(f"缺少环境变量：{clean_prefix}{name}_1 或 {clean_prefix}{name}")
     return default if default is not None else []
 
+_AUTH_HEADER_RE = re.compile(r"(?i)authorization[ \t]*:[ \t]*")
+_AUTH_STATUS_AT_RE = re.compile(r"HTTP[ \t]?\d{3}")
+
+
+def _mask_authorization_values(text: str) -> str:
+    """遮盖 Authorization 头的字段值：整行到字段边界，同行末尾的 HTTP 状态码保留。
+
+    为什么单独成函数而不写成正则：状态码边界前瞻（`[ \\t]*HTTP`）会在每个候选
+    起点重新扫描其后的整段空白，空格串上呈平方级回溯——8k 空格实测 0.26s，
+    通知脱敏又走 `limit=None`，长度上限帮不上忙（CodeRabbit round-10）。
+
+    改为单次左到右扫描，每个字符只走一遍；同时跟踪引号状态，避免把
+    `response="HTTP 401 …"` 这类**引号内**的文本误判成字段终点而让
+    `nonce="n"` 之类的后续参数裸奔（同轮 finding）。
+
+    字段值本身的取舍（round-8/9 累积）：只吃一个 `\\S+` 会把方案关键字当成
+    凭据值；按方案白名单取下一个 token 又漏掉自定义方案与 Digest 的逗号参数
+    列表。行尾即字段边界，整段遮盖是唯一同时覆盖三种形态的做法。
+    """
+    if not text:
+        return text
+    parts: List[str] = []
+    pos = 0
+    for m in _AUTH_HEADER_RE.finditer(text):
+        if m.start() < pos:
+            continue
+        value_start = m.end()
+        line_end = len(text)
+        for sep in ("\r", "\n"):
+            idx = text.find(sep, value_start)
+            if idx != -1 and idx < line_end:
+                line_end = idx
+        if value_start >= line_end:
+            # 空值：不插入占位符，也不跨越到下一行
+            continue
+        cut = line_end
+        in_quote = False
+        i = value_start
+        while i < line_end:
+            ch = text[i]
+            if ch == '"':
+                in_quote = not in_quote
+            elif not in_quote and ch in "Hh" and text[i:i + 4].lower() == "http":
+                sm = _AUTH_STATUS_AT_RE.match(text, i, line_end)
+                # 状态码必须独占字段尾部，否则只是值的一部分，不能据此截断
+                if sm is not None and not text[sm.end():line_end].strip():
+                    cut = i
+                    while cut > value_start and text[cut - 1] in " \t":
+                        cut -= 1
+                    break
+            i += 1
+        parts.append(text[pos:value_start])
+        parts.append("<masked>")
+        pos = cut
+    parts.append(text[pos:])
+    return "".join(parts)
+
+
 _SNIPPET_SENSITIVE_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
     # Set-Cookie / Cookie 头：响应回显中最直接的凭据载体
     (re.compile(r"(?i)(set-cookie\s*:\s*)[^\r\n;]+"), r"\1<masked>"),
     (re.compile(r"(?i)(cookie\s*:\s*)[^\r\n]+"), r"\1<masked>"),
-    # Authorization 头：整条字段值遮盖到行尾。
-    # - 只匹配一个 `\S+` 会把 `Basic` 当成凭据值吃掉，真正的 base64 凭据反而留在
-    #   明文里（CodeRabbit round-8）；
-    # - 即便按方案关键字取下一个 token，Digest 形态的真凭据仍藏在逗号分隔的
-    #   `response=` 参数里——匹配会在 `username="u",` 处停下，realm/nonce/response
-    #   全部裸奔（CodeRabbit round-9）；
-    # - 枚举方案白名单还会漏掉自定义方案（`Sso-Key` 等）与直接携带的裸凭据。
-    # 反应头值本就是单行，行尾即字段边界，因此整段遮盖既覆盖全部形态又不越界。
-    # 但状态码常与头部同行出现在其后（`… HTTP 401`），一并吞掉会让
-    # `_ERROR_HINTS` 的 `HTTP\s?40[13]` 失效、凭证失效提示降级成「可重跑排查」。
-    # 用懒匹配在行尾或状态码前收尾，两者兼得。
-    (re.compile(
-        r"(?i)(authorization[ \t]*:[ \t]*)(?=\S)[^\r\n]*?(?=[ \t]*HTTP[ \t]?\d{3}|[\r\n]|$)"
-    ), r"\1<masked>"),
     # 上下文兜底：无字段名时 `Basic <base64>` 仍以裸凭据形态出现（响应体回显、
     # 诊断片段）。要求 `Basic` 为独立单词且其后至少 4 位 base64 字符，避免把
     # 「Basic 认证」之类叙述误杀；该模式线性、无回溯风险（实测 2.5M 字符 0.05s）。
@@ -827,6 +871,8 @@ def sanitize_snippet(text: str, limit: Optional[int] = 300) -> str:
     自行承担长度责任（CodeRabbit round-8）。
     """
     s = text or ""
+    # Authorization 需要按行扫描（引号状态 + 状态码边界），放在正则链之前
+    s = _mask_authorization_values(s)
     for pat, repl in _SNIPPET_SENSITIVE_PATTERNS:
         s = pat.sub(repl, s)
     s = s.replace("\n", " ")
@@ -867,7 +913,11 @@ _PII_INTL_PHONE_RE = re.compile(r"(?<![\d+])(\+(?:86)?)(\d{11})(?!\d)")
 _PII_INTL_SEP_PHONE_RE = re.compile(r"(?<![\d+])(\+\d{1,3})((?:[ -]?\d){9,20})(?!\d)")
 # 日期/时间写法不是号码：`+1 2020-01-01 12:00` 的位数足以落入上面的重复范围，
 # 必须显式排除，否则报告里的版本号+时间戳会被整段打码，诊断信息全丢。
-_PII_DATE_LIKE_RE = re.compile(r"^[\s-]*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}")
+# 只有**完整**日期且边界干净时才放行：`2020-01-0188` 这类「日期前缀 + 多余数字」
+# 与号码存在歧义，必须按号码遮盖（CodeRabbit round-10）。
+_PII_DATE_LIKE_RE = re.compile(
+    r"^[ \t-]*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?!\d)(?=$|[\s,:])"
+)
 # 分隔符写法必须让分隔符两侧都是数字，且整段恰好 11 位——否则版本号、端口、
 # 日期区间这类带连字符/空格的数字串会被误判成手机号。
 _PII_SEP_PHONE_RE = re.compile(r"(?<!\d)(\d{3})[- ](\d{4})[- ](\d{4})(?!\d)")
