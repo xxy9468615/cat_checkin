@@ -125,6 +125,18 @@ class TestSanitizeSnippet(unittest.TestCase):
             self.assertEqual(out, "Authorization: <masked>")
             self.assertLess(elapsed, 1.0, f"n={n} 耗时 {elapsed:.3f}s，疑似平方级回溯")
 
+    def test_authorization_many_fields_stay_linear(self):
+        # 纯 LF 文本里逐字段 find("\r") 会扫到全文末尾，字段数一多即平方级
+        # （CodeRabbit round-12）
+        import time as _time
+        raw = "\n".join("Authorization: V1.0FAKEfixture" for _ in range(20000))
+        start = _time.monotonic()
+        out = common.sanitize_snippet(raw, limit=None)
+        elapsed = _time.monotonic() - start
+        self.assertEqual(out.count("<masked>"), 20000)
+        self.assertNotIn("V1.0FAKE", out)
+        self.assertLess(elapsed, 1.0, f"耗时 {elapsed:.3f}s，疑似逐字段重扫全文")
+
     def test_sanitize_limit_none_disables_truncation(self):
         # 脱敏是扩张替换（值 → 定长占位符），按原文长度设上限会在替换后切掉尾部
         raw = "token=ab " * 50 + "z" * 400 + " HTTP 401"
@@ -199,6 +211,18 @@ class TestRedactPii(unittest.TestCase):
         # 但「日期前缀 + 多余数字」与号码有歧义，必须保守遮盖（round-10）
         for ambiguous in ("+1 2020-01-0188", "+1 2020-01-0112"):
             self.assertNotEqual(common.redact_pii(ambiguous), ambiguous)
+
+    def test_continuous_intl_phone_does_not_guess_country_code(self):
+        # 无分隔符时国家码无法可靠切分：`+442079460958` 的真实国家码是 +44，
+        # 贪婪取 3 位会把号码首位 `2` 当成国家码留在明文（CodeRabbit round-12）
+        out = common.redact_pii("+442079460958")
+        self.assertEqual(out[-4:], "0958")          # 只留末 4 位
+        self.assertNotIn("207946", out)              # 号码主体不得残留
+        self.assertNotIn("442", out)                 # 也不得把首位算进国家码输出
+        # 带分隔符的等价输入仍按国家码 + 掩码主体呈现
+        self.assertEqual(common.redact_pii("+44 20 7946 0958"), "+44 ** **** 0958")
+        # 已识别 +86 的形态保持原样
+        self.assertEqual(common.redact_pii("+8613800138000"), "+86*******8000")
 
     def test_non_collateral_preserved(self):
         # 前后邻接数字的 11 位段不命中：13 位毫秒时间戳 / 16 位 GUID / 长 docid
