@@ -42,14 +42,16 @@ class TestSanitizeSnippet(unittest.TestCase):
 
     def test_basic_authorization_masked(self):
         # `(?:bearer\s+)?` 只认 Bearer 时，`Basic` 被当成凭据值吃掉，真正的
-        # base64 凭据反而留在明文里（CodeRabbit round-8）
+        # base64 凭据反而留在明文里（CodeRabbit round-8）。合成凭据一律
+        # V1.0FAKE 前缀（规则 3/10，round-10 要求）
+        fake_basic = "V1.0FAKE" + "dXNlcjpwYXNzd29yZA=="
         self.assertEqual(
-            common.sanitize_snippet("Authorization: Basic dXNlcjpwYXNzd29yZA=="),
+            common.sanitize_snippet(f"Authorization: Basic {fake_basic}"),
             "Authorization: <masked>",
         )
         # 无字段名的裸 Basic 形态同样要遮盖
         self.assertEqual(
-            common.sanitize_snippet("回显 Basic c2VjcmV0MTIzNDU2Nzg5"),
+            common.sanitize_snippet("回显 Basic V1.0FAKEc2VjcmV0MTIzNDU2Nzg5"),
             "回显 <masked>",
         )
         # 反应头值整体遮盖：`Authorization: 未配置` 这类叙述文本一并被遮盖，
@@ -65,21 +67,46 @@ class TestSanitizeSnippet(unittest.TestCase):
             "Authorization: <masked>",
         )
         self.assertEqual(
-            common.sanitize_snippet("Authorization: dXNlcjpwYXNzd29yZA=="),
+            common.sanitize_snippet("Authorization: V1.0FAKEdXNlcjpwYXNzd29yZA=="),
             "Authorization: <masked>",
         )
-        self.assertEqual(common.sanitize_snippet("Authorization: abc"), "Authorization: <masked>")
+        self.assertEqual(
+            common.sanitize_snippet("Authorization: V1.0FAKEabc"),
+            "Authorization: <masked>",
+        )
 
     def test_digest_authorization_masks_whole_parameter_list(self):
         # Digest 的真凭据在 response= 里；只吃一个 token 会在 username="u", 处停下
         # （CodeRabbit round-9）
         out = common.sanitize_snippet(
-            'Authorization: Digest username="u", realm="r", nonce="n", '
-            'uri="/x", response="deadbeef"'
+            'Authorization: Digest username="u", realm="r", nonce="V1.0FAKEnonce", '
+            'uri="/x", response="V1.0FAKEdeadbeef"'
         )
         self.assertEqual(out, "Authorization: <masked>")
-        for fragment in ("realm", "nonce", "response", "deadbeef"):
+        for fragment in ("realm", "nonce", "response", "V1.0FAKE"):
             self.assertNotIn(fragment, out)
+
+    def test_authorization_quoted_status_code_is_not_a_boundary(self):
+        # 引号内的 `HTTP 401` 是值的一部分，不能据此截断，否则后续的
+        # nonce= 等参数会裸奔（CodeRabbit round-10）
+        raw = ('Authorization: Digest username="u", '
+               'response="HTTP 401 V1.0FAKEsecret", nonce="V1.0FAKEnonce"')
+        out = common.sanitize_snippet(raw, limit=None)
+        self.assertEqual(out, "Authorization: <masked>")
+        self.assertNotIn("V1.0FAKE", out)
+        self.assertNotIn("nonce", out)
+
+    def test_authorization_masking_is_linear(self):
+        # 状态码边界前瞻在空格串上会平方级回溯（8k 空格 0.26s）；改为单次
+        # 左到右扫描后必须线性（CodeRabbit round-10）
+        import time as _time
+        for n in (20000, 200000):
+            raw = "Authorization: x" + " " * n
+            start = _time.monotonic()
+            out = common.sanitize_snippet(raw, limit=None)
+            elapsed = _time.monotonic() - start
+            self.assertEqual(out, "Authorization: <masked>")
+            self.assertLess(elapsed, 1.0, f"n={n} 耗时 {elapsed:.3f}s，疑似平方级回溯")
 
     def test_sanitize_limit_none_disables_truncation(self):
         # 脱敏是扩张替换（值 → 定长占位符），按原文长度设上限会在替换后切掉尾部
@@ -151,6 +178,10 @@ class TestRedactPii(unittest.TestCase):
         self.assertEqual(out.replace("+1", "").replace(" ", "").replace("-", "")[-4:], "0123")
         # 日期/时间写法不是号码，不得被误伤
         self.assertEqual(common.redact_pii("+1 2020-01-01 12:00"), "+1 2020-01-01 12:00")
+        self.assertEqual(common.redact_pii("+1 2020-01-01"), "+1 2020-01-01")
+        # 但「日期前缀 + 多余数字」与号码有歧义，必须保守遮盖（round-10）
+        for ambiguous in ("+1 2020-01-0188", "+1 2020-01-0112"):
+            self.assertNotEqual(common.redact_pii(ambiguous), ambiguous)
 
     def test_non_collateral_preserved(self):
         # 前后邻接数字的 11 位段不命中：13 位毫秒时间戳 / 16 位 GUID / 长 docid

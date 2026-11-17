@@ -156,10 +156,11 @@ assert n._failed_accounts('', {'fail_lines': ['a' * 100000]})
         # Digest 的真凭据在 response= 里；整段遮盖的同时必须保住同行末尾的
         # HTTP 状态码，否则 _ERROR_HINTS 的 HTTP\s?40[13] 失效，凭证失效提示
         # 会降级成「可手动重跑排查」（CodeRabbit round-9）
-        raw = '❌ [2/3] a***1 失败 Authorization: Digest username="u", response="deadbeef" HTTP 401'
+        raw = ('❌ [2/3] a***1 失败 Authorization: Digest username="u", '
+               'response="V1.0FAKEdeadbeef" HTTP 401')
         line = notify._redact_failure_line(raw)
         self.assertIn("HTTP 401", line)
-        self.assertNotIn("deadbeef", line)
+        self.assertNotIn("V1.0FAKE", line)
         self.assertNotIn("username", line)
         items = notify._failure_items(raw, max_items=3)
         self.assertIn("登录凭证疑似失效", notify._error_hint(items))
@@ -175,6 +176,15 @@ assert n._failed_accounts('', {'fail_lines': ['a' * 100000]})
         self.assertIn("HTTP 401", line)
         label = notify._failed_accounts("", {"fail_lines": [raw]})
         self.assertNotIn("2025550123", label)
+
+    def test_quoted_status_code_does_not_expose_following_params(self):
+        # 引号内的 `HTTP 401` 不是字段终点；误判会让后续参数进失败卡
+        # （CodeRabbit round-10）
+        raw = ('❌ [2/3] a***1 失败 Authorization: Digest '
+               'response="HTTP 401 V1.0FAKEsecret", nonce="V1.0FAKEnonce"')
+        line = notify._redact_failure_line(raw)
+        self.assertNotIn("V1.0FAKE", line)
+        self.assertNotIn("nonce", line)
 
     def test_failure_line_redaction_failure_returns_placeholder(self):
         # 脱敏工具不可用时必须返回固定占位文本：任何原始片段都不能放行，
