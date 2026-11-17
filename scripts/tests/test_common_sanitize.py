@@ -96,6 +96,23 @@ class TestSanitizeSnippet(unittest.TestCase):
         self.assertNotIn("V1.0FAKE", out)
         self.assertNotIn("nonce", out)
 
+    def test_credential_internal_http_suffix_stays_masked(self):
+        # 凭据内部的 `HTTP401` 不是独立诊断字段：前后边界缺一不可，否则
+        # 凭据尾部会以 `HTTP401` 形态留在明文（CodeRabbit round-11）
+        for raw in (
+            "Authorization: Bearer V1.0FAKEHTTP401",
+            "Authorization: Bearer V1.0FAKEabcHTTP 401",
+            "Authorization: HTTP 401",
+        ):
+            out = common.sanitize_snippet(raw, limit=None)
+            self.assertEqual(out, "Authorization: <masked>", raw)
+            self.assertNotIn("HTTP", out)
+        # 独立诊断字段（前有空白、止于字段末尾）仍保留
+        self.assertEqual(
+            common.sanitize_snippet("Authorization: abc HTTP 401", limit=None),
+            "Authorization: <masked> HTTP 401",
+        )
+
     def test_authorization_masking_is_linear(self):
         # 状态码边界前瞻在空格串上会平方级回溯（8k 空格 0.26s）；改为单次
         # 左到右扫描后必须线性（CodeRabbit round-10）

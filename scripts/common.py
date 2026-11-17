@@ -815,6 +815,10 @@ def _mask_authorization_values(text: str) -> str:
         if value_start >= line_end:
             # 空值：不插入占位符，也不跨越到下一行
             continue
+        # 有效末尾只算一次：循环里反复切片 + strip() 会把 O(行长度) 抬成平方级
+        eff_end = line_end
+        while eff_end > value_start and text[eff_end - 1] in " \t":
+            eff_end -= 1
         cut = line_end
         in_quote = False
         i = value_start
@@ -822,10 +826,18 @@ def _mask_authorization_values(text: str) -> str:
             ch = text[i]
             if ch == '"':
                 in_quote = not in_quote
-            elif not in_quote and ch in "Hh" and text[i:i + 4].lower() == "http":
+            elif (
+                not in_quote
+                and ch in "Hh"
+                and text[i:i + 4].lower() == "http"
+                # 前边界也必须是空白：`<cred>HTTP401` 里的 HTTP 是凭据的一部分，
+                # 不是独立诊断字段，据此截断会把凭据尾部留在明文（round-11）
+                and i > value_start
+                and text[i - 1] in " \t"
+            ):
                 sm = _AUTH_STATUS_AT_RE.match(text, i, line_end)
-                # 状态码必须独占字段尾部，否则只是值的一部分，不能据此截断
-                if sm is not None and not text[sm.end():line_end].strip():
+                # 状态码还必须止于字段有效末尾，否则只是值的一部分
+                if sm is not None and sm.end() == eff_end:
                     cut = i
                     while cut > value_start and text[cut - 1] in " \t":
                         cut -= 1
