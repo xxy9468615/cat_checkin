@@ -189,18 +189,21 @@ class TestExpiryTag(unittest.TestCase):
         state = {}
         with patch.object(glados, "load_kv_state", return_value=state), \
              patch.object(glados, "save_kv_state") as save:
-            checker._mark_run_day(SYNTHETIC_COOKIE, 1, {})
+            checker._mark_run_day(SYNTHETIC_COOKIE, 1, {}, Mock(learned={}))
         saved = save.call_args[0][2]
         self.assertTrue(saved.get("ok_days_total", 0) >= 1)
 
     def test_expiry_tag_does_not_double_count_run_day(self):
-        # 运行日由 _mark_run_day 负责；渲染标签只更新证据，不重复入账
+        # 运行日由 _mark_run_day 负责；渲染标签只更新证据，不重复入账。
+        # 断言必须针对 save_kv_state 实际收到的对象（_load_state 的 or {} 可能换字典）。
         checker = self._checker()
-        state = {}
+        state = {"cookie_md5": glados.hashlib.md5(SYNTHETIC_COOKIE.encode()).hexdigest(),
+                 "ok_days_total": 3, "first_seen_ts": 1}
         with patch.object(glados, "load_kv_state", return_value=state), \
-             patch.object(glados, "save_kv_state"):
+             patch.object(glados, "save_kv_state") as save:
             checker._expiry_tag(Mock(learned={}), SYNTHETIC_COOKIE, 1)
-        self.assertFalse(state.get("ok_days_total"))
+        saved = save.call_args[0][2]
+        self.assertEqual(saved.get("ok_days_total"), 3)
 
     def test_engine_error_falls_back_to_unknown(self):
         checker = self._checker()
@@ -218,7 +221,9 @@ class TestStrictCode(unittest.TestCase):
                 self.assertEqual(glados.coerce_code(raw), int(float(raw)))
 
     def test_rejects_bool_and_garbage(self):
-        for raw in (True, False, None, "", "ok", "2.5", 2.5, [], {}):
+        for raw in (True, False, None, "", "ok", "2.5", 2.5,
+                    float("nan"), float("inf"), float("-inf"),
+                    "12345678901234567890.5", [], {}):
             with self.subTest(raw=raw):
                 self.assertEqual(glados.coerce_code(raw), glados.CHECKIN_FAILURE)
 
@@ -338,6 +343,63 @@ class TestCredentialScopedEvidence(unittest.TestCase):
         resp = Mock(code=200, headers=headers, text="{}", json=Mock(return_value={"code": 0}))
         api._learn(resp)
         self.assertIn("gld:sess", api.learned)
+
+
+class TestUnknownSubmission(unittest.TestCase):
+    """POST 已发出但结果未知时不得重复提交。"""
+
+    def _checker(self, browser):
+        checker = glados.Checker.__new__(glados.Checker)
+        checker.results = []
+        checker.devices = {}
+        checker.browser = browser
+        return checker
+
+    def test_unknown_after_initial_submit(self):
+        browser = Mock()
+        # _checkin 调 checkin 前会重置 flag：用 side_effect 模拟「POST 已发出但无响应」
+        def submitting(*args, **kwargs):
+            browser.submitted_unknown = True
+            return None
+        browser.checkin.side_effect = submitting
+        checker = self._checker(browser)
+        api = Mock()
+        result, learned = checker._checkin(api, SYNTHETIC_COOKIE, 1, "glados.example")
+        self.assertEqual(result[0], "提交结果未知")
+        api.checkin.assert_not_called()
+        self.assertEqual(learned, {})
+
+
+
+class TestFailureDetailWhitelist(unittest.TestCase):
+    """服务端原始 message 不进任务结果；只按白名单固定文案。"""
+
+    def test_turnstile_reason_uses_fixed_text(self):
+        api = glados.GladosAPI("glados.example", 1)
+        api.http = Mock()
+        api.challenge = Mock(return_value={"nonce": SYNTHETIC_NONCE, "turnstile": "0x4AAAAsynthetic"})
+        resp = Mock(code=200, text="{}", json=Mock(return_value={
+            "code": 2, "reason": "turnstile",
+            "message": "user@example.com 的签到请求被拒"}))
+        api.http.request.side_effect = [resp]
+        with patch.object(glados.time, "sleep"):
+            status, code, _, detail = api.checkin(SYNTHETIC_COOKIE)
+        self.assertEqual((status, code), ("签到失败", glados.CHECKIN_FAILURE))
+        self.assertIn("reason=turnstile", detail)
+        self.assertNotIn("user@example.com", detail)
+
+    def test_device_mismatch_uses_fixed_text(self):
+        api = glados.GladosAPI("glados.example", 1)
+        api.http = Mock()
+        api.challenge = Mock(return_value={"nonce": SYNTHETIC_NONCE})
+        resp = Mock(code=200, text="{}", json=Mock(return_value={
+            "code": 4, "reason": "device-mismatch",
+            "message": "private.user@example.org denied"}))
+        api.http.request.side_effect = [resp]
+        with patch.object(glados.time, "sleep"):
+            _, _, _, detail = api.checkin(SYNTHETIC_COOKIE)
+        self.assertNotIn("private.user@example.org", detail)
+        self.assertIn("device-mismatch", detail)
 
 
 if __name__ == "__main__":
