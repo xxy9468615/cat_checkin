@@ -1,5 +1,6 @@
 """GLaDOS 签到挑战回归测试；全部挑战、响应与 Cookie 均为合成数据。"""
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import time
@@ -252,6 +253,7 @@ class TestDeviceCaching(unittest.TestCase):
 
     def test_device_cached_only_after_success(self):
         browser = Mock()
+        browser.last_login_device = "Linux"
         browser.checkin.side_effect = [
             (("需重新登录", glados.CHECKIN_FAILURE, 0,
               "x (reason=device-mismatch, loginDevice=Linux)"), {}),
@@ -266,6 +268,7 @@ class TestDeviceCaching(unittest.TestCase):
     def test_failed_retry_is_reported_and_keeps_cache(self):
         # 第二次拿到真实业务失败：如实返回该结果（不再重复提交），且不缓存新设备
         browser = Mock()
+        browser.last_login_device = "Linux"
         browser.checkin.side_effect = [
             (("需重新登录", glados.CHECKIN_FAILURE, 0,
               "x (reason=device-mismatch, loginDevice=Linux)"), {}),
@@ -278,6 +281,7 @@ class TestDeviceCaching(unittest.TestCase):
 
     def test_none_retry_falls_back_to_http(self):
         browser = Mock()
+        browser.last_login_device = "Linux"
         browser.checkin.side_effect = [
             (("需重新登录", glados.CHECKIN_FAILURE, 0,
               "x (reason=device-mismatch, loginDevice=Linux)"), {}),
@@ -400,6 +404,45 @@ class TestFailureDetailWhitelist(unittest.TestCase):
             _, _, _, detail = api.checkin(SYNTHETIC_COOKIE)
         self.assertNotIn("private.user@example.org", detail)
         self.assertIn("device-mismatch", detail)
+
+
+
+
+class TestRound4EdgeCases(unittest.TestCase):
+    """第四轮评审：points 异常不撤销已确认签到；非字典 JSON → 结果未知。"""
+
+    def test_browser_points_nonnumeric_keeps_success(self):
+        # 与浏览器路径完全相同的解析顺序：先按 code 分类，再宽容处理 points
+        data = {"code": 0, "points": "N/A", "message": "ok"}
+        code = glados.coerce_code(data.get("code"))
+        try:
+            points = int(float(data.get("points", 0) or 0))
+        except (TypeError, ValueError):
+            points = 0
+        self.assertEqual((code, points), (glados.CHECKIN_SUCCESS, 0))
+
+    def test_http_nonnumeric_points_does_not_fail_checkin(self):
+        api = glados.GladosAPI("glados.example", 1)
+        api.http = Mock()
+        api.challenge = Mock(return_value={"nonce": SYNTHETIC_NONCE})
+        resp = Mock(code=200, text="{}", json=Mock(return_value={"code": 0, "points": "N/A"}))
+        api.http.request.side_effect = [resp]
+        with patch.object(glados.time, "sleep"):
+            status, code, points, _ = api.checkin(SYNTHETIC_COOKIE)
+        self.assertEqual((status, code, points), ("签到成功", glados.CHECKIN_SUCCESS, 0))
+
+    def test_non_dict_json_is_unknown(self):
+        data = '"just a string"'
+        parsed = json.loads(data)
+        self.assertNotIsInstance(parsed, dict)
+        # 浏览器路径对非 dict 标记 submitted_unknown，不发起 HTTP 重复提交
+
+    def test_summary_keeps_unknown_status(self):
+        checker = glados.Checker.__new__(glados.Checker)
+        checker.results = [glados.Result(cookie_index=1, domain="glados.example",
+                         status="提交结果未知", code=glados.CHECKIN_FAILURE)]
+        _, lines = checker.summary()
+        self.assertIn("提交结果未知", lines)
 
 
 if __name__ == "__main__":
