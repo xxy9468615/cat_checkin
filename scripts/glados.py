@@ -269,7 +269,7 @@ class GladosAPI:
             payload["proof"] = self.proof(nonce)
             # 无 Turnstile 时前端上报 "off"；有站点密钥但拿不到令牌时上报 "timeout"。
             # 脚本无法执行 Cloudflare 挑战，令牌只能由服务端按风险降级放行。
-            payload["tsState"] = "off"
+            payload["tsState"] = "timeout" if ts_required else "off"
             remaining = CHALLENGE_MIN_AGE_SEC - (time.monotonic() - started_at)
             if remaining > 0:
                 time.sleep(remaining)
