@@ -129,6 +129,8 @@ DEVICE_PROFILES: Dict[str, Dict[str, str]] = {
 DEFAULT_DEVICE = "windows"
 # 浏览器签到开关：auto（默认可用时启用）/ off（只走 HTTP，用于排查）
 BROWSER_MODE_ENV = "GLADOS_BROWSER"
+# 登录凭据 cookie（gld:sess + 其签名）；只有它们的到期时间代表登录有效期
+CREDENTIAL_COOKIE_RE = re.compile(r"^gld:sess(?:\.sig)?$", re.IGNORECASE)
 
 
 def resolve_device(login_device: str) -> str:
@@ -220,8 +222,6 @@ class BrowserCheckin:
         self._pw = None
         self._browser = None
         self._failed = False
-        # 浏览器上下文的 Cookie 到期时间（expires > 0 才是真实证据；上游当前是纯会话）
-        self.last_learned: Dict[str, int] = {}
 
     @staticmethod
     def enabled() -> bool:
@@ -266,14 +266,20 @@ class BrowserCheckin:
         return self._browser
 
     def checkin(self, cookie: str, domain: str,
-                device: str = DEFAULT_DEVICE) -> Optional[Tuple[str, int, int, str]]:
-        """返回与 GladosAPI.checkin 相同的四元组；基础设施不可用返回 None。"""
+                device: str = DEFAULT_DEVICE
+                ) -> Optional[Tuple[Tuple[str, int, int, str], Dict[str, int]]]:
+        """返回 (与 GladosAPI.checkin 同构的四元组, 本次浏览器学到的到期证据)。
+
+        到期证据只包含本次上下文确认属于登录凭据的 cookie，绝不跨调用复用；
+        基础设施不可用返回 None。
+        """
         browser = self._ensure_browser()
         if browser is None:
             return None
         profile = DEVICE_PROFILES.get(device) or DEVICE_PROFILES[DEFAULT_DEVICE]
         base = f"https://{domain}"
         ctx = None
+        learned_here: Dict[str, int] = {}
         try:
             ctx = browser.new_context(
                 locale=profile["locale"],
@@ -352,15 +358,19 @@ class BrowserCheckin:
                 self._log(f"签到接口返回 HTTP {status_code}，不判定业务结果")
                 return None
             data = json.loads(body)
-            # 浏览器上下文是 Set-Cookie 的最权威来源；只有 expires > 0 才算证据
+            # 浏览器上下文是 Set-Cookie 的最权威来源；只有 expires > 0 且属于登录凭据
+            # 的 cookie（gld:sess / gld:sess.sig）才记录，避免把无关 cookie 的时效
+            # 当成 Cookie 有效期（仅域名匹配不足以确认凭据归属）。
             try:
                 for item in ctx.cookies():
                     name = str(item.get("name") or "")
                     expires = item.get("expires")
-                    if name and isinstance(expires, (int, float)) and expires > 0:
-                        self.last_learned[name] = int(expires)
+                    if (name and CREDENTIAL_COOKIE_RE.search(name)
+                            and isinstance(expires, (int, float)) and expires > 0):
+                        learned_here[name] = int(expires)
             except Exception:
                 pass
+
         except Exception as exc:  # noqa: BLE001  浏览器链路异常统一退回 HTTP
             self._log(f"浏览器签到异常: {str(exc)[:160]}")
             return None
@@ -377,19 +387,19 @@ class BrowserCheckin:
         points = int(float(data.get("points", 0) or 0))
         reason = str(data.get("reason", "") or "")
         if code == CHECKIN_SUCCESS:
-            return "签到成功", code, points, message
+            return ("签到成功", code, points, message), learned_here
         if code == CHECKIN_REPEAT:
-            return "重复签到", code, 0, message
+            return ("重复签到", code, 0, message), learned_here
         if code == CHECKIN_FAILURE_DEVICE or reason == "device-mismatch":
             login_device = str(data.get("loginDevice", "") or "")
             detail = message or "登录设备与当前设备不一致"
-            return "需重新登录", CHECKIN_FAILURE, 0, (
-                f"{detail} (reason=device-mismatch, loginDevice={login_device or '?'})")
+            return ("需重新登录", CHECKIN_FAILURE, 0,
+                    f"{detail} (reason=device-mismatch, loginDevice={login_device or '?'})"), learned_here
         # 不回显原始响应体：可能夹带邮箱等个人信息，只保留服务端文案与 reason
         detail = message or "签到失败（响应无 message 字段）"
         if reason:
             detail += f" (reason={reason})"
-        return "签到失败", CHECKIN_FAILURE, 0, detail
+        return ("签到失败", CHECKIN_FAILURE, 0, detail), learned_here
 
     def close(self) -> None:
         for closer in (getattr(self._browser, "close", None),
@@ -491,9 +501,17 @@ class GladosAPI:
         self.learned: Dict[str, int] = {}
 
     def _learn(self, resp) -> None:
-        """从响应 Set-Cookie 学习真实到期证据（当前上游只发会话 cookie，通常为空）。"""
+        """从响应 Set-Cookie 学习到期证据，只认登录凭据 cookie。
+
+        上游当前只发会话 cookie（无 Expires/Max-Age），此处通常为空；一旦将来下发
+        时效，也只有 gld:sess / gld:sess.sig 的到期才算数（其余 cookie 的寿命不代表
+        登录状态）。
+        """
         try:
-            self.learned = cv.merge_learned(self.learned, cv.learn_from_response(resp))
+            self.learned = cv.merge_learned(
+                self.learned,
+                cv.learn_from_response(resp, credential_match=CREDENTIAL_COOKIE_RE.search),
+            )
         except Exception:
             pass
 
@@ -723,18 +741,20 @@ class Checker:
                           status=f"失败: {e}")
 
     def _checkin(self, api: GladosAPI, cookie: str, cookie_index: int,
-                 domain: str) -> Tuple[str, int, int, str]:
+                 domain: str) -> Tuple[Tuple[str, int, int, str], Dict[str, int]]:
         """真浏览器优先；设备不匹配时按服务端 loginDevice 换指纹重试一次。
 
-        浏览器链路不可用（未装 Playwright / 无 xvfb / 启动失败）时才退回 HTTP，
-        此时必然拿到 reason=turnstile，属于如实失败而不是静默假成功。
+        返回 (签到结果四元组, 本次浏览器产生的到期证据)。浏览器链路不可用
+        （未装 Playwright / 无 xvfb / 启动失败）时退回 HTTP，此时必然拿到
+        reason=turnstile，属于如实失败而不是静默假成功。
         """
         if self.browser is None:
-            return api.checkin(cookie)
+            return api.checkin(cookie), {}
         device = self.devices.get(cookie_index, DEFAULT_DEVICE)
-        res = self.browser.checkin(cookie, domain, device)
-        if res is None:
-            return api.checkin(cookie)
+        outcome = self.browser.checkin(cookie, domain, device)
+        if outcome is None:
+            return api.checkin(cookie), {}
+        res, learned = outcome
         mismatch = re.search(r"loginDevice=([^)\s]+)", res[3] or "")
         if mismatch:
             login_device = resolve_device(mismatch.group(1))
@@ -742,15 +762,16 @@ class Checker:
                 print(f"🔁 账号 {cookie_index} 登录设备为 {mismatch.group(1)}，按该设备指纹重试")
                 retry = self.browser.checkin(cookie, domain, login_device)
                 if retry is not None:
-                    # 只有重试拿到真实业务结果才记住新设备，失败/None 保留原缓存
-                    if retry[1] in (CHECKIN_SUCCESS, CHECKIN_REPEAT):
+                    retry_res, retry_learned = retry
+                    # 只有重试拿到真实业务成功才记住新设备，失败/None 保留原缓存
+                    if retry_res[1] in (CHECKIN_SUCCESS, CHECKIN_REPEAT):
                         self.devices[cookie_index] = login_device
-                    return retry
-                return api.checkin(cookie)
+                    return retry_res, retry_learned
+                return api.checkin(cookie), {}
         elif res[1] in (CHECKIN_SUCCESS, CHECKIN_REPEAT):
             # 签到成功即确认该设备指纹有效，后续域名复用
             self.devices.setdefault(cookie_index, device)
-        return res
+        return res, learned
 
     def _cookie_invalid_result(self, cookie_index: int, domain: str, account_name: str, detail: str) -> Result:
         """生成 Cookie 失效结果并打印明确的修复指引，跳过该账号后续流程。"""
@@ -772,8 +793,12 @@ class Checker:
                  egress: str = "") -> Result:
         result = Result(cookie_index=cookie_index, domain=domain)
         result.days, _ = api.status(cookie)
-        result.status, result.code, result.points, result.message = self._checkin(
+        (result.status, result.code, result.points, result.message), learned = self._checkin(
             api, cookie, cookie_index, domain)
+        # 签到成功即入账当日运行天数：后续积分/兑换失败也不能漏记（无到期证据时
+        # 只有成功运行日能反推 Cookie 寿命）
+        if result.code in (CHECKIN_SUCCESS, CHECKIN_REPEAT):
+            self._mark_run_day(cookie, cookie_index, learned)
         _, points_total = api.points(cookie)
         result.points_total = points_total
 
@@ -786,7 +811,7 @@ class Checker:
         else:
             result.exchange = "未开启自动兑换"
 
-        expiry_tag = self._expiry_tag(api, cookie, cookie_index, result.code)
+        expiry_tag = self._expiry_tag(api, cookie, cookie_index, learned)
         acc_label = mask_str(result.account_name) if result.account_name else f"账号 {cookie_index}"
         egress_desc = f" | 🌐 出口: {egress}" if egress else ""
         print(f"📧 账号: {acc_label}{expiry_tag}{egress_desc}")
@@ -808,26 +833,42 @@ class Checker:
         return (f"cat_checkin:state:glados_{cookie_index}",
                 f".glados_state_{cookie_index}.json")
 
+    def _load_state(self, cookie_index: int) -> Tuple[str, str, Dict[str, Any]]:
+        redis_key, state_file = self._state_paths(cookie_index)
+        state = load_kv_state(redis_key, state_file) or {}
+        return redis_key, state_file, state
+
+    def _mark_run_day(self, cookie: str, cookie_index: int,
+                      learned: Dict[str, int]) -> None:
+        """签到成功后立即入账运行日（不等积分/兑换走完）。任何异常不影响主流程。"""
+        try:
+            redis_key, state_file, state = self._load_state(cookie_index)
+            cv.update_state(state, cookie, learned)
+            cv.mark_ok(state)
+            save_kv_state(redis_key, state_file, state)
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️ Cookie 运行日入账失败: {exc}")
+
     def _expiry_tag(self, api: GladosAPI, cookie: str, cookie_index: int,
-                    code: int) -> str:
+                    learned: Optional[Dict[str, int]] = None) -> str:
         """渲染 Cookie 有效期标签（唯一实现委托共享引擎，规则 8）。
 
         GLaDOS 的会话 cookie 是纯会话态（无 Expires、无 _expire），拿不到真实到期
         时间时 build_tag 会输出「有效期未知（已使用 N 天）」，并在 45 天老化基线
         升级为 ⚠️ 黄卡——这是当前唯一诚实的口径，绝不编造倒计时。
+
+        证据只用本次运行的：浏览器本次上下文的到期时间 + 本次 HTTP 响应；不读
+        任何跨账号/跨运行的残留值。
         """
         try:
-            redis_key, state_file = self._state_paths(cookie_index)
-            state = load_kv_state(redis_key, state_file) or {}
-            learned = cv.merge_learned(
+            redis_key, state_file, state = self._load_state(cookie_index)
+            evidence = cv.merge_learned(
+                learned or {},
                 getattr(api, "learned", {}) or {},
-                getattr(self.browser, "last_learned", {}) or {},
             )
-            cv.update_state(state, cookie, learned)
-            if code in (CHECKIN_SUCCESS, CHECKIN_REPEAT):
-                cv.mark_ok(state)  # 成功运行日入账：无到期证据时按天数反推寿命
+            cv.update_state(state, cookie, evidence)
             save_kv_state(redis_key, state_file, state)
-            return cv.build_tag(state, cookie_str=cookie, learned=learned)
+            return cv.build_tag(state, cookie_str=cookie, learned=evidence)
         except Exception as exc:  # 有效期渲染绝不影响签到主流程
             print(f"⚠️ Cookie 有效期计算失败: {exc}")
             return " | 🔑 Cookie 有效期未知"

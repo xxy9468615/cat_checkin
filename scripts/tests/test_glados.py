@@ -168,44 +168,44 @@ class TestExpiryTag(unittest.TestCase):
         checker = self._checker()
         with patch.object(glados, "load_kv_state", return_value={}), \
              patch.object(glados, "save_kv_state") as save:
-            tag = checker._expiry_tag(Mock(learned={}), SYNTHETIC_COOKIE, 1,
-                                      glados.CHECKIN_SUCCESS)
+            tag = checker._expiry_tag(Mock(learned={}), SYNTHETIC_COOKIE, 1)
         self.assertIn("Cookie 有效期未知", tag)
         save.assert_called_once()
 
     def test_learned_expiry_renders_remaining_days(self):
         checker = self._checker()
-        ts = int(time.time()) + 40 * 86400
-        with patch.object(glados, "load_kv_state", return_value={}), \
+        # 固定时钟 + 39 天 12 小时：验证向下取整（不是 40 天也不是 39.5）
+        now = 1_800_000_000
+        ts = now + 39 * 86400 + 43200
+        with patch.object(glados.cv.time, "time", return_value=now), \
+             patch.object(glados, "load_kv_state", return_value={}), \
              patch.object(glados, "save_kv_state"):
             tag = checker._expiry_tag(Mock(learned={"gld:sess": ts}),
-                                      SYNTHETIC_COOKIE, 1, glados.CHECKIN_SUCCESS)
+                                      SYNTHETIC_COOKIE, 1)
         self.assertIn("Cookie 剩余 39 天", tag)
 
-    def test_success_marks_run_day(self):
+    def test_run_day_marked_immediately(self):
         checker = self._checker()
         state = {}
         with patch.object(glados, "load_kv_state", return_value=state), \
              patch.object(glados, "save_kv_state") as save:
-            checker._expiry_tag(Mock(learned={}), SYNTHETIC_COOKIE, 1,
-                                glados.CHECKIN_SUCCESS)
+            checker._mark_run_day(SYNTHETIC_COOKIE, 1, {})
         saved = save.call_args[0][2]
         self.assertTrue(saved.get("ok_days_total", 0) >= 1)
 
-    def test_failure_does_not_mark_run_day(self):
+    def test_expiry_tag_does_not_double_count_run_day(self):
+        # 运行日由 _mark_run_day 负责；渲染标签只更新证据，不重复入账
         checker = self._checker()
         state = {}
         with patch.object(glados, "load_kv_state", return_value=state), \
-             patch.object(glados, "save_kv_state") as save:
-            checker._expiry_tag(Mock(learned={}), SYNTHETIC_COOKIE, 1,
-                                glados.CHECKIN_FAILURE)
-        saved = save.call_args[0][2]
-        self.assertFalse(saved.get("ok_days_total"))
+             patch.object(glados, "save_kv_state"):
+            checker._expiry_tag(Mock(learned={}), SYNTHETIC_COOKIE, 1)
+        self.assertFalse(state.get("ok_days_total"))
 
     def test_engine_error_falls_back_to_unknown(self):
         checker = self._checker()
         with patch.object(glados, "load_kv_state", side_effect=RuntimeError("boom")):
-            tag = checker._expiry_tag(Mock(learned={}), SYNTHETIC_COOKIE, 1, 0)
+            tag = checker._expiry_tag(Mock(learned={}), SYNTHETIC_COOKIE, 1)
         self.assertIn("Cookie 有效期未知", tag)
 
 
@@ -248,39 +248,44 @@ class TestDeviceCaching(unittest.TestCase):
     def test_device_cached_only_after_success(self):
         browser = Mock()
         browser.checkin.side_effect = [
-            ("需重新登录", glados.CHECKIN_FAILURE, 0, "x (reason=device-mismatch, loginDevice=Linux)"),
-            ("签到成功", glados.CHECKIN_SUCCESS, 2, "ok"),
+            (("需重新登录", glados.CHECKIN_FAILURE, 0,
+              "x (reason=device-mismatch, loginDevice=Linux)"), {}),
+            (("签到成功", glados.CHECKIN_SUCCESS, 2, "ok"), {"gld:sess": 123}),
         ]
         checker = self._checker(browser)
-        result = checker._checkin(self._api(), SYNTHETIC_COOKIE, 1, "glados.example")
+        result, learned = checker._checkin(self._api(), SYNTHETIC_COOKIE, 1, "glados.example")
         self.assertEqual(result[0], "签到成功")
+        self.assertEqual(learned, {"gld:sess": 123})
         self.assertEqual(checker.devices[1], "linux")
 
     def test_failed_retry_is_reported_and_keeps_cache(self):
         # 第二次拿到真实业务失败：如实返回该结果（不再重复提交），且不缓存新设备
         browser = Mock()
         browser.checkin.side_effect = [
-            ("需重新登录", glados.CHECKIN_FAILURE, 0, "x (reason=device-mismatch, loginDevice=Linux)"),
-            ("签到失败", glados.CHECKIN_FAILURE, 0, "still bad"),
+            (("需重新登录", glados.CHECKIN_FAILURE, 0,
+              "x (reason=device-mismatch, loginDevice=Linux)"), {}),
+            (("签到失败", glados.CHECKIN_FAILURE, 0, "still bad"), {}),
         ]
         checker = self._checker(browser)
-        result = checker._checkin(self._api(), SYNTHETIC_COOKIE, 1, "glados.example")
+        result, _ = checker._checkin(self._api(), SYNTHETIC_COOKIE, 1, "glados.example")
         self.assertEqual(result[3], "still bad")
         self.assertEqual(checker.devices[1], "windows")
 
     def test_none_retry_falls_back_to_http(self):
         browser = Mock()
         browser.checkin.side_effect = [
-            ("需重新登录", glados.CHECKIN_FAILURE, 0, "x (reason=device-mismatch, loginDevice=Linux)"),
+            (("需重新登录", glados.CHECKIN_FAILURE, 0,
+              "x (reason=device-mismatch, loginDevice=Linux)"), {}),
             None,
         ]
         checker = self._checker(browser)
-        result = checker._checkin(self._api(), SYNTHETIC_COOKIE, 1, "glados.example")
+        result, learned = checker._checkin(self._api(), SYNTHETIC_COOKIE, 1, "glados.example")
         self.assertEqual(result[3], "http fallback")
+        self.assertEqual(learned, {})
 
     def test_browser_unavailable_uses_http(self):
         checker = self._checker(None)
-        result = checker._checkin(self._api(), SYNTHETIC_COOKIE, 1, "glados.example")
+        result, _ = checker._checkin(self._api(), SYNTHETIC_COOKIE, 1, "glados.example")
         self.assertEqual(result[3], "http fallback")
 
 
@@ -305,6 +310,34 @@ class TestEgressResolution(unittest.TestCase):
         config = glados.Config.__new__(glados.Config)
         config.proxies = [endpoint]
         self.assertIs(config._resolve_egress(), endpoint)
+
+
+class TestCredentialScopedEvidence(unittest.TestCase):
+    """到期证据只认登录凭据 cookie（gld:sess / gld:sess.sig）。"""
+
+    def test_credential_regex_scope(self):
+        for name in ("gld:sess", "gld:sess.sig", "GLD:SESS"):
+            with self.subTest(name=name):
+                self.assertIsNotNone(glados.CREDENTIAL_COOKIE_RE.search(name))
+        for name in ("gld:accts", "gld:accts.sig", "cf_clearance", "", "sess"):
+            with self.subTest(name=name):
+                self.assertIsNone(glados.CREDENTIAL_COOKIE_RE.search(name))
+
+    def test_learn_ignores_non_credential_set_cookie(self):
+        api = glados.GladosAPI("glados.example", 1)
+        api.http = Mock()
+        headers = {"Set-Cookie": "gld:accts=1; Expires=Wed, 01 Jan 2031 00:00:00 GMT"}
+        resp = Mock(code=200, headers=headers, text="{}", json=Mock(return_value={"code": 0}))
+        api._learn(resp)
+        self.assertEqual(api.learned, {})
+
+    def test_learn_keeps_credential_set_cookie(self):
+        api = glados.GladosAPI("glados.example", 1)
+        api.http = Mock()
+        headers = {"Set-Cookie": "gld:sess=1; Expires=Wed, 01 Jan 2031 00:00:00 GMT"}
+        resp = Mock(code=200, headers=headers, text="{}", json=Mock(return_value={"code": 0}))
+        api._learn(resp)
+        self.assertIn("gld:sess", api.learned)
 
 
 if __name__ == "__main__":
