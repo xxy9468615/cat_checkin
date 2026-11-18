@@ -24,7 +24,8 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "script": "glados.py",
         "name": "GLaDOS 签到兑换",
         "result": "glados.json",
-        "timeout": 300,
+        # 真浏览器签到（Turnstile）：启动 Chrome + 逐账号 new_context，留足余量
+        "timeout": 480,
         "account": "",
         "tags": ["00:50", "matrix", "daily"],
     },

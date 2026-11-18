@@ -415,11 +415,13 @@ class Http:
         # 直连模式：显式空代理串 = libcurl CURLOPT_PROXY ""，掐掉环境变量代理
         if getattr(self, "direct_no_env_proxy", False):
             sess_kwargs["proxies"] = {"http": "", "https": ""}
-        # 代理出口：优先走具体的 ProxyEndpoint（含 socks5/http），与 urllib 链路一致
+        # 代理出口：优先走具体的 ProxyEndpoint（含 socks5/http），与 urllib 链路一致；
+        # SOCKS 一律升级为远程 DNS 变体，避免 libcurl 本地解析把不可用 IP 交给代理
         elif getattr(self, "proxy_endpoint", None):
+            proxy_url = remote_dns_proxy_url(self.proxy_endpoint.url)
             sess_kwargs["proxies"] = {
-                "http": self.proxy_endpoint.url,
-                "https": self.proxy_endpoint.url,
+                "http": proxy_url,
+                "https": proxy_url,
             }
         elif getattr(self, "has_proxy", False):
             # 仅有代理标记但无 endpoint 对象（sockshandler 全局 patch 类）——curl_cffi 原生
@@ -435,6 +437,7 @@ class Http:
                     f"[{mask_str(proxy_url)}]（可经 SINGBOX_SOCKS_URL 覆盖）",
                     file=sys.stderr,
                 )
+            proxy_url = remote_dns_proxy_url(proxy_url)
             sess_kwargs["proxies"] = {
                 "http": proxy_url,
                 "https": proxy_url,
@@ -1085,6 +1088,23 @@ def mask_email(value: Any, mask_char: str = "*") -> str:
     if len(user_part) <= 4:
         return f"{mask_char * 3}@{mask_char * 3}"
     return f"{mask_char * 3}{user_part[-4:]}@{mask_char * 3}"
+
+
+def remote_dns_proxy_url(proxy_url: str) -> str:
+    """把 SOCKS 代理统一改写为远程 DNS 变体（socks5h / socks4a）。
+
+    libcurl 对 `socks5://` 是本地解析后只把 IP 交给代理，`socks5h://` 才把域名交给
+    代理端解析；urllib 链路一直用 sockshandler(rdns=True) 强制远程解析，两条链路的
+    DNS 语义必须一致，否则会漏出本地 DNS 泄漏与解析漂移。
+    2026-11-18 glados 经 sing-box 台湾出站复现：socks5:// 下 BoringSSL 握手被对端
+    直接重置（本地解析出的 IP 不可用），改 socks5h:// 立即 HTTP 200。
+    """
+    low = proxy_url.lower()
+    if low.startswith("socks5://"):
+        return "socks5h://" + proxy_url[len("socks5://"):]
+    if low.startswith("socks4://"):
+        return "socks4a://" + proxy_url[len("socks4://"):]
+    return proxy_url
 
 
 def mask_str(value: Any, keep_start: int | None = None, keep_end: int | None = None, mask_char: str = "*") -> str:
