@@ -286,6 +286,7 @@ jobs:
           echo "AGENTROUTER_PROXY=" >> "$GITHUB_ENV"
           echo "CLOUDSTUDIO_PROXY=" >> "$GITHUB_ENV"
           echo "GLADOS_PROXY=" >> "$GITHUB_ENV"
+          echo "GLADOS_ALLOW_DIRECT=1" >> "$GITHUB_ENV"
           echo "direct 诊断模式：跳过代理，任务用 runner IP 直连"
       - name: no_cffi mode (nodeseek 强制 urllib)
         if: inputs.no_cffi == true
