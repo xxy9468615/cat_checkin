@@ -560,8 +560,9 @@ jobs:
         run: |
           pip install --quiet playwright
           python3 -m playwright install --with-deps chrome >/dev/null 2>&1 || python3 -m playwright install --with-deps chromium >/dev/null 2>&1
-          python3 - <<'PY' || true
-          import json, os, re, time
+          which xvfb-run || (sudo apt-get update -qq && sudo apt-get install -y -qq xvfb)
+          xvfb-run -a python3 - <<'PY' || true
+          import os, re, time
           from playwright.sync_api import sync_playwright
 
           raw = os.environ.get("GLADOS_COOKIE_1", "")
@@ -573,45 +574,46 @@ jobs:
                                   "path": "/", "secure": True, "httpOnly": False})
           print("cookie_names", [c["name"] for c in cookies])
 
-          captured = []
+          posts = []
           with sync_playwright() as p:
-              try:
-                  browser = p.chromium.launch(channel="chrome", headless=True,
-                                              proxy={"server": "socks5://127.0.0.1:1080"})
-                  print("browser chrome ok")
-              except Exception as exc:
-                  print("chrome channel unavailable:", str(exc)[:120])
-                  browser = p.chromium.launch(headless=True,
-                                              proxy={"server": "socks5://127.0.0.1:1080"})
-                  print("browser chromium fallback ok")
-              ctx = browser.new_context(locale="zh-CN", timezone_id="Asia/Shanghai",
+              browser = p.chromium.launch(
+                  channel="chrome", headless=False,
+                  proxy={"server": "socks5://127.0.0.1:1080"},
+                  args=["--disable-blink-features=AutomationControlled",
+                        "--window-size=1366,900"])
+              print("browser headful chrome ok")
+              ctx = browser.new_context(locale="en-US", timezone_id="Asia/Shanghai",
                                         viewport={"width": 1366, "height": 900})
               ctx.add_cookies(cookies)
-
               page = ctx.new_page()
-              page.on("response", lambda r: captured.append((r.url, r.status))
-                      if "/api/user/checkin" in r.url else None)
+
+              def on_response(r):
+                  if "/api/user/checkin" in r.url and r.request.method == "POST":
+                      try:
+                          posts.append((r.status, r.text()[:200]))
+                      except Exception:
+                          posts.append((r.status, "<no body>"))
+              page.on("response", on_response)
               page.goto("https://glados.cloud/console/checkin", wait_until="domcontentloaded", timeout=60000)
-              page.wait_for_timeout(8000)
-              print("title", page.title(), "url", page.url)
+              page.wait_for_timeout(6000)
               print("has_turnstile", page.evaluate("!!window.turnstile"))
-              buttons = page.evaluate("Array.from(document.querySelectorAll('button')).map(b=>b.innerText.trim()).filter(Boolean)")
-              print("buttons", buttons[:12])
               hit = None
               for b in page.query_selector_all("button"):
                   txt = (b.inner_text() or "").strip().lower()
-                  if re.search(r"签到|check", txt):
+                  if txt == "checkin" or "签到" in txt:
                       hit = b
                       break
+              print("clicking", (hit.inner_text() or "").strip() if hit else "none")
               if hit:
-                  print("clicking", (hit.inner_text() or "").strip())
                   hit.click()
-              else:
-                  print("no checkin button found")
-              page.wait_for_timeout(25000)
-              print("api_calls", captured[-6:])
-              body = page.evaluate("document.body.innerText.slice(0,600)")
-              print("body", body.replace("\n", " | ")[:600])
+              for i in range(12):
+                  page.wait_for_timeout(5000)
+                  frames = [f.url for f in page.frames if "challenges.cloudflare.com" in f.url]
+                  print(f"t+{(i+1)*5}s posts={len(posts)} ts_frames={len(frames)}")
+                  if posts:
+                      break
+              print("posts", posts)
+              print("body_tail", page.evaluate("document.body.innerText.slice(-400)").replace("\n", " | ")[:400])
               browser.close()
           PY
 
