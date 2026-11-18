@@ -549,6 +549,21 @@ jobs:
             stash_proxy_state none "" "" ""
           fi
 
+      - name: DIAG 52pojie cookie evidence (temporary)
+        if: contains(steps.orch_tasks.outputs.due_tasks, '52pojie')
+        continue-on-error: true
+        env:
+          52POJIE_COOKIE_1: ${{ secrets.WUAI_COOKIE_1 }}
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, "scripts")
+          import cookie_validity as cv
+          c = os.environ.get("52POJIE_COOKIE_1", "")
+          print("cookie_names", [p.split("=",1)[0].strip() for p in c.split(";") if "=" in p])
+          print("expire_from_cookie_str", cv.expire_from_cookie_str(c, domain_hint="52pojie"))
+          PY
+
       - name: Execute daily orchestrator
         id: orchestrator
         if: steps.orch_tasks.outputs.due_tasks != 'none'
