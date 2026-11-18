@@ -590,6 +590,42 @@ jobs:
                     "len", len(sc))
           PY
 
+      - name: DIAG glados browser cookie expiry (temporary)
+        if: contains(inputs.tasks, 'glados')
+        continue-on-error: true
+        env:
+          GLADOS_COOKIE_1: ${{ secrets.GLADOS_COOKIE_1 }}
+        run: |
+          pip install --quiet playwright
+          python3 -m playwright install --with-deps chrome >/dev/null 2>&1
+          xvfb-run -a python3 - <<'PY' || true
+          import os
+          from playwright.sync_api import sync_playwright
+          raw = os.environ.get("GLADOS_COOKIE_1", "")
+          cookies = []
+          for part in raw.split(";"):
+              n, sep, v = part.strip().partition("=")
+              if sep and n:
+                  cookies.append({"name": n, "value": v, "domain": "glados.cloud",
+                                  "path": "/", "secure": True})
+          with sync_playwright() as p:
+              b = p.chromium.launch(channel="chrome", headless=False,
+                                    proxy={"server": "socks5://127.0.0.1:1080"})
+              ctx = b.new_context()
+              ctx.add_cookies(cookies)
+              page = ctx.new_page()
+              page.goto("https://glados.cloud/console/checkin", wait_until="domcontentloaded", timeout=60000)
+              page.wait_for_timeout(6000)
+              print("after_load", [(c["name"], c["expires"]) for c in ctx.cookies()])
+              for btn in page.query_selector_all("button"):
+                  if (btn.inner_text() or "").strip().lower() == "checkin":
+                      btn.click()
+                      break
+              page.wait_for_timeout(15000)
+              print("after_click", [(c["name"], c["expires"]) for c in ctx.cookies()])
+              b.close()
+          PY
+
       - name: Install browser for glados (Turnstile)
         if: contains(steps.orch_tasks.outputs.due_tasks, 'glados')
         run: |
