@@ -114,5 +114,43 @@ class TestCheckinFlow(unittest.TestCase):
             api.checkin(SYNTHETIC_COOKIE)
 
 
+class TestBrowserHelpers(unittest.TestCase):
+    def test_cookie_pairs_split(self):
+        pairs = glados.parse_cookie_pairs(SYNTHETIC_COOKIE)
+        self.assertEqual(pairs["koa:sess"], "V1.0FAKEsynthetic")
+        self.assertEqual(pairs["koa:sess.sig"], "V1.0FAKEsynthetic-signature")
+
+    def test_cookie_pairs_ignore_malformed(self):
+        self.assertEqual(glados.parse_cookie_pairs("broken; a=b; =c"), {"a": "b"})
+
+    def test_resolve_device_aliases(self):
+        cases = {
+            "Windows": "windows", "Linux": "linux", "macOS": "macos",
+            "MacIntel": "macos", "Android": "android", "iOS": "ios",
+            "iPhone": "ios", "": "windows", "FreeBSD": "windows",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(glados.resolve_device(raw), expected)
+
+    def test_device_profiles_have_required_fields(self):
+        for name, profile in glados.DEVICE_PROFILES.items():
+            with self.subTest(device=name):
+                for field in ("ua", "platform", "ch_platform", "mobile", "locale"):
+                    self.assertTrue(profile.get(field), f"{name} 缺少 {field}")
+
+    def test_browser_disabled_by_env(self):
+        with patch.dict("os.environ", {"GLADOS_BROWSER": "off"}):
+            self.assertFalse(glados.BrowserCheckin.enabled())
+        with patch.dict("os.environ", {"GLADOS_BROWSER": "auto"}):
+            self.assertTrue(glados.BrowserCheckin.enabled())
+
+    def test_browser_missing_playwright_falls_back(self):
+        bc = glados.BrowserCheckin(proxy="socks5://127.0.0.1:1080")
+        with patch.dict("sys.modules", {"playwright": None, "playwright.sync_api": None}):
+            self.assertIsNone(bc.checkin(SYNTHETIC_COOKIE, "glados.example"))
+        self.assertTrue(bc._failed)
+
+
 if __name__ == "__main__":
     unittest.main()

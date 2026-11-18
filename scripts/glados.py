@@ -69,6 +69,87 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
+# ── 真浏览器签到（Turnstile 只能由真实浏览器解出）───────────────────────────
+# 2026-11-18 实测结论（家庭宽带 TW 出口 + Chrome131 JA3 也一样）：
+#   纯 HTTP 客户端拿到的挑战必然带 turnstile 站点密钥，POST 恒定
+#   {"code":..,"reason":"turnstile"}；headful 真 Chrome 在同一个家宽出口上
+#   5 秒内自动过盾。因此签到必须交给真浏览器，HTTP 链路只做查询与兑换。
+# 另外服务端把会话绑定到登录设备：设备不一致时返回
+#   {"code":4,"reason":"device-mismatch","loginDevice":"Windows","currentDevice":"Linux"}
+# 浏览器必须按登录设备伪装 UA/platform，否则过盾也会被判定为异地设备。
+DEVICE_PROFILES: Dict[str, Dict[str, str]] = {
+    "windows": {
+        "ua": USER_AGENT,
+        "platform": "Win32",
+        "ch_platform": '"Windows"',
+        "mobile": "?0",
+        "locale": "en-US",
+    },
+    "macos": {
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "platform": "MacIntel",
+        "ch_platform": '"macOS"',
+        "mobile": "?0",
+        "locale": "en-US",
+    },
+    "linux": {
+        "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "platform": "Linux x86_64",
+        "ch_platform": '"Linux"',
+        "mobile": "?0",
+        "locale": "en-US",
+    },
+    "android": {
+        "ua": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+        "platform": "Linux armv8l",
+        "ch_platform": '"Android"',
+        "mobile": "?1",
+        "locale": "en-US",
+    },
+    "ios": {
+        "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 "
+              "(KHTML, like Gecko) CriOS/131.0.0.0 Mobile/15E148 Safari/604.1",
+        "platform": "iPhone",
+        "ch_platform": '"iOS"',
+        "mobile": "?1",
+        "locale": "en-US",
+    },
+}
+DEFAULT_DEVICE = "windows"
+# 浏览器签到开关：auto（默认可用时启用）/ off（只走 HTTP，用于排查）
+BROWSER_MODE_ENV = "GLADOS_BROWSER"
+
+
+def resolve_device(login_device: str) -> str:
+    """把服务端的 loginDevice 归一化为 DEVICE_PROFILES 键。"""
+    key = (login_device or "").strip().lower()
+    if key in DEVICE_PROFILES:
+        return key
+    if key.startswith("mac") or key.startswith("darwin"):
+        return "macos"
+    if "win" in key:
+        return DEFAULT_DEVICE
+    if "android" in key:
+        return "android"
+    if "ios" in key or "iphone" in key:
+        return "ios"
+    if "linux" in key:
+        return "linux"
+    return DEFAULT_DEVICE
+
+
+def parse_cookie_pairs(cookie: str) -> Dict[str, str]:
+    """把浏览器导出的 Cookie 串拆成 name->value（Playwright add_cookies 用）。"""
+    pairs: Dict[str, str] = {}
+    for part in (cookie or "").split(";"):
+        name, sep, value = part.strip().partition("=")
+        if sep and name:
+            pairs[name] = value
+    return pairs
+
 # Cookie 失效时响应中常见的登录关键词（命中即判定登录态过期）
 # 注意 "没有权限"/"No permission"（code=-2）是 koa:sess 签名校验失败时服务端的
 # 固定返回——不带 Cookie 请求也会得到同一结果，与越权/封号无关，必须归入
@@ -109,6 +190,189 @@ class Result:
     points_total: int = 0
     exchange: str = "未兑换"
     message: str = ""
+
+
+class BrowserCheckin:
+    """真浏览器签到器：headful Chrome + 家宽出口 + 登录设备指纹。
+
+    一个浏览器实例服务全部账号（每次 new_context 隔离 Cookie），避免重复启动
+    Chromium 吃掉任务超时。Playwright 缺失或无显示环境（headful 起不来）时返回
+    None，由调用方退回 HTTP 链路（会拿到 reason=turnstile，如实失败）。
+    """
+
+    def __init__(self, proxy: str = "", verbose: bool = False) -> None:
+        self.proxy = proxy
+        self.verbose = verbose
+        self._pw = None
+        self._browser = None
+        self._failed = False
+
+    @staticmethod
+    def enabled() -> bool:
+        mode = (os.getenv(BROWSER_MODE_ENV) or "auto").strip().lower()
+        return mode not in ("0", "false", "off", "no")
+
+    def _log(self, message: str) -> None:
+        if self.verbose:
+            print(f"[browser] {message}")
+
+    def _ensure_browser(self):
+        if self._browser is not None:
+            return self._browser
+        if self._failed:
+            return None
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            print("⚠️ 未安装 Playwright，签到退回 HTTP 链路（Turnstile 将无法通过）")
+            self._failed = True
+            return None
+        try:
+            self._pw = sync_playwright().start()
+            self._browser = self._pw.chromium.launch(
+                channel="chrome",
+                headless=False,
+                proxy={"server": self.proxy} if self.proxy else None,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            self._log("headful chrome ready")
+        except Exception as exc:  # noqa: BLE001  无显示/无 Chrome 时退回 HTTP
+            print(f"⚠️ 浏览器启动失败（需要 xvfb DISPLAY 与 Chrome）：{str(exc)[:160]}")
+            self._failed = True
+            try:
+                if self._pw is not None:
+                    self._pw.stop()
+            except Exception:
+                pass
+            self._pw = None
+            self._browser = None
+            return None
+        return self._browser
+
+    def checkin(self, cookie: str, domain: str,
+                device: str = DEFAULT_DEVICE) -> Optional[Tuple[str, int, int, str]]:
+        """返回与 GladosAPI.checkin 相同的四元组；基础设施不可用返回 None。"""
+        browser = self._ensure_browser()
+        if browser is None:
+            return None
+        profile = DEVICE_PROFILES.get(device) or DEVICE_PROFILES[DEFAULT_DEVICE]
+        base = f"https://{domain}"
+        ctx = None
+        try:
+            ctx = browser.new_context(
+                locale=profile["locale"],
+                timezone_id="Asia/Shanghai",
+                viewport={"width": 1366, "height": 900},
+                user_agent=profile["ua"],
+                extra_http_headers={
+                    "sec-ch-ua": '"Chromium";v="131", "Google Chrome";v="131", "Not_A Brand";v="24"',
+                    "sec-ch-ua-mobile": profile["mobile"],
+                    "sec-ch-ua-platform": profile["ch_platform"],
+                },
+            )
+            cookies = [
+                {"name": name, "value": value, "domain": domain, "path": "/", "secure": True}
+                for name, value in parse_cookie_pairs(cookie).items()
+            ]
+            if not cookies:
+                return None
+            ctx.add_cookies(cookies)
+            # navigator.platform / userAgentData 必须与 UA 一致，否则设备指纹露馅
+            ctx.add_init_script(
+                "Object.defineProperty(navigator,'platform',{get:()=>%r});"
+                "Object.defineProperty(navigator,'userAgentData',{get:()=>({"
+                "platform:%r,brands:[{brand:'Chromium',version:'131'},"
+                "{brand:'Google Chrome',version:'131'}]})});"
+                % (profile["platform"], profile["ch_platform"].strip('"'))
+            )
+            page = ctx.new_page()
+            try:
+                cdp = ctx.new_cdp_session(page)
+                cdp.send("Emulation.setUserAgentOverride", {
+                    "userAgent": profile["ua"],
+                    "acceptLanguage": "en-US,en;q=0.9",
+                    "platform": profile["platform"],
+                })
+            except Exception:
+                pass
+
+            captured: List[str] = []
+
+            def on_response(resp) -> None:
+                try:
+                    if "/api/user/checkin" in resp.url and resp.request.method == "POST" \
+                            and "/challenge" not in resp.url:
+                        captured.append(resp.text())
+                except Exception:
+                    pass
+
+            page.on("response", on_response)
+            page.goto(base + "/console/checkin", wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(4000)
+            button = None
+            for _ in range(6):
+                for candidate in page.query_selector_all("button"):
+                    text = (candidate.inner_text() or "").strip().lower()
+                    if text in ("checkin", "check in") or "签到" in text:
+                        button = candidate
+                        break
+                if button is not None:
+                    break
+                page.wait_for_timeout(2500)
+            if button is None:
+                self._log("未找到签到按钮")
+                return None
+            button.click()
+            for _ in range(12):
+                page.wait_for_timeout(5000)
+                if captured:
+                    break
+            if not captured:
+                self._log("等待签到响应超时（Turnstile 未通过）")
+                return None
+            data = json.loads(captured[-1])
+        except Exception as exc:  # noqa: BLE001  浏览器链路异常统一退回 HTTP
+            self._log(f"浏览器签到异常: {str(exc)[:160]}")
+            return None
+        finally:
+            if ctx is not None:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+
+        # 严格解析 code：缺失/非数字一律失败，绝不让缺字段被当成 code=0 假成功
+        try:
+            code = int(float(data.get("code")))
+        except (TypeError, ValueError):
+            code = CHECKIN_FAILURE
+        message = str(data.get("message", ""))
+        points = int(float(data.get("points", 0) or 0))
+        reason = str(data.get("reason", "") or "")
+        if code == CHECKIN_SUCCESS:
+            return "签到成功", code, points, message
+        if code == CHECKIN_REPEAT:
+            return "重复签到", code, 0, message
+        if code == CHECKIN_FAILURE_DEVICE or reason == "device-mismatch":
+            login_device = str(data.get("loginDevice", "") or "")
+            detail = message or "登录设备与当前设备不一致"
+            return "需重新登录", CHECKIN_FAILURE, 0, (
+                f"{detail} (reason=device-mismatch, loginDevice={login_device or '?'})")
+        detail = message or json.dumps(data, ensure_ascii=False)[:200]
+        if reason:
+            detail += f" (reason={reason})"
+        return "签到失败", CHECKIN_FAILURE, 0, detail
+
+    def close(self) -> None:
+        for closer in (getattr(self._browser, "close", None),
+                       getattr(self._pw, "stop", None)):
+            try:
+                if closer:
+                    closer()
+            except Exception:
+                pass
+        self._browser = None
+        self._pw = None
 
 
 class Config:
@@ -356,15 +620,26 @@ class Checker:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.results: List[Result] = []
+        self.devices: Dict[int, str] = {}
+        # 浏览器与 HTTP 链路共用同一条住宅出口；浏览器签到是该出口上唯一能过盾的路径
+        proxy_url = config.proxies[0].url if config.proxies else ""
+        self.browser: Optional[BrowserCheckin] = (
+            BrowserCheckin(proxy=proxy_url, verbose=config.verbose)
+            if BrowserCheckin.enabled() else None
+        )
 
     def run(self) -> None:
         print("【GLaDOS 签到兑换】")
         # 上游无密码登录接口，仅支持 Cookie 认证
         candidates = self.config.proxies or [None]
-        for cookie_index, cookie in enumerate(self.config.cookies, 1):
-            for domain in self.config.domains:
-                res = self._run_with_failover(cookie, cookie_index, domain, candidates)
-                self.results.append(res)
+        try:
+            for cookie_index, cookie in enumerate(self.config.cookies, 1):
+                for domain in self.config.domains:
+                    res = self._run_with_failover(cookie, cookie_index, domain, candidates)
+                    self.results.append(res)
+        finally:
+            if self.browser is not None:
+                self.browser.close()
 
     def _run_with_failover(self, cookie: str, cookie_index: int, domain: str,
                            candidates: List[Optional[ProxyEndpoint]]) -> Result:
@@ -390,6 +665,33 @@ class Checker:
             print(f"🔁 出口 {tag} 触发 CF 质询，切换下一个出口重试 ({i}/{len(candidates)})")
         return res
 
+    def _checkin(self, api: GladosAPI, cookie: str, cookie_index: int,
+                 domain: str) -> Tuple[str, int, int, str]:
+        """真浏览器优先；设备不匹配时按服务端 loginDevice 换指纹重试一次。
+
+        浏览器链路不可用（未装 Playwright / 无 xvfb / 启动失败）时才退回 HTTP，
+        此时必然拿到 reason=turnstile，属于如实失败而不是静默假成功。
+        """
+        if self.browser is not None:
+            device = self.devices.get(cookie_index, DEFAULT_DEVICE)
+            res = self.browser.checkin(cookie, domain, device)
+            if res is not None:
+                mismatch = re.search(r"loginDevice=([^)\s]+)", res[3] or "")
+                if mismatch:
+                    login_device = resolve_device(mismatch.group(1))
+                    if login_device != device:
+                        print(f"🔁 账号 {cookie_index} 登录设备为 {mismatch.group(1)}，"
+                              f"按该设备指纹重试")
+                        self.devices[cookie_index] = login_device
+                        retry = self.browser.checkin(cookie, domain, login_device)
+                        if retry is not None:
+                            return retry
+                elif res[1] in (CHECKIN_SUCCESS, CHECKIN_REPEAT):
+                    # 签到成功即确认该设备指纹有效，后续域名复用
+                    self.devices.setdefault(cookie_index, device)
+                return res
+        return api.checkin(cookie)
+
     def _cookie_invalid_result(self, cookie_index: int, domain: str, account_name: str, detail: str) -> Result:
         """生成 Cookie 失效结果并打印明确的修复指引，跳过该账号后续流程。"""
         acc_label = mask_str(account_name) if account_name else f"账号 {cookie_index}"
@@ -410,7 +712,8 @@ class Checker:
                  egress: str = "") -> Result:
         result = Result(cookie_index=cookie_index, domain=domain)
         result.days, _ = api.status(cookie)
-        result.status, result.code, result.points, result.message = api.checkin(cookie)
+        result.status, result.code, result.points, result.message = self._checkin(
+            api, cookie, cookie_index, domain)
         _, points_total = api.points(cookie)
         result.points_total = points_total
 

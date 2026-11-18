@@ -552,84 +552,14 @@ jobs:
             stash_proxy_state none "" "" ""
           fi
 
-      - name: DIAG glados real-browser turnstile (temporary)
-        if: contains(inputs.tasks, 'glados')
-        continue-on-error: true
-        env:
-          GLADOS_COOKIE_1: ${{ secrets.GLADOS_COOKIE_1 }}
+      - name: Install browser for glados (Turnstile)
+        if: contains(steps.orch_tasks.outputs.due_tasks, 'glados')
         run: |
+          # Turnstile 只能由真浏览器解出：headful Chrome + xvfb 虚拟显示
           pip install --quiet playwright
-          python3 -m playwright install --with-deps chrome >/dev/null 2>&1 || python3 -m playwright install --with-deps chromium >/dev/null 2>&1
-          which xvfb-run || (sudo apt-get update -qq && sudo apt-get install -y -qq xvfb)
-          xvfb-run -a python3 - <<'PY' || true
-          import os, re, time
-          from playwright.sync_api import sync_playwright
-
-          raw = os.environ.get("GLADOS_COOKIE_1", "")
-          cookies = []
-          for part in raw.split(";"):
-              name, sep, value = part.strip().partition("=")
-              if sep and name:
-                  cookies.append({"name": name, "value": value, "domain": "glados.cloud",
-                                  "path": "/", "secure": True, "httpOnly": False})
-          print("cookie_names", [c["name"] for c in cookies])
-
-          posts = []
-          with sync_playwright() as p:
-              browser = p.chromium.launch(
-                  channel="chrome", headless=False,
-                  proxy={"server": "socks5://127.0.0.1:1080"},
-                  args=["--disable-blink-features=AutomationControlled",
-                        "--window-size=1366,900"])
-              print("browser headful chrome ok")
-              ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-              ctx = browser.new_context(locale="en-US", timezone_id="Asia/Shanghai",
-                                        viewport={"width": 1366, "height": 900},
-                                        user_agent=ua,
-                                        extra_http_headers={
-                                            "sec-ch-ua": '"Chromium";v="131", "Google Chrome";v="131", "Not_A Brand";v="24"',
-                                            "sec-ch-ua-mobile": "?0",
-                                            "sec-ch-ua-platform": '"Windows"',
-                                        })
-              ctx.add_init_script(
-                  "Object.defineProperty(navigator,'platform',{get:()=>'Win32'});"
-                  "Object.defineProperty(navigator,'userAgentData',{get:()=>({platform:'Windows',brands:[{brand:'Chromium',version:'131'},{brand:'Google Chrome',version:'131'}]})});")
-              ctx.add_cookies(cookies)
-              page = ctx.new_page()
-              cdp = ctx.new_cdp_session(page)
-              cdp.send("Emulation.setUserAgentOverride", {
-                  "userAgent": ua, "acceptLanguage": "en-US,en;q=0.9", "platform": "Win32"})
-
-              def on_response(r):
-                  if "/api/user/checkin" in r.url and r.request.method == "POST":
-                      try:
-                          posts.append((r.status, r.text()[:200]))
-                      except Exception:
-                          posts.append((r.status, "<no body>"))
-              page.on("response", on_response)
-              page.goto("https://glados.cloud/console/checkin", wait_until="domcontentloaded", timeout=60000)
-              page.wait_for_timeout(6000)
-              print("has_turnstile", page.evaluate("!!window.turnstile"))
-              hit = None
-              for b in page.query_selector_all("button"):
-                  txt = (b.inner_text() or "").strip().lower()
-                  if txt == "checkin" or "签到" in txt:
-                      hit = b
-                      break
-              print("clicking", (hit.inner_text() or "").strip() if hit else "none")
-              if hit:
-                  hit.click()
-              for i in range(12):
-                  page.wait_for_timeout(5000)
-                  frames = [f.url for f in page.frames if "challenges.cloudflare.com" in f.url]
-                  print(f"t+{(i+1)*5}s posts={len(posts)} ts_frames={len(frames)}")
-                  if posts:
-                      break
-              print("posts", posts)
-              print("body_tail", page.evaluate("document.body.innerText.slice(-400)").replace("\n", " | ")[:400])
-              browser.close()
-          PY
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb >/dev/null
+          python3 -m playwright install --with-deps chrome >/dev/null
 
       - name: Execute daily orchestrator
         id: orchestrator
@@ -643,10 +573,16 @@ jobs:
           if [ "$RESET_CIRCUIT" = "true" ]; then
             RESET_FLAG="--reset-circuit"
           fi
+          # glados 的 Turnstile 需要 headful Chrome，xvfb 提供虚拟显示；
+          # 其余任务在 DISPLAY 存在的环境里行为不变。
+          RUNNER_CMD=(python3)
+          if command -v xvfb-run >/dev/null 2>&1; then
+            RUNNER_CMD=(xvfb-run -a python3)
+          fi
           if [ -n "$ORCH_TASKS" ] && [ "$ORCH_TASKS" != "none" ]; then
-            python3 scripts/daily_orchestrator.py --tasks "$ORCH_TASKS" $RESET_FLAG
+            "${RUNNER_CMD[@]}" scripts/daily_orchestrator.py --tasks "$ORCH_TASKS" $RESET_FLAG
           else
-            python3 scripts/daily_orchestrator.py $RESET_FLAG
+            "${RUNNER_CMD[@]}" scripts/daily_orchestrator.py $RESET_FLAG
           fi
 
       # 日报邮件已收敛到 report-fallback job（20:00 主发 + 21:30 补发）；
