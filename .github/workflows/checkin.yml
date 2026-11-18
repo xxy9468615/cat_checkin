@@ -582,10 +582,24 @@ jobs:
                   args=["--disable-blink-features=AutomationControlled",
                         "--window-size=1366,900"])
               print("browser headful chrome ok")
+              ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
               ctx = browser.new_context(locale="en-US", timezone_id="Asia/Shanghai",
-                                        viewport={"width": 1366, "height": 900})
+                                        viewport={"width": 1366, "height": 900},
+                                        user_agent=ua,
+                                        extra_http_headers={
+                                            "sec-ch-ua": '"Chromium";v="131", "Google Chrome";v="131", "Not_A Brand";v="24"',
+                                            "sec-ch-ua-mobile": "?0",
+                                            "sec-ch-ua-platform": '"Windows"',
+                                        })
+              ctx.add_init_script(
+                  "Object.defineProperty(navigator,'platform',{get:()=>'Win32'});"
+                  "Object.defineProperty(navigator,'userAgentData',{get:()=>({platform:'Windows',brands:[{brand:'Chromium',version:'131'},{brand:'Google Chrome',version:'131'}]})});")
               ctx.add_cookies(cookies)
               page = ctx.new_page()
+              cdp = ctx.new_cdp_session(page)
+              cdp.send("Emulation.setUserAgentOverride", {
+                  "userAgent": ua, "acceptLanguage": "en-US,en;q=0.9", "platform": "Win32"})
 
               def on_response(r):
                   if "/api/user/checkin" in r.url and r.request.method == "POST":
