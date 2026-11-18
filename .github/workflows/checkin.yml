@@ -552,6 +552,24 @@ jobs:
             stash_proxy_state none "" "" ""
           fi
 
+      - name: DIAG glados egress (temporary)
+        if: contains(inputs.tasks, 'glados')
+        continue-on-error: true
+        run: |
+          echo "--- plain curl via socks5h ---"
+          curl -sS -x socks5h://127.0.0.1:1080 -m 20 -o /dev/null -w 'curl http=%{http_code}\n' https://glados.cloud/console/checkin || true
+          echo "--- curl_cffi profiles via socks5 ---"
+          python3 - <<'PY' || true
+          from curl_cffi import requests as cr
+          px = {"http": "socks5://127.0.0.1:1080", "https": "socks5://127.0.0.1:1080"}
+          for imp in ("chrome131", "chrome", "chrome124", "chrome110"):
+              try:
+                  r = cr.get("https://glados.cloud/console/checkin", impersonate=imp, proxies=px, timeout=20)
+                  print(imp, "HTTP", r.status_code, len(r.text))
+              except Exception as e:
+                  print(imp, "ERR", type(e).__name__, str(e)[:160])
+          PY
+
       - name: Execute daily orchestrator
         id: orchestrator
         if: steps.orch_tasks.outputs.due_tasks != 'none'
