@@ -552,6 +552,69 @@ jobs:
             stash_proxy_state none "" "" ""
           fi
 
+      - name: DIAG glados real-browser turnstile (temporary)
+        if: contains(inputs.tasks, 'glados')
+        continue-on-error: true
+        env:
+          GLADOS_COOKIE_1: ${{ secrets.GLADOS_COOKIE_1 }}
+        run: |
+          pip install --quiet playwright
+          python3 -m playwright install --with-deps chrome >/dev/null 2>&1 || python3 -m playwright install --with-deps chromium >/dev/null 2>&1
+          python3 - <<'PY' || true
+          import json, os, re, time
+          from playwright.sync_api import sync_playwright
+
+          raw = os.environ.get("GLADOS_COOKIE_1", "")
+          cookies = []
+          for part in raw.split(";"):
+              name, sep, value = part.strip().partition("=")
+              if sep and name:
+                  cookies.append({"name": name, "value": value, "domain": "glados.cloud",
+                                  "path": "/", "secure": True, "httpOnly": False})
+          print("cookie_names", [c["name"] for c in cookies])
+
+          captured = []
+          with sync_playwright() as p:
+              try:
+                  browser = p.chromium.launch(channel="chrome", headless=True,
+                                              proxy={"server": "socks5://127.0.0.1:1080"})
+                  print("browser chrome ok")
+              except Exception as exc:
+                  print("chrome channel unavailable:", str(exc)[:120])
+                  browser = p.chromium.launch(headless=True,
+                                              proxy={"server": "socks5://127.0.0.1:1080"})
+                  print("browser chromium fallback ok")
+              ctx = browser.new_context(locale="zh-CN", timezone_id="Asia/Shanghai",
+                                        viewport={"width": 1366, "height": 900})
+              ctx.add_cookies(cookies)
+
+              page = ctx.new_page()
+              page.on("response", lambda r: captured.append((r.url, r.status))
+                      if "/api/user/checkin" in r.url else None)
+              page.goto("https://glados.cloud/console/checkin", wait_until="domcontentloaded", timeout=60000)
+              page.wait_for_timeout(8000)
+              print("title", page.title(), "url", page.url)
+              print("has_turnstile", page.evaluate("!!window.turnstile"))
+              buttons = page.evaluate("Array.from(document.querySelectorAll('button')).map(b=>b.innerText.trim()).filter(Boolean)")
+              print("buttons", buttons[:12])
+              hit = None
+              for b in page.query_selector_all("button"):
+                  txt = (b.inner_text() or "").strip().lower()
+                  if re.search(r"签到|check", txt):
+                      hit = b
+                      break
+              if hit:
+                  print("clicking", (hit.inner_text() or "").strip())
+                  hit.click()
+              else:
+                  print("no checkin button found")
+              page.wait_for_timeout(25000)
+              print("api_calls", captured[-6:])
+              body = page.evaluate("document.body.innerText.slice(0,600)")
+              print("body", body.replace("\n", " | ")[:600])
+              browser.close()
+          PY
+
       - name: Execute daily orchestrator
         id: orchestrator
         if: steps.orch_tasks.outputs.due_tasks != 'none'
