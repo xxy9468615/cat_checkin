@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common import Http  # noqa: E402
+from common import Http, remote_dns_proxy_url  # noqa: E402
 
 
 class TestHttpProxyInfer(unittest.TestCase):
@@ -74,6 +74,28 @@ class TestHttpProxyInfer(unittest.TestCase):
             h = Http(proxy="")
         self.assertFalse(h.has_proxy)
         self.assertIsNone(h.proxy_endpoint)
+
+
+class TestRemoteDnsProxyUrl(unittest.TestCase):
+    """curl_cffi 链路的 SOCKS 代理必须与 urllib 链路一致使用远程 DNS。"""
+
+    def test_socks5_upgraded_to_remote_dns(self):
+        self.assertEqual(remote_dns_proxy_url("socks5://127.0.0.1:1080"),
+                         "socks5h://127.0.0.1:1080")
+
+    def test_socks4_upgraded_to_socks4a(self):
+        self.assertEqual(remote_dns_proxy_url("socks4://10.0.0.1:1080"),
+                         "socks4a://10.0.0.1:1080")
+
+    def test_remote_dns_and_http_left_untouched(self):
+        for url in ("socks5h://127.0.0.1:1080", "socks4a://127.0.0.1:1080",
+                    "http://127.0.0.1:7890", "https://proxy.example:8443"):
+            with self.subTest(url=url):
+                self.assertEqual(remote_dns_proxy_url(url), url)
+
+    def test_uppercase_scheme_is_normalized(self):
+        self.assertEqual(remote_dns_proxy_url("SOCKS5://127.0.0.1:1080"),
+                         "socks5h://127.0.0.1:1080")
 
 
 if __name__ == "__main__":
