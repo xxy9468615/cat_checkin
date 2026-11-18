@@ -31,7 +31,15 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from common import Http, env_seq, load_kv_state, main_guard, mask_str, save_kv_state
+from common import (
+    Http,
+    env_seq,
+    load_kv_state,
+    main_guard,
+    mask_str,
+    sanitize_snippet,
+    save_kv_state,
+)
 from proxy_manager import ProxyEndpoint, get_task_proxy_endpoints
 import cookie_validity as cv
 
@@ -149,6 +157,23 @@ def parse_cookie_pairs(cookie: str) -> Dict[str, str]:
         if sep and name:
             pairs[name] = value
     return pairs
+
+
+def coerce_code(raw: Any) -> int:
+    """严格解析业务 code：只接受整数（含整值浮点/数字串），bool 与非数字一律失败。
+
+    浏览器链路与 HTTP 链路口径必须一致；`code=0` 是成功值，不能用 `or` 兜底
+    （0 是 falsy 会被吞成失败）。
+    """
+    if isinstance(raw, bool) or raw is None or raw == "":
+        return CHECKIN_FAILURE
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return CHECKIN_FAILURE
+    if value != int(value):
+        return CHECKIN_FAILURE
+    return int(value)
 
 # Cookie 失效时响应中常见的登录关键词（命中即判定登录态过期）
 # 注意 "没有权限"/"No permission"（code=-2）是 koa:sess 签名校验失败时服务端的
@@ -287,13 +312,13 @@ class BrowserCheckin:
             except Exception:
                 pass
 
-            captured: List[str] = []
+            captured: List[Tuple[int, str]] = []
 
             def on_response(resp) -> None:
                 try:
                     if "/api/user/checkin" in resp.url and resp.request.method == "POST" \
                             and "/challenge" not in resp.url:
-                        captured.append(resp.text())
+                        captured.append((resp.status, resp.text()))
                 except Exception:
                     pass
 
@@ -321,7 +346,12 @@ class BrowserCheckin:
             if not captured:
                 self._log("等待签到响应超时（Turnstile 未通过）")
                 return None
-            data = json.loads(captured[-1])
+            status_code, body = captured[-1]
+            if status_code != 200:
+                # 非 200 一律不解析业务码：网关/CF 的 HTML 错误页可能恰好含 code 字样
+                self._log(f"签到接口返回 HTTP {status_code}，不判定业务结果")
+                return None
+            data = json.loads(body)
             # 浏览器上下文是 Set-Cookie 的最权威来源；只有 expires > 0 才算证据
             try:
                 for item in ctx.cookies():
@@ -341,11 +371,8 @@ class BrowserCheckin:
                 except Exception:
                     pass
 
-        # 严格解析 code：缺失/非数字一律失败，绝不让缺字段被当成 code=0 假成功
-        try:
-            code = int(float(data.get("code")))
-        except (TypeError, ValueError):
-            code = CHECKIN_FAILURE
+        # 与 HTTP 链路共用严格解析：缺失/非整数一律失败，绝不把缺字段当成 code=0
+        code = coerce_code(data.get("code"))
         message = str(data.get("message", ""))
         points = int(float(data.get("points", 0) or 0))
         reason = str(data.get("reason", "") or "")
@@ -358,7 +385,8 @@ class BrowserCheckin:
             detail = message or "登录设备与当前设备不一致"
             return "需重新登录", CHECKIN_FAILURE, 0, (
                 f"{detail} (reason=device-mismatch, loginDevice={login_device or '?'})")
-        detail = message or json.dumps(data, ensure_ascii=False)[:200]
+        # 不回显原始响应体：可能夹带邮箱等个人信息，只保留服务端文案与 reason
+        detail = message or "签到失败（响应无 message 字段）"
         if reason:
             detail += f" (reason={reason})"
         return "签到失败", CHECKIN_FAILURE, 0, detail
@@ -384,10 +412,12 @@ class Config:
         self.auto_exchange = self._bool_env("GLADOS_AUTO_EXCHANGE", True)
         self.verbose = self._bool_env("GLADOS_VERBOSE", False)
         self.proxies = self._load_proxies()
+        self.egress = self._resolve_egress()
 
     @staticmethod
     def _load_proxies() -> List[ProxyEndpoint]:
-        """出口候选：GLADOS_PROXY(_1..N/PROXIES) 优先，否则复用 NodeSeek 的台湾节点。
+        """出口候选：GLADOS_PROXY(*_PROXIES/*_BACKUP_PROXIES) 优先，全部缺失才复用
+        NodeSeek 的台湾家宽节点。
 
         上游 CF 风控按出口 IP 信誉打分，脚本自身不持有住宅出口，直接复用工作流
         统一 sing-box 入站（NodeSeek 已绑定的 TW-X1 节点），避免再维护一套节点。
@@ -396,6 +426,24 @@ class Config:
         if not endpoints:
             endpoints = get_task_proxy_endpoints("nodeseek")
         return endpoints
+
+    def _resolve_egress(self) -> Optional[ProxyEndpoint]:
+        """确定唯一出网出口。
+
+        依赖家宽出口的任务不应在代理缺失时静默直连（会拿到 reason=turnstile 且
+        掩盖代理故障，参照 NodeSeek 的「公平失败」约定）；只有显式
+        `GLADOS_ALLOW_DIRECT=1`（本机家宽排查）才允许无代理直连。
+        """
+        if self.proxies:
+            return self.proxies[0]
+        if self._bool_env("GLADOS_ALLOW_DIRECT", False):
+            print("⚠️ 未配置 GLaDOS 代理出口，按 GLADOS_ALLOW_DIRECT=1 直连出网")
+            return None
+        raise RuntimeError(
+            "未找到 GLaDOS 代理出口（GLADOS_PROXY / GLADOS_PROXIES / "
+            "GLADOS_BACKUP_PROXIES，或工作流注入的 NODESEEK_PROXY）；"
+            "家宽出口缺失时签到必被 Turnstile 拒绝。本机直连排查请设 GLADOS_ALLOW_DIRECT=1"
+        )
 
     def _load_cookies(self) -> List[str]:
         # 优先扫描 COOKIE_1, COOKIE_2 序列，回退至 COOKIES / cookie (含 && 切分)
@@ -471,14 +519,8 @@ class GladosAPI:
 
     @staticmethod
     def _parse_code(data: Dict[str, Any]) -> int:
-        """解析业务 code。注意 code=0 是成功值，不能用 `or` 兜底（0 是 falsy 会被吞掉）。"""
-        raw = data.get("code")
-        if raw is None or raw == "":
-            return CHECKIN_FAILURE
-        try:
-            return int(float(raw))
-        except (TypeError, ValueError):
-            return CHECKIN_FAILURE
+        """解析业务 code（与浏览器链路共用同一严格口径，见 coerce_code）。"""
+        return coerce_code(data.get("code"))
 
     def _ensure_auth(self, resp, data: Dict[str, Any]) -> None:
         """检测 Cookie 是否已失效（HTTP 非 200 / 非 JSON / 缺 code / 命中登录关键词）。
@@ -486,14 +528,20 @@ class GladosAPI:
         判定失效时抛出 CookieExpiredError 并附带响应摘要，避免事后翻日志找原因。
         """
         if resp.code != 200:
-            raise CookieExpiredError(f"HTTP {resp.code}，响应: {resp.text[:120]}")
+            raise CookieExpiredError(f"HTTP {resp.code}，响应: {sanitize_snippet(resp.text, 120)}")
         if not data:
-            raise CookieExpiredError(f"响应非 JSON（可能返回了登录页），响应: {resp.text[:120]}")
+            raise CookieExpiredError(
+                f"响应非 JSON（可能返回了登录页），响应: {sanitize_snippet(resp.text, 120)}"
+            )
         if "code" not in data:
-            raise CookieExpiredError(f"响应缺少 code 字段，响应: {str(data)[:150]}")
+            raise CookieExpiredError(
+                f"响应缺少 code 字段，响应: {sanitize_snippet(str(data), 150)}"
+            )
         message = str(data.get("message", "")).lower()
         if any(kw in message for kw in AUTH_FAILURE_KEYWORDS):
-            raise CookieExpiredError(f"接口提示需要重新登录，响应: {str(data)[:150]}")
+            raise CookieExpiredError(
+                f"接口提示需要重新登录，响应: {sanitize_snippet(str(data), 150)}"
+            )
 
     def status(self, cookie: str) -> Tuple[str, int]:
         resp = self.http.request("GET", self.base + "/api/user/status", headers=self._headers(cookie))
@@ -503,7 +551,7 @@ class GladosAPI:
         code = self._parse_code(data)
         left_days = (data.get("data") or {}).get("leftDays")
         if left_days is None:
-            self._log(f"{Emoji.FAIL} 查询剩余天数失败: {data}", force=True)
+            self._log(f"{Emoji.FAIL} 查询剩余天数失败: {sanitize_snippet(str(data), 150)}", force=True)
             return "None 天", code
         days = int(float(left_days))
         return f"{days} 天", code
@@ -511,8 +559,9 @@ class GladosAPI:
     def challenge(self, cookie: str) -> Dict[str, Any]:
         """获取签到挑战（nonce / ttl / 是否强制 Cloudflare Turnstile）。
 
-        挑战接口本身的 code=0 才是成功；其余状态按登录态/网络问题如实返回空字典，
-        由调用方决定是否退化为旧协议提交，避免挑战接口抖动直接判账号失败。
+        挑战接口抖动（5xx/网关错误/非 JSON）属于临时故障，返回空字典交由调用方
+        降级处理；只有明确表明登录态失效（HTTP 200 + code=-2/登录关键词）才抛
+        CookieExpiredError，避免一次 503 把整个账号判成 Cookie 过期。
         """
         resp = self.http.request(
             "GET",
@@ -521,9 +570,13 @@ class GladosAPI:
         )
         self._learn(resp)
         data = self._safe_json(resp)
+        if resp.code != 200 or not data:
+            self._log(f"⚠️ 获取签到挑战失败: HTTP {resp.code}（临时故障，按无挑战处理）", force=True)
+            return {}
         self._ensure_auth(resp, data)
-        if self._parse_code(data) != CHECKIN_SUCCESS:
-            self._log(f"⚠️ 获取签到挑战失败: code={data.get('code')} {str(data)[:120]}", force=True)
+        code = self._parse_code(data)
+        if code != CHECKIN_SUCCESS:
+            self._log(f"⚠️ 获取签到挑战失败: code={code}（按无挑战处理）", force=True)
             return {}
         return data
 
@@ -575,7 +628,7 @@ class GladosAPI:
             # 新增码会让失败被静默吞掉（不退出、不计入标题）。
             return "需重新登录", CHECKIN_FAILURE, 0, f"{detail} (reason=device-mismatch，请在浏览器重新登录后更新 Cookie)"
 
-        detail = message or str(data)
+        detail = message or "签到失败（响应无 message 字段）"
         if reason:
             detail += f" (reason={reason})"
         if not nonce:
@@ -636,7 +689,7 @@ class Checker:
         self.results: List[Result] = []
         self.devices: Dict[int, str] = {}
         # 浏览器与 HTTP 链路共用同一条住宅出口；浏览器签到是该出口上唯一能过盾的路径
-        proxy_url = config.proxies[0].url if config.proxies else ""
+        proxy_url = config.egress.url if config.egress else ""
         self.browser: Optional[BrowserCheckin] = (
             BrowserCheckin(proxy=proxy_url, verbose=config.verbose)
             if BrowserCheckin.enabled() else None
@@ -645,39 +698,29 @@ class Checker:
     def run(self) -> None:
         print("【GLaDOS 签到兑换】")
         # 上游无密码登录接口，仅支持 Cookie 认证
-        candidates = self.config.proxies or [None]
+        endpoint = self.config.egress
+        tag = endpoint.display_name if endpoint else "直连（GLADOS_ALLOW_DIRECT=1）"
         try:
             for cookie_index, cookie in enumerate(self.config.cookies, 1):
                 for domain in self.config.domains:
-                    res = self._run_with_failover(cookie, cookie_index, domain, candidates)
-                    self.results.append(res)
+                    self.results.append(self._run_account(cookie, cookie_index, domain, endpoint, tag))
         finally:
             if self.browser is not None:
                 self.browser.close()
 
-    def _run_with_failover(self, cookie: str, cookie_index: int, domain: str,
-                           candidates: List[Optional[ProxyEndpoint]]) -> Result:
-        """按出口候选逐个尝试：CF 质询（reason=turnstile）说明该出口信誉不足，
-        换下一个出口重来；登录态失效与业务失败不换出口（换了也没用）。"""
-        res = Result(cookie_index=cookie_index, domain=domain)
-        for i, endpoint in enumerate(candidates, 1):
-            tag = endpoint.display_name if endpoint else "直连"
-            api = GladosAPI(domain, cookie_index, self.config.verbose,
-                            proxy=endpoint.url if endpoint else "")
-            try:
-                res = self._run_one(api, cookie, cookie_index, domain, tag)
-            except CookieExpiredError as e:
-                return self._cookie_invalid_result(cookie_index, domain, "", str(e))
-            except Exception as e:
-                # 单个 cookie 的解析等异常不能中断其余 cookie
-                print(f"❌ 账号 {cookie_index} on {domain} 执行失败: {e}")
-                res = Result(cookie_index=cookie_index, domain=domain, account_name="",
-                             status=f"失败: {e}")
-                return res
-            if "reason=turnstile" not in res.message or i >= len(candidates):
-                return res
-            print(f"🔁 出口 {tag} 触发 CF 质询，切换下一个出口重试 ({i}/{len(candidates)})")
-        return res
+    def _run_account(self, cookie: str, cookie_index: int, domain: str,
+                     endpoint: Optional[ProxyEndpoint], tag: str) -> Result:
+        """单账号单域名只跑一次：重试与熔断统一交给框架（规则 6），脚本内不再重跑。"""
+        api = GladosAPI(domain, cookie_index, self.config.verbose,
+                        proxy=endpoint.url if endpoint else "")
+        try:
+            return self._run_one(api, cookie, cookie_index, domain, tag)
+        except CookieExpiredError as e:
+            return self._cookie_invalid_result(cookie_index, domain, "", str(e))
+        except Exception as e:  # noqa: BLE001  单个账号异常不中断其余账号
+            print(f"❌ 账号 {cookie_index} on {domain} 执行失败: {e}")
+            return Result(cookie_index=cookie_index, domain=domain, account_name="",
+                          status=f"失败: {e}")
 
     def _checkin(self, api: GladosAPI, cookie: str, cookie_index: int,
                  domain: str) -> Tuple[str, int, int, str]:
@@ -686,25 +729,28 @@ class Checker:
         浏览器链路不可用（未装 Playwright / 无 xvfb / 启动失败）时才退回 HTTP，
         此时必然拿到 reason=turnstile，属于如实失败而不是静默假成功。
         """
-        if self.browser is not None:
-            device = self.devices.get(cookie_index, DEFAULT_DEVICE)
-            res = self.browser.checkin(cookie, domain, device)
-            if res is not None:
-                mismatch = re.search(r"loginDevice=([^)\s]+)", res[3] or "")
-                if mismatch:
-                    login_device = resolve_device(mismatch.group(1))
-                    if login_device != device:
-                        print(f"🔁 账号 {cookie_index} 登录设备为 {mismatch.group(1)}，"
-                              f"按该设备指纹重试")
+        if self.browser is None:
+            return api.checkin(cookie)
+        device = self.devices.get(cookie_index, DEFAULT_DEVICE)
+        res = self.browser.checkin(cookie, domain, device)
+        if res is None:
+            return api.checkin(cookie)
+        mismatch = re.search(r"loginDevice=([^)\s]+)", res[3] or "")
+        if mismatch:
+            login_device = resolve_device(mismatch.group(1))
+            if login_device != device:
+                print(f"🔁 账号 {cookie_index} 登录设备为 {mismatch.group(1)}，按该设备指纹重试")
+                retry = self.browser.checkin(cookie, domain, login_device)
+                if retry is not None:
+                    # 只有重试拿到真实业务结果才记住新设备，失败/None 保留原缓存
+                    if retry[1] in (CHECKIN_SUCCESS, CHECKIN_REPEAT):
                         self.devices[cookie_index] = login_device
-                        retry = self.browser.checkin(cookie, domain, login_device)
-                        if retry is not None:
-                            return retry
-                elif res[1] in (CHECKIN_SUCCESS, CHECKIN_REPEAT):
-                    # 签到成功即确认该设备指纹有效，后续域名复用
-                    self.devices.setdefault(cookie_index, device)
-                return res
-        return api.checkin(cookie)
+                    return retry
+                return api.checkin(cookie)
+        elif res[1] in (CHECKIN_SUCCESS, CHECKIN_REPEAT):
+            # 签到成功即确认该设备指纹有效，后续域名复用
+            self.devices.setdefault(cookie_index, device)
+        return res
 
     def _cookie_invalid_result(self, cookie_index: int, domain: str, account_name: str, detail: str) -> Result:
         """生成 Cookie 失效结果并打印明确的修复指引，跳过该账号后续流程。"""
