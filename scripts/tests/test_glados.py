@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import sys
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -150,6 +151,61 @@ class TestBrowserHelpers(unittest.TestCase):
         with patch.dict("sys.modules", {"playwright": None, "playwright.sync_api": None}):
             self.assertIsNone(bc.checkin(SYNTHETIC_COOKIE, "glados.example"))
         self.assertTrue(bc._failed)
+
+
+class TestExpiryTag(unittest.TestCase):
+    """Cookie 有效期统一走共享引擎：无证据如实报未知，有证据才倒计时。"""
+
+    def _checker(self):
+        checker = glados.Checker.__new__(glados.Checker)
+        checker.results = []
+        checker.devices = {}
+        checker.browser = None
+        return checker
+
+    def test_no_evidence_reports_unknown(self):
+        checker = self._checker()
+        with patch.object(glados, "load_kv_state", return_value={}), \
+             patch.object(glados, "save_kv_state") as save:
+            tag = checker._expiry_tag(Mock(learned={}), SYNTHETIC_COOKIE, 1,
+                                      glados.CHECKIN_SUCCESS)
+        self.assertIn("Cookie 有效期未知", tag)
+        save.assert_called_once()
+
+    def test_learned_expiry_renders_remaining_days(self):
+        checker = self._checker()
+        ts = int(time.time()) + 40 * 86400
+        with patch.object(glados, "load_kv_state", return_value={}), \
+             patch.object(glados, "save_kv_state"):
+            tag = checker._expiry_tag(Mock(learned={"gld:sess": ts}),
+                                      SYNTHETIC_COOKIE, 1, glados.CHECKIN_SUCCESS)
+        self.assertIn("Cookie 剩余 39 天", tag)
+
+    def test_success_marks_run_day(self):
+        checker = self._checker()
+        state = {}
+        with patch.object(glados, "load_kv_state", return_value=state), \
+             patch.object(glados, "save_kv_state") as save:
+            checker._expiry_tag(Mock(learned={}), SYNTHETIC_COOKIE, 1,
+                                glados.CHECKIN_SUCCESS)
+        saved = save.call_args[0][2]
+        self.assertTrue(saved.get("ok_days_total", 0) >= 1)
+
+    def test_failure_does_not_mark_run_day(self):
+        checker = self._checker()
+        state = {}
+        with patch.object(glados, "load_kv_state", return_value=state), \
+             patch.object(glados, "save_kv_state") as save:
+            checker._expiry_tag(Mock(learned={}), SYNTHETIC_COOKIE, 1,
+                                glados.CHECKIN_FAILURE)
+        saved = save.call_args[0][2]
+        self.assertFalse(saved.get("ok_days_total"))
+
+    def test_engine_error_falls_back_to_unknown(self):
+        checker = self._checker()
+        with patch.object(glados, "load_kv_state", side_effect=RuntimeError("boom")):
+            tag = checker._expiry_tag(Mock(learned={}), SYNTHETIC_COOKIE, 1, 0)
+        self.assertIn("Cookie 有效期未知", tag)
 
 
 if __name__ == "__main__":

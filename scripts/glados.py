@@ -31,7 +31,7 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from common import Http, env_seq, main_guard, mask_str
+from common import Http, env_seq, load_kv_state, main_guard, mask_str, save_kv_state
 from proxy_manager import ProxyEndpoint, get_task_proxy_endpoints
 import cookie_validity as cv
 
@@ -167,17 +167,6 @@ EXCHANGE_PLANS = {
 }
 
 
-def _parse_cookie_expiry(cookie_str: str) -> Tuple[Optional[int], Optional[int]]:
-    """解析 Koa Session Cookie (koa:sess) 中的 _expire 时间戳，返回 (expire_ts, remaining_days)。
-
-    解析委托共享引擎 cookie_validity（全任务唯一实现，2026-10 收敛）。
-    """
-    expire_ts = cv.expire_from_cookie_str(cookie_str)
-    if not expire_ts:
-        return None, None
-    return expire_ts, cv.remaining_days(expire_ts)
-
-
 @dataclass
 class Result:
     cookie_index: int
@@ -206,6 +195,8 @@ class BrowserCheckin:
         self._pw = None
         self._browser = None
         self._failed = False
+        # 浏览器上下文的 Cookie 到期时间（expires > 0 才是真实证据；上游当前是纯会话）
+        self.last_learned: Dict[str, int] = {}
 
     @staticmethod
     def enabled() -> bool:
@@ -331,6 +322,15 @@ class BrowserCheckin:
                 self._log("等待签到响应超时（Turnstile 未通过）")
                 return None
             data = json.loads(captured[-1])
+            # 浏览器上下文是 Set-Cookie 的最权威来源；只有 expires > 0 才算证据
+            try:
+                for item in ctx.cookies():
+                    name = str(item.get("name") or "")
+                    expires = item.get("expires")
+                    if name and isinstance(expires, (int, float)) and expires > 0:
+                        self.last_learned[name] = int(expires)
+            except Exception:
+                pass
         except Exception as exc:  # noqa: BLE001  浏览器链路异常统一退回 HTTP
             self._log(f"浏览器签到异常: {str(exc)[:160]}")
             return None
@@ -439,6 +439,15 @@ class GladosAPI:
             impersonate=IMPERSONATE,
         )
         self.base = f"https://{domain}"
+        # 本轮从 Set-Cookie 学到的 {cookie 名: 到期 epoch}，给共享有效期引擎用
+        self.learned: Dict[str, int] = {}
+
+    def _learn(self, resp) -> None:
+        """从响应 Set-Cookie 学习真实到期证据（当前上游只发会话 cookie，通常为空）。"""
+        try:
+            self.learned = cv.merge_learned(self.learned, cv.learn_from_response(resp))
+        except Exception:
+            pass
 
     def _headers(self, cookie: str) -> Dict[str, str]:
         return {
@@ -488,6 +497,7 @@ class GladosAPI:
 
     def status(self, cookie: str) -> Tuple[str, int]:
         resp = self.http.request("GET", self.base + "/api/user/status", headers=self._headers(cookie))
+        self._learn(resp)
         data = self._safe_json(resp)
         self._ensure_auth(resp, data)
         code = self._parse_code(data)
@@ -509,6 +519,7 @@ class GladosAPI:
             self.base + "/api/user/checkin/challenge",
             headers=self._headers(cookie),
         )
+        self._learn(resp)
         data = self._safe_json(resp)
         self._ensure_auth(resp, data)
         if self._parse_code(data) != CHECKIN_SUCCESS:
@@ -546,6 +557,7 @@ class GladosAPI:
             headers=self._headers(cookie),
             json_data=payload,
         )
+        self._learn(resp)
         data = self._safe_json(resp)
         self._ensure_auth(resp, data)
         code = self._parse_code(data)
@@ -572,6 +584,7 @@ class GladosAPI:
 
     def points(self, cookie: str) -> Tuple[str, int]:
         resp = self.http.request("GET", self.base + "/api/user/points", headers=self._headers(cookie))
+        self._learn(resp)
         data = self._safe_json(resp)
         self._ensure_auth(resp, data)
         value = data.get("points")
@@ -599,6 +612,7 @@ class GladosAPI:
                 headers=self._headers(cookie),
                 json_data={"planType": plan},
             )
+            self._learn(resp)
             data = self._safe_json(resp)
             self._ensure_auth(resp, data)
             code = self._parse_code(data)
@@ -726,16 +740,10 @@ class Checker:
         else:
             result.exchange = "未开启自动兑换"
 
-        _, remaining_days = _parse_cookie_expiry(cookie)
-        expiry_desc = (
-            f"Cookie 剩余 {remaining_days} 天"
-            if remaining_days is not None
-            else "Cookie 有效期未知"
-        )
-
+        expiry_tag = self._expiry_tag(api, cookie, cookie_index, result.code)
         acc_label = mask_str(result.account_name) if result.account_name else f"账号 {cookie_index}"
         egress_desc = f" | 🌐 出口: {egress}" if egress else ""
-        print(f"📧 账号: {acc_label} | 🔑 {expiry_desc}{egress_desc}")
+        print(f"📧 账号: {acc_label}{expiry_tag}{egress_desc}")
         if result.code == CHECKIN_SUCCESS:
             print(f"✅ 签到状态: 签到成功 (+{result.points} 积分)")
         elif result.code == CHECKIN_REPEAT:
@@ -746,10 +754,37 @@ class Checker:
         print(f"📅 剩余天数: {result.days}")
         print(f"💰 当前积分: {result.points_total} 积分")
         print(f"🎯 兑换进度: {result.exchange}")
-        if remaining_days is not None and remaining_days < 30:
-            print(f"⚠️ Cookie 剩余有效期不足 30 天（剩余 {remaining_days} 天），请及时更新")
         print("")
         return result
+
+    def _state_paths(self, cookie_index: int) -> Tuple[str, str]:
+        """每账号独立的 Cookie 有效期状态（与 52pojie/cloud189 同构）。"""
+        return (f"cat_checkin:state:glados_{cookie_index}",
+                f".glados_state_{cookie_index}.json")
+
+    def _expiry_tag(self, api: GladosAPI, cookie: str, cookie_index: int,
+                    code: int) -> str:
+        """渲染 Cookie 有效期标签（唯一实现委托共享引擎，规则 8）。
+
+        GLaDOS 的会话 cookie 是纯会话态（无 Expires、无 _expire），拿不到真实到期
+        时间时 build_tag 会输出「有效期未知（已使用 N 天）」，并在 45 天老化基线
+        升级为 ⚠️ 黄卡——这是当前唯一诚实的口径，绝不编造倒计时。
+        """
+        try:
+            redis_key, state_file = self._state_paths(cookie_index)
+            state = load_kv_state(redis_key, state_file) or {}
+            learned = cv.merge_learned(
+                getattr(api, "learned", {}) or {},
+                getattr(self.browser, "last_learned", {}) or {},
+            )
+            cv.update_state(state, cookie, learned)
+            if code in (CHECKIN_SUCCESS, CHECKIN_REPEAT):
+                cv.mark_ok(state)  # 成功运行日入账：无到期证据时按天数反推寿命
+            save_kv_state(redis_key, state_file, state)
+            return cv.build_tag(state, cookie_str=cookie, learned=learned)
+        except Exception as exc:  # 有效期渲染绝不影响签到主流程
+            print(f"⚠️ Cookie 有效期计算失败: {exc}")
+            return " | 🔑 Cookie 有效期未知"
 
     def summary(self) -> Tuple[str, str]:
         success = sum(1 for r in self.results if r.code in (CHECKIN_SUCCESS, CHECKIN_REPEAT))
