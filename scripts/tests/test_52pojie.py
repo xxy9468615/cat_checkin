@@ -276,10 +276,11 @@ class Test52Pojie(unittest.TestCase):
         self.assertIn("Cookie 剩余", tag_real)
         self.assertNotIn("有效期未知", tag_real)
 
-        # 估算分支：近期粘贴（saved_ts 不足 3 天，留 2 小时余量防 floor 抖动）→ 30 天窗口内估算
+        # Discuz auth 是纯会话 cookie，无真实到期证据 → 不再产出臆测的「剩余 N 天」，
+        # 统一如实报「有效期未知（已使用 N 天）」，由共享引擎的 45 天老化基线兜底
         tag_est = pojie._build_expiry_tag("k=v", {"saved_ts": int(now - 3 * 86400 + 7200)})
-        self.assertIn("🔑 Cookie 剩余 27 天", tag_est)
-        # 估算耗尽但登录态存活 → 如实报「未知」，不再产出假 0 天告警
+        self.assertIn("Cookie 有效期未知", tag_est)
+        self.assertNotIn("剩余 27 天", tag_est)
         tag_dead = pojie._build_expiry_tag("k=v", {"saved_ts": int(now - 60 * 86400)})
         self.assertIn("Cookie 有效期未知", tag_dead)
         self.assertNotIn("剩余 0 天", tag_dead)

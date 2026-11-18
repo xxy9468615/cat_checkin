@@ -549,45 +549,6 @@ jobs:
             stash_proxy_state none "" "" ""
           fi
 
-      - name: DIAG 52pojie cookie evidence (temporary)
-        if: contains(steps.orch_tasks.outputs.due_tasks, '52pojie')
-        continue-on-error: true
-        env:
-          52POJIE_COOKIE_1: ${{ secrets.WUAI_COOKIE_1 }}
-        run: |
-          python3 - <<'PY'
-          import os, sys
-          sys.path.insert(0, "scripts")
-          import cookie_validity as cv
-          c = os.environ.get("52POJIE_COOKIE_1", "")
-          print("cookie_names", [p.split("=",1)[0].strip() for p in c.split(";") if "=" in p])
-          print("expire_from_cookie_str", cv.expire_from_cookie_str(c, domain_hint="52pojie"))
-          import sys
-          sys.path.insert(0, "scripts")
-          import importlib.util
-          spec = importlib.util.spec_from_file_location("pojie", "scripts/52pojie.py")
-          pojie = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(pojie)
-          import common
-          h = common.Http(follow_redirects=True)
-          headers = {"User-Agent": pojie.DEFAULT_UA, "Referer": pojie.BASE_URL + "/",
-                     "Cookie": c}
-          resp = h.request("GET", pojie.BASE_URL + "/home.php?mod=spacecp&ac=credit&showcredit=1", headers=headers)
-          raw = []
-          gh = getattr(resp.headers, "get_all", None)
-          if callable(gh):
-              raw = gh("Set-Cookie") or []
-          else:
-              v = (resp.headers or {}).get("Set-Cookie")
-              raw = v if isinstance(v, list) else ([v] if v else [])
-          print("http", resp.code, "set_cookie_count", len(raw))
-          for sc in raw[:20]:
-              name = str(sc).split("=", 1)[0].strip()
-              has_exp = "expires=" in str(sc).lower() or "max-age=" in str(sc).lower()
-              print("  sc", name[:40], "expiry", has_exp)
-          print("learned", pojie._collect_cookie_expiries(resp))
-          PY
-
       - name: Execute daily orchestrator
         id: orchestrator
         if: steps.orch_tasks.outputs.due_tasks != 'none'
