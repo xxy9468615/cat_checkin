@@ -285,6 +285,7 @@ jobs:
           echo "NODESEEK_PROXY=" >> "$GITHUB_ENV"
           echo "AGENTROUTER_PROXY=" >> "$GITHUB_ENV"
           echo "CLOUDSTUDIO_PROXY=" >> "$GITHUB_ENV"
+          echo "GLADOS_PROXY=" >> "$GITHUB_ENV"
           echo "direct 诊断模式：跳过代理，任务用 runner IP 直连"
       - name: no_cffi mode (nodeseek 强制 urllib)
         if: inputs.no_cffi == true
@@ -537,6 +538,8 @@ jobs:
             echo "AGENTROUTER_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             echo "NODESEEK_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             echo "CLOUDSTUDIO_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
+            # GLaDOS 复用同一台湾住宅出口（CF Turnstile 按 IP 信誉+指纹联合判定）
+            echo "GLADOS_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             ns_code=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
             echo "sing-box egress ready on 127.0.0.1:1080 (pid $SINGBOX_PID), nodeseek probe HTTP $ns_code"
             stash_proxy_state singbox "$node_tag" "$exit_ip" "$ns_code"

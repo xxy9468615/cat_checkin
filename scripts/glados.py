@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from common import Http, env_seq, main_guard, mask_str
+from proxy_manager import ProxyEndpoint, get_task_proxy_endpoints
 import cookie_validity as cv
 
 
@@ -60,6 +61,13 @@ COOKIE_INVALID = -3
 PROOF_SALT = "glados-observe-v1"
 # 前端在拿到挑战后至少等待 2500ms 才提交，服务端按首次请求耗时判定自动化，不能省。
 CHALLENGE_MIN_AGE_SEC = 2.5
+# Chrome TLS/JA3 指纹档位：与 DEFAULT_UA 的 Chrome/131 版本号保持一致，
+# 避免 UA 与 sec-ch-ua 自相矛盾（curl_cffi 0.16.3 支持 chrome131 profile）。
+IMPERSONATE = "chrome131"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 # Cookie 失效时响应中常见的登录关键词（命中即判定登录态过期）
 # 注意 "没有权限"/"No permission"（code=-2）是 koa:sess 签名校验失败时服务端的
@@ -111,6 +119,19 @@ class Config:
         self.exchange_plan = self._load_exchange_plan()
         self.auto_exchange = self._bool_env("GLADOS_AUTO_EXCHANGE", True)
         self.verbose = self._bool_env("GLADOS_VERBOSE", False)
+        self.proxies = self._load_proxies()
+
+    @staticmethod
+    def _load_proxies() -> List[ProxyEndpoint]:
+        """出口候选：GLADOS_PROXY(_1..N/PROXIES) 优先，否则复用 NodeSeek 的台湾节点。
+
+        上游 CF 风控按出口 IP 信誉打分，脚本自身不持有住宅出口，直接复用工作流
+        统一 sing-box 入站（NodeSeek 已绑定的 TW-X1 节点），避免再维护一套节点。
+        """
+        endpoints = get_task_proxy_endpoints("glados")
+        if not endpoints:
+            endpoints = get_task_proxy_endpoints("nodeseek")
+        return endpoints
 
     def _load_cookies(self) -> List[str]:
         # 优先扫描 COOKIE_1, COOKIE_2 序列，回退至 COOKIES / cookie (含 && 切分)
@@ -139,11 +160,20 @@ class Config:
 
 
 class GladosAPI:
-    def __init__(self, domain: str, cookie_index: int, verbose: bool = False) -> None:
+    def __init__(self, domain: str, cookie_index: int, verbose: bool = False,
+                 proxy: str = "") -> None:
         self.domain = domain
         self.cookie_index = cookie_index
         self.verbose = verbose
-        self.http = Http()
+        # 出口走代理（CI 复用 NodeSeek 的 sing-box 台湾节点），并且必须叠加 Chrome
+        # TLS/JA3 指纹：Turnstile 的风险打分是「IP 信誉 + 指纹」的联合判定，裸 urllib
+        # 指纹在数据中心出口上即便换了 IP 也会被要求令牌。
+        self.http = Http(
+            follow_redirects=True,
+            proxy=proxy,
+            task_name="glados",
+            impersonate=IMPERSONATE,
+        )
         self.base = f"https://{domain}"
 
     def _headers(self, cookie: str) -> Dict[str, str]:
@@ -151,8 +181,10 @@ class GladosAPI:
             "Cookie": cookie,
             "Origin": self.base,
             "Referer": f"{self.base}/console/checkin",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36",
+            "User-Agent": USER_AGENT,
+            # Chrome 默认 keep-alive；common.Http 的 "Connection: close" 默认值
+            # 与浏览器指纹不自洽，这里显式覆盖。
+            "Connection": "keep-alive",
         }
 
     def _log(self, message: str, force: bool = False) -> None:
@@ -328,19 +360,35 @@ class Checker:
     def run(self) -> None:
         print("【GLaDOS 签到兑换】")
         # 上游无密码登录接口，仅支持 Cookie 认证
+        candidates = self.config.proxies or [None]
         for cookie_index, cookie in enumerate(self.config.cookies, 1):
             for domain in self.config.domains:
-                api = GladosAPI(domain, cookie_index, self.config.verbose)
-                try:
-                    res = self._run_one(api, cookie, cookie_index, domain)
-                except CookieExpiredError as e:
-                    res = self._cookie_invalid_result(cookie_index, domain, "", str(e))
-                except Exception as e:
-                    # 单个 cookie 的解析等异常不能中断其余 cookie
-                    print(f"❌ 账号 {cookie_index} on {domain} 执行失败: {e}")
-                    res = Result(cookie_index=cookie_index, domain=domain, account_name="",
-                                 status=f"失败: {e}")
+                res = self._run_with_failover(cookie, cookie_index, domain, candidates)
                 self.results.append(res)
+
+    def _run_with_failover(self, cookie: str, cookie_index: int, domain: str,
+                           candidates: List[Optional[ProxyEndpoint]]) -> Result:
+        """按出口候选逐个尝试：CF 质询（reason=turnstile）说明该出口信誉不足，
+        换下一个出口重来；登录态失效与业务失败不换出口（换了也没用）。"""
+        res = Result(cookie_index=cookie_index, domain=domain)
+        for i, endpoint in enumerate(candidates, 1):
+            tag = endpoint.display_name if endpoint else "直连"
+            api = GladosAPI(domain, cookie_index, self.config.verbose,
+                            proxy=endpoint.url if endpoint else "")
+            try:
+                res = self._run_one(api, cookie, cookie_index, domain, tag)
+            except CookieExpiredError as e:
+                return self._cookie_invalid_result(cookie_index, domain, "", str(e))
+            except Exception as e:
+                # 单个 cookie 的解析等异常不能中断其余 cookie
+                print(f"❌ 账号 {cookie_index} on {domain} 执行失败: {e}")
+                res = Result(cookie_index=cookie_index, domain=domain, account_name="",
+                             status=f"失败: {e}")
+                return res
+            if "reason=turnstile" not in res.message or i >= len(candidates):
+                return res
+            print(f"🔁 出口 {tag} 触发 CF 质询，切换下一个出口重试 ({i}/{len(candidates)})")
+        return res
 
     def _cookie_invalid_result(self, cookie_index: int, domain: str, account_name: str, detail: str) -> Result:
         """生成 Cookie 失效结果并打印明确的修复指引，跳过该账号后续流程。"""
@@ -358,7 +406,8 @@ class Checker:
             message=detail,
         )
 
-    def _run_one(self, api: GladosAPI, cookie: str, cookie_index: int, domain: str) -> Result:
+    def _run_one(self, api: GladosAPI, cookie: str, cookie_index: int, domain: str,
+                 egress: str = "") -> Result:
         result = Result(cookie_index=cookie_index, domain=domain)
         result.days, _ = api.status(cookie)
         result.status, result.code, result.points, result.message = api.checkin(cookie)
@@ -382,7 +431,8 @@ class Checker:
         )
 
         acc_label = mask_str(result.account_name) if result.account_name else f"账号 {cookie_index}"
-        print(f"📧 账号: {acc_label} | 🔑 {expiry_desc}")
+        egress_desc = f" | 🌐 出口: {egress}" if egress else ""
+        print(f"📧 账号: {acc_label} | 🔑 {expiry_desc}{egress_desc}")
         if result.code == CHECKIN_SUCCESS:
             print(f"✅ 签到状态: 签到成功 (+{result.points} 积分)")
         elif result.code == CHECKIN_REPEAT:
