@@ -553,7 +553,12 @@ jobs:
           fi
 
       - name: Install browser for glados (Turnstile)
+        id: glados_browser
+        # 安装失败绝不影响后续编排：GLaDOS 运行时自会退回 HTTP 链路（如实失败），
+        # 其余到期任务（Railgun 等）照常执行。
         if: contains(steps.orch_tasks.outputs.due_tasks, 'glados')
+        continue-on-error: true
+        timeout-minutes: 8
         run: |
           # Turnstile 只能由真浏览器解出：headful Chrome + xvfb 虚拟显示
           pip install --quiet playwright
@@ -576,8 +581,11 @@ jobs:
           # glados 的 Turnstile 需要 headful Chrome，xvfb 提供虚拟显示；
           # 其余任务在 DISPLAY 存在的环境里行为不变。
           RUNNER_CMD=(python3)
-          if command -v xvfb-run >/dev/null 2>&1; then
+          if [ "${{ steps.glados_browser.outcome }}" = "success" ] \
+             && command -v xvfb-run >/dev/null 2>&1; then
             RUNNER_CMD=(xvfb-run -a python3)
+          else
+            echo "⚠️ 浏览器环境不可用，GLaDOS 将退回 HTTP 链路（Turnstile 无法通过）"
           fi
           if [ -n "$ORCH_TASKS" ] && [ "$ORCH_TASKS" != "none" ]; then
             "${RUNNER_CMD[@]}" scripts/daily_orchestrator.py --tasks "$ORCH_TASKS" $RESET_FLAG

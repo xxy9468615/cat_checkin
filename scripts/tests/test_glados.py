@@ -49,7 +49,9 @@ class TestCheckinFlow(unittest.TestCase):
             response({"code": 0, "message": "ok", "points": 12}),
         )
         sleeps = []
-        with patch.object(glados.time, "sleep", side_effect=sleeps.append):
+        # 固定单调时钟：挑战前 100.0s，提交前 100.5s → 必须恰好补足 2.0s
+        with patch.object(glados.time, "monotonic", side_effect=[100.0, 100.5]), \
+             patch.object(glados.time, "sleep", side_effect=sleeps.append):
             status, code, points, _ = api.checkin(SYNTHETIC_COOKIE)
 
         self.assertEqual((status, code, points), ("签到成功", glados.CHECKIN_SUCCESS, 12))
@@ -58,9 +60,8 @@ class TestCheckinFlow(unittest.TestCase):
         self.assertEqual(payload["proof"], EXPECTED_PROOF)
         self.assertEqual(payload["tsState"], "off")
         self.assertEqual(payload["token"], "glados.example")
-        # 前端固定等待 2500ms 才提交，脚本至少要等待一次
-        self.assertEqual(len(sleeps), 1)
-        self.assertGreater(sleeps[0], 0)
+        # 前端固定等待 2500ms 才提交：已过 0.5s，还剩 2.0s
+        self.assertEqual(sleeps, [2.0])
 
     def test_turnstile_challenge_reports_timeout_state(self):
         api = build_api(
@@ -206,6 +207,104 @@ class TestExpiryTag(unittest.TestCase):
         with patch.object(glados, "load_kv_state", side_effect=RuntimeError("boom")):
             tag = checker._expiry_tag(Mock(learned={}), SYNTHETIC_COOKIE, 1, 0)
         self.assertIn("Cookie 有效期未知", tag)
+
+
+class TestStrictCode(unittest.TestCase):
+    """浏览器与 HTTP 链路口径一致：只接受整数 code，bool/非整数一律失败。"""
+
+    def test_valid_integers(self):
+        for raw in (0, 1, "0", "1", 1.0, "1.0", 4, -2):
+            with self.subTest(raw=raw):
+                self.assertEqual(glados.coerce_code(raw), int(float(raw)))
+
+    def test_rejects_bool_and_garbage(self):
+        for raw in (True, False, None, "", "ok", "2.5", 2.5, [], {}):
+            with self.subTest(raw=raw):
+                self.assertEqual(glados.coerce_code(raw), glados.CHECKIN_FAILURE)
+
+    def test_parse_code_shares_the_same_strictness(self):
+        api = glados.GladosAPI("glados.example", 1)
+        api.http = Mock()
+        self.assertEqual(api._parse_code({"code": True}), glados.CHECKIN_FAILURE)
+        self.assertEqual(api._parse_code({"code": 0}), glados.CHECKIN_SUCCESS)
+
+
+class TestDeviceCaching(unittest.TestCase):
+    """只有拿到真实业务成功才缓存新设备；失败/None 保留原缓存并走 HTTP 回退。"""
+
+    def _checker(self, browser):
+        checker = glados.Checker.__new__(glados.Checker)
+        checker.results = []
+        checker.devices = {1: "windows"}
+        checker.browser = browser
+        return checker
+
+    def _api(self):
+        api = glados.GladosAPI("glados.example", 1)
+        api.http = Mock()
+        api.checkin = Mock(return_value=("签到失败", glados.CHECKIN_FAILURE, 0, "http fallback"))
+        return api
+
+    def test_device_cached_only_after_success(self):
+        browser = Mock()
+        browser.checkin.side_effect = [
+            ("需重新登录", glados.CHECKIN_FAILURE, 0, "x (reason=device-mismatch, loginDevice=Linux)"),
+            ("签到成功", glados.CHECKIN_SUCCESS, 2, "ok"),
+        ]
+        checker = self._checker(browser)
+        result = checker._checkin(self._api(), SYNTHETIC_COOKIE, 1, "glados.example")
+        self.assertEqual(result[0], "签到成功")
+        self.assertEqual(checker.devices[1], "linux")
+
+    def test_failed_retry_is_reported_and_keeps_cache(self):
+        # 第二次拿到真实业务失败：如实返回该结果（不再重复提交），且不缓存新设备
+        browser = Mock()
+        browser.checkin.side_effect = [
+            ("需重新登录", glados.CHECKIN_FAILURE, 0, "x (reason=device-mismatch, loginDevice=Linux)"),
+            ("签到失败", glados.CHECKIN_FAILURE, 0, "still bad"),
+        ]
+        checker = self._checker(browser)
+        result = checker._checkin(self._api(), SYNTHETIC_COOKIE, 1, "glados.example")
+        self.assertEqual(result[3], "still bad")
+        self.assertEqual(checker.devices[1], "windows")
+
+    def test_none_retry_falls_back_to_http(self):
+        browser = Mock()
+        browser.checkin.side_effect = [
+            ("需重新登录", glados.CHECKIN_FAILURE, 0, "x (reason=device-mismatch, loginDevice=Linux)"),
+            None,
+        ]
+        checker = self._checker(browser)
+        result = checker._checkin(self._api(), SYNTHETIC_COOKIE, 1, "glados.example")
+        self.assertEqual(result[3], "http fallback")
+
+    def test_browser_unavailable_uses_http(self):
+        checker = self._checker(None)
+        result = checker._checkin(self._api(), SYNTHETIC_COOKIE, 1, "glados.example")
+        self.assertEqual(result[3], "http fallback")
+
+
+class TestEgressResolution(unittest.TestCase):
+    """家宽出口缺失时按设计公平失败，只有显式 ALLOW_DIRECT 才允许直连。"""
+
+    def test_missing_egress_fails_fast(self):
+        config = glados.Config.__new__(glados.Config)
+        config._bool_env = lambda name, default=False: False
+        config.proxies = []
+        with self.assertRaisesRegex(RuntimeError, "未找到 GLaDOS 代理出口"):
+            config._resolve_egress()
+
+    def test_allow_direct_opt_in(self):
+        config = glados.Config.__new__(glados.Config)
+        config._bool_env = lambda name, default=False: name == "GLADOS_ALLOW_DIRECT"
+        config.proxies = []
+        self.assertIsNone(config._resolve_egress())
+
+    def test_first_candidate_is_egress(self):
+        endpoint = Mock(display_name="【测试节点】", url="socks5://127.0.0.1:1080")
+        config = glados.Config.__new__(glados.Config)
+        config.proxies = [endpoint]
+        self.assertIs(config._resolve_egress(), endpoint)
 
 
 if __name__ == "__main__":
