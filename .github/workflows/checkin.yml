@@ -552,6 +552,33 @@ jobs:
             stash_proxy_state none "" "" ""
           fi
 
+      - name: DIAG glados cookie expiry (temporary)
+        if: contains(inputs.tasks, 'glados')
+        continue-on-error: true
+        env:
+          GLADOS_COOKIE_1: ${{ secrets.GLADOS_COOKIE_1 }}
+          GLADOS_COOKIE_2: ${{ secrets.GLADOS_COOKIE_2 }}
+          GLADOS_COOKIE_3: ${{ secrets.GLADOS_COOKIE_3 }}
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, "scripts")
+          import cookie_validity as cv
+          for i in (1, 2, 3):
+              c = os.environ.get(f"GLADOS_COOKIE_{i}", "")
+              pairs = {}
+              for part in c.split(";"):
+                  if "=" in part:
+                      k, v = part.strip().split("=", 1)
+                      pairs[k] = v
+              print("account", i, "names", sorted(pairs))
+              for n, v in pairs.items():
+                  if n.endswith("sess"):
+                      print("  sess-name", n, "len", len(v),
+                            "koa_parse", cv.parse_koa_sess_expire(v))
+              print("  expire_from_cookie_str", cv.expire_from_cookie_str(c))
+          PY
+
       - name: Install browser for glados (Turnstile)
         if: contains(steps.orch_tasks.outputs.due_tasks, 'glados')
         run: |
