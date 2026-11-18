@@ -577,6 +577,17 @@ jobs:
                       print("  sess-name", n, "len", len(v),
                             "koa_parse", cv.parse_koa_sess_expire(v))
               print("  expire_from_cookie_str", cv.expire_from_cookie_str(c))
+              from common import Http
+              h = Http(task_name="glados", impersonate="chrome131", follow_redirects=True)
+              resp = h.request("GET", "https://glados.cloud/api/user/status",
+                               headers={"Cookie": c,
+                                        "Referer": "https://glados.cloud/console/checkin"})
+              sc = str(resp.headers.get("Set-Cookie") or "")
+              names = sorted({p.split("=", 1)[0].strip()
+                              for p in sc.replace("\n", ";").split(";") if "=" in p})
+              print("  status_code", resp.code, "set_cookie_names", names,
+                    "expires", "expires=" in sc.lower(), "max_age", "max-age=" in sc.lower(),
+                    "len", len(sc))
           PY
 
       - name: Install browser for glados (Turnstile)
