@@ -151,8 +151,11 @@ def _merge_cookie_str(base_cookie: str, set_cookies: List[str]) -> str:
 
 # 登录凭据 cookie（Discuz 前缀 4 位站点哈希 + _2132_ + auth）：其 Expires 即登录有效期
 LOGIN_COOKIE_RE = re.compile(r"^[A-Za-z0-9]+_2132_auth$", re.IGNORECASE)
-# 无任何真实到期证据时的估算窗口（Discuz 默认会话周期）
-COOKIE_FALLBACK_LIFETIME_DAYS = 30
+# 2026-11-18 实测：Discuz auth 是纯会话 cookie（无 Expires），credential 响应下发的
+# sid/lastact/ulastactivity 等辅助 cookie 的 Expires 不代表登录有效期。旧的 30 天
+# 「估算窗口」是臆测：Cookie 实际存活远超 30 天，导致每天成功签到后必然报
+# 「超出 30 天估算窗口建议更新」黄卡，属于假预警。改为不传 fallback，交给共享
+# 引擎的 45 天成功运行老化基线：只有确实长期运行才提示更新（与 GLaDOS 同口径）。
 
 
 def _parse_cookie_date(text: str) -> Optional[int]:
@@ -221,7 +224,6 @@ def _build_expiry_tag(cookie_str: str, state: Dict[str, Any], learned: Optional[
         cookie_str=cookie_str,
         learned=learned,
         credential_match=LOGIN_COOKIE_RE.match,
-        fallback_lifetime_days=COOKIE_FALLBACK_LIFETIME_DAYS,
     )
 
 
