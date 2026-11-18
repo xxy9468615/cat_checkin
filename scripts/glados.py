@@ -21,6 +21,7 @@ a real browser session and refreshed manually once the server-side session dies.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -49,7 +50,16 @@ class Emoji:
 CHECKIN_SUCCESS = 0
 CHECKIN_REPEAT = 1
 CHECKIN_FAILURE = -2
+CHECKIN_FAILURE_DEVICE = 4
 COOKIE_INVALID = -3
+
+# 签到挑战（2026-11 上游改版）：POST /api/user/checkin 不再接受裸 {"token": domain}，
+# 必须携带 GET /api/user/checkin/challenge 下发的 nonce 与客户端证明：
+#   proof = hex(SHA-256(nonce + "." + "glados-observe-v1"))
+# 常量取自控制台前端 checkinProof 分包的字节数组（g/l/a/d/o/s/-/o/b/s/e/r/v/e/-/v/1）。
+PROOF_SALT = "glados-observe-v1"
+# 前端在拿到挑战后至少等待 2500ms 才提交，服务端按首次请求耗时判定自动化，不能省。
+CHALLENGE_MIN_AGE_SEC = 2.5
 
 # Cookie 失效时响应中常见的登录关键词（命中即判定登录态过期）
 # 注意 "没有权限"/"No permission"（code=-2）是 koa:sess 签名校验失败时服务端的
@@ -192,25 +202,77 @@ class GladosAPI:
         days = int(float(left_days))
         return f"{days} 天", code
 
+    def challenge(self, cookie: str) -> Dict[str, Any]:
+        """获取签到挑战（nonce / ttl / 是否强制 Cloudflare Turnstile）。
+
+        挑战接口本身的 code=0 才是成功；其余状态按登录态/网络问题如实返回空字典，
+        由调用方决定是否退化为旧协议提交，避免挑战接口抖动直接判账号失败。
+        """
+        resp = self.http.request(
+            "GET",
+            self.base + "/api/user/checkin/challenge",
+            headers=self._headers(cookie),
+        )
+        data = self._safe_json(resp)
+        self._ensure_auth(resp, data)
+        if self._parse_code(data) != CHECKIN_SUCCESS:
+            self._log(f"⚠️ 获取签到挑战失败: code={data.get('code')} {str(data)[:120]}", force=True)
+            return {}
+        return data
+
+    @staticmethod
+    def proof(nonce: str) -> str:
+        """复刻前端 checkinProof：SHA-256(nonce + "." + PROOF_SALT) 的十六进制摘要。"""
+        return hashlib.sha256(f"{nonce}.{PROOF_SALT}".encode("utf-8")).hexdigest()
+
     def checkin(self, cookie: str) -> Tuple[str, int, int, str]:
+        started_at = time.monotonic()
+        challenge = self.challenge(cookie)
+        nonce = str(challenge.get("nonce") or "")
+        ts_required = bool(challenge.get("turnstile"))
+
+        payload: Dict[str, Any] = {"token": self.domain}
+        if nonce:
+            payload["nonce"] = nonce
+            payload["proof"] = self.proof(nonce)
+            # 无 Turnstile 时前端上报 "off"；有站点密钥但拿不到令牌时上报 "timeout"。
+            # 脚本无法执行 Cloudflare 挑战，令牌只能由服务端按风险降级放行。
+            payload["tsState"] = "timeout" if ts_required else "off"
+            remaining = CHALLENGE_MIN_AGE_SEC - (time.monotonic() - started_at)
+            if remaining > 0:
+                time.sleep(remaining)
+            if ts_required:
+                self._log("⚠️ 签到挑战要求 Cloudflare Turnstile，脚本无法生成令牌，尝试无令牌提交", force=True)
+
         resp = self.http.request(
             "POST",
             self.base + "/api/user/checkin",
             headers=self._headers(cookie),
-            json_data={"token": self.domain},
+            json_data=payload,
         )
         data = self._safe_json(resp)
         self._ensure_auth(resp, data)
         code = self._parse_code(data)
         message = str(data.get("message", ""))
+        reason = str(data.get("reason", "") or "")
         points = int(float(data.get("points", 0) or 0))
 
         if code == CHECKIN_SUCCESS:
             return "签到成功", code, points, message
         if code == CHECKIN_REPEAT:
             return "重复签到", code, 0, message
+        if code == CHECKIN_FAILURE_DEVICE or reason == "device-mismatch":
+            detail = message or "登录设备与当前设备不一致"
+            # 归入常规失败码：summary/退出码/熔断器只认 CHECKIN_FAILURE/COOKIE_INVALID，
+            # 新增码会让失败被静默吞掉（不退出、不计入标题）。
+            return "需重新登录", CHECKIN_FAILURE, 0, f"{detail} (reason=device-mismatch，请在浏览器重新登录后更新 Cookie)"
 
-        return "签到失败", CHECKIN_FAILURE, 0, message or str(data)
+        detail = message or str(data)
+        if reason:
+            detail += f" (reason={reason})"
+        if not nonce:
+            detail += " (未取到签到挑战 nonce)"
+        return "签到失败", CHECKIN_FAILURE, 0, detail
 
     def points(self, cookie: str) -> Tuple[str, int]:
         resp = self.http.request("GET", self.base + "/api/user/points", headers=self._headers(cookie))
