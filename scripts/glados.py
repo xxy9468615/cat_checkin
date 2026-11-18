@@ -39,6 +39,7 @@ from common import (
     load_kv_state,
     main_guard,
     mask_str,
+    redact_pii,
     sanitize_snippet,
     save_kv_state,
 )
@@ -236,6 +237,8 @@ class BrowserCheckin:
         self._failed = False
         # True = 签到 POST 已发出但无法确认结果（超时/非 200/解析失败）
         self.submitted_unknown = False
+        # 本次响应明确返回的登录设备（仅 code=4/reason=device-mismatch 时填）
+        self.last_login_device: str = ""
 
     @staticmethod
     def enabled() -> bool:
@@ -294,6 +297,7 @@ class BrowserCheckin:
         base = f"https://{domain}"
         ctx = None
         learned_here: Dict[str, int] = {}
+        self.last_login_device = ""
         try:
             ctx = browser.new_context(
                 locale=profile["locale"],
@@ -377,6 +381,9 @@ class BrowserCheckin:
             except (ValueError, TypeError):
                 self.submitted_unknown = True
                 return None
+            if not isinstance(data, dict):
+                self.submitted_unknown = True
+                return None
             # 浏览器上下文是 Set-Cookie 的最权威来源；只有 expires > 0 且属于登录凭据
             # 的 cookie（gld:sess / gld:sess.sig）才记录，避免把无关 cookie 的时效
             # 当成 Cookie 有效期（仅域名匹配不足以确认凭据归属）。
@@ -403,14 +410,19 @@ class BrowserCheckin:
         # 与 HTTP 链路共用严格解析：缺失/非整数一律失败，绝不把缺字段当成 code=0
         code = coerce_code(data.get("code"))
         message = str(data.get("message", ""))
-        points = int(float(data.get("points", 0) or 0))
         reason = str(data.get("reason", "") or "")
+        try:
+            points = int(float(data.get("points", 0) or 0))
+        except (TypeError, ValueError):
+            points = 0  # 已确认签到成功，积分字段异常不能撤销结果
         if code == CHECKIN_SUCCESS:
             return ("签到成功", code, points, message), learned_here
         if code == CHECKIN_REPEAT:
             return ("重复签到", code, 0, message), learned_here
         if code == CHECKIN_FAILURE_DEVICE or reason == "device-mismatch":
             login_device = str(data.get("loginDevice", "") or "")
+            if login_device:
+                self.last_login_device = login_device
             detail = message or "登录设备与当前设备不一致"
             return ("需重新登录", CHECKIN_FAILURE, 0,
                     f"{detail} (reason=device-mismatch, loginDevice={login_device or '?'})"), learned_here
@@ -613,7 +625,11 @@ class GladosAPI:
             self._log(f"⚠️ 获取签到挑战失败: HTTP {resp.code}（临时故障，按无挑战处理）", force=True)
             return {}
         if "code" not in data:
-            # HTTP 200 + 非空 JSON 但缺 code 是协议/网关故障，不是登录态失效
+            # 缺 code 时仍先查登录关键词：命中即明确登录失效，交 _ensure_auth 抛错；
+            # 否则按协议/网关故障返回空挑战，交由调用方降级处理。
+            message = str(data.get("message", "") or "").lower()
+            if any(kw in message for kw in AUTH_FAILURE_KEYWORDS):
+                self._ensure_auth(resp, data)  # 命中登录失效语义 → 抛 CookieExpiredError
             self._log("⚠️ 获取签到挑战失败: 响应缺少 code（协议故障，按无挑战处理）", force=True)
             return {}
         self._ensure_auth(resp, data)
@@ -659,8 +675,10 @@ class GladosAPI:
         code = self._parse_code(data)
         message = str(data.get("message", ""))
         reason = str(data.get("reason", "") or "")
-        points = int(float(data.get("points", 0) or 0))
-
+        try:
+            points = int(float(data.get("points", 0) or 0))
+        except (TypeError, ValueError):
+            points = 0
         if code == CHECKIN_SUCCESS:
             return "签到成功", code, points, message
         if code == CHECKIN_REPEAT:
@@ -679,7 +697,7 @@ class GladosAPI:
             detail += " (未取到签到挑战 nonce)"
         if message:
             # 原始 message 只进 verbose 日志且必须脱敏，绝不写入任务结果/邮件
-            self._log(f"服务端消息: {sanitize_snippet(message, 120)}")
+            self._log(f"服务端消息: {redact_pii(sanitize_snippet(message, 120))}")
         return "签到失败", CHECKIN_FAILURE, 0, detail
 
     def points(self, cookie: str) -> Tuple[str, int]:
@@ -789,11 +807,13 @@ class Checker:
                         "签到请求已提交但无法确认结果（超时/非 200/响应异常），未重复提交"), {}
             return api.checkin(cookie), {}
         res, learned = outcome
-        mismatch = re.search(r"loginDevice=([^)\s]+)", res[3] or "")
-        if mismatch:
-            login_device = resolve_device(mismatch.group(1))
+        # 只有浏览器从结构化字段确认 device-mismatch 才换设备重试；
+        # 首次已成功/重复的签到绝不因文案里出现 loginDevice 字样被重试覆盖。
+        reported_device = self.browser.last_login_device
+        if reported_device and res[1] not in (CHECKIN_SUCCESS, CHECKIN_REPEAT):
+            login_device = resolve_device(reported_device)
             if login_device != device:
-                print(f"🔁 账号 {cookie_index} 登录设备为 {mismatch.group(1)}，按该设备指纹重试")
+                print(f"🔁 账号 {cookie_index} 登录设备为 {reported_device}，按该设备指纹重试")
                 retry = self.browser.checkin(cookie, domain, login_device)
                 if retry is not None:
                     retry_res, retry_learned = retry
@@ -837,8 +857,15 @@ class Checker:
         marked_state = None
         if result.code in (CHECKIN_SUCCESS, CHECKIN_REPEAT):
             marked_state = self._mark_run_day(cookie, cookie_index, learned, api)
-        _, points_total = api.points(cookie)
-        result.points_total = points_total
+        try:
+            _, points_total = api.points(cookie)
+            result.points_total = points_total
+        except CookieExpiredError as exc:
+            # 签到已确认成功/重复，积分查询失败不能把结果覆盖成 Cookie 失效
+            print(f"⚠️ 签到已确认，但积分查询失败（凭据可能在查询时过期）: "
+                  f"{sanitize_snippet(str(exc), 120)}")
+            result.exchange = "积分查询失败（签到已确认）"
+            return result
 
         if self.config.auto_exchange:
             required = EXCHANGE_PLANS[self.config.exchange_plan]
@@ -943,6 +970,8 @@ class Checker:
                 st = "今日已签到"
             elif r.code == COOKIE_INVALID:
                 st = "Cookie失效(需更新)"
+            elif r.status == "提交结果未知":
+                st = "提交结果未知（未重复提交）"
             else:
                 st = "签到失败"
             lines.append(f"#{idx} {name} | {st} | 剩余:{r.days} | 积分:{r.points_total} | {r.exchange}")

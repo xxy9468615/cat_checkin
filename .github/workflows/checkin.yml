@@ -584,7 +584,13 @@ jobs:
           RUNNER_CMD=(python3)
           if [ "${{ steps.glados_browser.outcome }}" = "success" ] \
              && command -v xvfb-run >/dev/null 2>&1; then
-            RUNNER_CMD=(xvfb-run -a python3)
+            # xvfb-run 存在不代表能启动：先跑一次真实探测（启动/display 就绪），
+            # 失败则退回普通 python3——必须在编排器启动前决定，不能跑完整批再重跑。
+            if xvfb-run -a python3 -c 'import os; assert os.environ.get("DISPLAY")' >/dev/null 2>&1; then
+              RUNNER_CMD=(xvfb-run -a python3)
+            else
+              echo "⚠️ Xvfb 虚拟显示启动失败，GLaDOS 将退回 HTTP 链路（Turnstile 无法通过）"
+            fi
           else
             echo "⚠️ 浏览器环境不可用，GLaDOS 将退回 HTTP 链路（Turnstile 无法通过）"
           fi
