@@ -561,13 +561,23 @@ jobs:
           echo "--- curl_cffi profiles via socks5 ---"
           python3 - <<'PY' || true
           from curl_cffi import requests as cr
-          px = {"http": "socks5://127.0.0.1:1080", "https": "socks5://127.0.0.1:1080"}
-          for imp in ("chrome131", "chrome", "chrome124", "chrome110"):
+          from curl_cffi.const import CurlOpt
+          px5 = {"http": "socks5://127.0.0.1:1080", "https": "socks5://127.0.0.1:1080"}
+          px5h = {"http": "socks5h://127.0.0.1:1080", "https": "socks5h://127.0.0.1:1080"}
+          url = "https://glados.cloud/console/checkin"
+          cases = [
+              ("socks5h chrome131", px5h, {}),
+              ("socks5 ECH-off", px5, {"curl_options": {CurlOpt.ECH: "false"}}),
+              ("socks5h ECH-off", px5h, {"curl_options": {CurlOpt.ECH: "false"}}),
+              ("socks5 v4only", px5, {"curl_options": {CurlOpt.IPRESOLVE: 4}}),
+              ("socks5 ALPN-off", px5, {"curl_options": {CurlOpt.SSL_ENABLE_ALPN: 0}}),
+          ]
+          for name, px, kw in cases:
               try:
-                  r = cr.get("https://glados.cloud/console/checkin", impersonate=imp, proxies=px, timeout=20)
-                  print(imp, "HTTP", r.status_code, len(r.text))
+                  r = cr.get(url, impersonate="chrome131", proxies=px, timeout=20, **kw)
+                  print(name, "HTTP", r.status_code, len(r.text))
               except Exception as e:
-                  print(imp, "ERR", type(e).__name__, str(e)[:160])
+                  print(name, "ERR", type(e).__name__, str(e)[:120])
           PY
 
       - name: Execute daily orchestrator
