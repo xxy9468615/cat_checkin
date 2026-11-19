@@ -735,18 +735,26 @@ jobs:
                   for k, v in it.items():
                       sv = str(v)
                       print("AMTKV", k, "=", sv[:120] if k not in ("url","jumpUrl","link") else sv[:200])
-          # 公告接口（isAnnouncement=1 提示有公告，可能含活动变更说明）
-          for path in ("/gateway/golden/api/queryAnnouncement",
-                       "/gateway/golden/api/getAnnouncement",
-                       "/gateway/standQuery/detail/queryAnnouncement"):
-              r = http.request("GET", "https://wapact.189.cn:9001" + path + "?userType=1",
-                               headers={**H, "methodCode": "I00004"}, timeout=15)
+          # 商城首页/楼层配置探测：getGoodsList 的 floorType/tabOrder 来自首页配置
+          for path in ("/gateway/golden/api/queryIndex",
+                       "/gateway/golden/api/index",
+                       "/gateway/golden/goldGoods/getFloor",
+                       "/gateway/golden/goldGoods/getTab",
+                       "/gateway/golden/api/getConfig",
+                       "/gateway/golden/api/queryConfig",
+                       "/gateway/standQuery/index/query",
+                       "/gateway/golden/goldGoods/getGoodsList?floorType=1&userType=1&page=1&order=3&tabOrder=1",
+                       "/gateway/golden/goldGoods/getGoodsList?floorType=2&userType=1&page=1&order=3&tabOrder=1"):
+              r = http.request("GET", "https://wapact.189.cn:9001" + path,
+                               headers={**H, "methodCode": "I01001"}, timeout=15)
               try:
                   d = r.json() or {}
               except Exception:
                   d = {}
-              print("ANN", path.split("/")[-1], r.code, d.get("code"),
-                    json.dumps(d.get("biz"), ensure_ascii=False)[:300])
+              biz = d.get("biz")
+              keys = sorted(biz.keys())[:12] if isinstance(biz, dict) else type(biz).__name__
+              print("IDX", path.split("?")[0].split("/")[-1][:40], r.code, d.get("code"),
+                    str(d.get("message") or "")[:30], "bizkeys", keys)
           PY2
 
       - name: Execute daily orchestrator
