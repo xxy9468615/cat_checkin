@@ -810,8 +810,10 @@ class Checker:
         # 只有浏览器从结构化字段确认 device-mismatch 才换设备重试；
         # 首次已成功/重复的签到绝不因文案里出现 loginDevice 字样被重试覆盖。
         raw_device = getattr(self.browser, "last_login_device", "")
-        # 只接受字符串；dict/对象一律忽略，日志只输出归一化后的固定设备名
-        reported_device = resolve_device(raw_device) if isinstance(raw_device, str) else ""
+        # 只接受非空字符串；空串/None/dict 一律忽略——空设备名若走 resolve_device
+        # 会兜底成 windows，凭空触发一次多余签到重试。日志只输出归一化后的固定设备名
+        reported_device = (resolve_device(raw_device)
+                           if isinstance(raw_device, str) and raw_device.strip() else "")
         if reported_device and res[1] not in (CHECKIN_SUCCESS, CHECKIN_REPEAT):
             login_device = reported_device
             if login_device != device:

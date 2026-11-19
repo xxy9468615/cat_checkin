@@ -491,5 +491,42 @@ class TestBrowserResponseParsing(unittest.TestCase):
         self.assertEqual((status, code, points), ("签到成功", glados.CHECKIN_SUCCESS, 0))
 
 
+class TestEmptyDeviceField(unittest.TestCase):
+    """第六轮评审：空 loginDevice 不得兜底成 windows 触发多余签到。"""
+
+    def _checker(self, browser, cached="linux"):
+        checker = glados.Checker.__new__(glados.Checker)
+        checker.results = []
+        checker.devices = {1: cached}
+        checker.browser = browser
+        return checker
+
+    def test_empty_device_no_retry(self):
+        # 缓存设备 linux，响应 loginDevice 为空串 → 只调用一次浏览器，不重试
+        browser = Mock()
+        browser.last_login_device = ""
+        browser.checkin.return_value = (
+            ("需重新登录", glados.CHECKIN_FAILURE, 0, "device mismatch"), {})
+        checker = self._checker(browser)
+        api = Mock()
+        result, _ = checker._checkin(api, SYNTHETIC_COOKIE, 1, "glados.example")
+        self.assertEqual(result[0], "需重新登录")
+        self.assertEqual(browser.checkin.call_count, 1)
+        api.checkin.assert_not_called()
+
+    def test_non_string_device_no_retry(self):
+        browser = Mock()
+        browser.last_login_device = {"device": "Linux"}
+        browser.checkin.return_value = (
+            ("需重新登录", glados.CHECKIN_FAILURE, 0, "device mismatch"), {})
+        checker = self._checker(browser)
+        result, _ = checker._checkin(Mock(), SYNTHETIC_COOKIE, 1, "glados.example")
+        self.assertEqual(browser.checkin.call_count, 1)
+
+    def test_valid_linux_still_normalized(self):
+        self.assertEqual(glados.resolve_device("Linux"), "linux")
+        self.assertEqual(glados.resolve_device("WINDOWS"), "windows")
+
+
 if __name__ == "__main__":
     unittest.main()
