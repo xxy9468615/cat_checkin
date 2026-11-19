@@ -641,8 +641,17 @@ jobs:
                       impersonate="chrome124", infer_proxy=False)
           client = t.TelecomClient(acc, http)
           client.prepare_auth()
-          # ticket 一次性：缓存 ticket 已被浏览器段消费，必须现签新 ticket
-          token = client.jindou_unified_login()
+          print("auth_state", "sign", bool(client.sign), "ticket", bool(client.ticket),
+                "app_token", bool(client.app_token), "uid", bool(client.uid),
+                "target_id", bool(client.target_id), "authorization", bool(client.authorization))
+          # 缓存的 authorization 就是商城 Bearer（auth=560），优先直接复用
+          token = ""
+          if client.authorization:
+              au = client.authorization
+              token = au[7:] if au.startswith("Bearer ") else au
+              print("reuse cached bearer, len", len(token))
+          if not token:
+              token = client.jindou_unified_login()
           if not token and client.app_token and client.uid and client.target_id:
               print("re-mint ticket via app token")
               if client.mint_ticket_with_token():
