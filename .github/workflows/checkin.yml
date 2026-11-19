@@ -618,8 +618,10 @@ jobs:
               print("scripts", scripts[:10])
               inline = page.evaluate(
                   "Array.from(document.querySelectorAll('script:not([src])'))"
-                  ".map(s => s.textContent).join('\\n---\\n').slice(0, 6000)")
-              print("INLINE_SCRIPTS", inline[:5000])
+                  ".map(s => s.textContent).join('\\n---\\n')")
+              for ln in inline.split("\n"):
+                  if re.search(r'url:|methodCode|fcode|ajax|exchange|activityId|standExchange|standQuery|golden|dzqd', ln, re.I):
+                      print("JSLINE", ln.strip()[:220])
               globs = page.evaluate(
                   "JSON.stringify({toolsObj: typeof window.toolsObj,"
                   " settings: typeof window.settings,"
