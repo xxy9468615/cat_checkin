@@ -1096,6 +1096,77 @@ class TestJindouExchange(unittest.TestCase):
         due_dt = datetime.fromtimestamp(next_due, telecom.BJT)
         self.assertEqual(due_dt.strftime("%H:%M"), "23:30")
 
+    # ---------- 抢兑主流程出口顺序与会话持久化（2026-11-19 CI 复盘） ----------
+
+    def test_exchange_mode_direct_egress_first(self):
+        """0 点抢兑出口队列必须直连优先：CI 实测现签链在所有代理出口失败、
+        唯一直连成功；代理先烧 ~60s 超时会侵蚀 23:59:20 预检窗口。"""
+        acc = telecom.TelecomAccount(index=1, phone="18912345678")
+        observed_labels = []
+
+        def fake_http(task_name=None, proxy=None, **kw):
+            observed_labels.append(proxy)
+            # 直连候选必须 infer_proxy=False（规则 11）
+            if proxy == "":
+                self.assertFalse(kw.get("infer_proxy", True))
+            return MagicMock()
+
+        with patch.object(telecom, "load_all_accounts", return_value=[acc]), \
+             patch.object(telecom, "_get_candidate_proxies",
+                          return_value=[MagicMock(url="socks5://fake", display_name="代理A")]), \
+             patch.object(telecom, "Http", side_effect=fake_http), \
+             patch.object(telecom.TelecomClient, "prepare_auth", return_value=True), \
+             patch.object(telecom, "run_rights_exchange",
+                          return_value=(True, "🎉 成功兑换【LV4等级权益2元话费】")), \
+             patch.object(telecom.TelecomClient, "save_session") as m_save, \
+             patch.object(telecom, "_rights_schedule_next_run"), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            rc = telecom.run_exchange_mode()
+        self.assertEqual(rc, 0)
+        # 首个出口必须是直连（proxy=""），代理仅作兜底
+        self.assertEqual(observed_labels[0], "")
+        # 终局后会话必须落盘（sign/accId 供下一场复用）
+        m_save.assert_called_once()
+
+    def test_exchange_mode_rotates_to_proxy_on_auth_failure(self):
+        """直连鉴权类失败 → 轮换代理候选；代理终局后不再继续。"""
+        acc = telecom.TelecomAccount(index=1, phone="18912345678")
+        ep = MagicMock(url="socks5://fake", display_name="代理A")
+        outcomes = [(False, "等级权益查询鉴权失败: 登录已失效"),
+                    (True, "🎉 成功兑换【LV4等级权益2元话费】")]
+        with patch.object(telecom, "load_all_accounts", return_value=[acc]), \
+             patch.object(telecom, "_get_candidate_proxies", return_value=[ep]), \
+             patch.object(telecom, "Http", return_value=MagicMock()), \
+             patch.object(telecom.TelecomClient, "prepare_auth", return_value=True), \
+             patch.object(telecom, "run_rights_exchange", side_effect=outcomes) as m_run, \
+             patch.object(telecom.TelecomClient, "save_session"), \
+             patch.object(telecom, "_rights_schedule_next_run"), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            rc = telecom.run_exchange_mode()
+        self.assertEqual(rc, 0)
+        self.assertEqual(m_run.call_count, 2)
+
+    def test_acc_id_roundtrips_through_session_cache(self):
+        """accId 必须随 sign 持久化/恢复：缓存 sign 回退档缺 accId 会被
+        「缺少 sign/accId」闸门拦死（ticket 一次性，补换大概率失败）。"""
+        client = self._rights_client()
+        captured = {}
+
+        def fake_save(redis_key, state_file, state):
+            captured.update(state)
+
+        with patch.object(telecom, "save_kv_state", side_effect=fake_save), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            client.save_session()
+        self.assertEqual(captured.get("acc_id"), "V1.0FAKEacc")
+
+        fresh = self._client()
+        with patch.object(telecom, "load_kv_state", return_value=captured), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            fresh.restore_cached_session()
+        self.assertEqual(fresh.acc_id, "V1.0FAKEacc")
+        self.assertEqual(fresh.sign, "V1.0FAKEsign")
+
 
 if __name__ == "__main__":
     unittest.main()

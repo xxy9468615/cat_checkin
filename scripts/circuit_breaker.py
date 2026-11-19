@@ -25,7 +25,7 @@ ROOT_DIR = BASE_DIR.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from common import BJT, load_kv_state, save_kv_state
+from common import BJT, load_kv_state, save_kv_state, upstash_redis_command
 from task_registry import TASKS
 
 # 单日累计最大尝试次数上限（超过该次数立即熔断）
@@ -55,19 +55,54 @@ def _bjt_now_ts() -> float:
 
 
 def _state_paths(task_id: str) -> Tuple[str, str]:
-    """获取任务状态在 Upstash Redis 与本地文件的存储路径。
+    """获取熔断器专属状态在 Upstash Redis 与本地文件的存储路径。
 
-    保持与 discord_notify.py 的存储契约 100% 对齐，共享 Actions 缓存与 Redis 键。
+    必须使用独立键 cat_checkin:cb:<task_id>（CLAUDE.md §4 拓扑），不得复用
+    notify 状态键：discord_notify.notify_task_result 每次运行结束都会用
+    「新建字典」整键覆盖 state:notify:<task_id>（只含 updated_at/attempt_date/
+    attempts/last_ok_date/fail_streak/ok_streak），熔断器写入的 status/
+    circuit_broken/next_retry_at/suspend_reason 会在同一次运行内被抹掉——
+    resume 失效、熔断拦截失效、status 表格永远显示「尚未执行」
+    （2026-11-19 复盘，与 rolling 键 2026-11-05 被覆盖同构）。
     """
     prefix = (os.getenv("CAT_CHECKIN_REDIS_PREFIX") or "cat_checkin:").rstrip(":")
-    return f"{prefix}:state:notify:{task_id}", f".notify_state_{task_id}.json"
+    return f"{prefix}:cb:{task_id}", f".cb_state_{task_id}.json"
+
+
+# 熔断器专属字段：旧实现曾把这些字段写进 notify 键，迁移时只认领这些字段，
+# 绝不把 notify 的展示字段（ok_streak/warn_texts 等）带进 cb 状态。
+_CB_OWNED_FIELDS = (
+    "status", "circuit_broken", "suspended_at", "suspend_reason",
+    "attempts", "attempt_date", "next_retry_at", "last_fail_ts",
+    "last_ok_date", "fail_streak", "updated_at",
+)
+
+
+def _legacy_notify_state(task_id: str) -> Dict[str, Any]:
+    """读取旧版共用的 notify 状态（只读迁移源，不回写）。"""
+    prefix = (os.getenv("CAT_CHECKIN_REDIS_PREFIX") or "cat_checkin:").rstrip(":")
+    try:
+        data = load_kv_state(f"{prefix}:state:notify:{task_id}", f".notify_state_{task_id}.json")
+        return dict(data) if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def load_circuit_state(task_id: str) -> Dict[str, Any]:
-    """读取指定任务的重试与熔断状态字典。"""
+    """读取指定任务的重试与熔断状态字典（cb 专属键，缺失时一次性认领旧 notify 字段）。
+
+    迁移语义：cb 键不存在时，从旧 notify 键只认领 _CB_OWNED_FIELDS 中存在的字段
+    （含熔断标记，保证升级前已停用的任务不会因换键而「复活」）；cb 键一旦存在
+    即为权威，不再回读 notify——notify 键里的 circuit_broken 可能是
+    discord_notify 推送熔断卡时留下的陈旧标记（该函数只置位不清除）。
+    """
     redis_key, state_file = _state_paths(task_id)
     state = load_kv_state(redis_key, state_file)
-    return dict(state) if isinstance(state, dict) else {}
+    state = dict(state) if isinstance(state, dict) else {}
+    if not state:
+        legacy = _legacy_notify_state(task_id)
+        state = {k: legacy[k] for k in _CB_OWNED_FIELDS if k in legacy}
+    return state
 
 
 def save_circuit_state(task_id: str, state: Dict[str, Any]) -> None:
@@ -385,6 +420,26 @@ def evaluate_retry_candidates(
     }
 
 
+def _redis_channel_status() -> str:
+    """探测 Upstash Redis 通道可用性（状态表格的数据源健康提示）。
+
+    未配置凭据时 load_kv_state 静默降级为本地文件——本地没有 CI 缓存文件时
+    全表显示「尚未执行」，与真实 CI 状态完全脱节。表格必须明示数据源，
+    否则会把「读不到状态」误读成「任务没跑过」（2026-11-19 用户指认）。
+    """
+    try:
+        from common import _upstash_redis_env
+        url, token = _upstash_redis_env()
+        if not url or not token:
+            return "⚠️ 未配置 UPSTASH_REDIS_REST_URL/TOKEN，仅显示本地缓存（CI 真实状态不可见）"
+        ok, _ = upstash_redis_command(["PING"])
+        if ok:
+            return "☁️ Upstash Redis 在线（权威状态）+ 本地缓存"
+        return "⚠️ Upstash Redis 不可达，仅显示本地缓存（可能滞后于 CI 真实状态）"
+    except Exception as exc:
+        return f"⚠️ Redis 通道探测异常（{type(exc).__name__}），仅显示本地缓存"
+
+
 def cli_status(task_id: Optional[str] = None) -> None:
     """格式化打印指定任务或全量任务的重试与熔断状态表格。"""
     today = _bjt_today()
@@ -393,6 +448,7 @@ def cli_status(task_id: Optional[str] = None) -> None:
 
     print(f"\n{'='*75}")
     print(f"📊 任务重试与熔断状态列表（当前北京时间日期: {today}）")
+    print(f"数据源: {_redis_channel_status()}")
     print(f"{'='*75}")
     print(f"{'任务 ID':<20} {'状态':<14} {'今日尝试':<10} {'下次重试':<14} {'上次成功':<12}")
     print(f"{'-'*75}")
@@ -400,9 +456,15 @@ def cli_status(task_id: Optional[str] = None) -> None:
     for tid in targets:
         st = load_circuit_state(tid)
         is_susp = bool(st.get("circuit_broken")) or str(st.get("status") or "").lower() == "suspended"
-        att = int(st.get("attempts") or 0) if str(st.get("attempt_date") or "") == today else 0
+        try:
+            att = int(st.get("attempts") or 0) if str(st.get("attempt_date") or "") == today else 0
+        except (TypeError, ValueError):
+            att = 0
         last_ok = str(st.get("last_ok_date") or "—")
-        next_at = float(st.get("next_retry_at") or 0)
+        try:
+            next_at = float(st.get("next_retry_at") or 0)
+        except (TypeError, ValueError):
+            next_at = 0.0
 
         if is_susp:
             status_desc = "🛑 熔断停用"
@@ -411,8 +473,12 @@ def cli_status(task_id: Optional[str] = None) -> None:
             status_desc = "✅ 今日成功"
             next_desc = "—"
         elif att > 0:
-            status_desc = f"⚠️ 失败待试"
-            if next_at <= now_ts:
+            status_desc = "⚠️ 失败待试"
+            if next_at <= 0:
+                # 失败但没有重试时刻（状态被部分覆盖/写入中断）：不能显示
+                # 「到期就绪」误导立即重试，如实标注缺失
+                next_desc = "未排定"
+            elif next_at <= now_ts:
                 next_desc = "到期就绪"
             else:
                 rem_min = max(1, int((next_at - now_ts) // 60))

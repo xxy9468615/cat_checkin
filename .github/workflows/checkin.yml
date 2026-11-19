@@ -200,6 +200,7 @@ jobs:
           path: |
             .notify_state_*.json
             .rolling_state_*.json
+            .cb_state_*.json
           key: operational-states-v1-${{ github.run_id }}
           restore-keys: |
             operational-states-v1-
@@ -652,6 +653,7 @@ jobs:
           path: |
             .notify_state_*.json
             .rolling_state_*.json
+            .cb_state_*.json
           key: operational-states-v1-${{ github.run_id }}
 
       - name: Cleanup sing-box tunnel

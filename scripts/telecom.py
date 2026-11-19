@@ -50,6 +50,7 @@ from common import (
     main_guard,
     mask_str,
     parse_proxies_text,
+    sanitize_snippet,
     save_kv_state,
 )
 from circuit_breaker import trip_circuit_breaker
@@ -618,6 +619,11 @@ class TelecomClient:
             self.password = str(state.get("password"))
         if not self.sign and state.get("sign"):
             self.sign = str(state.get("sign"))
+        # accId 与 sign 同源（ssoHomLogin 下发）：缓存 sign 回退档若缺 accId，
+        # 只能靠一次性 ticket 补换（大概率已过期）→「缺少 sign/accId」假失败。
+        # 随 sign 一并持久化/恢复，让回退档也能直接进权益接口。
+        if not self.acc_id and state.get("acc_id"):
+            self.acc_id = str(state.get("acc_id"))
         if not self.authorization and state.get("authorization"):
             self.authorization = str(state.get("authorization"))
         if not self.ticket and state.get("ticket"):
@@ -659,6 +665,7 @@ class TelecomClient:
         state = {
             "phone": self.phone,
             "sign": self.sign,
+            "acc_id": self.acc_id,
             "authorization": self.authorization,
             "ticket": self.ticket,
             "cookie": self.cookie,
@@ -805,9 +812,10 @@ class TelecomClient:
             print(f"    [ticket] 成功利用 ticket 换取电信会话 sign: {mask_str(self.sign, 4, 4)}", flush=True)
             return True
         # 失败不得静默：打印响应要点（脱敏）定位 WAF/会话层问题（2026-09-19 CI 排障）
+        # 服务端原始 msg 可能携带手机号/会话片段，必须经 sanitize_snippet 双重脱敏
         print(f"    [ticket] 换取 sign 失败: http_code={res.get('code')} "
               f"resoultCode={res.get('resoultCode')} "
-              f"msg={str(res.get('resoultMsg') or res.get('msg') or '')[:80]}", flush=True)
+              f"msg={sanitize_snippet(str(res.get('resoultMsg') or res.get('msg') or ''), 80)}", flush=True)
         return False
 
     def mint_ticket_with_token(self) -> bool:
@@ -1542,8 +1550,8 @@ def run_rights_exchange(
     if str(rights_res.get("resoultCode")) != "0":
         msg = str(rights_res.get("resoultMsg") or rights_res.get("msg") or "")
         if any(k in msg for k in ("登录", "失效", "过期", "sign")):
-            return False, f"等级权益查询鉴权失败: {msg[:60]}"
-        return False, f"等级权益查询失败: {msg[:60] or rights_res.get('resoultCode')}"
+            return False, f"等级权益查询鉴权失败: {sanitize_snippet(msg, 60)}"
+        return False, f"等级权益查询失败: {sanitize_snippet(msg, 60) or rights_res.get('resoultCode')}"
 
     item, pick_note = _pick_phone_right(rights_res, goal)
     if item is None:
@@ -1605,11 +1613,11 @@ def run_rights_exchange(
             print(f"    [权益] 🎉 第{attempt}发兑换成功: {title}", flush=True)
             return True, f"🎉 成功兑换【{title}】(耗 {cost} 金豆)，话费 7 个工作日内到账"
         if "还未达到该等级" in msg or "等级" in msg and "不足" in msg:
-            return True, f"【{title}】等级不足（{msg[:40]}），今日终止"
+            return True, f"【{title}】等级不足（{sanitize_snippet(msg, 40)}），今日终止"
         if "已兑换" in msg or "已领取" in msg or "每月" in msg or "限兑" in msg:
-            return True, f"【{title}】本月已兑/限兑（{msg[:40]}），今日终止"
+            return True, f"【{title}】本月已兑/限兑（{sanitize_snippet(msg, 40)}），今日终止"
         if "抢光" in msg or "售罄" in msg or "库存" in msg:
-            return True, f"【{title}】已售罄（{msg[:40]}），今日终止"
+            return True, f"【{title}】已售罄（{sanitize_snippet(msg, 40)}），今日终止"
         http_code = res.get("_http_status") or res.get("code")
         if http_code in (429, "429"):
             wait = min(2.0 * attempt, 8.0)
@@ -1618,9 +1626,9 @@ def run_rights_exchange(
             continue
         if http_code in (412, "412"):
             return False, f"【{title}】WAF 拦截(HTTP 412)，换出口重试"
-        print(f"    [权益] 第{attempt}/{burst}发未中: rc={rc} {msg[:50]}", flush=True)
+        print(f"    [权益] 第{attempt}/{burst}发未中: rc={rc} {sanitize_snippet(msg, 50)}", flush=True)
         time.sleep(random.uniform(0.3, 0.8))
-    return False, f"【{title}】连发 {burst} 次未成功（末次: {last_msg[:50] or 'HTTP错误'}）"
+    return False, f"【{title}】连发 {burst} 次未成功（末次: {sanitize_snippet(last_msg, 50) or 'HTTP错误'}）"
 
 
 def run_exchange_mode() -> int:
@@ -1638,9 +1646,12 @@ def run_exchange_mode() -> int:
     for acc in accounts:
         print(f"\n👤 用户: 【{acc.display_name}】")
         terminal = False
-        proxy_queue: List[Optional[ProxyEndpoint]] = list(_get_candidate_proxies())
-        if None not in proxy_queue:
-            proxy_queue.append(None)
+        # 出口顺序（2026-11-19 CI 实测复盘）：ssoHomLogin/getSingle 现签链在
+        # 全部代理出口（电信CN-HK09/HK03/HK22、singbox 国际家宽）上均失败，
+        # 唯一直连出网端到端成功（家宽 IP + Chrome 指纹，与用户手机同属性）。
+        # 0 点抢兑对时延敏感：先打唯一次次成功的直连，代理仅作直连被 WAF
+        # 拦截时的兜底轮换，避免每个代理先烧 ~60s 现签超时再轮到直连。
+        proxy_queue: List[Optional[ProxyEndpoint]] = [None] + list(_get_candidate_proxies())
         for candidate in proxy_queue:
             p_url = candidate.url if candidate else ""
             label = candidate.display_name if candidate else "直连出网"
@@ -1658,6 +1669,9 @@ def run_exchange_mode() -> int:
                 client, TELECOM_EXCHANGE_GOAL, wait_for_window=True)
             print(f"• 抢兑: 【{msg}】", flush=True)
             if terminal:
+                # 终局即持久化会话（sign/accId 同源材料），下一场 23:30 可直接
+                # 复用健康会话，不必再走全链现签（对齐主链路 save_session 时机）
+                client.save_session()
                 break
             if not ("鉴权失败" in msg or "查询失败" in msg or "缺少 sign" in msg
                     or "WAF" in msg):

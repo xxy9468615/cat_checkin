@@ -302,6 +302,104 @@ class TestCircuitBreaker(unittest.TestCase):
         self.assertEqual(res["due_now"], [])
 
 
+class TestCircuitStateKeyIsolation(unittest.TestCase):
+    """熔断状态键隔离与旧 notify 键迁移（2026-11-19 复盘）。
+
+    旧实现把熔断状态写进 state:notify:<task>，而 discord_notify 每次运行
+    结束用新建字典整键覆盖该键 → status/circuit_broken/next_retry_at 被抹掉，
+    resume 失效、status 表格永远「尚未执行」。现改用专属 cb 键。
+    """
+
+    def test_state_paths_use_dedicated_cb_key(self):
+        with mock.patch.dict(os.environ, {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:"}, clear=False):
+            redis_key, state_file = circuit_breaker._state_paths("telecom-exchange")
+        self.assertEqual(redis_key, "cat_checkin:cb:telecom-exchange")
+        self.assertEqual(state_file, ".cb_state_telecom-exchange.json")
+        self.assertNotIn("notify", redis_key)
+
+    def test_load_migrates_owned_fields_from_legacy_notify(self):
+        """cb 键缺失时一次性认领旧 notify 键中的熔断器字段（含熔断标记，
+        防止升级前已停用的任务因换键复活），不带入 notify 展示字段。"""
+        legacy = {
+            "status": "suspended",
+            "circuit_broken": True,
+            "suspend_reason": "单日累计失败达 8 次上限",
+            "attempts": 8,
+            "attempt_date": "2026-11-19",
+            "next_retry_at": None,
+            "last_ok_date": "2026-11-18",
+            "ok_streak": 3,          # notify 展示字段：不得带入
+            "warn_texts": ["x"],     # notify 展示字段：不得带入
+        }
+        with mock.patch.object(circuit_breaker, "load_kv_state", return_value={}) as m_load, \
+             mock.patch.object(circuit_breaker, "_legacy_notify_state", return_value=legacy):
+            st = circuit_breaker.load_circuit_state("smzdm")
+        self.assertTrue(st["circuit_broken"])
+        self.assertEqual(st["status"], "suspended")
+        self.assertEqual(st["attempts"], 8)
+        self.assertNotIn("ok_streak", st)
+        self.assertNotIn("warn_texts", st)
+        # 首个 load 必须读 cb 专属键
+        self.assertIn(":cb:smzdm", m_load.call_args[0][0])
+
+    def test_cb_key_authoritative_over_stale_notify_flag(self):
+        """cb 键存在即权威：notify 键里 discord_notify 推送熔断卡留下的
+        陈旧 circuit_broken 标记不得复活已恢复的任务。"""
+        cb = {"status": "active", "circuit_broken": False, "attempts": 0}
+        with mock.patch.object(circuit_breaker, "load_kv_state", return_value=cb), \
+             mock.patch.object(circuit_breaker, "_legacy_notify_state",
+                               return_value={"circuit_broken": True}) as m_legacy:
+            st = circuit_breaker.load_circuit_state("glados")
+        self.assertFalse(st["circuit_broken"])
+        m_legacy.assert_not_called()
+
+    def test_resume_survives_notify_overwrite(self):
+        """端到端回归：resume 后模拟 discord_notify 整键覆盖 notify 键，
+        熔断状态必须不受影响（旧实现在此处复活失败任务/丢失重试排程）。"""
+        store: dict = {}
+
+        def fake_load(redis_key, state_file):
+            return dict(store.get(redis_key, {}))
+
+        def fake_save(redis_key, state_file, state):
+            store[redis_key] = dict(state)
+
+        with mock.patch.object(circuit_breaker, "load_kv_state", side_effect=fake_load), \
+             mock.patch.object(circuit_breaker, "save_kv_state", side_effect=fake_save), \
+             mock.patch.object(circuit_breaker, "_legacy_notify_state", return_value={}), \
+             mock.patch.object(circuit_breaker, "save_suspended_result_record"), \
+             mock.patch("discord_notify.notify_circuit_breaker", return_value=True), \
+             mock.patch("builtins.print"):
+            circuit_breaker.trip_circuit_breaker("smzdm", reason="测试熔断")
+            self.assertTrue(circuit_breaker.is_task_suspended("smzdm"))
+            circuit_breaker.resume_task("smzdm", reason="修复后上线")
+            # 模拟 notify_task_result 的整键覆盖（只写 notify 键，新建字典）
+            store["cat_checkin:state:notify:smzdm"] = {
+                "updated_at": "x", "attempt_date": "2026-11-19",
+                "attempts": 1, "last_ok_date": "", "fail_streak": 1, "ok_streak": 0,
+            }
+            self.assertFalse(circuit_breaker.is_task_suspended("smzdm"))
+            st = circuit_breaker.load_circuit_state("smzdm")
+            self.assertEqual(st["status"], "active")
+
+    def test_cli_status_shows_data_source_and_missing_retry(self):
+        """status 表格必须明示数据源；失败但无重试时刻不得显示「到期就绪」。"""
+        import io
+        st = {"attempt_date": circuit_breaker._bjt_today(), "attempts": 2,
+              "status": "active", "next_retry_at": 0}
+        buf = io.StringIO()
+        with mock.patch.object(circuit_breaker, "load_circuit_state", return_value=st), \
+             mock.patch.object(circuit_breaker, "_redis_channel_status",
+                               return_value="⚠️ 未配置凭据，仅本地缓存"), \
+             mock.patch("sys.stdout", buf):
+            circuit_breaker.cli_status("smzdm")
+        out = buf.getvalue()
+        self.assertIn("数据源", out)
+        self.assertIn("未配置凭据", out)
+        self.assertIn("未排定", out)
+        self.assertNotIn("到期就绪", out)
+
+
 class TestDailyOrchestratorCircuitIntegration(unittest.TestCase):
     """编排器与熔断机制集成测试。"""
 
