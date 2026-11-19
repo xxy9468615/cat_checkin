@@ -557,8 +557,11 @@ jobs:
           TELECOM_PASSWORD_1: ${{ secrets.TELECOM_PASSWORD_1 }}
           TELECOM_PHONE_1: ${{ secrets.TELECOM_PHONE_1 }}
           CLOUD189_USERNAME_1: ${{ secrets.CLOUD189_USERNAME_1 }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
         run: |
           pip install --quiet playwright
+          pip install --quiet -r requirements.txt
           sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11-utils >/dev/null
           python3 -m playwright install --with-deps chrome >/dev/null
           Xvfb :99 -screen 0 1366x900x24 >/tmp/xvfb.log 2>&1 &
