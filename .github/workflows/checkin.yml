@@ -641,8 +641,15 @@ jobs:
                       impersonate="chrome124", infer_proxy=False)
           client = t.TelecomClient(acc, http)
           client.prepare_auth()
+          # ticket 一次性：缓存 ticket 已被浏览器段消费，必须现签新 ticket
           token = client.jindou_unified_login()
+          if not token and client.app_token and client.uid and client.target_id:
+              print("re-mint ticket via app token")
+              if client.mint_ticket_with_token():
+                  token = client.jindou_unified_login()
           print("token_len", len(token or ""))
+          if not token:
+              sys.exit(0)
           H = {**client._jindou_headers(token), "fcode": "p201041201", "dzqd-version": "1"}
           for mc in ("I01001", "I00004", ""):
               hh = dict(H)
