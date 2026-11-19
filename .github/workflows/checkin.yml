@@ -631,6 +631,46 @@ jobs:
               browser.close()
           PY
           kill $XPID 2>/dev/null || true
+          python3 - <<'PY2' || true
+          import sys, json
+          sys.path.insert(0, "scripts")
+          import telecom as t
+          from common import Http
+          acc = t.load_all_accounts()[0]
+          http = Http(task_name="TELECOM", proxy="", follow_redirects=True,
+                      impersonate="chrome124", infer_proxy=False)
+          client = t.TelecomClient(acc, http)
+          client.prepare_auth()
+          token = client.jindou_unified_login()
+          print("token_len", len(token or ""))
+          H = {**client._jindou_headers(token), "fcode": "p201041201", "dzqd-version": "1"}
+          for mc in ("I01001", "I00004", ""):
+              hh = dict(H)
+              if mc:
+                  hh["methodCode"] = mc
+              r = http.request("GET", t.JINDOU_GOODS_URL, headers=hh, timeout=15)
+              d = r.json() or {}
+              biz = d.get("biz") or {}
+              items = biz.get("ExchangeGoodslist") if isinstance(biz, dict) else None
+              print("goods+hdr", mc or "-", "http", r.code, "code", d.get("code"),
+                    "msg", str(d.get("message") or "")[:50], "n", len(items or []))
+              if items:
+                  for it in items[:10]:
+                      print("  ITEM", {k: it.get(k) for k in ("id", "title", "amount", "exchangeStatus", "typeCode") if k in it})
+          r = http.request("GET", t.JINDOU_QUERY_URL, headers={**H, "methodCode": "I00004"}, timeout=15)
+          d = r.json() or {}
+          print("queryInfo+hdr", r.code, d.get("code"), "balance", (d.get("biz") or {}).get("amountTotal"))
+          r = http.request("POST", "https://wapact.189.cn:9001/gateway/standExchange/detail/exchange",
+                           json_data={}, headers={**H, "methodCode": "I01004",
+                           "Content-Type": "application/json;charset=UTF-8"}, timeout=15)
+          d = r.json() or {}
+          print("newExchange_empty", r.code, d.get("code"), str(d.get("message") or "")[:60])
+          r = http.request("POST", t.JINDOU_EXCHANGE_URL,
+                           json_data={}, headers={**H, "methodCode": "I01004",
+                           "Content-Type": "application/json;charset=UTF-8"}, timeout=15)
+          d = r.json() or {}
+          print("oldExchange_empty", r.code, d.get("code"), str(d.get("message") or "")[:60])
+          PY2
 
       - name: Execute daily orchestrator
         id: orchestrator
