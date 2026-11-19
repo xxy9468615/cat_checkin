@@ -514,14 +514,20 @@ class TestEmptyDeviceField(unittest.TestCase):
         self.assertEqual(browser.checkin.call_count, 1)
         api.checkin.assert_not_called()
 
-    def test_non_string_device_no_retry(self):
-        browser = Mock()
-        browser.last_login_device = {"device": "Linux"}
-        browser.checkin.return_value = (
-            ("需重新登录", glados.CHECKIN_FAILURE, 0, "device mismatch"), {})
-        checker = self._checker(browser)
-        result, _ = checker._checkin(Mock(), SYNTHETIC_COOKIE, 1, "glados.example")
-        self.assertEqual(browser.checkin.call_count, 1)
+    def test_non_string_device_no_retry_real_browser(self):
+        # 真实 BrowserCheckin.checkin() 路径：loginDevice 为 dict 时不得 str() 强转，
+        # 缓存设备 linux 也不得触发重试；浏览器只提交一次，HTTP 不回退
+        helper = TestBrowserResponseParsing()
+        bc = helper._browser_with_response(
+            '{"code":4,"reason":"device-mismatch","loginDevice":{"device":"Windows"}}')
+        checker = self._checker(bc, cached="linux")
+        api = Mock()
+        with patch.object(glados.time, "sleep"):
+            result, _ = checker._checkin(api, SYNTHETIC_COOKIE, 1, "glados.example")
+        self.assertEqual(result[0], "需重新登录")
+        self.assertNotIn("{'device'", result[3])  # dict 不得被强转进文案
+        self.assertEqual(bc.last_login_device, "")
+        api.checkin.assert_not_called()
 
     def test_valid_linux_still_normalized(self):
         self.assertEqual(glados.resolve_device("Linux"), "linux")

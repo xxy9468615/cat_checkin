@@ -420,7 +420,10 @@ class BrowserCheckin:
         if code == CHECKIN_REPEAT:
             return ("重复签到", code, 0, message), learned_here
         if code == CHECKIN_FAILURE_DEVICE or reason == "device-mismatch":
-            login_device = str(data.get("loginDevice", "") or "")
+            # 只接受非空字符串设备字段：dict/对象不得 str() 强转（会把整个对象
+            # 灌进日志与重试判定），非字符串一律视为未上报
+            raw = data.get("loginDevice")
+            login_device = raw.strip() if isinstance(raw, str) else ""
             if login_device:
                 self.last_login_device = login_device
             detail = message or "登录设备与当前设备不一致"
