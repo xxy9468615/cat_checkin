@@ -600,13 +600,22 @@ jobs:
               page.on("response", on_resp)
               page.goto("https://wapact.189.cn:9001/JinDouMall/JinDouMall_independentDetails.html",
                         wait_until="domcontentloaded", timeout=60000)
-              page.wait_for_timeout(15000)
+              for i in range(6):
+                  page.wait_for_timeout(10000)
+                  n = page.evaluate("document.body ? document.body.innerText.length : -1")
+                  print(f"t+{(i+1)*10}s body_len", n, "api_calls", len(captured))
+                  if n > 50:
+                      break
               print("final_url", page.url[:100])
               print("title", page.title())
-              for u, st, b in captured[:15]:
-                  print("API", st, u, "body", b[:200].replace("\n", " "))
-              txt = page.evaluate("document.body.innerText.slice(0,400)")
-              print("body_text", txt.replace("\n", " | ")[:400])
+              for u, st, b in captured[:20]:
+                  print("API", st, u, "body", b[:250].replace("\n", " "))
+              txt = page.evaluate("document.body ? document.body.innerText.slice(0,500) : ''")
+              print("body_text", txt.replace("\n", " | ")[:500])
+              html = page.content()
+              print("html_len", len(html))
+              scripts = re.findall(r'<script[^>]+src="([^"]+)"', html)
+              print("scripts", scripts[:10])
               browser.close()
           PY
           kill $XPID 2>/dev/null || true
