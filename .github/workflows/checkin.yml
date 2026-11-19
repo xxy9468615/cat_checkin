@@ -549,6 +549,75 @@ jobs:
             stash_proxy_state none "" "" ""
           fi
 
+      - name: DIAG telecom jindou mall (temporary)
+        if: contains(inputs.tasks, 'telecom-exchange')
+        continue-on-error: true
+        env:
+          TELECOM_HEADER_1: ${{ secrets.TELECOM_HEADER_1 }}
+          TELECOM_PASSWORD_1: ${{ secrets.TELECOM_PASSWORD_1 }}
+          TELECOM_PHONE_1: ${{ secrets.TELECOM_PHONE_1 }}
+          CLOUD189_USERNAME_1: ${{ secrets.CLOUD189_USERNAME_1 }}
+        run: |
+          python3 - <<'PY'
+          import sys, time, json
+          sys.path.insert(0, "scripts")
+          import telecom as t
+          accounts = t.load_all_accounts()
+          if not accounts:
+              print("NO_ACCOUNTS"); sys.exit(0)
+          acc = accounts[0]
+          from common import Http
+          http = Http(task_name="TELECOM", proxy="", follow_redirects=True,
+                      impersonate="chrome124", infer_proxy=False)
+          client = t.TelecomClient(acc, http)
+          ok = client.prepare_auth()
+          print("prepare_auth", ok, "has_ticket", bool(client.ticket), "has_sign", bool(client.sign))
+          if not ok:
+              sys.exit(0)
+          token = client.jindou_unified_login()
+          print("unified_login_token_len", len(token or ""))
+          if not token:
+              sys.exit(0)
+          bal = client.jindou_query_balance(token)
+          print("balance", bal)
+          # 商品列表：多组参数探测（floorType/tabOrder/page/order 变体）
+          variants = [
+              ("orig", t.JINDOU_GOODS_URL),
+              ("floor1", t.JINDOU_GOODS_URL.replace("floorType=0", "floorType=1")),
+              ("floor2", t.JINDOU_GOODS_URL.replace("floorType=0", "floorType=2")),
+              ("no_tab", "https://wapact.189.cn:9001/gateway/golden/goldGoods/getGoodsList?userType=1&page=1"),
+              ("bare", "https://wapact.189.cn:9001/gateway/golden/goldGoods/getGoodsList"),
+              ("order1", t.JINDOU_GOODS_URL.replace("order=3", "order=1")),
+          ]
+          for name, url in variants:
+              r = http.request("GET", url, headers=client._jindou_headers(token), timeout=15)
+              try:
+                  d = r.json() or {}
+              except Exception:
+                  d = {}
+              biz = d.get("biz") or {}
+              items = biz.get("ExchangeGoodslist") if isinstance(biz, dict) else None
+              titles = [str(it.get("title") or "?")[:24] for it in (items or [])[:8] if isinstance(it, dict)]
+              print("goods", name, "http", r.code, "code", d.get("code"),
+                    "msg", str(d.get("message") or "")[:40], "n", len(items or []), "titles", titles)
+          # 场次/楼层元信息接口探测（只读）
+          probes = [
+              "https://wapact.189.cn:9001/gateway/golden/goldGoods/getFloorList?userType=1",
+              "https://wapact.189.cn:9001/gateway/golden/api/queryInfo",
+              "https://wapact.189.cn:9001/gateway/golden/goldGoods/getGoodsType?userType=1",
+              "https://wapact.189.cn:9001/gateway/golden/api/queryExchangeList?userType=1&page=1",
+          ]
+          for url in probes:
+              r = http.request("GET", url, headers=client._jindou_headers(token), timeout=15)
+              try:
+                  d = r.json() or {}
+              except Exception:
+                  d = {}
+              keys = sorted((d.get("biz") or {}).keys()) if isinstance(d.get("biz"), dict) else type(d.get("biz")).__name__
+              print("probe", url.split("9001")[1][:60], "http", r.code, "code", d.get("code"),
+                    "msg", str(d.get("message") or "")[:40], "biz_keys", keys)
+          PY
+
       - name: Execute daily orchestrator
         id: orchestrator
         if: steps.orch_tasks.outputs.due_tasks != 'none'
