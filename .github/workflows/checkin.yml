@@ -722,10 +722,28 @@ jobs:
                            headers={**H, "methodCode": "I00004"}, timeout=15)
           d = r.json() or {}
           print("doubleEntry", r.code, d.get("code"), json.dumps(d.get("biz"), ensure_ascii=False)[:600])
-          # queryInfo 完整 biz（amountList 可能含场次/商品配置）
+          # queryInfo 完整 biz：amountList 逐项打印（含 activitiesName/jumpType，
+          # 可能是现行活动入口清单——getGoodsList 已死，活动目录或迁移至此）
           r = http.request("GET", t.JINDOU_QUERY_URL, headers={**H, "methodCode": "I00004"}, timeout=15)
           d = r.json() or {}
-          print("queryInfo_biz", json.dumps(d.get("biz"), ensure_ascii=False)[:1200])
+          biz = d.get("biz") or {}
+          al = biz.get("amountList") or []
+          print("amountList_n", len(al))
+          for it in al:
+              if isinstance(it, dict):
+                  print("AMT", json.dumps(it, ensure_ascii=False)[:300])
+          # 公告接口（isAnnouncement=1 提示有公告，可能含活动变更说明）
+          for path in ("/gateway/golden/api/queryAnnouncement",
+                       "/gateway/golden/api/getAnnouncement",
+                       "/gateway/standQuery/detail/queryAnnouncement"):
+              r = http.request("GET", "https://wapact.189.cn:9001" + path + "?userType=1",
+                               headers={**H, "methodCode": "I00004"}, timeout=15)
+              try:
+                  d = r.json() or {}
+              except Exception:
+                  d = {}
+              print("ANN", path.split("/")[-1], r.code, d.get("code"),
+                    json.dumps(d.get("biz"), ensure_ascii=False)[:300])
           PY2
 
       - name: Execute daily orchestrator
