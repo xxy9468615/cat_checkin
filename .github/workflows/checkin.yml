@@ -601,21 +601,6 @@ jobs:
                       except Exception:
                           captured.append((r.url.split("9001")[1][:80], r.status, "<no body>"))
               page.on("response", on_resp)
-              # 先试列表页（商品目录入口），再试详情页
-              page.goto("https://wapact.189.cn:9001/JinDouMall/JinDouMall.html",
-                        wait_until="domcontentloaded", timeout=60000)
-              page.wait_for_timeout(12000)
-              print("LIST_URL", page.url[:110])
-              print("LIST_TITLE", page.title())
-              list_html = page.content()
-              for ln in re.findall(r'<script[^>]+src="([^"]+)"', list_html):
-                  print("LIST_SCRIPT", ln[:120])
-              inline_list = page.evaluate(
-                  "Array.from(document.querySelectorAll('script:not([src])'))"
-                  ".map(s => s.textContent).join('\n')")
-              for ln in inline_list.split("\n"):
-                  if re.search(r'url:|methodCode|getGoods|GoodsList|golden|standQuery|floorType', ln, re.I):
-                      print("LIST_JSLINE", ln.strip()[:220])
               page.goto("https://wapact.189.cn:9001/JinDouMall/JinDouMall_independentDetails.html",
                         wait_until="domcontentloaded", timeout=60000)
               for i in range(6):
@@ -694,6 +679,26 @@ jobs:
                            "Content-Type": "application/json;charset=UTF-8"}, timeout=15)
           d = r.json() or {}
           print("oldExchange_empty", r.code, d.get("code"), str(d.get("message") or "")[:60])
+          cands = [
+              "/gateway/standQuery/goods/list?userType=1&page=1",
+              "/gateway/standQuery/detail/list?userType=1",
+              "/gateway/golden/api/getGoodsList?userType=1&page=1",
+              "/gateway/golden/goldGoods/getGoodsListNew?floorType=0&userType=1&page=1",
+              "/gateway/golden/api/queryGoodsList?userType=1&page=1",
+              "/gateway/standQuery/detail/queryRedis?activityId=0",
+              "/gateway/golden/goldGoods/getGoodsList?floorType=0&userType=1&page=1&order=3&tabOrder=1",
+          ]
+          for path in cands:
+              r = http.request("GET", "https://wapact.189.cn:9001" + path,
+                               headers={**H, "methodCode": "I01001"}, timeout=15)
+              try:
+                  d = r.json() or {}
+              except Exception:
+                  d = {}
+              biz = d.get("biz")
+              n = len(biz.get("ExchangeGoodslist") or []) if isinstance(biz, dict) else "-"
+              print("ROUTE", path.split("?")[0][24:80], "http", r.code,
+                    "code", d.get("code"), "msg", str(d.get("message") or "")[:36], "n", n)
           PY2
 
       - name: Execute daily orchestrator
