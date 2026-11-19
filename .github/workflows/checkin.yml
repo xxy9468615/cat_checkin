@@ -699,6 +699,19 @@ jobs:
               n = len(biz.get("ExchangeGoodslist") or []) if isinstance(biz, dict) else "-"
               print("ROUTE", path.split("?")[0][24:80], "http", r.code,
                     "code", d.get("code"), "msg", str(d.get("message") or "")[:36], "n", n)
+          r = http.request("GET", "https://wapact.189.cn:9001/gateway/standQuery/detail/queryRedis?activityId=0",
+                           headers={**H, "methodCode": "I01003"}, timeout=15)
+          d = r.json() or {}
+          print("queryRedis_biz", json.dumps(d.get("biz"), ensure_ascii=False)[:1500])
+          r = http.request("GET", "https://wapact.189.cn:9001/gateway/standQuery/detail/query?activityId=0",
+                           headers={**H, "methodCode": "I01001"}, timeout=15)
+          d = r.json() or {}
+          print("query_biz", json.dumps(d, ensure_ascii=False)[:800])
+          for ver in ("1", "2", "2024", "2025"):
+              hh = {**H, "methodCode": "I01001", "dzqd-version": ver}
+              r = http.request("GET", t.JINDOU_GOODS_URL, headers=hh, timeout=15)
+              d = r.json() or {}
+              print("goods_ver", ver, "code", d.get("code"), str(d.get("message") or "")[:30])
           PY2
 
       - name: Execute daily orchestrator
