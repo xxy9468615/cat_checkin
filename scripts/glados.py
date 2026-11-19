@@ -413,7 +413,7 @@ class BrowserCheckin:
         reason = str(data.get("reason", "") or "")
         try:
             points = int(float(data.get("points", 0) or 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             points = 0  # 已确认签到成功，积分字段异常不能撤销结果
         if code == CHECKIN_SUCCESS:
             return ("签到成功", code, points, message), learned_here
@@ -677,7 +677,7 @@ class GladosAPI:
         reason = str(data.get("reason", "") or "")
         try:
             points = int(float(data.get("points", 0) or 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             points = 0
         if code == CHECKIN_SUCCESS:
             return "签到成功", code, points, message
@@ -809,11 +809,13 @@ class Checker:
         res, learned = outcome
         # 只有浏览器从结构化字段确认 device-mismatch 才换设备重试；
         # 首次已成功/重复的签到绝不因文案里出现 loginDevice 字样被重试覆盖。
-        reported_device = self.browser.last_login_device
+        raw_device = getattr(self.browser, "last_login_device", "")
+        # 只接受字符串；dict/对象一律忽略，日志只输出归一化后的固定设备名
+        reported_device = resolve_device(raw_device) if isinstance(raw_device, str) else ""
         if reported_device and res[1] not in (CHECKIN_SUCCESS, CHECKIN_REPEAT):
-            login_device = resolve_device(reported_device)
+            login_device = reported_device
             if login_device != device:
-                print(f"🔁 账号 {cookie_index} 登录设备为 {reported_device}，按该设备指纹重试")
+                print(f"🔁 账号 {cookie_index} 登录设备为 {login_device}，按该设备指纹重试")
                 retry = self.browser.checkin(cookie, domain, login_device)
                 if retry is not None:
                     retry_res, retry_learned = retry
@@ -861,10 +863,12 @@ class Checker:
             _, points_total = api.points(cookie)
             result.points_total = points_total
         except CookieExpiredError as exc:
-            # 签到已确认成功/重复，积分查询失败不能把结果覆盖成 Cookie 失效
-            print(f"⚠️ 签到已确认，但积分查询失败（凭据可能在查询时过期）: "
+            # 积分查询失败不能覆盖已确认的签到结果；文案按是否已确认区分
+            confirmed = result.code in (CHECKIN_SUCCESS, CHECKIN_REPEAT)
+            prefix = "签到已确认，但" if confirmed else ""
+            print(f"⚠️ {prefix}积分查询失败（凭据可能在查询时过期）: "
                   f"{sanitize_snippet(str(exc), 120)}")
-            result.exchange = "积分查询失败（签到已确认）"
+            result.exchange = f"积分查询失败（{'签到已确认' if confirmed else '签到未确认'}）"
             return result
 
         if self.config.auto_exchange:

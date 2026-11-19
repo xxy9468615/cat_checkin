@@ -408,18 +408,59 @@ class TestFailureDetailWhitelist(unittest.TestCase):
 
 
 
-class TestRound4EdgeCases(unittest.TestCase):
-    """第四轮评审：points 异常不撤销已确认签到；非字典 JSON → 结果未知。"""
+class TestBrowserResponseParsing(unittest.TestCase):
+    """第五轮评审：浏览器路径必须真跑 checkin()，覆盖 points 与非 dict 响应。"""
 
-    def test_browser_points_nonnumeric_keeps_success(self):
-        # 与浏览器路径完全相同的解析顺序：先按 code 分类，再宽容处理 points
-        data = {"code": 0, "points": "N/A", "message": "ok"}
-        code = glados.coerce_code(data.get("code"))
-        try:
-            points = int(float(data.get("points", 0) or 0))
-        except (TypeError, ValueError):
-            points = 0
-        self.assertEqual((code, points), (glados.CHECKIN_SUCCESS, 0))
+    def _browser_with_response(self, payload):
+        """构造最小 Playwright mock：page.on 注册回调，button.click() 触发响应。"""
+        bc = glados.BrowserCheckin()
+        page = Mock()
+        listeners = {}
+
+        def on(evt, fn):
+            listeners[evt] = fn
+        page.on.side_effect = on
+
+        button = Mock()
+        button.inner_text.return_value = "Checkin"
+
+        def click():
+            resp = Mock()
+            resp.url = "https://glados.example/api/user/checkin"
+            resp.status = 200
+            resp.request = Mock(method="POST")
+            resp.text.return_value = payload
+            listeners["response"](resp)
+
+        button.click.side_effect = click
+        page.query_selector_all.return_value = [button]
+        ctx = Mock()
+        ctx.new_page.return_value = page
+        ctx.cookies.return_value = []
+        ctx.new_cdp_session.side_effect = Exception("no cdp")
+        bc._ensure_browser = Mock(return_value=Mock(new_context=Mock(return_value=ctx)))
+        return bc
+
+    def test_points_nonnumeric_keeps_success(self):
+        bc = self._browser_with_response('{"code":0,"points":"N/A","message":"ok"}')
+        with patch.object(glados.time, "sleep"):
+            outcome = bc.checkin(SYNTHETIC_COOKIE, "glados.example")
+        self.assertIsNotNone(outcome)
+        (status, code, points, _), _ = outcome
+        self.assertEqual((status, code, points), ("签到成功", glados.CHECKIN_SUCCESS, 0))
+
+    def test_non_dict_json_is_unknown_via_checker(self):
+        bc = self._browser_with_response('"just a string"')
+        checker = glados.Checker.__new__(glados.Checker)
+        checker.results = []
+        checker.devices = {}
+        checker.browser = bc
+        api = Mock()
+        with patch.object(glados.time, "sleep"):
+            result, learned = checker._checkin(api, SYNTHETIC_COOKIE, 1, "glados.example")
+        self.assertEqual(result[0], "提交结果未知")
+        api.checkin.assert_not_called()
+        self.assertEqual(learned, {})
 
     def test_http_nonnumeric_points_does_not_fail_checkin(self):
         api = glados.GladosAPI("glados.example", 1)
@@ -431,18 +472,23 @@ class TestRound4EdgeCases(unittest.TestCase):
             status, code, points, _ = api.checkin(SYNTHETIC_COOKIE)
         self.assertEqual((status, code, points), ("签到成功", glados.CHECKIN_SUCCESS, 0))
 
-    def test_non_dict_json_is_unknown(self):
-        data = '"just a string"'
-        parsed = json.loads(data)
-        self.assertNotIsInstance(parsed, dict)
-        # 浏览器路径对非 dict 标记 submitted_unknown，不发起 HTTP 重复提交
-
     def test_summary_keeps_unknown_status(self):
         checker = glados.Checker.__new__(glados.Checker)
         checker.results = [glados.Result(cookie_index=1, domain="glados.example",
                          status="提交结果未知", code=glados.CHECKIN_FAILURE)]
         _, lines = checker.summary()
         self.assertIn("提交结果未知", lines)
+
+    def test_overflow_points_keeps_success(self):
+        api = glados.GladosAPI("glados.example", 1)
+        api.http = Mock()
+        api.challenge = Mock(return_value={"nonce": SYNTHETIC_NONCE})
+        resp = Mock(code=200, text="{}", json=Mock(return_value={
+            "code": 0, "points": "1e99999"}))
+        api.http.request.side_effect = [resp]
+        with patch.object(glados.time, "sleep"):
+            status, code, points, _ = api.checkin(SYNTHETIC_COOKIE)
+        self.assertEqual((status, code, points), ("签到成功", glados.CHECKIN_SUCCESS, 0))
 
 
 if __name__ == "__main__":
