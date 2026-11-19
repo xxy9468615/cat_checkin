@@ -616,6 +616,16 @@ jobs:
               print("html_len", len(html))
               scripts = re.findall(r'<script[^>]+src="([^"]+)"', html)
               print("scripts", scripts[:10])
+              inline = page.evaluate(
+                  "Array.from(document.querySelectorAll('script:not([src])'))"
+                  ".map(s => s.textContent).join('\\n---\\n').slice(0, 6000)")
+              print("INLINE_SCRIPTS", inline[:5000])
+              globs = page.evaluate(
+                  "JSON.stringify({toolsObj: typeof window.toolsObj,"
+                  " settings: typeof window.settings,"
+                  " ajaxUrl: (window.settings && window.settings.ajaxUrl) || null,"
+                  " keys: Object.keys(window).filter(k => /mall|goods|jindou|api|url|config/i.test(k)).slice(0,30)})")
+              print("GLOBALS", globs)
               browser.close()
           PY
           kill $XPID 2>/dev/null || true
