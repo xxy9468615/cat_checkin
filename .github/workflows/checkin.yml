@@ -735,26 +735,34 @@ jobs:
                   for k, v in it.items():
                       sv = str(v)
                       print("AMTKV", k, "=", sv[:120] if k not in ("url","jumpUrl","link") else sv[:200])
-          # 商城首页/楼层配置探测：getGoodsList 的 floorType/tabOrder 来自首页配置
-          for path in ("/gateway/golden/api/queryIndex",
-                       "/gateway/golden/api/index",
-                       "/gateway/golden/goldGoods/getFloor",
-                       "/gateway/golden/goldGoods/getTab",
-                       "/gateway/golden/api/getConfig",
-                       "/gateway/golden/api/queryConfig",
-                       "/gateway/standQuery/index/query",
-                       "/gateway/golden/goldGoods/getGoodsList?floorType=1&userType=1&page=1&order=3&tabOrder=1",
-                       "/gateway/golden/goldGoods/getGoodsList?floorType=2&userType=1&page=1&order=3&tabOrder=1"):
-              r = http.request("GET", "https://wapact.189.cn:9001" + path,
-                               headers={**H, "methodCode": "I01001"}, timeout=15)
-              try:
-                  d = r.json() or {}
-              except Exception:
-                  d = {}
+          # getGoodsList 恒 999999：探测是否缺 activityId/场次参数（现行 H5 按活动维度查询）
+          # queryRedis 已证实按 activityId 查询是现行模式。getGoodsList 可能也需要 activityId。
+          base = "https://wapact.189.cn:9001/gateway/golden/goldGoods/getGoodsList"
+          variants = [
+              "?activityId=0&userType=1",
+              "?floorType=0&userType=1&page=1&order=3&tabOrder=&activityId=0",
+              "?userType=1&provinceCode=600202",
+              "?floorType=0&userType=1&page=1&order=3&tabOrder=&version=1",
+          ]
+          for q in variants:
+              r = http.request("GET", base + q, headers={**H, "methodCode": "I01001"}, timeout=15)
+              d = r.json() or {}
+              print("GLVAR", q[:60], "code", d.get("code"), str(d.get("message") or "")[:30])
+          # standQuery/detail/query 带真实活动 ID 探测：从 queryRedis 拿不到商品，
+          # 但 H5 详情页 URL 的 activitieId 来自上游跳转。探测常见话费券活动 ID 段。
+          # 先确认 query 接口对非零 activityId 的响应形态（不兑换，只读）
+          for aid in ("1", "100", "1000"):
+              r = http.request("GET",
+                  f"https://wapact.189.cn:9001/gateway/standQuery/detail/query?activityId={aid}",
+                  headers={**H, "methodCode": "I01001"}, timeout=15)
+              d = r.json() or {}
               biz = d.get("biz")
-              keys = sorted(biz.keys())[:12] if isinstance(biz, dict) else type(biz).__name__
-              print("IDX", path.split("?")[0].split("/")[-1][:40], r.code, d.get("code"),
-                    str(d.get("message") or "")[:30], "bizkeys", keys)
+              has_goods = isinstance(biz, dict) and "exchangeGoodsBean" in biz
+              print("QID", aid, "code", d.get("code"), str(d.get("message") or "")[:30],
+                    "hasGoodsBean", has_goods)
+              if has_goods:
+                  gb = biz.get("exchangeGoodsBean") or {}
+                  print("  GOODS", json.dumps({k: gb.get(k) for k in ("detailTitle","detailBut","exchangeStatus","amount","id") if k in gb}, ensure_ascii=False)[:300])
           PY2
 
       - name: Execute daily orchestrator
