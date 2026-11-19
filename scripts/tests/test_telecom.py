@@ -768,7 +768,7 @@ class TestTelecom(unittest.TestCase):
                     {"TELECOM_EXCHANGE_BEANS": bad, "TELECOM_EXCHANGE_GOAL": "   "}
                 )
                 self.assertEqual(beans, 8000)
-                self.assertEqual(goal, "10元话费直充券")
+                self.assertEqual(goal, "等级权益话费")
 
 
 class TestJindouExchange(unittest.TestCase):
@@ -897,129 +897,172 @@ class TestJindouExchange(unittest.TestCase):
         self.assertNotEqual(res.get("code"), 0)
         m_req.assert_not_called()
 
-    def _goods(self):
-        return [
-            {"id": "g20", "title": "20元话费券", "amount": "16000"},
-            {"id": "g10", "title": "10元话费直充券", "amount": "8000"},
-            {"id": "g110", "title": "110元话费大额券", "amount": "88000"},
-        ]
+    # ---------- 等级权益话费抢兑（2026-11-19 现行链路）----------
 
-    def test_match_goal_goods(self):
-        """目标商品匹配：金额+话费双条件，金额带非数字前缀防 10 误中 110。"""
-        goods = self._goods()
-        hit = telecom._match_goal_goods("10元话费直充券", goods)
-        self.assertEqual(hit["id"], "g10")
-        self.assertIsNone(telecom._match_goal_goods("3元话费券", goods))
-        self.assertIsNone(telecom._match_goal_goods("", goods))
+    def _rights(self, cur_level=4):
+        """合成 queryLevelRightInfo 响应（V1..V6 话费档 + 干扰项）。"""
+        data = {"resoultCode": "0", "currentLevel": cur_level}
+        phone = {3: ("1元", "200"), 4: ("2元", "400"), 5: ("3元", "600"), 6: ("5元", "1000")}
+        for lv in range(1, 7):
+            items = []
+            if lv in phone:
+                amt, price = phone[lv]
+                items.append({
+                    "activityId": f"V1.0FAKEright{lv}", "title": f"LV{lv}等级权益{amt}话费",
+                    "promotionalPrice": price, "showType": "9003",
+                    "showEffect": "8", "isReceive": "false",
+                })
+            items.append({"activityId": f"V1.0FAKEcoupon{lv}", "title": f"LV{lv}专享优惠券",
+                          "promotionalPrice": "10", "showType": "9001", "showEffect": "7"})
+            data[f"V{lv}"] = items
+        return data
 
-    def test_next_window_math(self):
-        """场次窗口推进：上午前→10:00，两场之间→14:00，下午场后→次日 10:00。"""
-        with patch.object(telecom, "BJT", telecom.BJT):
-            morning = telecom._jindou_next_window(telecom.datetime(2026, 10, 31, 9, 0, tzinfo=telecom.BJT))
-            self.assertEqual((morning.hour, morning.minute), (10, 0))
-            noon = telecom._jindou_next_window(telecom.datetime(2026, 10, 31, 11, 30, tzinfo=telecom.BJT))
-            self.assertEqual((noon.hour, noon.minute), (14, 0))
-            late = telecom._jindou_next_window(telecom.datetime(2026, 10, 31, 15, 0, tzinfo=telecom.BJT))
-            self.assertEqual((late.day, late.hour, late.minute), (32 if late.day != 1 else 1, 10, 0))
+    def test_pick_phone_right_goal_hit(self):
+        item, note = telecom._pick_phone_right(self._rights(6), "5元话费")
+        self.assertIsNotNone(item)
+        self.assertEqual(item["title"], "LV6等级权益5元话费")
+        self.assertIn("命中", note)
 
-    def _run(self, client, *, balance=8214, goods="ok", burst=3, exchange_results=None):
-        """在 mock 掉 wapact 三接口的前提下执行 run_jindou_exchange。"""
-        def login():
-            return "tok" if balance is not None else ""
+    def test_pick_phone_right_downgrade(self):
+        """LV4 账号目标 5元 → 自动降级到 2元（等级不足不硬抢）。"""
+        item, note = telecom._pick_phone_right(self._rights(4), "5元话费")
+        self.assertEqual(item["title"], "LV4等级权益2元话费")
+        self.assertIn("降级", note)
 
-        client.jindou_unified_login = MagicMock(side_effect=login)
-        client.jindou_query_balance = MagicMock(return_value=balance)
-        if goods == "ok":
-            client.jindou_fetch_goods = MagicMock(return_value=(self._goods(), ""))
-        elif goods is None:
-            client.jindou_fetch_goods = MagicMock(return_value=(None, "系统错误"))
-        else:
-            client.jindou_fetch_goods = MagicMock(return_value=([], ""))
-        seq = list(exchange_results or [])
-        client.jindou_exchange_once = MagicMock(side_effect=seq)
+    def test_pick_phone_right_auto_max(self):
+        item, note = telecom._pick_phone_right(self._rights(4), "等级权益话费")
+        self.assertEqual(item["title"], "LV4等级权益2元话费")
+        self.assertIn("最高档", note)
+
+    def test_pick_phone_right_no_level(self):
+        item, note = telecom._pick_phone_right({"resoultCode": "0"}, "5元话费")
+        self.assertIsNone(item)
+        self.assertIn("无法确定账号等级", note)
+
+    def test_pick_phone_right_ignores_coupons(self):
+        """showType=9001 优惠券不得被当成话费档。"""
+        rights = self._rights(4)
+        rights["V4"] = [it for it in rights["V4"] if it["showType"] != "9003"]
+        item, _ = telecom._pick_phone_right(rights, "2元话费")
+        # V3 1元档仍在（<=4），降级到 1元而非误选优惠券
+        self.assertEqual(item["title"], "LV3等级权益1元话费")
+
+    def _rights_client(self):
+        client = self._client()
+        client.sign = "V1.0FAKEsign"
+        client.acc_id = "V1.0FAKEacc"
+        return client
+
+    def _run_rights(self, client, rights=None, stock=102, receive_results=None, burst=3):
+        rights = rights if rights is not None else self._rights(4)
+        seq = list(receive_results or [])
+
+        def fake_req(method, url, **kw):
+            if "queryLevelRightInfo" in url:
+                return rights
+            if "querystockNum" in url:
+                return {"resoultCode": "0", "stockNum": stock}
+            if "receiverRights" in url:
+                return seq.pop(0) if seq else {"resoultCode": "1", "resoultMsg": "系统繁忙"}
+            return {}
+
+        client._req = MagicMock(side_effect=fake_req)
         with patch.object(telecom.time, "sleep", lambda *_: None):
-            return telecom.run_jindou_exchange(
-                client, "10元话费直充券", 8000, wait_for_window=False, burst=burst)
+            return telecom.run_rights_exchange(
+                client, "2元话费", wait_for_window=False, burst=burst)
 
-    def test_exchange_success(self):
-        ok, msg = self._run(self._client(), exchange_results=[
-            {"code": "0", "result_code": "0", "message": "成功"}])
+    def test_rights_exchange_success(self):
+        ok, msg = self._run_rights(self._rights_client(), receive_results=[
+            {"resoultCode": "0", "resoultMsg": "兑换成功"}])
         self.assertTrue(ok)
         self.assertIn("成功兑换", msg)
-        self.assertIn("10元话费直充券", msg)
+        self.assertIn("2元话费", msg)
 
-    def test_exchange_sold_out_terminal(self):
-        ok, msg = self._run(self._client(), exchange_results=[
-            {"code": "0", "result_code": "413", "message": ""}])
+    def test_rights_exchange_level_insufficient_terminal(self):
+        ok, msg = self._run_rights(self._rights_client(), receive_results=[
+            {"resoultCode": "1", "resoultMsg": "你还未达到该等级"}])
+        self.assertTrue(ok)
+        self.assertIn("等级不足", msg)
+
+    def test_rights_exchange_monthly_limit_terminal(self):
+        ok, msg = self._run_rights(self._rights_client(), receive_results=[
+            {"resoultCode": "1", "resoultMsg": "本月已兑换过话费奖品"}])
+        self.assertTrue(ok)
+        self.assertIn("本月已兑", msg)
+
+    def test_rights_exchange_sold_out_terminal(self):
+        ok, msg = self._run_rights(self._rights_client(), receive_results=[
+            {"resoultCode": "1", "resoultMsg": "奖品已抢光"}])
         self.assertTrue(ok)
         self.assertIn("售罄", msg)
 
-    def test_exchange_limit_terminal(self):
-        ok, msg = self._run(self._client(), exchange_results=[
-            {"code": "0", "result_code": "412", "message": ""}])
+    def test_rights_exchange_already_received_terminal(self):
+        rights = self._rights(4)
+        for it in rights["V4"]:
+            if it["showType"] == "9003":
+                it["isReceive"] = "true"
+        ok, msg = self._run_rights(self._rights_client(), rights=rights)
         self.assertTrue(ok)
-        self.assertIn("次数上限", msg)
+        self.assertIn("本月已兑换", msg)
 
-    def test_exchange_burst_exhausted_transient(self):
-        ok, msg = self._run(self._client(), exchange_results=[
-            {"code": "0", "result_code": "410", "message": ""}] * 3)
+    def test_rights_exchange_burst_exhausted_transient(self):
+        ok, msg = self._run_rights(self._rights_client(), receive_results=[
+            {"resoultCode": "1", "resoultMsg": "系统繁忙，再试一次吧"}] * 3)
         self.assertFalse(ok)
         self.assertIn("未成功", msg)
 
-    def test_exchange_goods_unavailable_transient(self):
-        ok, msg = self._run(self._client(), goods=None)
+    def test_rights_exchange_429_backoff_then_success(self):
+        ok, msg = self._run_rights(self._rights_client(), receive_results=[
+            {"resoultCode": "1", "resoultMsg": "", "_http_status": 429},
+            {"resoultCode": "0", "resoultMsg": "兑换成功"}])
+        self.assertTrue(ok)
+        self.assertIn("成功兑换", msg)
+
+    def test_rights_exchange_waf_transient(self):
+        ok, msg = self._run_rights(self._rights_client(), receive_results=[
+            {"resoultCode": "1", "resoultMsg": "", "_http_status": 412}])
         self.assertFalse(ok)
-        self.assertIn("列表不可用", msg)
+        self.assertIn("WAF", msg)
 
-    def test_exchange_no_goal_item_terminal(self):
-        ok, msg = self._run(self._client(), goods="empty")
-        self.assertTrue(ok)
-        self.assertIn("无「10元话费直充券」上架", msg)
+    def test_rights_exchange_missing_credentials(self):
+        client = self._client()  # 无 sign/accId
+        ok, msg = telecom.run_rights_exchange(client, "2元话费", wait_for_window=False)
+        self.assertFalse(ok)
+        self.assertIn("缺少 sign/accId", msg)
 
-    def test_exchange_below_target_terminal(self):
-        ok, msg = self._run(self._client(), balance=4000)
-        self.assertTrue(ok)
-        self.assertIn("未达目标", msg)
+    def test_rights_exchange_auth_failure_transient(self):
+        client = self._rights_client()
+        client._req = MagicMock(return_value={"resoultCode": "1", "resoultMsg": "登录已失效"})
+        ok, msg = telecom.run_rights_exchange(client, "2元话费", wait_for_window=False)
+        self.assertFalse(ok)
+        self.assertIn("鉴权失败", msg)
 
-    def test_try_exchange_no_more_fake_submitted(self):
-        """回归护栏：兑换响应为空/失败时严禁再出现旧链路的「已提交」假成功文案。"""
-        client = self._client()
-        client.jindou_unified_login = MagicMock(return_value="")
-        msg = client.try_exchange_phone_bill("10元话费直充券", 8000)
+    def test_try_exchange_no_fake_submitted(self):
+        """回归护栏：兑换失败严禁出现旧链路「已提交」假成功文案。"""
+        client = self._client()  # 无凭据
+        msg = client.try_exchange_phone_bill("2元话费", 400)
         self.assertNotIn("已提交", msg)
-        self.assertIn("登录失败", msg)
 
-
-    def test_next_due_beijing_time(self):
-        """自排程下次到期时刻必须按北京时间场次推算（用户核心诉求）。
-
-        terminal=True → 明日 09:30 BJT（首个场次前 30 分钟）；
-        terminal=False → 下一个场次前 30 分钟（07:00→09:30，11:00→13:30，
-        15:00 已过下午场→明日 09:30）。"""
+    def test_rights_next_window_midnight(self):
         from datetime import datetime as _dt
-        cases = [
-            # (now BJT, terminal, 期望 时:分)
-            ((2026, 10, 31, 10, 5), True, (31 + 1, 9, 30)),   # 上午场后终局 → 明日 09:30
-            ((2026, 10, 31, 7, 0), False, (31, 9, 30)),        # 场次前探测失败 → 09:30
-            ((2026, 10, 31, 11, 0), False, (31, 13, 30)),      # 两场之间失败 → 13:30
-            ((2026, 10, 31, 15, 0), False, (32, 9, 30)),       # 下午场后失败 → 明日 09:30
-        ]
-        for (y, mo, d, h, mi), terminal, (exp_d, exp_h, exp_m) in cases:
-            with self.subTest(now=(y, mo, d, h, mi), terminal=terminal):
-                due = telecom._jindou_next_due(
-                    terminal, _dt(y, mo, d, h, mi, tzinfo=telecom.BJT))
-                # 期望日可能跨月（10-31 +1 → 11-01），按日差校验而非硬编码日号
-                day_delta = (due.date() - _dt(y, mo, d, tzinfo=telecom.BJT).date()).days
-                self.assertEqual((day_delta, due.hour, due.minute),
-                                 (exp_d - d, exp_h, exp_m))
+        # 23:00 → 次日 00:00；00:30 → 再次日 00:00
+        w1 = telecom._rights_next_window(_dt(2026, 11, 19, 23, 0, tzinfo=telecom.BJT))
+        self.assertEqual((w1.day, w1.hour, w1.minute), (20, 0, 0))
+        w2 = telecom._rights_next_window(_dt(2026, 11, 19, 0, 30, tzinfo=telecom.BJT))
+        self.assertEqual((w2.day, w2.hour, w2.minute), (20, 0, 0))
 
-    def test_next_due_window_preceded_by_30min(self):
-        """到期时刻恒为场次前 30 分钟：配合任务内等待正好压在 09:59:15 突发。"""
+    def test_rights_next_due_2330(self):
+        """自排程钉在 0 点场前 30 分钟（23:30 BJT）。"""
         from datetime import datetime as _dt
-        due = telecom._jindou_next_due(False, _dt(2026, 10, 31, 8, 0, tzinfo=telecom.BJT))
-        self.assertEqual((due.hour, due.minute), (9, 30))
-        self.assertEqual((due.hour * 60 + due.minute),
-                         (10 * 60) - 30)
+        # 22:00 暂时性失败 → 当晚 23:30
+        due = telecom._rights_next_due(False, _dt(2026, 11, 19, 22, 0, tzinfo=telecom.BJT))
+        self.assertEqual((due.day, due.hour, due.minute), (19, 23, 30))
+        # 00:30 终局 → 当晚 23:30（下一个 0 点场是 20 日 00:00）
+        due2 = telecom._rights_next_due(True, _dt(2026, 11, 19, 0, 30, tzinfo=telecom.BJT))
+        self.assertEqual((due2.day, due2.hour, due2.minute), (19, 23, 30))
+        # 23:45 暂时性失败（已过 23:30）→ 次日 23:30
+        due3 = telecom._rights_next_due(False, _dt(2026, 11, 19, 23, 45, tzinfo=telecom.BJT))
+        self.assertEqual((due3.day, due3.hour, due3.minute), (20, 23, 30))
 
     def test_registry_task_is_rolling(self):
         """telecom-exchange 必须注册为 rolling（24h），rolling 检查先于退避检查，
@@ -1030,12 +1073,11 @@ class TestJindouExchange(unittest.TestCase):
         self.assertEqual(float(cfg["sched"].get("period_h")), 24.0)
         self.assertEqual(cfg.get("env", {}).get("TELECOM_MODE"), "exchange")
 
-    def test_jindou_schedule_writes_dedicated_rolling_key(self):
+    def test_rights_schedule_writes_dedicated_rolling_key(self):
         """滚动排程必须写专用 state:rolling: 键 + .rolling_state_ 文件。
 
-        notify 状态键（cat_checkin:state:notify:telecom-exchange）在任务结束后被
-        orchestrator 的 notify 状态同步整键覆盖——旧实现复用该键导致
-        last_credit_ts 每次运行即被抹掉，rolling 冷却静默失效（2026-11-05 复盘）。"""
+        notify 状态键在任务结束后被 orchestrator 整键覆盖——旧实现复用该键
+        导致 last_credit_ts 每次运行即被抹掉（2026-11-05 复盘）。"""
         captured = {}
 
         def fake_save(redis_key, state_file, state):
@@ -1047,13 +1089,12 @@ class TestJindouExchange(unittest.TestCase):
         with patch.dict(os.environ, {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:"}, clear=False), \
              patch.object(telecom, "save_kv_state", side_effect=fake_save), \
              patch("sys.stdout", new_callable=io.StringIO):
-            telecom._jindou_schedule_next_run(terminal=False)
+            telecom._rights_schedule_next_run(terminal=False)
         self.assertEqual(captured["redis_key"], "cat_checkin:state:rolling:telecom-exchange")
         self.assertEqual(captured["state_file"], ".rolling_state_telecom-exchange.json")
         next_due = float(captured["state"]["last_credit_ts"]) + 24 * 3600
         due_dt = datetime.fromtimestamp(next_due, telecom.BJT)
-        # 下一个场次（10:00/14:00 BJT）前 30 分钟
-        self.assertIn(due_dt.strftime("%H:%M"), ("09:30", "13:30"))
+        self.assertEqual(due_dt.strftime("%H:%M"), "23:30")
 
 
 if __name__ == "__main__":
