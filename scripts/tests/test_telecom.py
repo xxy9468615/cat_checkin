@@ -1227,6 +1227,105 @@ class TestJindouExchange(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("无法确定账号等级", msg)
 
+    def test_rights_exchange_limit_query_error_not_terminal(self):
+        """「每月限兑次数查询异常」含「每月/限兑」但是故障文案：不得判终局
+        （PR #34 第二轮评审）。"""
+        ok, msg = self._run_rights(self._rights_client(), receive_results=[
+            {"resoultCode": "1", "resoultMsg": "每月限兑次数查询异常，请稍后重试"}] * 3)
+        self.assertFalse(ok)
+        self.assertNotIn("本月已兑", msg)
+
+    # ---------- 每日签到大转盘（2026-11-19 HAR 逆向接入） ----------
+
+    def _wheel_client(self, remain=3, beans=1000, cost=20):
+        client = self._rights_client()
+        self._wheel_status = {"resoultCode": "0", "data": {
+            "remainCount": remain, "userMaximum": "3", "amount": cost,
+            "beanAmount": beans, "showEntry": True, "state": "1",
+        }}
+        self._wheel_submits = []
+        return client
+
+    def _wheel_req(self, client, submit_results):
+        seq = list(submit_results)
+
+        def fake_req(method, url, **kw):
+            if "getWheelStatusAndInfo" in url:
+                return self._wheel_status
+            if "wheelRewardSubmit" in url:
+                self._wheel_submits.append(kw.get("json_data"))
+                return seq.pop(0) if seq else {"code": 1, "msg": "系统繁忙"}
+            return {}
+
+        client._req = MagicMock(side_effect=fake_req)
+
+    def test_wheel_draws_all_remaining(self):
+        """remainCount=3 → 连抽 3 次，奖品汇总；para.phone 必须填 accId。"""
+        client = self._wheel_client(remain=3)
+        self._wheel_req(client, [
+            {"code": 0, "data": {"prizeName": "88金豆", "prizeState": "0"}},
+            {"code": 0, "data": {"prizeName": "188金豆", "prizeState": "0"}},
+            {"code": 0, "data": {"prizeName": "漫花纸品10元优惠券", "prizeState": "0"}},
+        ])
+        with patch.object(telecom.time, "sleep", lambda *_: None), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            res = client.wheel_daily_draws()
+        self.assertEqual(res, "88金豆、188金豆、漫花纸品10元优惠券")
+        self.assertEqual(len(self._wheel_submits), 3)
+
+    def test_wheel_respects_server_remain_zero(self):
+        """remainCount=0 → 今日已抽，不发任何提交。"""
+        client = self._wheel_client(remain=0)
+        self._wheel_req(client, [])
+        with patch("sys.stdout", new_callable=io.StringIO):
+            res = client.wheel_daily_draws()
+        self.assertEqual(res, "今日已抽")
+        self.assertEqual(len(self._wheel_submits), 0)
+
+    def test_wheel_stops_on_insufficient_beans(self):
+        """余额 < 单抽成本 → 停手不硬抽。"""
+        client = self._wheel_client(remain=3, beans=10, cost=20)
+        self._wheel_req(client, [])
+        with patch("sys.stdout", new_callable=io.StringIO):
+            res = client.wheel_daily_draws()
+        self.assertIn("金豆不足", res)
+        self.assertEqual(len(self._wheel_submits), 0)
+
+    def test_wheel_server_exhausted_stops(self):
+        """服务端裁决次数用尽（「今日已抽完」）→ 停手，不继续提交。"""
+        client = self._wheel_client(remain=3)
+        self._wheel_req(client, [
+            {"code": 0, "data": {"prizeName": "88金豆"}},
+            {"code": 1, "resoultMsg": "今日抽奖次数已用完"},
+        ])
+        with patch.object(telecom.time, "sleep", lambda *_: None), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            res = client.wheel_daily_draws()
+        self.assertEqual(res, "88金豆")
+        self.assertEqual(len(self._wheel_submits), 2)
+
+    def test_wheel_missing_creds_silent(self):
+        """缺 sign/accId → 空串静默跳过（不重复刷屏）。"""
+        client = self._client()
+        self.assertEqual(client.wheel_daily_draws(), "")
+
+    def test_wheel_para_phone_is_acc_id(self):
+        """协议护栏：para.phone 字段填 accId（JS 实证），不是手机号。"""
+        client = self._wheel_client(remain=1)
+        captured = {}
+
+        def fake_encrypt(payload):
+            captured.update(payload)
+            return "V1.0FAKEcipher"
+
+        self._wheel_req(client, [{"code": 0, "data": {"prizeName": "88金豆"}}])
+        with patch.object(telecom, "_encrypt_rsa", side_effect=fake_encrypt), \
+             patch.object(telecom.time, "sleep", lambda *_: None), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            client.wheel_daily_draws()
+        self.assertEqual(captured.get("phone"), "V1.0FAKEacc")
+        self.assertEqual(captured.get("provinceCode"), telecom.WHEEL_PROVINCE_CODE)
+
 
 if __name__ == "__main__":
     unittest.main()

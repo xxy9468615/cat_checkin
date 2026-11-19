@@ -331,7 +331,8 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
             "ok_streak": 3,          # notify 展示字段：不得带入
             "warn_texts": ["x"],     # notify 展示字段：不得带入
         }
-        with mock.patch.object(circuit_breaker, "load_kv_state", return_value={}) as m_load, \
+        with mock.patch.object(circuit_breaker, "_load_cb_state_raw",
+                               return_value=({}, True)) as m_load, \
              mock.patch.object(circuit_breaker, "_legacy_notify_state", return_value=legacy):
             st = circuit_breaker.load_circuit_state("smzdm")
         self.assertTrue(st["circuit_broken"])
@@ -346,7 +347,8 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
         """cb 键存在即权威：notify 键里 discord_notify 推送熔断卡留下的
         陈旧 circuit_broken 标记不得复活已恢复的任务。"""
         cb = {"status": "active", "circuit_broken": False, "attempts": 0}
-        with mock.patch.object(circuit_breaker, "load_kv_state", return_value=cb), \
+        with mock.patch.object(circuit_breaker, "_load_cb_state_raw",
+                               return_value=(cb, False)), \
              mock.patch.object(circuit_breaker, "_legacy_notify_state",
                                return_value={"circuit_broken": True}) as m_legacy:
             st = circuit_breaker.load_circuit_state("glados")
@@ -358,13 +360,14 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
         熔断状态必须不受影响（旧实现在此处复活失败任务/丢失重试排程）。"""
         store: dict = {}
 
-        def fake_load(redis_key, state_file):
-            return dict(store.get(redis_key, {}))
+        def fake_raw(redis_key, state_file):
+            data = dict(store.get(redis_key, {}))
+            return data, (not data)
 
         def fake_save(redis_key, state_file, state):
             store[redis_key] = dict(state)
 
-        with mock.patch.object(circuit_breaker, "load_kv_state", side_effect=fake_load), \
+        with mock.patch.object(circuit_breaker, "_load_cb_state_raw", side_effect=fake_raw), \
              mock.patch.object(circuit_breaker, "save_kv_state", side_effect=fake_save), \
              mock.patch.object(circuit_breaker, "_legacy_notify_state", return_value={}), \
              mock.patch.object(circuit_breaker, "save_suspended_result_record"), \
@@ -403,8 +406,8 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
         """Redis 读取失败且无本地文件 ≠ 确认缺键：不得回读旧 notify 的陈旧
         熔断标记把已恢复任务重新熔断（PR #34 评审）。"""
         legacy = {"status": "suspended", "circuit_broken": True, "attempts": 8}
-        with mock.patch.object(circuit_breaker, "load_kv_state", return_value={}), \
-             mock.patch.object(circuit_breaker, "_cb_read_failed", return_value=True), \
+        with mock.patch.object(circuit_breaker, "_load_cb_state_raw",
+                               return_value=({}, False)), \
              mock.patch.object(circuit_breaker, "_legacy_notify_state",
                                return_value=legacy) as m_legacy:
             st = circuit_breaker.load_circuit_state("smzdm")
@@ -414,28 +417,70 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
     def test_migration_when_absence_confirmed(self):
         """确认缺键（纯本地模式文件缺失 / Redis 明确返回 nil）仍正常迁移。"""
         legacy = {"status": "suspended", "circuit_broken": True, "attempts": 8}
-        with mock.patch.object(circuit_breaker, "load_kv_state", return_value={}), \
-             mock.patch.object(circuit_breaker, "_cb_read_failed", return_value=False), \
+        with mock.patch.object(circuit_breaker, "_load_cb_state_raw",
+                               return_value=({}, True)), \
              mock.patch.object(circuit_breaker, "_legacy_notify_state", return_value=legacy):
             st = circuit_breaker.load_circuit_state("smzdm")
         self.assertTrue(st["circuit_broken"])
 
-    def test_cb_read_failed_local_mode_is_not_failure(self):
-        """凭据未配置（纯本地模式）：文件缺失即确认缺键，不算读取失败。"""
+    def test_raw_local_mode_absence_confirmed(self):
+        """凭据未配置（纯本地模式）：文件缺失即确认缺键，可迁移。"""
         with mock.patch.dict(os.environ, {}, clear=True), \
              mock.patch("os.path.exists", return_value=False):
-            self.assertFalse(circuit_breaker._cb_read_failed("cat_checkin:cb:x", ".cb_state_x.json"))
+            state, absent = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", ".cb_state_x.json")
+        self.assertEqual(state, {})
+        self.assertTrue(absent)
 
-    def test_cb_read_failed_local_file_present(self):
-        """本地文件可读时无论 Redis 状态如何都不算读取失败。"""
+    def test_raw_local_file_present_no_redis_probe(self):
+        """本地文件可读时直接采用，不探测 Redis（单次读取，无 TOCTOU）。"""
         import tempfile
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             f.write('{"status": "active"}')
             path = f.name
         try:
-            with mock.patch.object(circuit_breaker, "upstash_redis_command",
-                                   side_effect=AssertionError("不应探测 Redis")):
-                self.assertFalse(circuit_breaker._cb_read_failed("cat_checkin:cb:x", path))
+            with mock.patch.dict(os.environ, {}, clear=True):
+                state, absent = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", path)
+            self.assertEqual(state["status"], "active")
+            self.assertFalse(absent)
+        finally:
+            os.unlink(path)
+
+    def test_raw_redis_nil_confirms_absence(self):
+        """Redis GET 成功但 result 为空（明确 nil）→ 确认缺键。"""
+        with mock.patch.dict(os.environ, {"UPSTASH_REDIS_REST_URL": "https://fake",
+                                          "UPSTASH_REDIS_REST_TOKEN": "V1.0FAKEtok"}, clear=False), \
+             mock.patch("os.path.exists", return_value=False), \
+             mock.patch.object(circuit_breaker, "upstash_redis_command",
+                               return_value=(True, {"result": None})):
+            state, absent = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", ".cb_state_x.json")
+        self.assertEqual(state, {})
+        self.assertTrue(absent)
+
+    def test_raw_redis_failure_no_migration(self):
+        """Redis GET 失败（ok=False）→ 不确认缺键，不迁移。"""
+        with mock.patch.dict(os.environ, {"UPSTASH_REDIS_REST_URL": "https://fake",
+                                          "UPSTASH_REDIS_REST_TOKEN": "V1.0FAKEtok"}, clear=False), \
+             mock.patch("os.path.exists", return_value=False), \
+             mock.patch.object(circuit_breaker, "upstash_redis_command",
+                               return_value=(False, "HTTP 500")):
+            state, absent = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", ".cb_state_x.json")
+        self.assertEqual(state, {})
+        self.assertFalse(absent)
+
+    def test_raw_redis_data_wins_over_local(self):
+        """Redis 有数据时远端权威（覆盖本地），不迁移。"""
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write('{"status": "suspended", "attempts": 8}')
+            path = f.name
+        try:
+            with mock.patch.dict(os.environ, {"UPSTASH_REDIS_REST_URL": "https://fake",
+                                              "UPSTASH_REDIS_REST_TOKEN": "V1.0FAKEtok"}, clear=False), \
+                 mock.patch.object(circuit_breaker, "upstash_redis_command",
+                                   return_value=(True, {"result": '{"status": "active", "attempts": 0}'})):
+                state, absent = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", path)
+            self.assertEqual(state["status"], "active")
+            self.assertFalse(absent)
         finally:
             os.unlink(path)
 

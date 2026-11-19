@@ -88,49 +88,64 @@ def _legacy_notify_state(task_id: str) -> Dict[str, Any]:
         return {}
 
 
-def _cb_read_failed(redis_key: str, state_file: str) -> bool:
-    """cb 状态读取是否处于「无法确认」态（本地文件缺失/损坏 且 Redis 读取失败）。
+def _load_cb_state_raw(redis_key: str, state_file: str) -> Tuple[Dict[str, Any], bool]:
+    """单次读取 cb 状态，返回 (状态字典, 是否确认缺键)。
 
-    load_kv_state 把「键不存在」与「读取失败」都静默降级为 {}；迁移逻辑若把
-    读取失败当缺键，会回读旧 notify 的陈旧熔断标记，把已恢复（active）的任务
-    重新熔断并写回 cb（PR #34 评审指认）。此探测区分两者：仅当确认两层都
-    没有可读数据时才允许迁移。凭据未配置（纯本地模式）不算失败——本地文件
-    缺失即确认缺键。
+    「确认缺键」= 本地文件无有效数据 且 Redis 明确返回 nil（GET 成功但
+    result 为空）。读取失败（网络异常/HTTP 错误）返回 ({}, False)——既不
+    迁移也不覆盖，让本次记录按新任务计 1 次尝试（PR #34 两轮评审指认：
+    二次 GET 探测存在 TOCTOU 竞争，必须一次读取同时判定存在性与数据）。
+    凭据未配置（纯本地模式）：文件缺失即确认缺键。
     """
+    state: Dict[str, Any] = {}
     local_ok = False
     try:
         if os.path.exists(state_file):
             with open(state_file, encoding="utf-8") as f:
-                local_ok = isinstance(json.loads(f.read()), dict)
+                data = json.loads(f.read())
+            if isinstance(data, dict):
+                state.update(data)
+                local_ok = True
     except Exception:
-        local_ok = False
-    if local_ok:
-        return False
+        pass
     try:
         from common import _upstash_redis_env
         url, token = _upstash_redis_env()
         if not url or not token:
-            return False  # 纯本地模式：文件缺失即确认缺键
-        ok, _ = upstash_redis_command(["GET", redis_key])
-        return not ok
+            # 纯本地模式：文件有效→用文件；文件缺失→确认缺键（可迁移）
+            return state, (not local_ok)
+        ok, res = upstash_redis_command(["GET", redis_key])
+        if not ok:
+            # 读取失败：本地有数据则用本地（不迁移），否则无法确认（不迁移）
+            return state, False
+        raw_val = res.get("result") if isinstance(res, dict) else None
+        if raw_val and isinstance(raw_val, str):
+            try:
+                remote = json.loads(raw_val)
+                if isinstance(remote, dict):
+                    state.update(remote)
+                    return state, False
+            except Exception:
+                pass
+        # GET 成功但无有效值：Redis 侧确认缺键；本地有数据时以本地为准不迁移
+        return state, (not local_ok)
     except Exception:
-        return True
+        return state, False
 
 
 def load_circuit_state(task_id: str) -> Dict[str, Any]:
     """读取指定任务的重试与熔断状态字典（cb 专属键，缺失时一次性认领旧 notify 字段）。
 
-    迁移语义：cb 键不存在时，从旧 notify 键只认领 _CB_OWNED_FIELDS 中存在的字段
-    （含熔断标记，保证升级前已停用的任务不会因换键而「复活」）；cb 键一旦存在
-    即为权威，不再回读 notify——notify 键里的 circuit_broken 可能是
-    discord_notify 推送熔断卡时留下的陈旧标记（该函数只置位不清除）。
-    读取失败（Redis 抖动且无本地文件）不迁移：返回空状态，让本次记录按
-    新任务计 1 次尝试，绝不把陈旧熔断标记写回 cb。
+    迁移语义：仅当单次读取确认 cb 键不存在时，从旧 notify 键只认领
+    _CB_OWNED_FIELDS 中存在的字段（含熔断标记，保证升级前已停用的任务不会
+    因换键而「复活」）；cb 键一旦存在即为权威，不再回读 notify——notify 键
+    里的 circuit_broken 可能是 discord_notify 推送熔断卡时留下的陈旧标记
+    （该函数只置位不清除）。读取失败不迁移：返回空状态，绝不把陈旧熔断
+    标记写回 cb。
     """
     redis_key, state_file = _state_paths(task_id)
-    state = load_kv_state(redis_key, state_file)
-    state = dict(state) if isinstance(state, dict) else {}
-    if not state and not _cb_read_failed(redis_key, state_file):
+    state, confirmed_absent = _load_cb_state_raw(redis_key, state_file)
+    if not state and confirmed_absent:
         legacy = _legacy_notify_state(task_id)
         state = {k: legacy[k] for k in _CB_OWNED_FIELDS if k in legacy}
     return state

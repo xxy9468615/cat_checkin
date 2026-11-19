@@ -118,6 +118,19 @@ try:
 except ValueError:
     RIGHTS_BURST = 8
 
+# ---------- 每日签到大转盘（wappark jt-sign，2026-11-19 HAR 逆向 + 实测）----------
+# 活动规则（getWheelStatusAndInfo instructions 原文）：每日每用户最多抽兑 3 次，
+# 每次消耗 20 金豆；奖品池含 88/188/288 金豆与第三方优惠券，活动至 2026-12-31。
+# 协议要点（signNew.*.js 实证 + 本地只读探测验证）：
+#   para = RSA({"phone": <accId>, "provinceCode": "600202"})——phone 字段填 accId
+#   查询 getWheelStatusAndInfo → data.remainCount/userMaximum/amount/beanAmount
+#   提交 wheelRewardSubmit（同 para）→ {"code":0,"data":{"prizeName","prizeState","prizeType"}}
+#   注意提交响应是 code 字段（非 resoultCode），成功判定双码兼容。
+WHEEL_STATUS_URL = "https://wappark.189.cn/jt-sign/activity/getWheelStatusAndInfo"
+WHEEL_SUBMIT_URL = "https://wappark.189.cn/jt-sign/activity/wheelRewardSubmit"
+WHEEL_PROVINCE_CODE = "600202"  # 随账号归属省固定（与 getSingle 抓包值同源）
+WHEEL_MAX_DRAWS = 3  # 服务端 userMaximum 为准，此值仅作上限护栏
+
 # ---------- 金豆商城（wapact.189.cn:9001）遗留链路（转盘抽奖仍在用）----------
 # getGoodsList 商品目录已下线（见上），但 unified/login + queryInfo + queryTurnTable
 # 仍存活，转盘抽奖链路保留。兑换不再走此路径。
@@ -991,6 +1004,63 @@ class TelecomClient:
         _, msg = run_rights_exchange(self, goal, wait_for_window=False, burst=1)
         return msg
 
+    def wheel_daily_draws(self) -> str:
+        """每日签到大转盘：把当日剩余免费抽兑次数全部用完（服务端限 3 次/日）。
+
+        协议（2026-11-19 HAR + 实测）：para.phone 填 accId；查询返回
+        remainCount/userMaximum/amount（单抽金豆成本）/beanAmount（余额）；
+        提交响应成功码是 code=0（非 resoultCode），奖品在 data.prizeName。
+        余额不足单抽成本时停手（不硬抽）；次数/余额以服务端为准，本地不计数。
+        返回可读结果串（供 lottery_res 字段与日报展示）。"""
+        if not (self.sign and self.acc_id and HAS_CRYPTO):
+            return ""  # 缺凭据静默跳过（wapact 转盘已报过凭据状态，不重复刷屏）
+        para = {"phone": self.acc_id, "provinceCode": WHEEL_PROVINCE_CODE}
+        status = self._req("POST", WHEEL_STATUS_URL,
+                           json_data={"para": _encrypt_rsa(para)},
+                           headers={"sign": self.sign})
+        if str(status.get("resoultCode")) != "0":
+            msg = str(status.get("resoultMsg") or status.get("msg") or "")
+            return f"转盘查询失败({sanitize_snippet(msg, 40) or status.get('resoultCode')})"
+        data = status.get("data") or {}
+        try:
+            remain = int(data.get("remainCount") or 0)
+            cost = int(data.get("amount") or 20)
+            beans = int(data.get("beanAmount") or 0)
+            user_max = int(data.get("userMaximum") or WHEEL_MAX_DRAWS)
+        except (TypeError, ValueError):
+            return "转盘状态字段异常"
+        if str(data.get("showEntry")).lower() == "false" or str(data.get("state")) not in ("1", ""):
+            return "转盘活动未开放"
+        if remain <= 0:
+            return "今日已抽"
+        draws = min(remain, user_max, WHEEL_MAX_DRAWS)
+        if beans < cost:
+            return f"金豆不足({beans}<{cost}/次)，跳过转盘"
+        prizes: List[str] = []
+        for i in range(draws):
+            if i:
+                time.sleep(random.uniform(1.0, 2.5))  # 拟人间隔，防连点风控
+            res = self._req("POST", WHEEL_SUBMIT_URL,
+                            json_data={"para": _encrypt_rsa(para)},
+                            headers={"sign": self.sign})
+            ok = str(res.get("code")) == "0" or str(res.get("resoultCode")) == "0"
+            rdata = res.get("data") or {}
+            prize = str(rdata.get("prizeName") or rdata.get("title") or "")
+            if ok and prize:
+                prizes.append(prize)
+                print(f"    [转盘] 第{i + 1}抽: {prize}", flush=True)
+                continue
+            msg = str(res.get("resoultMsg") or res.get("msg") or res.get("errorMsg") or "")
+            if "已" in msg and ("抽" in msg or "兑" in msg or "完" in msg):
+                break  # 次数用尽（服务端裁决），如实停手
+            if "金豆" in msg and ("不足" in msg or "不够" in msg):
+                break
+            # 单抽失败不硬重试（框架管跨运行重试）；记录后继续下一抽
+            print(f"    [转盘] 第{i + 1}抽未中: {sanitize_snippet(msg, 40) or res.get('code')}", flush=True)
+        if prizes:
+            return "、".join(prizes)
+        return "今日已抽" if remain <= 0 else "转盘未中奖"
+
     def prepare_auth(self) -> bool:
         """准备可用鉴权票据：Token 现签优先（App 同款），缓存会话仅作回退。"""
         self.restore_cached_session()
@@ -1230,6 +1300,18 @@ def execute_telecom_task(client: TelecomClient) -> Dict[str, Any]:
         else:
             res["lottery_res"] = "无抽奖凭据（统一登录换取 Bearer 失败）"
             print(f"    [抽奖] {res['lottery_res']}", flush=True)
+
+        # 3b. 每日签到大转盘（wappark jt-sign，每日 3 次 × 20 金豆，2026-11-19 接入）
+        # 与 wapact 免费转盘是两套独立活动：此处消耗金豆抽兑，奖品池含金豆与
+        # 优惠券（HAR 实证）。服务端 remainCount 裁决次数，本地不重复计数。
+        wheel_res = client.wheel_daily_draws()
+        if wheel_res and wheel_res not in ("今日已抽",):
+            if res["lottery_res"] and res["lottery_res"] not in ("今日已抽", "无抽奖凭据（统一登录换取 Bearer 失败）"):
+                res["lottery_res"] = f"{res['lottery_res']}；签到大转盘: {wheel_res}"
+            else:
+                res["lottery_res"] = f"签到大转盘: {wheel_res}"
+        if wheel_res:
+            print(f"    [转盘] {wheel_res}", flush=True)
 
         # 4. 金豆日常浏览与聚合任务
         if client.sign and HAS_CRYPTO:
@@ -1635,7 +1717,10 @@ def run_rights_exchange(
             return True, f"🎉 成功兑换【{title}】(耗 {cost} 金豆)，话费 7 个工作日内到账"
         if "还未达到该等级" in msg or "等级" in msg and "不足" in msg:
             return True, f"【{title}】等级不足（{sanitize_snippet(msg, 40)}），今日终止"
-        if "已兑换" in msg or "已领取" in msg or "每月" in msg or "限兑" in msg:
+        # 限兑终局只认明确状态文案；「每月限兑次数查询异常」等含「每月/限兑」
+        # 的故障文案不得判终局（PR #34 第二轮评审指认）
+        if "已兑换" in msg or "已领取" in msg or "本月已兑" in msg or "限兑次数已" in msg \
+                or "已达兑换上限" in msg or "超过兑换次数" in msg:
             return True, f"【{title}】本月已兑/限兑（{sanitize_snippet(msg, 40)}），今日终止"
         # 售罄只认明确文案；「库存服务异常」等含「库存」的故障文案不得判终局
         if "已抢光" in msg or "抢光" in msg or "已领完" in msg or "售罄" in msg or "库存不足" in msg:
