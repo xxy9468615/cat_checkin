@@ -601,6 +601,21 @@ jobs:
                       except Exception:
                           captured.append((r.url.split("9001")[1][:80], r.status, "<no body>"))
               page.on("response", on_resp)
+              # 先试列表页（商品目录入口），再试详情页
+              page.goto("https://wapact.189.cn:9001/JinDouMall/JinDouMall.html",
+                        wait_until="domcontentloaded", timeout=60000)
+              page.wait_for_timeout(12000)
+              print("LIST_URL", page.url[:110])
+              print("LIST_TITLE", page.title())
+              list_html = page.content()
+              for ln in re.findall(r'<script[^>]+src="([^"]+)"', list_html):
+                  print("LIST_SCRIPT", ln[:120])
+              inline_list = page.evaluate(
+                  "Array.from(document.querySelectorAll('script:not([src])'))"
+                  ".map(s => s.textContent).join('\n')")
+              for ln in inline_list.split("\n"):
+                  if re.search(r'url:|methodCode|getGoods|GoodsList|golden|standQuery|floorType', ln, re.I):
+                      print("LIST_JSLINE", ln.strip()[:220])
               page.goto("https://wapact.189.cn:9001/JinDouMall/JinDouMall_independentDetails.html",
                         wait_until="domcontentloaded", timeout=60000)
               for i in range(6):
