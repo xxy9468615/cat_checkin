@@ -1092,7 +1092,9 @@ class TestJindouExchange(unittest.TestCase):
         """滚动排程必须写专用 state:rolling: 键 + .rolling_state_ 文件。
 
         notify 状态键在任务结束后被 orchestrator 整键覆盖——旧实现复用该键
-        导致 last_credit_ts 每次运行即被抹掉（2026-11-05 复盘）。"""
+        导致 last_credit_ts 每次运行即被抹掉（2026-11-05 复盘）。
+        固定时钟：_rights_next_due 默认读真实 now，CI 在 23:30~00:00 BJT
+        窗口内跑时 terminal=False 走「立即重试」分支，断言 23:30 会假红。"""
         captured = {}
 
         def fake_save(redis_key, state_file, state):
@@ -1101,8 +1103,16 @@ class TestJindouExchange(unittest.TestCase):
             captured["state"] = state
 
         from datetime import datetime
+        fixed_now = datetime(2026, 11, 19, 22, 0, tzinfo=telecom.BJT)
+
+        class _FixedDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now if tz is None else fixed_now.astimezone(tz)
+
         with patch.dict(os.environ, {"CAT_CHECKIN_REDIS_PREFIX": "cat_checkin:"}, clear=False), \
              patch.object(telecom, "save_kv_state", side_effect=fake_save), \
+             patch.object(telecom, "datetime", _FixedDT), \
              patch("sys.stdout", new_callable=io.StringIO):
             telecom._rights_schedule_next_run(terminal=False)
         self.assertEqual(captured["redis_key"], "cat_checkin:state:rolling:telecom-exchange")
