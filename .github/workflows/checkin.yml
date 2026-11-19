@@ -748,21 +748,22 @@ jobs:
               r = http.request("GET", base + q, headers={**H, "methodCode": "I01001"}, timeout=15)
               d = r.json() or {}
               print("GLVAR", q[:60], "code", d.get("code"), str(d.get("message") or "")[:30])
-          # standQuery/detail/query 带真实活动 ID 探测：从 queryRedis 拿不到商品，
-          # 但 H5 详情页 URL 的 activitieId 来自上游跳转。探测常见话费券活动 ID 段。
-          # 先确认 query 接口对非零 activityId 的响应形态（不兑换，只读）
-          for aid in ("1", "100", "1000"):
+          # queryRedis 对 activityId=0 返回 resultStatus=0（成功）但无商品——
+          # 说明该接口是「按活动查状态」，商品目录不在这里。
+          # 关键对照：query（DB）恒 999999，queryRedis（缓存）code=0。
+          # 999999 是 DB 查询路径的系统错误——可能整个 standQuery/detail/query 与
+          # goldGoods/getGoodsList 共用的后端服务已下线，仅 Redis 缓存路径存活。
+          # 最后探测：queryRedis 带不同 activityId 是否返回商品（缓存里可能有场次数据）
+          for aid in ("0", "1", "100"):
               r = http.request("GET",
-                  f"https://wapact.189.cn:9001/gateway/standQuery/detail/query?activityId={aid}",
-                  headers={**H, "methodCode": "I01001"}, timeout=15)
+                  f"https://wapact.189.cn:9001/gateway/standQuery/detail/queryRedis?activityId={aid}",
+                  headers={**H, "methodCode": "I01003"}, timeout=15)
               d = r.json() or {}
-              biz = d.get("biz")
-              has_goods = isinstance(biz, dict) and "exchangeGoodsBean" in biz
-              print("QID", aid, "code", d.get("code"), str(d.get("message") or "")[:30],
-                    "hasGoodsBean", has_goods)
-              if has_goods:
-                  gb = biz.get("exchangeGoodsBean") or {}
-                  print("  GOODS", json.dumps({k: gb.get(k) for k in ("detailTitle","detailBut","exchangeStatus","amount","id") if k in gb}, ensure_ascii=False)[:300])
+              biz = d.get("biz") or {}
+              keys = sorted(biz.keys()) if isinstance(biz, dict) else []
+              print("QR", aid, "code", d.get("code"), "bizkeys", keys[:15])
+              if isinstance(biz, dict) and biz.get("exchangeGoodsBean"):
+                  print("  QRGOODS", json.dumps(biz["exchangeGoodsBean"], ensure_ascii=False)[:400])
           PY2
 
       - name: Execute daily orchestrator
