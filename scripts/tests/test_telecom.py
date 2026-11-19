@@ -1056,7 +1056,8 @@ class TestJindouExchange(unittest.TestCase):
         self.assertEqual((w2.day, w2.hour, w2.minute), (20, 0, 0))
 
     def test_rights_next_due_2330(self):
-        """自排程钉在 0 点场前 30 分钟（23:30 BJT）。"""
+        """自排程钉在 0 点场前 30 分钟（23:30 BJT）；未开抢场次的暂时性失败
+        不得跨过场次（PR #34 评审）。"""
         from datetime import datetime as _dt
         # 22:00 暂时性失败 → 当晚 23:30
         due = telecom._rights_next_due(False, _dt(2026, 11, 19, 22, 0, tzinfo=telecom.BJT))
@@ -1064,9 +1065,19 @@ class TestJindouExchange(unittest.TestCase):
         # 00:30 终局 → 当晚 23:30（下一个 0 点场是 20 日 00:00）
         due2 = telecom._rights_next_due(True, _dt(2026, 11, 19, 0, 30, tzinfo=telecom.BJT))
         self.assertEqual((due2.day, due2.hour, due2.minute), (19, 23, 30))
-        # 23:45 暂时性失败（已过 23:30）→ 次日 23:30
-        due3 = telecom._rights_next_due(False, _dt(2026, 11, 19, 23, 45, tzinfo=telecom.BJT))
-        self.assertEqual((due3.day, due3.hour, due3.minute), (20, 23, 30))
+        # 23:45 暂时性失败（场次未开抢）→ 立即重试保留场次，不得排到明晚
+        t3 = _dt(2026, 11, 19, 23, 45, tzinfo=telecom.BJT)
+        due3 = telecom._rights_next_due(False, t3)
+        self.assertEqual(due3, t3)
+        # 23:59:25 预检抖动（距 0 点 35s）→ 同样立即重试
+        t4 = _dt(2026, 11, 19, 23, 59, 25, tzinfo=telecom.BJT)
+        self.assertEqual(telecom._rights_next_due(False, t4), t4)
+        # 23:45 终局（售罄/限兑）→ 下一场 23:30（次日）
+        due5 = telecom._rights_next_due(True, _dt(2026, 11, 19, 23, 45, tzinfo=telecom.BJT))
+        self.assertEqual((due5.day, due5.hour, due5.minute), (20, 23, 30))
+        # 00:05 暂时性失败（场次已过）→ 下一场 23:30
+        due6 = telecom._rights_next_due(False, _dt(2026, 11, 20, 0, 5, tzinfo=telecom.BJT))
+        self.assertEqual((due6.day, due6.hour, due6.minute), (20, 23, 30))
 
     def test_registry_task_is_rolling(self):
         """telecom-exchange 必须注册为 rolling（24h），rolling 检查先于退避检查，
@@ -1170,6 +1181,41 @@ class TestJindouExchange(unittest.TestCase):
             fresh.restore_cached_session()
         self.assertEqual(fresh.acc_id, "V1.0FAKEacc")
         self.assertEqual(fresh.sign, "V1.0FAKEsign")
+
+    def test_acc_id_not_restored_across_account_switch(self):
+        """配置提供新账号 sign 时，不得恢复旧账号缓存的 accId（PR #34 评审）：
+        sign/accId 必须同源配对，错配会把兑换打到旧账户。"""
+        acc = telecom.TelecomAccount(index=1, phone="18912345678", sign="V1.0FAKEnewsign")
+        client = telecom.TelecomClient(acc, MagicMock())
+        stale_cache = {"sign": "V1.0FAKEoldsign", "acc_id": "V1.0FAKEoldacc"}
+        with patch.object(telecom, "load_kv_state", return_value=stale_cache), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            client.restore_cached_session()
+        self.assertEqual(client.sign, "V1.0FAKEnewsign")
+        self.assertEqual(client.acc_id, "", "换账号后旧 accId 不得配到新 sign")
+
+    def test_rights_exchange_negative_success_text_not_terminal(self):
+        """「未兑换成功，请稍后重试」含「兑换成功」子串但 rc=1：不得判成功。"""
+        ok, msg = self._run_rights(self._rights_client(), receive_results=[
+            {"resoultCode": "1", "resoultMsg": "未兑换成功，请稍后重试"}] * 3)
+        self.assertFalse(ok)
+        self.assertNotIn("成功兑换", msg)
+
+    def test_rights_exchange_stock_service_error_not_terminal(self):
+        """「库存服务异常」含「库存」但是故障文案：不得判售罄终局。"""
+        ok, msg = self._run_rights(self._rights_client(), receive_results=[
+            {"resoultCode": "1", "resoultMsg": "库存服务异常，请稍后重试"}] * 3)
+        self.assertFalse(ok)
+        self.assertNotIn("售罄", msg)
+
+    def test_rights_exchange_unknown_level_transient(self):
+        """协议成功但 currentLevel 缺失：暂时性失败交框架重试，不得终局。"""
+        client = self._rights_client()
+        client._req = MagicMock(return_value={"resoultCode": "0"})
+        with patch.object(telecom.time, "sleep", lambda *_: None):
+            ok, msg = telecom.run_rights_exchange(client, "2元话费", wait_for_window=False)
+        self.assertFalse(ok)
+        self.assertIn("无法确定账号等级", msg)
 
 
 if __name__ == "__main__":

@@ -622,7 +622,10 @@ class TelecomClient:
         # accId 与 sign 同源（ssoHomLogin 下发）：缓存 sign 回退档若缺 accId，
         # 只能靠一次性 ticket 补换（大概率已过期）→「缺少 sign/accId」假失败。
         # 随 sign 一并持久化/恢复，让回退档也能直接进权益接口。
-        if not self.acc_id and state.get("acc_id"):
+        # 仅当缓存 sign 与当前 sign 一致时恢复 accId：同一配置序号换账号后，
+        # 不得把旧账号 accId 配到新账号 sign 上（PR #34 评审指认）
+        cached_sign = str(state.get("sign") or "")
+        if not self.acc_id and state.get("acc_id") and cached_sign and self.sign == cached_sign:
             self.acc_id = str(state.get("acc_id"))
         if not self.authorization and state.get("authorization"):
             self.authorization = str(state.get("authorization"))
@@ -1423,8 +1426,11 @@ def _rights_next_window(now: Optional[datetime] = None) -> datetime:
 def _rights_next_due(terminal: bool, now: Optional[datetime] = None) -> datetime:
     """滚动冷却下次到期时刻（BJT）：钉在 0 点场前 30 分钟（23:30）。
 
-    terminal=True（今日终局：成功/售罄/限兑/等级不足/本月已兑）→ 明日 23:30；
-    terminal=False（暂时性失败：网络/鉴权）→ 今晚 23:30（若已过则明晚）。
+    terminal=True（今日终局：成功/售罄/限兑/等级不足/本月已兑）→ 下一场 23:30；
+    terminal=False（暂时性失败：网络/鉴权）→ 尚未开抢的当前场次必须保留：
+    23:59:25 预检抖动时距 0 点仅 35s，若把冷却排到明晚 23:30 会跨过即将
+    开始的场次（PR #34 评审指认）——此时返回「现在」（立即重试，任务内
+    自行等到 0 点突发）；已过 0 点则排下一场 23:30。
     任务内等待对齐 23:59:20 预检 + 00:00:00 突发，不依赖心跳半点量化。"""
     now = now or datetime.now(BJT)
     win = _rights_next_window(now)
@@ -1433,7 +1439,10 @@ def _rights_next_due(terminal: bool, now: Optional[datetime] = None) -> datetime
         # 尚未到今晚 23:30 → 今晚拉起，等 0 点场（终局与否都一样：
         # 0 点场属于「次日」，今晚 23:30 是它唯一的准备窗口）
         return due
-    # 已过今晚 23:30（0 点场刚结束或正在抢）→ 明晚 23:30
+    if not terminal and now < win:
+        # 23:30~00:00 之间的暂时性失败：当前场次尚未开抢，立即重试保留场次
+        return now
+    # 终局，或已过 0 点（场次刚结束）→ 下一场 23:30
     nxt = _rights_next_window(win + timedelta(seconds=1))
     return nxt - timedelta(minutes=30)
 
@@ -1555,6 +1564,10 @@ def run_rights_exchange(
 
     item, pick_note = _pick_phone_right(rights_res, goal)
     if item is None:
+        # 等级未知是查询侧异常（协议成功但字段缺失），属暂时性失败交框架重试；
+        # 只有「等级有效但确无话费档」才是终局（PR #34 评审指认）
+        if "无法确定账号等级" in pick_note:
+            return False, pick_note
         return True, pick_note
     print(f"    [权益] {pick_note}", flush=True)
     activity_id = str(item.get("activityId") or "")
@@ -1592,6 +1605,12 @@ def run_rights_exchange(
                 time.sleep(max(0.0, wait_s))
 
     # 4. 突发提交 receiverRights
+    # 窗口内突发是「单次提交动作」的组成部分（对齐前端 3 秒倒计时连点），不是
+    # 跨运行重试：0 点场稍纵即逝，框架 15min 起步的退避梯子无法替代窗口内连发。
+    # 边界约束（PR #34 评审）：burst 上限 RIGHTS_BURST（env 可调，硬顶 20）、
+    # 429 退避封顶 8s、412 立即交还框架换出口、终局文案立即停发——突发总时长
+    # 有界（≤ burst×8s），不会演变成无界自建重试循环。跨场次重试仍由 rolling
+    # 自排程 + 框架梯子管理，本函数不做任何跨运行等待。
     payload = {
         "id": activity_id,
         "accId": client.acc_id,
@@ -1609,14 +1628,17 @@ def run_rights_exchange(
         rc = str(res.get("resoultCode") or "")
         msg = str(res.get("resoultMsg") or res.get("msg") or "")
         last_msg = msg
-        if "兑换成功" in msg:
+        # 成功判定必须协议码先行：「未兑换成功，请稍后重试」也含「兑换成功」
+        # 子串，纯文案匹配会把失败判成成功（PR #34 评审指认，规则 9a(1)）
+        if rc == "0" and "兑换成功" in msg:
             print(f"    [权益] 🎉 第{attempt}发兑换成功: {title}", flush=True)
             return True, f"🎉 成功兑换【{title}】(耗 {cost} 金豆)，话费 7 个工作日内到账"
         if "还未达到该等级" in msg or "等级" in msg and "不足" in msg:
             return True, f"【{title}】等级不足（{sanitize_snippet(msg, 40)}），今日终止"
         if "已兑换" in msg or "已领取" in msg or "每月" in msg or "限兑" in msg:
             return True, f"【{title}】本月已兑/限兑（{sanitize_snippet(msg, 40)}），今日终止"
-        if "抢光" in msg or "售罄" in msg or "库存" in msg:
+        # 售罄只认明确文案；「库存服务异常」等含「库存」的故障文案不得判终局
+        if "已抢光" in msg or "抢光" in msg or "已领完" in msg or "售罄" in msg or "库存不足" in msg:
             return True, f"【{title}】已售罄（{sanitize_snippet(msg, 40)}），今日终止"
         http_code = res.get("_http_status") or res.get("code")
         if http_code in (429, "429"):

@@ -264,6 +264,46 @@ class PlanModeTests(unittest.TestCase):
         self.assertNotIn("52pojie", due, "处于重试退避冷却期的任务不应立即到期")
         self.assertIn("alipan", due)
 
+    def test_auto_plan_rolling_success_does_not_block_next_window(self):
+        """rolling 任务白天终局（ok=True）不得屏蔽当晚 23:30 的次日 0 点场预检
+        （PR #34 评审）：成功日期属于上一场次；冷却到期检查仍然生效。"""
+        with patch.object(orch_mod, "_get_today_successful_tasks",
+                          return_value={"telecom-exchange", "glados"}), \
+             patch.object(orch_mod, "is_task_suspended", return_value=False), \
+             patch.object(orch_mod, "_cooldown_due_at", return_value=None), \
+             patch.object(orch_mod, "load_circuit_state", return_value={}):
+            due = plan_due_tasks("", due_only=False)
+        self.assertIn("telecom-exchange", due, "rolling 自排程到期优先于今日成功去重")
+        self.assertNotIn("glados", due, "常规任务今日成功仍跳过")
+
+    def test_auto_plan_rolling_cooldown_still_blocks(self):
+        """rolling 豁免只针对「今日成功」去重：冷却未到期仍拦截。"""
+        with patch.object(orch_mod, "_get_today_successful_tasks",
+                          return_value={"telecom-exchange"}), \
+             patch.object(orch_mod, "is_task_suspended", return_value=False), \
+             patch.object(orch_mod, "_cooldown_due_at",
+                          side_effect=lambda cfg: time.time() + 3600
+                          if cfg["id"] == "telecom-exchange" else None), \
+             patch.object(orch_mod, "load_circuit_state", return_value={}):
+            due = plan_due_tasks("", due_only=False)
+        self.assertNotIn("telecom-exchange", due)
+
+    def test_auto_plan_rolling_ignores_framework_backoff(self):
+        """rolling 任务节奏由自排程 due_at 全权决定：框架退避梯子不得把
+        23:30 预检推迟到梯子时刻（PR #34 评审配套）。"""
+        now = time.time()
+        today = orch_mod.bjt_now().strftime("%Y-%m-%d")
+        fake_circuit = {"attempt_date": today, "attempts": 2, "next_retry_at": now + 1800}
+        with patch.object(orch_mod, "_get_today_successful_tasks", return_value=set()), \
+             patch.object(orch_mod, "is_task_suspended", return_value=False), \
+             patch.object(orch_mod, "_cooldown_due_at", return_value=None), \
+             patch.object(orch_mod, "load_circuit_state",
+                          side_effect=lambda tid: fake_circuit
+                          if tid in ("telecom-exchange", "52pojie") else {}):
+            due = plan_due_tasks("", due_only=False)
+        self.assertIn("telecom-exchange", due, "rolling 到期不受框架退避梯子约束")
+        self.assertNotIn("52pojie", due, "常规任务退避梯子仍然生效")
+
     def test_auto_plan_due_only_night_skips_regular_tasks(self):
         """夜间（00:00~06:59 BJT）心跳模式：不偷跑常规单日任务，仅允许 rolling 任务。"""
         from datetime import datetime

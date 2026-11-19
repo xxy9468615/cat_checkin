@@ -437,21 +437,27 @@ def plan_due_tasks(raw_tasks: str = "", due_only: bool = False) -> List[str]:
     for tid, cfg in TASKS.items():
         if is_task_suspended(tid):
             continue
-        if tid in successful_today:
+        is_rolling = (cfg.get("sched") or {}).get("type") == "rolling"
+        # rolling 任务的「今日已成功」去重必须让位于自排程到期：白天终局
+        # （售罄/限兑/成功）写 ok=True 后，当晚 23:30 的次日 0 点场预检仍须
+        # 拉起——成功日期属于上一场次，不代表下一场次已完成（PR #34 评审）。
+        # 冷却未到期时仍由下方 due_at 检查拦截，不会重复执行。
+        if tid in successful_today and not is_rolling:
             continue
         due_at = _cooldown_due_at(cfg)
         if due_at and due_at > now:
             continue
         state = load_circuit_state(tid)
         has_failed_today = str(state.get("attempt_date") or "") == today and int(state.get("attempts") or 0) > 0
-        if has_failed_today:
+        if has_failed_today and not is_rolling:
+            # 退避梯子只管常规任务：rolling 任务的节奏由自排程 due_at 全权
+            # 决定（上方已检查），框架退避不得把 23:30 预检推迟到梯子时刻
             next_retry = float(state.get("next_retry_at") or 0)
             if next_retry > now:
                 continue
         elif due_only and bjt_hour < 7:
             # 心跳模式且在晨间主批次（07:00 BJT）前：不提前执行常规单日任务（避免夜间心跳偷跑主批次且抑制日报）
             # 仅允许 rolling 任务与到期重试任务执行
-            is_rolling = bool(cfg.get("sched") and cfg.get("sched", {}).get("type") == "rolling")
             if not is_rolling:
                 continue
         due.append(tid)

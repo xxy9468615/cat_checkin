@@ -399,6 +399,46 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
         self.assertIn("未排定", out)
         self.assertNotIn("到期就绪", out)
 
+    def test_no_migration_on_redis_read_failure(self):
+        """Redis 读取失败且无本地文件 ≠ 确认缺键：不得回读旧 notify 的陈旧
+        熔断标记把已恢复任务重新熔断（PR #34 评审）。"""
+        legacy = {"status": "suspended", "circuit_broken": True, "attempts": 8}
+        with mock.patch.object(circuit_breaker, "load_kv_state", return_value={}), \
+             mock.patch.object(circuit_breaker, "_cb_read_failed", return_value=True), \
+             mock.patch.object(circuit_breaker, "_legacy_notify_state",
+                               return_value=legacy) as m_legacy:
+            st = circuit_breaker.load_circuit_state("smzdm")
+        self.assertEqual(st, {})
+        m_legacy.assert_not_called()
+
+    def test_migration_when_absence_confirmed(self):
+        """确认缺键（纯本地模式文件缺失 / Redis 明确返回 nil）仍正常迁移。"""
+        legacy = {"status": "suspended", "circuit_broken": True, "attempts": 8}
+        with mock.patch.object(circuit_breaker, "load_kv_state", return_value={}), \
+             mock.patch.object(circuit_breaker, "_cb_read_failed", return_value=False), \
+             mock.patch.object(circuit_breaker, "_legacy_notify_state", return_value=legacy):
+            st = circuit_breaker.load_circuit_state("smzdm")
+        self.assertTrue(st["circuit_broken"])
+
+    def test_cb_read_failed_local_mode_is_not_failure(self):
+        """凭据未配置（纯本地模式）：文件缺失即确认缺键，不算读取失败。"""
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch("os.path.exists", return_value=False):
+            self.assertFalse(circuit_breaker._cb_read_failed("cat_checkin:cb:x", ".cb_state_x.json"))
+
+    def test_cb_read_failed_local_file_present(self):
+        """本地文件可读时无论 Redis 状态如何都不算读取失败。"""
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write('{"status": "active"}')
+            path = f.name
+        try:
+            with mock.patch.object(circuit_breaker, "upstash_redis_command",
+                                   side_effect=AssertionError("不应探测 Redis")):
+                self.assertFalse(circuit_breaker._cb_read_failed("cat_checkin:cb:x", path))
+        finally:
+            os.unlink(path)
+
 
 class TestDailyOrchestratorCircuitIntegration(unittest.TestCase):
     """编排器与熔断机制集成测试。"""
