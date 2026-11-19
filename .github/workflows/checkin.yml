@@ -731,7 +731,10 @@ jobs:
           print("amountList_n", len(al))
           for it in al:
               if isinstance(it, dict):
-                  print("AMT", json.dumps(it, ensure_ascii=False)[:300])
+                  # 逐键打印避免 GH 掩码吞整行（secret 子串匹配会掩码整段 JSON）
+                  for k, v in it.items():
+                      sv = str(v)
+                      print("AMTKV", k, "=", sv[:120] if k not in ("url","jumpUrl","link") else sv[:200])
           # 公告接口（isAnnouncement=1 提示有公告，可能含活动变更说明）
           for path in ("/gateway/golden/api/queryAnnouncement",
                        "/gateway/golden/api/getAnnouncement",
