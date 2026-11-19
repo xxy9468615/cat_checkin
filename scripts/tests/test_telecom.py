@@ -721,9 +721,13 @@ class TestTelecom(unittest.TestCase):
             return {"resoultCode": "0", "resoultMsg": "成功"}
 
         client._req = MagicMock(side_effect=fake_req)
+        # GOAL/BEANS 是模块级常量（import 时读 env）：patch.dict 只影响后续
+        # import，必须直接 patch 模块属性，否则断言随宿主环境漂移
+        # （本地 env 有旧值时假绿、CI 干净环境用默认值时假红，2026-11-19 PR #34）
         with patch.object(client, "restore_cached_session", return_value=True), \
              patch.object(client, "save_session", return_value=None), \
-             patch.dict(os.environ, {"TELECOM_EXCHANGE_GOAL": "10元话费直充券", "TELECOM_EXCHANGE_BEANS": "8000"}), \
+             patch.object(telecom, "TELECOM_EXCHANGE_GOAL", "10元话费直充券"), \
+             patch.object(telecom, "TELECOM_EXCHANGE_BEANS", 8000), \
              patch("sys.stdout", new_callable=io.StringIO):
             outcome = telecom.execute_telecom_task(client)
 
