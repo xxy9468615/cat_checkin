@@ -712,6 +712,20 @@ jobs:
               r = http.request("GET", t.JINDOU_GOODS_URL, headers=hh, timeout=15)
               d = r.json() or {}
               print("goods_ver", ver, "code", d.get("code"), str(d.get("message") or "")[:30])
+          # getTicket（I00014）：现行 H5 跳转前取票接口，可能返回场次/商品入口信息
+          r = http.request("GET", "https://wapact.189.cn:9001/gateway/golden/api/getTicket",
+                           headers={**H, "methodCode": "I00014"}, timeout=15)
+          d = r.json() or {}
+          print("getTicket", r.code, d.get("code"), json.dumps(d.get("biz"), ensure_ascii=False)[:600])
+          # doubleInforEntry（I00004）：翻倍活动入口，可能含商城楼层配置
+          r = http.request("GET", "https://wapact.189.cn:9001/gateway/function/double/doubleInforEntry",
+                           headers={**H, "methodCode": "I00004"}, timeout=15)
+          d = r.json() or {}
+          print("doubleEntry", r.code, d.get("code"), json.dumps(d.get("biz"), ensure_ascii=False)[:600])
+          # queryInfo 完整 biz（amountList 可能含场次/商品配置）
+          r = http.request("GET", t.JINDOU_QUERY_URL, headers={**H, "methodCode": "I00004"}, timeout=15)
+          d = r.json() or {}
+          print("queryInfo_biz", json.dumps(d.get("biz"), ensure_ascii=False)[:1200])
           PY2
 
       - name: Execute daily orchestrator
