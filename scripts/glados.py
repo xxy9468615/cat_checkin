@@ -426,11 +426,14 @@ class BrowserCheckin:
             login_device = raw.strip() if isinstance(raw, str) else ""
             if login_device:
                 self.last_login_device = login_device
-            detail = message or "登录设备与当前设备不一致"
+            # 服务端原始 message 可能夹带邮箱等 PII：与 HTTP 链路同等处理，
+            # 进 detail（会被 _run_one 打印/进日报）前必须双重脱敏
+            # （PR #32 第九轮评审指认）
+            detail = redact_pii(sanitize_snippet(message, 120)) if message else "登录设备与当前设备不一致"
             return ("需重新登录", CHECKIN_FAILURE, 0,
                     f"{detail} (reason=device-mismatch, loginDevice={login_device or '?'})"), learned_here
-        # 不回显原始响应体：可能夹带邮箱等个人信息，只保留服务端文案与 reason
-        detail = message or "签到失败（响应无 message 字段）"
+        # 不回显原始响应体：可能夹带邮箱等个人信息，只保留脱敏后的服务端文案与 reason
+        detail = redact_pii(sanitize_snippet(message, 120)) if message else "签到失败（响应无 message 字段）"
         if reason:
             detail += f" (reason={reason})"
         return ("签到失败", CHECKIN_FAILURE, 0, detail), learned_here
