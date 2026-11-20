@@ -23,7 +23,11 @@
   python3 scripts/setup_rights_schedule.py --delete   # 删除双排程
 
 所需环境变量：QSTASH_URL / QSTASH_TOKEN / GH_PAT / GITHUB_REPO
-（与 setup_report_schedule 一致；GH_PAT 需具备 actions: write）。
+（与 setup_report_schedule 一致）。
+
+GH_PAT 权限要求（PR #34 第五轮评审更正）：/repos/{repo}/dispatches API
+要求 **Contents: write**（fine-grained PAT）或 classic PAT 的 `repo` scope——
+仅有 Actions: write 的令牌排程注册能成功，但后续派发会被 GitHub 拒绝。
 """
 from __future__ import annotations
 
@@ -38,7 +42,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from common import Http, create_qstash_schedule  # noqa: E402
+from common import Http, create_qstash_schedule, sanitize_snippet  # noqa: E402
 
 # 派发事件名（checkin.yml Precheck 的 case 分支认此 action → telecom-exchange）
 EVENT_TYPE = "checkin_rights"
@@ -81,9 +85,12 @@ def list_schedules() -> int:
         if not isinstance(s, dict):
             continue
         flag = "⭐ " if s.get("scheduleId") in ours else "   "
+        # destination 可能含 query token（如 webhook ?token=...）：展示前
+        # 必须脱敏，不得把完整凭据写进输出（PR #34 第五轮评审指认）
+        dest = sanitize_snippet(str(s.get("destination") or ""), None)
         print(
             f"{flag}id={s.get('scheduleId')}  cron={s.get('cron')}  "
-            f"dest={s.get('destination')}  method={s.get('method', 'POST')}"
+            f"dest={dest}  method={s.get('method', 'POST')}"
         )
     return 0
 

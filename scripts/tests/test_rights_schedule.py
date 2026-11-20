@@ -76,6 +76,39 @@ class TestRightsSchedule(unittest.TestCase):
         self.assertIn("Ensure QStash rights schedule", wf)
         self.assertIn("python3 scripts/setup_rights_schedule.py", wf)
 
+    def test_list_masks_destination_tokens(self):
+        """--list 展示 destination 前必须脱敏：其他排程的 webhook query token
+        不得完整写进输出（PR #34 第五轮评审）。"""
+        import io
+        fake_resp = mock.Mock()
+        fake_resp.code = 200
+        fake_resp.json.return_value = [
+            {"scheduleId": "other", "cron": "0 0 * * *",
+             "destination": "https://hooks.example/notify?token=abc123secret",
+             "method": "POST"},
+            {"scheduleId": "cat-checkin-rights-window", "cron": "30 15 * * *",
+             "destination": "https://api.github.com/repos/owner/repo/dispatches",
+             "method": "POST"},
+        ]
+        buf = io.StringIO()
+        env = {"QSTASH_URL": "https://qstash.example/v2/publish", "QSTASH_TOKEN": "V1.0FAKEtok"}
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(srs, "Http") as m_http, \
+             mock.patch("sys.stdout", buf):
+            m_http.return_value.request.return_value = fake_resp
+            rc = srs.list_schedules()
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertNotIn("abc123secret", out)
+        self.assertIn("<masked>", out)
+        # 无凭据的 GitHub dispatch 目标不受影响
+        self.assertIn("api.github.com/repos/owner/repo/dispatches", out)
+
+    def test_docstring_states_contents_write_permission(self):
+        """文档护栏：dispatches API 要求 Contents: write（非 Actions: write），
+        说明文字不得误导用户配错令牌权限（PR #34 第五轮评审）。"""
+        self.assertIn("Contents: write", srs.__doc__)
+
 
 if __name__ == "__main__":
     unittest.main()
