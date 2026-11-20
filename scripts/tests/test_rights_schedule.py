@@ -84,7 +84,7 @@ class TestRightsSchedule(unittest.TestCase):
         fake_resp.code = 200
         fake_resp.json.return_value = [
             {"scheduleId": "other", "cron": "0 0 * * *",
-             "destination": "https://hooks.example/notify?token=abc123secret",
+             "destination": "https://hooks.example/notify?token=V1.0FAKEabc123secret",
              "method": "POST"},
             {"scheduleId": "cat-checkin-rights-window", "cron": "30 15 * * *",
              "destination": "https://api.github.com/repos/owner/repo/dispatches",
@@ -99,7 +99,7 @@ class TestRightsSchedule(unittest.TestCase):
             rc = srs.list_schedules()
         self.assertEqual(rc, 0)
         out = buf.getvalue()
-        self.assertNotIn("abc123secret", out)
+        self.assertNotIn("V1.0FAKEabc123secret", out)
         self.assertIn("<masked>", out)
         # 无凭据的 GitHub dispatch 目标不受影响
         self.assertIn("api.github.com/repos/owner/repo/dispatches", out)
