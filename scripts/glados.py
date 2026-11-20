@@ -428,12 +428,13 @@ class BrowserCheckin:
                 self.last_login_device = login_device
             # 服务端原始 message 可能夹带邮箱等 PII：与 HTTP 链路同等处理，
             # 进 detail（会被 _run_one 打印/进日报）前必须双重脱敏
-            # （PR #32 第九轮评审指认）
-            detail = redact_pii(sanitize_snippet(message, 120)) if message else "登录设备与当前设备不一致"
+            # （PR #32 第九轮评审指认）。顺序：先全文脱敏再截断——截断先行
+            # 会切开邮箱/手机号，redact_pii 识别不了残缺形态（第十轮评审）
+            detail = redact_pii(sanitize_snippet(message, None))[:120] if message else "登录设备与当前设备不一致"
             return ("需重新登录", CHECKIN_FAILURE, 0,
                     f"{detail} (reason=device-mismatch, loginDevice={login_device or '?'})"), learned_here
         # 不回显原始响应体：可能夹带邮箱等个人信息，只保留脱敏后的服务端文案与 reason
-        detail = redact_pii(sanitize_snippet(message, 120)) if message else "签到失败（响应无 message 字段）"
+        detail = redact_pii(sanitize_snippet(message, None))[:120] if message else "签到失败（响应无 message 字段）"
         if reason:
             detail += f" (reason={reason})"
         return ("签到失败", CHECKIN_FAILURE, 0, detail), learned_here
@@ -702,8 +703,9 @@ class GladosAPI:
         if not nonce:
             detail += " (未取到签到挑战 nonce)"
         if message:
-            # 原始 message 只进 verbose 日志且必须脱敏，绝不写入任务结果/邮件
-            self._log(f"服务端消息: {redact_pii(sanitize_snippet(message, 120))}")
+            # 原始 message 只进 verbose 日志且必须脱敏，绝不写入任务结果/邮件。
+            # 先全文脱敏再截断：截断先行会切开邮箱/手机号致 redact_pii 漏判
+            self._log(f"服务端消息: {redact_pii(sanitize_snippet(message, None))[:120]}")
         return "签到失败", CHECKIN_FAILURE, 0, detail
 
     def points(self, cookie: str) -> Tuple[str, int]:
