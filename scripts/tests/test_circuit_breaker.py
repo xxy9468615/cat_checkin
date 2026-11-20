@@ -407,11 +407,12 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
         熔断标记把已恢复任务重新熔断（PR #34 评审）。"""
         legacy = {"status": "suspended", "circuit_broken": True, "attempts": 8}
         with mock.patch.object(circuit_breaker, "_load_cb_state_raw",
-                               return_value=({}, False, False)), \
+                               return_value=({}, False, True)), \
              mock.patch.object(circuit_breaker, "_legacy_notify_state",
                                return_value=legacy) as m_legacy:
             st = circuit_breaker.load_circuit_state("smzdm")
-        self.assertEqual(st, {})
+        # 只含非持久化失败标记，无迁移字段
+        self.assertEqual(st, {circuit_breaker._CB_READ_FAILED: True})
         m_legacy.assert_not_called()
 
     def test_migration_when_absence_confirmed(self):

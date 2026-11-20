@@ -1043,37 +1043,34 @@ class TelecomClient:
                             json_data={"para": _encrypt_rsa(para)},
                             headers={"sign": self.sign})
             ok = str(res.get("code")) == "0" or str(res.get("resoultCode")) == "0"
-            # data 必须是字典：非映射响应（如 [1]）不得抛 AttributeError
-            # 中断资产查询/会话保存/后续账号（PR #34 full review 指认）
+            msg = str(res.get("resoultMsg") or res.get("msg") or res.get("errorMsg") or "")
+            # 先处理明确失败状态（传输故障/业务拒绝），保留脱敏后的真实原因；
+            # 不要把 TimeoutError/HTTP 500 一律报成「data 字段异常」
+            # （final review 指认）。
+            if not ok:
+                if "已" in msg and ("抽" in msg or "兑" in msg or "完" in msg):
+                    if not prizes:
+                        stop_note = "今日已抽"
+                    break
+                if "金豆" in msg and ("不足" in msg or "不够" in msg):
+                    stop_note = f"金豆不足({sanitize_snippet(msg, 30)})"
+                    break
+                fail_note = sanitize_snippet(msg, 40) or f"code={res.get('code')}"
+                print(f"    [转盘] 第{i + 1}抽提交故障，停手: {fail_note}", flush=True)
+                break
+            # 成功响应必须带字典 data 才能读奖品：data=[1] 时停手，
+            # 不恢复为无保护的 .get() 调用
             rdata = res.get("data")
             if not isinstance(rdata, dict):
-                rdata = {}
                 fail_note = "提交响应 data 字段异常"
                 print(f"    [转盘] 第{i + 1}抽响应字段异常，停手: {fail_note}", flush=True)
                 break
             prize = str(rdata.get("prizeName") or rdata.get("title") or "")
-            if ok and prize:
-                prizes.append(prize)
-                print(f"    [转盘] 第{i + 1}抽: {prize}", flush=True)
-                continue
-            msg = str(res.get("resoultMsg") or res.get("msg") or res.get("errorMsg") or "")
-            if "已" in msg and ("抽" in msg or "兑" in msg or "完" in msg):
-                # 次数用尽（服务端裁决）：此前无奖品→「今日已抽」（调用方
-                # 按幂等跳过）；已有奖品→保留奖品，耗尽事实由 print 留痕
-                if not prizes:
-                    stop_note = "今日已抽"
+            if not prize:
+                fail_note = "提交成功响应无奖品字段"
                 break
-            if "金豆" in msg and ("不足" in msg or "不够" in msg):
-                # 提交时服务端裁决余额不足（查询与提交间余额可能已变动）：
-                # 保留真实拒绝原因，不得吞成「今日已抽」（PR #34 第四轮评审）
-                stop_note = f"金豆不足({sanitize_snippet(msg, 30)})"
-                break
-            # 提交故障（网络错误/系统繁忙）：立即停手并如实保留故障原因，
-            # 不得继续盲提交、不得把请求失败报成「未中奖」（PR #34 第三轮
-            # 评审指认）。跨运行恢复交框架，本函数不做重试循环。
-            fail_note = sanitize_snippet(msg, 40) or f"code={res.get('code')}"
-            print(f"    [转盘] 第{i + 1}抽提交故障，停手: {fail_note}", flush=True)
-            break
+            prizes.append(prize)
+            print(f"    [转盘] 第{i + 1}抽: {prize}", flush=True)
         tail = f"；{stop_note}" if stop_note else (f"；后续提交故障({fail_note})" if fail_note else "")
         if prizes:
             return "、".join(prizes) + tail

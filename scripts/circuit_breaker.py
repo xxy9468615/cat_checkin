@@ -105,6 +105,7 @@ def _load_cb_state_raw(redis_key: str, state_file: str) -> Tuple[Dict[str, Any],
     """
     state: Dict[str, Any] = {}
     local_ok = False
+    local_read_failed = False
     try:
         if os.path.exists(state_file):
             with open(state_file, encoding="utf-8") as f:
@@ -112,21 +113,28 @@ def _load_cb_state_raw(redis_key: str, state_file: str) -> Tuple[Dict[str, Any],
             if isinstance(data, dict):
                 state.update(data)
                 local_ok = True
+            else:
+                local_read_failed = True  # 文件存在但结构不符
     except Exception:
-        pass
+        local_read_failed = True  # 文件存在但损坏/不可读 ≠ 确认缺键
     try:
         from common import _upstash_redis_env
         url, token = _upstash_redis_env()
         if not url or not token:
-            # 纯本地模式：文件有效→用文件；文件缺失→确认缺键（可迁移）
+            # 纯本地模式：文件有效→用文件；文件确实不存在→确认缺键（可迁移）
+            if local_read_failed:
+                return state, False, True
             return state, (not local_ok), False
         ok, res = upstash_redis_command(["GET", redis_key])
         if not ok:
             # 读取失败：本地有数据则用本地（不迁移），否则无法确认（fail-closed）
-            return state, False, not local_ok
+            return state, False, (not local_ok or local_read_failed)
         raw_val = res.get("result") if isinstance(res, dict) else None
         if raw_val is None or raw_val == "":
-            # Redis 明确 nil：键不存在。本地有数据时以本地为准不迁移
+            # Redis 明确 nil：键不存在。本地有数据时以本地为准不迁移；
+            # 本地文件损坏时仍属读取失败，不可迁移（full review 指认）
+            if local_read_failed:
+                return state, False, True
             return state, (not local_ok), False
         if isinstance(raw_val, str):
             try:
@@ -139,7 +147,7 @@ def _load_cb_state_raw(redis_key: str, state_file: str) -> Tuple[Dict[str, Any],
         # 键存在但值非空且无法解析/结构不符（如 "[]"、损坏 JSON）：
         # 不是缺键，禁止迁移——否则旧 notify 熔断标记会覆盖现存值
         # （PR #34 第三轮评审指认）。本地有数据用本地，否则空状态不迁移。
-        return state, False, not local_ok
+        return state, False, (not local_ok or local_read_failed)
     except Exception:
         return state, False, True
 
@@ -167,9 +175,14 @@ def load_circuit_state(task_id: str) -> Dict[str, Any]:
 
 
 def save_circuit_state(task_id: str, state: Dict[str, Any]) -> None:
-    """双通道持久化指定任务的重试与熔断状态字典。"""
+    """双通道持久化指定任务的重试与熔断状态字典。
+
+    保存边界强制剔除内部标记（_read_failed 绝不落盘）。读取失败时
+    写入入口应停止调用本函数；此处的过滤是最后一道防线。
+    """
     redis_key, state_file = _state_paths(task_id)
-    save_kv_state(redis_key, state_file, state)
+    clean = {k: v for k, v in state.items() if k != _CB_READ_FAILED}
+    save_kv_state(redis_key, state_file, clean)
 
 
 def is_task_suspended(task_id: str) -> bool:
@@ -247,6 +260,10 @@ def trip_circuit_breaker(
 ) -> Dict[str, Any]:
     """将任务置为熔断停用状态并持久化。"""
     state = load_circuit_state(task_id)
+    if state.pop(_CB_READ_FAILED, None):
+        print(f"⚠️ [CIRCUIT_BREAKER] [{task_id}] 状态读取失败，跳过熔断写入（fail-closed）",
+              file=sys.stderr)
+        return state
     now_iso = dt.datetime.now(BJT).isoformat()
     state["status"] = "suspended"
     state["circuit_broken"] = True
@@ -275,8 +292,13 @@ def resume_task(task_id: str, reason: str = "人工修复后重新上线") -> Di
     """人工修复后重新上线处于熔断状态的任务。
 
     清除熔断标记、重置当日尝试次数为 0，状态恢复为 active。
+    读取失败时拒绝写入（无法确认真实状态，避免标记污染持久状态）。
     """
     state = load_circuit_state(task_id)
+    if state.pop(_CB_READ_FAILED, None):
+        print(f"⚠️ [CIRCUIT_BREAKER] [{task_id}] 状态读取失败，拒绝 resume 写入（fail-closed）",
+              file=sys.stderr)
+        return state
     now_iso = dt.datetime.now(BJT).isoformat()
     state["status"] = "active"
     state["circuit_broken"] = False
