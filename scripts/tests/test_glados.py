@@ -430,6 +430,20 @@ class TestFailureDetailWhitelist(unittest.TestCase):
         self.assertEqual(res[1], glados.CHECKIN_FAILURE)
         self.assertNotIn("private.user@example.org", res[3])
 
+    def test_browser_email_across_truncation_boundary_redacted(self):
+        """第十轮评审：邮箱跨 120 字符截断边界时，先截断会切开邮箱致
+        redact_pii 漏判（本地部分明文残留）。必须先全文脱敏再截断。"""
+        # 邮箱从第 108 字符开始，跨越 120 边界
+        msg = "x" * 108 + "private.user@example.org denied"
+        bc = TestBrowserResponseParsing()._browser_with_response(
+            json.dumps({"code": -2, "message": msg}))
+        with patch.object(glados.time, "sleep"):
+            outcome = bc.checkin(SYNTHETIC_COOKIE, "glados.example")
+        self.assertIsNotNone(outcome)
+        res, _ = outcome
+        self.assertNotIn("private.user", res[3], "截断边界不得残留邮箱本地部分")
+        self.assertNotIn("example.org", res[3])
+
 
 
 
