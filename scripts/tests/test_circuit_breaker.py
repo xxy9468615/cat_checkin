@@ -484,6 +484,20 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_raw_redis_non_dict_value_no_migration(self):
+        """键存在但值结构不符（如 "[]"）：不是缺键，禁止迁移
+        （PR #34 第三轮评审）。"""
+        for bad_val in ('[]', '"str"', '123', '{corrupted'):
+            with self.subTest(value=bad_val), \
+                 mock.patch.dict(os.environ, {"UPSTASH_REDIS_REST_URL": "https://fake",
+                                              "UPSTASH_REDIS_REST_TOKEN": "V1.0FAKEtok"}, clear=False), \
+                 mock.patch("os.path.exists", return_value=False), \
+                 mock.patch.object(circuit_breaker, "upstash_redis_command",
+                                   return_value=(True, {"result": bad_val})):
+                state, absent = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", ".cb_state_x.json")
+            self.assertEqual(state, {})
+            self.assertFalse(absent, f"值 {bad_val!r} 存在但无效，不得确认缺键")
+
 
 class TestDailyOrchestratorCircuitIntegration(unittest.TestCase):
     """编排器与熔断机制集成测试。"""

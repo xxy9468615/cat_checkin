@@ -1400,9 +1400,9 @@ def ex_telecom(output: str, res: Dict[str, Any]) -> None:
             cur.parts.append(f"金豆 {_d(mm.group(1))}")
             res["assets"].append(("金豆", _f(mm.group(1))))
             continue
-        mm = re.search(r"• 目标:\s*【(.+?)】", ln)
-        if mm:
-            cur.parts.append(f"目标: {mm.group(1)}")
+        # 「• 目标:」行已随 10元话费达标兑换机制下线移除（2026-11-19）；
+        # 旧结果缓存（14 天 TTL）里可能残留该行，静默忽略不展示。
+        if re.search(r"• 目标:\s*【", ln):
             continue
         mm = re.search(r"• 赢花费:\s*【(.+?)】", ln)
         if mm:

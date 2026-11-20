@@ -74,13 +74,11 @@ PREFIX = "TELECOM_"
 #   LV3=1元(200金豆) LV4=2元(400) LV5=3元(600) LV6=5元(1000)
 # 目标解析：TELECOM_EXCHANGE_GOAL 含「N元」时优先匹配该金额档位；账号等级不足
 # 时自动降级到当前等级最高可兑话费档（如 LV4 账号目标 5元 → 实际兑 2元）。
+# 旧「8000 金豆达标自动兑换」门槛机制已随 10元活动下线移除（2026-11-19 用户
+# 指令）：0 点场由 telecom-exchange 专项任务独立执行，主链路不再探测/提示/
+# 触发兑换，避免下线活动干扰任务进度与日报。TELECOM_EXCHANGE_BEANS 环境变量
+# 自此忽略（仓库 Secret 可删）。
 TELECOM_EXCHANGE_GOAL = (os.getenv("TELECOM_EXCHANGE_GOAL") or "").strip() or "等级权益话费"
-try:
-    TELECOM_EXCHANGE_BEANS = int((os.getenv("TELECOM_EXCHANGE_BEANS") or "").strip() or "8000")
-except ValueError:
-    TELECOM_EXCHANGE_BEANS = 8000
-if TELECOM_EXCHANGE_BEANS <= 0:
-    TELECOM_EXCHANGE_BEANS = 8000
 
 # ---------- 等级权益话费抢兑（wappark.189.cn/jt-sign/paradise）----------
 # 2026-11-19 HAR 实抓 + CI 探测终局（取代 2026-10-31 的金豆商城秒杀场结论）：
@@ -995,15 +993,6 @@ class TelecomClient:
                 print("    [抽奖] Bearer 鉴权被拒，已现场重取并重试一次", flush=True)
         return res
 
-    def try_exchange_phone_bill(self, goal: str, target_beans: int) -> str:
-        """主签到链路的兑换探测（不等待 0 点场，单次提交）。
-
-        等级权益话费每日 0 点限量抢，主链路时点（00:50）通常已抢光/已兑；
-        此处只做单次探测并如实回报，真正的抢兑由 telecom-exchange 专项任务
-        在 23:30 拉起、0 点整突发执行。"""
-        _, msg = run_rights_exchange(self, goal, wait_for_window=False, burst=1)
-        return msg
-
     def wheel_daily_draws(self) -> str:
         """每日签到大转盘：把当日剩余免费抽兑次数全部用完（服务端限 3 次/日）。
 
@@ -1022,8 +1011,12 @@ class TelecomClient:
             msg = str(status.get("resoultMsg") or status.get("msg") or "")
             return f"转盘查询失败({sanitize_snippet(msg, 40) or status.get('resoultCode')})"
         data = status.get("data") or {}
+        # remainCount 必须显式存在且有效：缺失≠0，不得把字段异常报成「今日已抽」
+        # （PR #34 第三轮评审指认，规则 9a(1)）
+        if data.get("remainCount") is None:
+            return "转盘状态字段异常(缺 remainCount)"
         try:
-            remain = int(data.get("remainCount") or 0)
+            remain = int(data["remainCount"])
             cost = int(data.get("amount") or 20)
             beans = int(data.get("beanAmount") or 0)
             user_max = int(data.get("userMaximum") or WHEEL_MAX_DRAWS)
@@ -1037,6 +1030,7 @@ class TelecomClient:
         if beans < cost:
             return f"金豆不足({beans}<{cost}/次)，跳过转盘"
         prizes: List[str] = []
+        fail_note = ""
         for i in range(draws):
             if i:
                 time.sleep(random.uniform(1.0, 2.5))  # 拟人间隔，防连点风控
@@ -1055,11 +1049,19 @@ class TelecomClient:
                 break  # 次数用尽（服务端裁决），如实停手
             if "金豆" in msg and ("不足" in msg or "不够" in msg):
                 break
-            # 单抽失败不硬重试（框架管跨运行重试）；记录后继续下一抽
-            print(f"    [转盘] 第{i + 1}抽未中: {sanitize_snippet(msg, 40) or res.get('code')}", flush=True)
+            # 提交故障（网络错误/系统繁忙）：立即停手并如实保留故障原因，
+            # 不得继续盲提交、不得把请求失败报成「未中奖」（PR #34 第三轮
+            # 评审指认）。跨运行恢复交框架，本函数不做重试循环。
+            fail_note = sanitize_snippet(msg, 40) or f"code={res.get('code')}"
+            print(f"    [转盘] 第{i + 1}抽提交故障，停手: {fail_note}", flush=True)
+            break
+        if prizes and fail_note:
+            return "、".join(prizes) + f"；后续提交故障({fail_note})"
         if prizes:
             return "、".join(prizes)
-        return "今日已抽" if remain <= 0 else "转盘未中奖"
+        if fail_note:
+            return f"转盘提交故障({fail_note})"
+        return "今日已抽"
 
     def prepare_auth(self) -> bool:
         """准备可用鉴权票据：Token 现签优先（App 同款），缓存会话仅作回退。"""
@@ -1132,7 +1134,6 @@ def execute_telecom_task(client: TelecomClient) -> Dict[str, Any]:
         "task_res": "",
         "food_res": "",
         "total_bean": "",
-        "goal_res": "",
         "imusic_res": "",
         "error": "",
     }
@@ -1431,18 +1432,9 @@ def execute_telecom_task(client: TelecomClient) -> Dict[str, Any]:
             else:
                 res["total_bean"] = "查询异常"
 
-        # 7. 目标进度计算与达标自动兑换
-        if str(res["total_bean"]).isdigit():
-            curr_bean = int(res["total_bean"])
-            if curr_bean >= TELECOM_EXCHANGE_BEANS:
-                print(f"    [目标] 🎉 金豆已达标 ({curr_bean} >= {TELECOM_EXCHANGE_BEANS})！正在执行自动兑换【{TELECOM_EXCHANGE_GOAL}】...", flush=True)
-                ex_res = client.try_exchange_phone_bill(TELECOM_EXCHANGE_GOAL, TELECOM_EXCHANGE_BEANS)
-                res["goal_res"] = ex_res
-            else:
-                diff = TELECOM_EXCHANGE_BEANS - curr_bean
-                pct = round((curr_bean / TELECOM_EXCHANGE_BEANS) * 100, 1)
-                res["goal_res"] = f"距离【{TELECOM_EXCHANGE_GOAL}】({TELECOM_EXCHANGE_BEANS}金豆) 还差 {diff} 金豆 (进度 {pct}%)"
-                print(f"    [目标] {res['goal_res']}", flush=True)
+        # 7. （已移除）旧「金豆达标自动兑换 10元话费」目标进度机制：活动下线，
+        # 主链路不再探测/提示/触发兑换。话费抢兑由 telecom-exchange 专项任务
+        # 在每日 0 点场独立执行（2026-11-19 用户指令，排除下线活动干扰）。
 
         # 8. 天翼爱音乐「AI视频创作赢话费」（ai.imusic.cn ai119）：getSingle 现签
         # ticket 同源直接登录，月度免费生成次数用满，每次提交 +20 积分兑奖券开奖。
@@ -1893,8 +1885,6 @@ def main() -> None:
             print(f"• 乐园: 【{outcome['food_res']}】")
         if outcome["total_bean"]:
             print(f"• 资产: 金豆 【{outcome['total_bean']}】")
-        if outcome.get("goal_res"):
-            print(f"• 目标: 【{outcome['goal_res']}】")
         if outcome.get("imusic_res"):
             print(f"• 赢花费: 【{outcome['imusic_res']}】")
 

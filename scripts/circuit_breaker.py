@@ -119,7 +119,10 @@ def _load_cb_state_raw(redis_key: str, state_file: str) -> Tuple[Dict[str, Any],
             # 读取失败：本地有数据则用本地（不迁移），否则无法确认（不迁移）
             return state, False
         raw_val = res.get("result") if isinstance(res, dict) else None
-        if raw_val and isinstance(raw_val, str):
+        if raw_val is None or raw_val == "":
+            # Redis 明确 nil：键不存在。本地有数据时以本地为准不迁移
+            return state, (not local_ok)
+        if isinstance(raw_val, str):
             try:
                 remote = json.loads(raw_val)
                 if isinstance(remote, dict):
@@ -127,8 +130,10 @@ def _load_cb_state_raw(redis_key: str, state_file: str) -> Tuple[Dict[str, Any],
                     return state, False
             except Exception:
                 pass
-        # GET 成功但无有效值：Redis 侧确认缺键；本地有数据时以本地为准不迁移
-        return state, (not local_ok)
+        # 键存在但值非空且无法解析/结构不符（如 "[]"、损坏 JSON）：
+        # 不是缺键，禁止迁移——否则旧 notify 熔断标记会覆盖现存值
+        # （PR #34 第三轮评审指认）。本地有数据用本地，否则空状态不迁移。
+        return state, False
     except Exception:
         return state, False
 

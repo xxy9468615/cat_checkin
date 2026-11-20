@@ -150,7 +150,7 @@ jobs:
       TELECOM_PHONE_2: ${{ secrets.TELECOM_PHONE_2 }}
       # 金豆兑换目标（缺省即 10 元话费直充券 / 8000 豆）
       TELECOM_EXCHANGE_GOAL: ${{ secrets.TELECOM_EXCHANGE_GOAL || '等级权益话费' }}
-      TELECOM_EXCHANGE_BEANS: ${{ secrets.TELECOM_EXCHANGE_BEANS || '8000' }}
+      # TELECOM_EXCHANGE_BEANS 已随 10元话费达标兑换机制下线移除（2026-11-19）
       TELECOM_PROXY: ${{ secrets.TELECOM_PROXY || secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
       # OPPO 商城打卡与赚积分
       OPPO_COOKIE_1: ${{ secrets.OPPO_COOKIE_1 }}

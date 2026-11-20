@@ -680,7 +680,6 @@ class TestTelecom(unittest.TestCase):
 • 任务: 【完成1项】
 • 乐园: 【喂食1次】
 • 资产: 金豆 【2,580】
-• 目标: 【距离【10元话费直充券】(8000金豆) 还差 5420 金豆 (进度: 32.2%)】
 
 总结：成功 1/1
 """
@@ -691,7 +690,6 @@ class TestTelecom(unittest.TestCase):
         self.assertIn("+10金豆", res["lines"][0])
         self.assertIn("连签 7 天", res["lines"][0])
         self.assertIn("金豆 2,580", res["lines"][0])
-        self.assertIn("10元话费直充券", res["lines"][0])
 
         self.assertEqual(res["streak"], 7)
         self.assertIn(("金豆", 10.0), res["gains"])
@@ -700,48 +698,67 @@ class TestTelecom(unittest.TestCase):
         self.assertIn(("streak", "连签 7 天"), res["badges"])
         self.assertIn(("reward", "抽奖 100M全国流量日包"), res["badges"])
 
-    def test_exchange_goal_progress(self):
-        """金豆兑换目标进度计算与达标兑换。"""
+    def test_report_fields_legacy_goal_line_ignored(self):
+        """旧结果缓存（14 天 TTL）残留的「• 目标:」行必须静默忽略，
+        不得把下线活动的进度文案带进日报。"""
+        sample_output = """
+【中国电信 签到】
+
+👤 用户: 【189****1234】
+• 签到: 【成功】 (+10 金豆) 连签天数: 【7】天
+• 资产: 金豆 【2,580】
+• 目标: 【距离【10元话费直充券】(8000金豆) 还差 5420 金豆 (进度: 32.2%)】
+
+总结：成功 1/1
+"""
+        res = extract_for("telecom.py", sample_output)
+        self.assertEqual(len(res["lines"]), 1)
+        self.assertNotIn("10元话费直充券", res["lines"][0])
+        self.assertNotIn("目标", res["lines"][0])
+
+    def test_legacy_goal_mechanism_removed(self):
+        """10元话费达标兑换机制已下线移除（2026-11-19 用户指令）：
+        主链路不得再探测/提示/触发兑换，goal_res 字段与 BEANS 常量不复存在。"""
         if not telecom.HAS_CRYPTO:
             self.skipTest("缺少 pycryptodome 库，跳过测试")
+
+        self.assertFalse(hasattr(telecom, "TELECOM_EXCHANGE_BEANS"))
+        self.assertFalse(hasattr(telecom.TelecomClient, "try_exchange_phone_bill"))
 
         acc = telecom.TelecomAccount(
             index=1,
             phone="18912345678",
             sign="mock_sign_token_1234567890123456",
         )
-        mock_http = MagicMock()
-        client = telecom.TelecomClient(acc, mock_http)
+        client = telecom.TelecomClient(acc, MagicMock())
+        exchange_calls = []
 
         def fake_req(method, url, headers=None, json_data=None, data=None, timeout=15):
+            if "receiverRights" in url or "queryLevelRightInfo" in url:
+                exchange_calls.append(url)
             if "webSign/sign" in url:
                 return {"resoultCode": "0", "data": {"code": 0}, "resoultMsg": "成功"}
             if "userCoinInfo" in url:
-                return {"resoultCode": "0", "totalCoin": 1500}
+                return {"resoultCode": "0", "totalCoin": 99999}  # 远超旧门槛也不触发
             return {"resoultCode": "0", "resoultMsg": "成功"}
 
         client._req = MagicMock(side_effect=fake_req)
-        # GOAL/BEANS 是模块级常量（import 时读 env）：patch.dict 只影响后续
-        # import，必须直接 patch 模块属性，否则断言随宿主环境漂移
-        # （本地 env 有旧值时假绿、CI 干净环境用默认值时假红，2026-11-19 PR #34）
         with patch.object(client, "restore_cached_session", return_value=True), \
              patch.object(client, "save_session", return_value=None), \
-             patch.object(telecom, "TELECOM_EXCHANGE_GOAL", "10元话费直充券"), \
-             patch.object(telecom, "TELECOM_EXCHANGE_BEANS", 8000), \
              patch("sys.stdout", new_callable=io.StringIO):
             outcome = telecom.execute_telecom_task(client)
 
         self.assertEqual(outcome["status"], "成功")
-        self.assertIn("距离【10元话费直充券】(8000金豆) 还差 6500 金豆", outcome["goal_res"])
-        self.assertIn("18.8%", outcome["goal_res"])
+        self.assertNotIn("goal_res", outcome)
+        self.assertEqual(exchange_calls, [], "主链路不得触碰等级权益兑换接口")
 
-    def _import_constants(self, extra_env):
-        """在独立子进程中导入 telecom，返回 (BADGES, GOAL) 常量，隔离模块级 env 解析。"""
+    def _import_goal_constant(self, extra_env):
+        """在独立子进程中导入 telecom，返回 GOAL 常量，隔离模块级 env 解析。"""
         code = (
             "import os, sys\n"
             f"sys.path.insert(0, {str(BASE)!r})\n"
             "import telecom\n"
-            "print(telecom.TELECOM_EXCHANGE_BEANS, telecom.TELECOM_EXCHANGE_GOAL)\n"
+            "print(telecom.TELECOM_EXCHANGE_GOAL)\n"
         )
         env = {k: v for k, v in os.environ.items() if not k.startswith("TELECOM_")}
         env.update(extra_env)
@@ -753,25 +770,18 @@ class TestTelecom(unittest.TestCase):
             env=env,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        beans, _, goal = proc.stdout.strip().partition(" ")
-        return int(beans), goal
+        return proc.stdout.strip()
 
     def test_exchange_env_custom_value(self):
-        """自定义兑换目标与门槛应被正确读取。"""
-        beans, goal = self._import_constants(
-            {"TELECOM_EXCHANGE_BEANS": "12000", "TELECOM_EXCHANGE_GOAL": "20元话费券"}
-        )
-        self.assertEqual(beans, 12000)
-        self.assertEqual(goal, "20元话费券")
+        """自定义兑换目标应被正确读取（0 点场专项任务用）。"""
+        goal = self._import_goal_constant({"TELECOM_EXCHANGE_GOAL": "2元话费"})
+        self.assertEqual(goal, "2元话费")
 
-    def test_exchange_env_fallback_non_numeric(self):
-        """门槛误配为非数字/空串/负数时应回退默认 8000，不得导入即崩。"""
-        for bad in ("abc", "", "   ", "-5", "0"):
+    def test_exchange_env_fallback_blank(self):
+        """目标空串/纯空白时回退默认「等级权益话费」，不得导入即崩。"""
+        for bad in ("", "   "):
             with self.subTest(value=bad):
-                beans, goal = self._import_constants(
-                    {"TELECOM_EXCHANGE_BEANS": bad, "TELECOM_EXCHANGE_GOAL": "   "}
-                )
-                self.assertEqual(beans, 8000)
+                goal = self._import_goal_constant({"TELECOM_EXCHANGE_GOAL": bad})
                 self.assertEqual(goal, "等级权益话费")
 
 
@@ -1041,10 +1051,11 @@ class TestJindouExchange(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("鉴权失败", msg)
 
-    def test_try_exchange_no_fake_submitted(self):
+    def test_rights_exchange_no_fake_submitted(self):
         """回归护栏：兑换失败严禁出现旧链路「已提交」假成功文案。"""
         client = self._client()  # 无凭据
-        msg = client.try_exchange_phone_bill("2元话费", 400)
+        ok, msg = telecom.run_rights_exchange(client, "2元话费", wait_for_window=False)
+        self.assertFalse(ok)
         self.assertNotIn("已提交", msg)
 
     def test_rights_next_window_midnight(self):
@@ -1325,6 +1336,43 @@ class TestJindouExchange(unittest.TestCase):
             client.wheel_daily_draws()
         self.assertEqual(captured.get("phone"), "V1.0FAKEacc")
         self.assertEqual(captured.get("provinceCode"), telecom.WHEEL_PROVINCE_CODE)
+
+    def test_wheel_missing_remain_count_not_reported_as_drawn(self):
+        """查询成功但缺 remainCount：字段异常，不得报「今日已抽」
+        （PR #34 第三轮评审）。"""
+        client = self._rights_client()
+        client._req = MagicMock(return_value={"resoultCode": "0", "data": {"amount": 20}})
+        with patch("sys.stdout", new_callable=io.StringIO):
+            res = client.wheel_daily_draws()
+        self.assertIn("字段异常", res)
+        self.assertNotIn("今日已抽", res)
+
+    def test_wheel_submit_failure_stops_and_reports(self):
+        """提交故障（系统繁忙）：立即停手、如实报故障，不得报「未中奖」、
+        不得继续盲提交（PR #34 第三轮评审）。"""
+        client = self._wheel_client(remain=3)
+        self._wheel_req(client, [
+            {"code": 0, "data": {"prizeName": "88金豆"}},
+            {"code": 1, "msg": "系统繁忙，请稍后再试"},
+        ])
+        with patch.object(telecom.time, "sleep", lambda *_: None), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            res = client.wheel_daily_draws()
+        self.assertIn("88金豆", res)
+        self.assertIn("提交故障", res)
+        self.assertNotIn("未中奖", res)
+        self.assertEqual(len(self._wheel_submits), 2, "故障后不得继续提交")
+
+    def test_wheel_all_submit_failure_not_reported_as_no_prize(self):
+        """全部提交故障：报故障而非「未中奖」。"""
+        client = self._wheel_client(remain=3)
+        self._wheel_req(client, [{"code": -1, "msg": "HTTP -1"}])
+        with patch.object(telecom.time, "sleep", lambda *_: None), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            res = client.wheel_daily_draws()
+        self.assertIn("提交故障", res)
+        self.assertNotIn("未中奖", res)
+        self.assertEqual(len(self._wheel_submits), 1)
 
 
 if __name__ == "__main__":
