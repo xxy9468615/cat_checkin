@@ -405,6 +405,31 @@ class TestFailureDetailWhitelist(unittest.TestCase):
         self.assertNotIn("private.user@example.org", detail)
         self.assertIn("device-mismatch", detail)
 
+    def test_browser_failure_message_redacted(self):
+        """第九轮评审：浏览器路径失败 detail 会进 _run_one 打印/日报，
+        服务端原始 message 中的邮箱必须脱敏（与 HTTP 链路同等处理）。"""
+        bc = TestBrowserResponseParsing()._browser_with_response(
+            '{"code":4,"reason":"device-mismatch",'
+            '"message":"private.user@example.org denied","loginDevice":"Windows"}')
+        with patch.object(glados.time, "sleep"):
+            outcome = bc.checkin(SYNTHETIC_COOKIE, "glados.example")
+        self.assertIsNotNone(outcome)
+        res, _ = outcome
+        self.assertNotIn("private.user@example.org", res[3])
+        self.assertIn("device-mismatch", res[3])
+
+    def test_browser_generic_failure_message_redacted(self):
+        """浏览器路径非 device-mismatch 失败（code=-2）：message 同样不得裸奔。
+        注意 code=1 是重复签到（CHECKIN_REPEAT），不走失败脱敏分支。"""
+        bc = TestBrowserResponseParsing()._browser_with_response(
+            '{"code":-2,"message":"account private.user@example.org locked"}')
+        with patch.object(glados.time, "sleep"):
+            outcome = bc.checkin(SYNTHETIC_COOKIE, "glados.example")
+        self.assertIsNotNone(outcome)
+        res, _ = outcome
+        self.assertEqual(res[1], glados.CHECKIN_FAILURE)
+        self.assertNotIn("private.user@example.org", res[3])
+
 
 
 
