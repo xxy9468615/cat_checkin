@@ -1010,7 +1010,11 @@ class TelecomClient:
         if str(status.get("resoultCode")) != "0":
             msg = str(status.get("resoultMsg") or status.get("msg") or "")
             return f"转盘查询失败({sanitize_snippet(msg, 40) or status.get('resoultCode')})"
-        data = status.get("data") or {}
+        data = status.get("data")
+        # data 必须是字典：非映射响应（如 [1]）不得绕过畸形处理抛 AttributeError
+        # 中断已签到账号的后续任务与会话保存（PR #34 第四轮评审指认）
+        if not isinstance(data, dict):
+            return "转盘状态字段异常(data 非字典)"
         # remainCount 必须显式存在且有效：缺失≠0，不得把字段异常报成「今日已抽」
         # （PR #34 第三轮评审指认，规则 9a(1)）
         if data.get("remainCount") is None:
@@ -1031,6 +1035,7 @@ class TelecomClient:
             return f"金豆不足({beans}<{cost}/次)，跳过转盘"
         prizes: List[str] = []
         fail_note = ""
+        stop_note = ""  # 服务端明确拒绝原因（次数耗尽/余额不足），与故障分开记录
         for i in range(draws):
             if i:
                 time.sleep(random.uniform(1.0, 2.5))  # 拟人间隔，防连点风控
@@ -1046,8 +1051,15 @@ class TelecomClient:
                 continue
             msg = str(res.get("resoultMsg") or res.get("msg") or res.get("errorMsg") or "")
             if "已" in msg and ("抽" in msg or "兑" in msg or "完" in msg):
-                break  # 次数用尽（服务端裁决），如实停手
+                # 次数用尽（服务端裁决）：此前无奖品→「今日已抽」（调用方
+                # 按幂等跳过）；已有奖品→保留奖品，耗尽事实由 print 留痕
+                if not prizes:
+                    stop_note = "今日已抽"
+                break
             if "金豆" in msg and ("不足" in msg or "不够" in msg):
+                # 提交时服务端裁决余额不足（查询与提交间余额可能已变动）：
+                # 保留真实拒绝原因，不得吞成「今日已抽」（PR #34 第四轮评审）
+                stop_note = f"金豆不足({sanitize_snippet(msg, 30)})"
                 break
             # 提交故障（网络错误/系统繁忙）：立即停手并如实保留故障原因，
             # 不得继续盲提交、不得把请求失败报成「未中奖」（PR #34 第三轮
@@ -1055,10 +1067,11 @@ class TelecomClient:
             fail_note = sanitize_snippet(msg, 40) or f"code={res.get('code')}"
             print(f"    [转盘] 第{i + 1}抽提交故障，停手: {fail_note}", flush=True)
             break
-        if prizes and fail_note:
-            return "、".join(prizes) + f"；后续提交故障({fail_note})"
+        tail = f"；{stop_note}" if stop_note else (f"；后续提交故障({fail_note})" if fail_note else "")
         if prizes:
-            return "、".join(prizes)
+            return "、".join(prizes) + tail
+        if stop_note:
+            return stop_note
         if fail_note:
             return f"转盘提交故障({fail_note})"
         return "今日已抽"

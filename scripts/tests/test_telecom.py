@@ -1374,6 +1374,27 @@ class TestJindouExchange(unittest.TestCase):
         self.assertNotIn("未中奖", res)
         self.assertEqual(len(self._wheel_submits), 1)
 
+    def test_wheel_non_dict_data_no_crash(self):
+        """data 非字典（如 [1]）：返回字段异常，不得抛 AttributeError 中断
+        已签到账号的后续任务（PR #34 第四轮评审）。"""
+        client = self._rights_client()
+        client._req = MagicMock(return_value={"resoultCode": "0", "data": [1]})
+        with patch("sys.stdout", new_callable=io.StringIO):
+            res = client.wheel_daily_draws()
+        self.assertIn("字段异常", res)
+
+    def test_wheel_submit_beans_insufficient_reason_kept(self):
+        """查询余额足够但提交时服务端裁决金豆不足：保留真实拒绝原因，
+        不得吞成「今日已抽」（PR #34 第四轮评审）。"""
+        client = self._wheel_client(remain=3, beans=1000)
+        self._wheel_req(client, [{"code": 1, "resoultMsg": "金豆不足，无法抽奖"}])
+        with patch.object(telecom.time, "sleep", lambda *_: None), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            res = client.wheel_daily_draws()
+        self.assertIn("金豆不足", res)
+        self.assertNotEqual(res, "今日已抽")
+        self.assertEqual(len(self._wheel_submits), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
