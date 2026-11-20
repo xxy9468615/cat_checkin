@@ -332,7 +332,7 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
             "warn_texts": ["x"],     # notify 展示字段：不得带入
         }
         with mock.patch.object(circuit_breaker, "_load_cb_state_raw",
-                               return_value=({}, True)) as m_load, \
+                               return_value=({}, True, False)) as m_load, \
              mock.patch.object(circuit_breaker, "_legacy_notify_state", return_value=legacy):
             st = circuit_breaker.load_circuit_state("smzdm")
         self.assertTrue(st["circuit_broken"])
@@ -348,7 +348,7 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
         陈旧 circuit_broken 标记不得复活已恢复的任务。"""
         cb = {"status": "active", "circuit_broken": False, "attempts": 0}
         with mock.patch.object(circuit_breaker, "_load_cb_state_raw",
-                               return_value=(cb, False)), \
+                               return_value=(cb, False, False)), \
              mock.patch.object(circuit_breaker, "_legacy_notify_state",
                                return_value={"circuit_broken": True}) as m_legacy:
             st = circuit_breaker.load_circuit_state("glados")
@@ -362,7 +362,7 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
 
         def fake_raw(redis_key, state_file):
             data = dict(store.get(redis_key, {}))
-            return data, (not data)
+            return data, (not data), False
 
         def fake_save(redis_key, state_file, state):
             store[redis_key] = dict(state)
@@ -407,7 +407,7 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
         熔断标记把已恢复任务重新熔断（PR #34 评审）。"""
         legacy = {"status": "suspended", "circuit_broken": True, "attempts": 8}
         with mock.patch.object(circuit_breaker, "_load_cb_state_raw",
-                               return_value=({}, False)), \
+                               return_value=({}, False, False)), \
              mock.patch.object(circuit_breaker, "_legacy_notify_state",
                                return_value=legacy) as m_legacy:
             st = circuit_breaker.load_circuit_state("smzdm")
@@ -418,7 +418,7 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
         """确认缺键（纯本地模式文件缺失 / Redis 明确返回 nil）仍正常迁移。"""
         legacy = {"status": "suspended", "circuit_broken": True, "attempts": 8}
         with mock.patch.object(circuit_breaker, "_load_cb_state_raw",
-                               return_value=({}, True)), \
+                               return_value=({}, True, False)), \
              mock.patch.object(circuit_breaker, "_legacy_notify_state", return_value=legacy):
             st = circuit_breaker.load_circuit_state("smzdm")
         self.assertTrue(st["circuit_broken"])
@@ -427,7 +427,7 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
         """凭据未配置（纯本地模式）：文件缺失即确认缺键，可迁移。"""
         with mock.patch.dict(os.environ, {}, clear=True), \
              mock.patch("os.path.exists", return_value=False):
-            state, absent = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", ".cb_state_x.json")
+            state, absent, failed = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", ".cb_state_x.json")
         self.assertEqual(state, {})
         self.assertTrue(absent)
 
@@ -439,7 +439,7 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
             path = f.name
         try:
             with mock.patch.dict(os.environ, {}, clear=True):
-                state, absent = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", path)
+                state, absent, failed = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", path)
             self.assertEqual(state["status"], "active")
             self.assertFalse(absent)
         finally:
@@ -452,7 +452,7 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
              mock.patch("os.path.exists", return_value=False), \
              mock.patch.object(circuit_breaker, "upstash_redis_command",
                                return_value=(True, {"result": None})):
-            state, absent = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", ".cb_state_x.json")
+            state, absent, failed = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", ".cb_state_x.json")
         self.assertEqual(state, {})
         self.assertTrue(absent)
 
@@ -463,7 +463,7 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
              mock.patch("os.path.exists", return_value=False), \
              mock.patch.object(circuit_breaker, "upstash_redis_command",
                                return_value=(False, "HTTP 500")):
-            state, absent = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", ".cb_state_x.json")
+            state, absent, failed = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", ".cb_state_x.json")
         self.assertEqual(state, {})
         self.assertFalse(absent)
 
@@ -478,7 +478,7 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
                                               "UPSTASH_REDIS_REST_TOKEN": "V1.0FAKEtok"}, clear=False), \
                  mock.patch.object(circuit_breaker, "upstash_redis_command",
                                    return_value=(True, {"result": '{"status": "active", "attempts": 0}'})):
-                state, absent = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", path)
+                state, absent, failed = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", path)
             self.assertEqual(state["status"], "active")
             self.assertFalse(absent)
         finally:
@@ -494,7 +494,7 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
                  mock.patch("os.path.exists", return_value=False), \
                  mock.patch.object(circuit_breaker, "upstash_redis_command",
                                    return_value=(True, {"result": bad_val})):
-                state, absent = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", ".cb_state_x.json")
+                state, absent, failed = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", ".cb_state_x.json")
             self.assertEqual(state, {})
             self.assertFalse(absent, f"值 {bad_val!r} 存在但无效，不得确认缺键")
 

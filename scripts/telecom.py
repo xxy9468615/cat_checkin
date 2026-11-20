@@ -1043,7 +1043,14 @@ class TelecomClient:
                             json_data={"para": _encrypt_rsa(para)},
                             headers={"sign": self.sign})
             ok = str(res.get("code")) == "0" or str(res.get("resoultCode")) == "0"
-            rdata = res.get("data") or {}
+            # data 必须是字典：非映射响应（如 [1]）不得抛 AttributeError
+            # 中断资产查询/会话保存/后续账号（PR #34 full review 指认）
+            rdata = res.get("data")
+            if not isinstance(rdata, dict):
+                rdata = {}
+                fail_note = "提交响应 data 字段异常"
+                print(f"    [转盘] 第{i + 1}抽响应字段异常，停手: {fail_note}", flush=True)
+                break
             prize = str(rdata.get("prizeName") or rdata.get("title") or "")
             if ok and prize:
                 prizes.append(prize)

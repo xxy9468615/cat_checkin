@@ -1058,6 +1058,18 @@ class TestJindouExchange(unittest.TestCase):
         self.assertFalse(ok)
         self.assertNotIn("已提交", msg)
 
+    def test_rights_exchange_http_500_no_fake_submitted(self):
+        """回归护栏（full review）：带凭据的 receiverRights HTTP 500 必须
+        如实失败，不得出现「已提交」/「成功兑换」假成功文案。"""
+        client = self._rights_client()
+        client._req = MagicMock(return_value={
+            "code": 500, "msg": "HTTP 500", "_http_error": True})
+        with patch.object(telecom.time, "sleep", lambda *_: None):
+            ok, msg = telecom.run_rights_exchange(client, "2元话费", wait_for_window=False)
+        self.assertFalse(ok)
+        self.assertNotIn("已提交", msg)
+        self.assertNotIn("成功兑换", msg)
+
     def test_rights_next_window_midnight(self):
         from datetime import datetime as _dt
         # 23:00 → 次日 00:00；00:30 → 再次日 00:00
@@ -1307,7 +1319,7 @@ class TestJindouExchange(unittest.TestCase):
         client = self._wheel_client(remain=3)
         self._wheel_req(client, [
             {"code": 0, "data": {"prizeName": "88金豆"}},
-            {"code": 1, "resoultMsg": "今日抽奖次数已用完"},
+            {"code": 1, "resoultMsg": "今日抽奖次数已用完", "data": {}},
         ])
         with patch.object(telecom.time, "sleep", lambda *_: None), \
              patch("sys.stdout", new_callable=io.StringIO):
@@ -1387,7 +1399,7 @@ class TestJindouExchange(unittest.TestCase):
         """查询余额足够但提交时服务端裁决金豆不足：保留真实拒绝原因，
         不得吞成「今日已抽」（PR #34 第四轮评审）。"""
         client = self._wheel_client(remain=3, beans=1000)
-        self._wheel_req(client, [{"code": 1, "resoultMsg": "金豆不足，无法抽奖"}])
+        self._wheel_req(client, [{"code": 1, "resoultMsg": "金豆不足，无法抽奖", "data": {}}])
         with patch.object(telecom.time, "sleep", lambda *_: None), \
              patch("sys.stdout", new_callable=io.StringIO):
             res = client.wheel_daily_draws()

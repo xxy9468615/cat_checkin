@@ -88,8 +88,14 @@ def _legacy_notify_state(task_id: str) -> Dict[str, Any]:
         return {}
 
 
-def _load_cb_state_raw(redis_key: str, state_file: str) -> Tuple[Dict[str, Any], bool]:
-    """单次读取 cb 状态，返回 (状态字典, 是否确认缺键)。
+# 内部标记：读取失败（无法确认状态）时附加在返回字典上，绝不持久化。
+# 消费方（is_task_suspended / record_task_outcome / get_due_retries 等）据此
+# fail-closed 处理：不调度、不覆盖写入（PR #34 full review 指认）。
+_CB_READ_FAILED = "_read_failed"
+
+
+def _load_cb_state_raw(redis_key: str, state_file: str) -> Tuple[Dict[str, Any], bool, bool]:
+    """单次读取 cb 状态，返回 (状态字典, 是否确认缺键, 是否读取失败)。
 
     「确认缺键」= 本地文件无有效数据 且 Redis 明确返回 nil（GET 成功但
     result 为空）。读取失败（网络异常/HTTP 错误）返回 ({}, False)——既不
@@ -113,29 +119,29 @@ def _load_cb_state_raw(redis_key: str, state_file: str) -> Tuple[Dict[str, Any],
         url, token = _upstash_redis_env()
         if not url or not token:
             # 纯本地模式：文件有效→用文件；文件缺失→确认缺键（可迁移）
-            return state, (not local_ok)
+            return state, (not local_ok), False
         ok, res = upstash_redis_command(["GET", redis_key])
         if not ok:
-            # 读取失败：本地有数据则用本地（不迁移），否则无法确认（不迁移）
-            return state, False
+            # 读取失败：本地有数据则用本地（不迁移），否则无法确认（fail-closed）
+            return state, False, not local_ok
         raw_val = res.get("result") if isinstance(res, dict) else None
         if raw_val is None or raw_val == "":
             # Redis 明确 nil：键不存在。本地有数据时以本地为准不迁移
-            return state, (not local_ok)
+            return state, (not local_ok), False
         if isinstance(raw_val, str):
             try:
                 remote = json.loads(raw_val)
                 if isinstance(remote, dict):
                     state.update(remote)
-                    return state, False
+                    return state, False, False
             except Exception:
                 pass
         # 键存在但值非空且无法解析/结构不符（如 "[]"、损坏 JSON）：
         # 不是缺键，禁止迁移——否则旧 notify 熔断标记会覆盖现存值
         # （PR #34 第三轮评审指认）。本地有数据用本地，否则空状态不迁移。
-        return state, False
+        return state, False, not local_ok
     except Exception:
-        return state, False
+        return state, False, True
 
 
 def load_circuit_state(task_id: str) -> Dict[str, Any]:
@@ -149,10 +155,14 @@ def load_circuit_state(task_id: str) -> Dict[str, Any]:
     标记写回 cb。
     """
     redis_key, state_file = _state_paths(task_id)
-    state, confirmed_absent = _load_cb_state_raw(redis_key, state_file)
-    if not state and confirmed_absent:
+    state, confirmed_absent, read_failed = _load_cb_state_raw(redis_key, state_file)
+    if not state and confirmed_absent and not read_failed:
         legacy = _legacy_notify_state(task_id)
         state = {k: legacy[k] for k in _CB_OWNED_FIELDS if k in legacy}
+    if read_failed:
+        # 非持久化标记：调用方据此 fail-closed（不调度、不覆盖写入）
+        state = dict(state)
+        state[_CB_READ_FAILED] = True
     return state
 
 
@@ -163,8 +173,14 @@ def save_circuit_state(task_id: str, state: Dict[str, Any]) -> None:
 
 
 def is_task_suspended(task_id: str) -> bool:
-    """检查任务当前是否处于熔断停用状态。"""
+    """检查任务当前是否处于熔断停用状态。
+
+    读取失败（Redis GET 失败且无本地 cb 文件）时 fail-closed：按已停用
+    处理，防止把真实停用的任务重新调度（PR #34 full review 指认）。
+    """
     state = load_circuit_state(task_id)
+    if state.get(_CB_READ_FAILED):
+        return True
     return bool(state.get("circuit_broken")) or str(state.get("status") or "").lower() == "suspended"
 
 
@@ -298,6 +314,12 @@ def record_task_outcome(
     now_ts = _bjt_now_ts()
     now_iso = dt.datetime.now(BJT).isoformat()
 
+    if state.pop(_CB_READ_FAILED, None):
+        # 状态读取失败时绝不写回初始化状态：可能覆盖 Redis 侧真实的熔断标记
+        print(f"⚠️ [CIRCUIT_BREAKER] [{task_id}] 状态读取失败，跳过本次状态写入（fail-closed）",
+              file=sys.stderr)
+        return state, False
+
     # 跨日自动归零当日尝试计数
     if str(state.get("attempt_date") or "") == today:
         try:
@@ -363,6 +385,9 @@ def get_due_retries(task_ids: Optional[List[str]] = None) -> List[str]:
     due = []
     for tid in pool:
         state = load_circuit_state(tid)
+        # 读取失败 fail-closed：不调度
+        if state.get(_CB_READ_FAILED):
+            continue
         # 已熔断停用的任务不参与重试
         if bool(state.get("circuit_broken")) or str(state.get("status") or "").lower() == "suspended":
             continue
@@ -384,6 +409,8 @@ def get_min_next_retry_delay(task_ids: Optional[List[str]] = None) -> Optional[i
     delays = []
     for tid in pool:
         state = load_circuit_state(tid)
+        if state.get(_CB_READ_FAILED):
+            continue
         if bool(state.get("circuit_broken")) or str(state.get("status") or "").lower() == "suspended":
             continue
         if str(state.get("attempt_date") or "") == today and int(state.get("attempts") or 0) > 0:
@@ -432,6 +459,9 @@ def evaluate_retry_candidates(
 
     for tid in normalized:
         state = load_circuit_state(tid)
+        if state.get(_CB_READ_FAILED):
+            suspended.append(tid)
+            continue
         is_susp = bool(state.get("circuit_broken")) or str(state.get("status") or "").lower() == "suspended"
         att = int(state.get("attempts") or 0) if str(state.get("attempt_date") or "") == today else 0
 
@@ -483,10 +513,12 @@ def _redis_channel_status() -> str:
         url, token = _upstash_redis_env()
         if not url or not token:
             return "⚠️ 未配置 UPSTASH_REDIS_REST_URL/TOKEN，仅显示本地缓存（CI 真实状态不可见）"
-        ok, _ = upstash_redis_command(["PING"])
-        if ok:
+        ok, res = upstash_redis_command(["PING"])
+        # ok=True 只表示 HTTP 200；必须确认响应 result=="PONG" 才显示在线
+        # （PR #34 full review 指认：禁止无依据的乐观文案）
+        if ok and isinstance(res, dict) and res.get("result") == "PONG":
             return "☁️ Upstash Redis 在线（权威状态）+ 本地缓存"
-        return "⚠️ Upstash Redis 不可达，仅显示本地缓存（可能滞后于 CI 真实状态）"
+        return "⚠️ Upstash Redis 不可达或响应异常，仅显示本地缓存（可能滞后于 CI 真实状态）"
     except Exception as exc:
         return f"⚠️ Redis 通道探测异常（{type(exc).__name__}），仅显示本地缓存"
 
