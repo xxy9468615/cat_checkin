@@ -522,11 +522,15 @@ class TestEmptyDeviceField(unittest.TestCase):
             '{"code":4,"reason":"device-mismatch","loginDevice":{"device":"Windows"}}')
         checker = self._checker(bc, cached="linux")
         api = Mock()
-        with patch.object(glados.time, "sleep"):
+        # wraps 包装真实方法：既走真实解析路径，又能断言调用次数
+        # （第八轮评审：防止重试逻辑回归时浏览器被多次提交）
+        with patch.object(glados.time, "sleep"), \
+             patch.object(bc, "checkin", wraps=bc.checkin) as spy:
             result, _ = checker._checkin(api, SYNTHETIC_COOKIE, 1, "glados.example")
         self.assertEqual(result[0], "需重新登录")
         self.assertNotIn("{'device'", result[3])  # dict 不得被强转进文案
         self.assertEqual(bc.last_login_device, "")
+        self.assertEqual(spy.call_count, 1, "浏览器只允许提交一次，不得重试")
         api.checkin.assert_not_called()
 
     def test_valid_linux_still_normalized(self):
