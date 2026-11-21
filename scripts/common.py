@@ -88,21 +88,32 @@ def is_already_signed(msg: str, extra_phrases: tuple = ()) -> bool:
     return "already" in low or "claimed" in low
 
 
-def load_kv_state(redis_key: str, state_file: str | os.PathLike) -> dict:
-    """本地 JSON + Upstash Redis 双层加载 KV 状态（远端权威性高于本地）。
+def load_kv_state(redis_key: str, state_file: str | os.PathLike,
+                  local_authoritative: bool = False) -> dict:
+    """本地 JSON + Upstash Redis 双层加载 KV 状态（默认远端权威性高于本地）。
 
     ai_router / agentrouter 的 token 链与 session 状态共用此模式；
     任一层缺失/损坏都静默降级为空 dict，由调用方走重登兜底。
+
+    local_authoritative=True：本地文件有效时直接返回，不被远端旧值覆盖。
+    供「整份替换型」状态（cb 熔断字典 / rolling 冷却时间戳）使用——这类状态
+    本地写入成功而 Redis SET 失败时，远端仍是旧值，默认合并会把本地新写入
+    的熔断标记/冷却时间戳静默抹掉（PR #34 第十三轮评审指认）。默认 False
+    保持其它调用方的远端优先语义不变。
     """
     state: dict = {}
+    local_valid = False
     try:
         if os.path.exists(state_file):
             with open(state_file, encoding="utf-8") as f:
                 data = json.loads(f.read())
             if isinstance(data, dict):
                 state.update(data)
+                local_valid = True
     except Exception as e:
         print(f"⚠️ 读取本地 state 失败（{state_file}）: {e}")
+    if local_authoritative and local_valid:
+        return state
     try:
         ok, res = upstash_redis_command(["GET", redis_key])
         if ok and isinstance(res, dict):
@@ -116,21 +127,35 @@ def load_kv_state(redis_key: str, state_file: str | os.PathLike) -> dict:
     return state
 
 
-def save_kv_state(redis_key: str, state_file: str | os.PathLike, state: dict) -> None:
-    """持久化 KV 状态到本地文件与 Upstash Redis（双通道，失败仅警告）。"""
+def save_kv_state(redis_key: str, state_file: str | os.PathLike, state: dict) -> tuple[bool, bool]:
+    """持久化 KV 状态到本地文件与 Upstash Redis（双通道，失败仅警告）。
+
+    返回 (本地写入成功?, 权威写入确认?)：配置 Redis 时权威=Redis SET 返回 OK；
+    纯本地模式（未配置凭据）权威=本地写入成功。既有调用方忽略返回值即可，
+    「失败仅警告」行为不变；需要确认写入结果的调用方（熔断 tripped 判定）
+    据第二个布尔值裁决（PR #34 第十三轮评审指认）。
+    """
     if not isinstance(state, dict):
-        return
+        return False, False
+    local_ok = False
     try:
         with open(state_file, "w", encoding="utf-8") as fh:
             fh.write(json.dumps(state, ensure_ascii=False))
+        local_ok = True
     except Exception as e:
         print(f"⚠️ 保存本地 state 失败: {e}")
+    url, token = _upstash_redis_env()
+    if not url or not token:
+        return local_ok, local_ok
+    remote_ok = False
     try:
         ok, res = upstash_redis_command(["SET", redis_key, json.dumps(state, ensure_ascii=False)])
         if ok and isinstance(res, dict) and res.get("result") == "OK":
+            remote_ok = True
             print(f"☁️ state 已实时同步至 Upstash Redis（{redis_key}）")
     except Exception as e:
         print(f"⚠️ 同步 state 到 Redis 异常: {e}")
+    return local_ok, remote_ok
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):

@@ -29,6 +29,7 @@ from alert_levels import detect_unconfigured
 from discord_notify import notify_task_result, notify_unconfigured
 from task_registry import TASKS, resolve_execution_queue
 from circuit_breaker import (
+    _CB_READ_FAILED,
     is_task_suspended,
     load_circuit_state,
     record_task_outcome,
@@ -185,7 +186,11 @@ def _cooldown_due_at(cfg: Dict[str, Any]) -> Optional[float]:
     prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
     try:
         from common import load_kv_state
-        state = load_kv_state(f"{prefix}:state:rolling:{task_id}", f".rolling_state_{task_id}.json")
+        # rolling 冷却是整份替换型时间戳：本地新写入不得被远端旧值覆盖
+        # （Redis SET 失败时远端仍是上一场时间戳，默认合并会让冷却静默失效，
+        # 任务每 30 分钟被心跳反复拉起直至熔断——PR #34 终局自审指认）
+        state = load_kv_state(f"{prefix}:state:rolling:{task_id}",
+                              f".rolling_state_{task_id}.json", local_authoritative=True)
         try:
             ts = float(state.get("last_credit_ts") or 0)
         except (TypeError, ValueError):
@@ -267,7 +272,11 @@ class Orchestrator:
         if not unconf:
             try:
                 circuit_info, newly_tripped = record_task_outcome(tid, ok=ok, output=out or "")
-                suspended = bool(circuit_info.get("status") == "suspended")
+                # 权威写入未确认时 record_task_outcome 附 _CB_READ_FAILED：
+                # 内存态虽为 suspended 但远端未落盘，不得据此标 SUSPENDED
+                # （PR #34 终局自审：下游按 status 判定会绕过 tripped 防线）
+                suspended = (bool(circuit_info.get("status") == "suspended")
+                             and not circuit_info.get(_CB_READ_FAILED))
             except Exception as exc:
                 print(f"WARN: circuit breaker 状态记录异常: {exc}", file=sys.stderr)
 
@@ -437,21 +446,27 @@ def plan_due_tasks(raw_tasks: str = "", due_only: bool = False) -> List[str]:
     for tid, cfg in TASKS.items():
         if is_task_suspended(tid):
             continue
-        if tid in successful_today:
+        is_rolling = (cfg.get("sched") or {}).get("type") == "rolling"
+        # rolling 任务的「今日已成功」去重必须让位于自排程到期：白天终局
+        # （售罄/限兑/成功）写 ok=True 后，当晚 23:30 的次日 0 点场预检仍须
+        # 拉起——成功日期属于上一场次，不代表下一场次已完成（PR #34 评审）。
+        # 冷却未到期时仍由下方 due_at 检查拦截，不会重复执行。
+        if tid in successful_today and not is_rolling:
             continue
         due_at = _cooldown_due_at(cfg)
         if due_at and due_at > now:
             continue
         state = load_circuit_state(tid)
         has_failed_today = str(state.get("attempt_date") or "") == today and int(state.get("attempts") or 0) > 0
-        if has_failed_today:
+        if has_failed_today and not is_rolling:
+            # 退避梯子只管常规任务：rolling 任务的节奏由自排程 due_at 全权
+            # 决定（上方已检查），框架退避不得把 23:30 预检推迟到梯子时刻
             next_retry = float(state.get("next_retry_at") or 0)
             if next_retry > now:
                 continue
         elif due_only and bjt_hour < 7:
             # 心跳模式且在晨间主批次（07:00 BJT）前：不提前执行常规单日任务（避免夜间心跳偷跑主批次且抑制日报）
             # 仅允许 rolling 任务与到期重试任务执行
-            is_rolling = bool(cfg.get("sched") and cfg.get("sched", {}).get("type") == "rolling")
             if not is_rolling:
                 continue
         due.append(tid)
@@ -506,16 +521,23 @@ def main() -> None:
         target_tasks = [t.strip() for t in args.reset_circuit_tasks.split(",") if t.strip()]
         if target_tasks:
             for t in target_tasks:
-                resume_task(t, reason="命令行显式指定恢复上线 (--reset-circuit-tasks)")
-                print(f"🔄 [CIRCUIT_BREAKER] 任务 [{t}] 熔断状态已重置上线")
+                st = resume_task(t, reason="命令行显式指定恢复上线 (--reset-circuit-tasks)")
+                if st.get(_CB_READ_FAILED):
+                    print(f"⚠️ [CIRCUIT_BREAKER] 任务 [{t}] 恢复未确认（读取失败或写入未落盘），可能仍处停用")
+                else:
+                    print(f"🔄 [CIRCUIT_BREAKER] 任务 [{t}] 熔断状态已重置上线")
         elif args.reset_circuit:
             if is_explicit:
                 for t in [t.strip() for t in args.tasks.split(",") if t.strip()]:
-                    resume_task(t, reason="手动任务调度恢复上线 (--reset-circuit)")
-                    print(f"🔄 [CIRCUIT_BREAKER] 任务 [{t}] 熔断状态已重置上线")
+                    st = resume_task(t, reason="手动任务调度恢复上线 (--reset-circuit)")
+                    if st.get(_CB_READ_FAILED):
+                        print(f"⚠️ [CIRCUIT_BREAKER] 任务 [{t}] 恢复未确认（读取失败或写入未落盘），可能仍处停用")
+                    else:
+                        print(f"🔄 [CIRCUIT_BREAKER] 任务 [{t}] 熔断状态已重置上线")
             else:
-                resume_all_tasks(reason="全局调度恢复上线 (--reset-circuit)")
-                print("🔄 [CIRCUIT_BREAKER] 全部任务熔断状态已重置上线")
+                resumed = resume_all_tasks(reason="全局调度恢复上线 (--reset-circuit)")
+                print(f"🔄 [CIRCUIT_BREAKER] 已重置上线 {len(resumed)} 个任务: "
+                      f"{', '.join(resumed) if resumed else '无（无熔断任务或恢复未确认）'}")
 
     if args.plan:
         due = plan_due_tasks(args.tasks, due_only=args.due_only)
