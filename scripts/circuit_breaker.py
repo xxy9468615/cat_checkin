@@ -276,7 +276,10 @@ def trip_circuit_breaker(
 ) -> Dict[str, Any]:
     """将任务置为熔断停用状态并持久化。"""
     state = load_circuit_state(task_id)
-    if state.pop(_CB_READ_FAILED, None):
+    if state.get(_CB_READ_FAILED):
+        # 保留标记返回：调用方（evaluate_retry_candidates）据此区分
+        # 「熔断写入完成」与「读取失败拒写」，不得虚报 tripped
+        # （PR #34 第十二轮评审指认，规则 9a(1)）
         print(f"⚠️ [CIRCUIT_BREAKER] [{task_id}] 状态读取失败，跳过熔断写入（fail-closed）",
               file=sys.stderr)
         return state
@@ -517,9 +520,14 @@ def evaluate_retry_candidates(
             continue
 
         if att >= max_attempts:
-            # 达到上限，补触发熔断
-            trip_circuit_breaker(tid, reason=f"单日累计失败达 {max_attempts} 次上限，自动熔断停用")
-            tripped.append(tid)
+            # 达到上限，补触发熔断；仅在熔断写入确认完成后才报 tripped，
+            # 二次读取失败拒写时归入 suspended（fail-closed 不调度），
+            # 不得虚报 SUSPENDED_TASKS（PR #34 第十二轮评审指认）
+            st = trip_circuit_breaker(tid, reason=f"单日累计失败达 {max_attempts} 次上限，自动熔断停用")
+            if st.get(_CB_READ_FAILED):
+                suspended.append(tid)
+            else:
+                tripped.append(tid)
             continue
 
         retryable.append(tid)

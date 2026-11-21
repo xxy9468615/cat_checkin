@@ -247,6 +247,43 @@ class TestCircuitBreaker(unittest.TestCase):
                 self.assertIn("cloud189", res["due_now"])
                 self.assertEqual(res["next_delay_seconds"], 900)
 
+    def test_tripped_only_after_confirmed_write(self):
+        """补触发熔断时二次读取失败拒写：不得虚报 tripped（任务实际仍
+        active），应归入 suspended fail-closed（PR #34 第十二轮评审）。"""
+        today = circuit_breaker._bjt_today()
+        st = {"attempt_date": today, "attempts": 8, "status": "active"}
+        with mock.patch.object(circuit_breaker, "load_circuit_state", return_value=dict(st)), \
+             mock.patch.object(circuit_breaker, "trip_circuit_breaker",
+                               return_value={circuit_breaker._CB_READ_FAILED: True}), \
+             mock.patch.object(circuit_breaker, "_bjt_now_ts", return_value=1750000000.0):
+            res = circuit_breaker.evaluate_retry_candidates("smzdm")
+        self.assertNotIn("smzdm", res["tripped"])
+        self.assertIn("smzdm", res["suspended"])
+
+    def test_tripped_reported_on_confirmed_trip(self):
+        """熔断写入确认完成：正常报 tripped（既有流程不回归）。"""
+        today = circuit_breaker._bjt_today()
+        st = {"attempt_date": today, "attempts": 8, "status": "active"}
+        with mock.patch.object(circuit_breaker, "load_circuit_state", return_value=dict(st)), \
+             mock.patch.object(circuit_breaker, "trip_circuit_breaker",
+                               return_value={"status": "suspended", "circuit_broken": True}), \
+             mock.patch.object(circuit_breaker, "_bjt_now_ts", return_value=1750000000.0):
+            res = circuit_breaker.evaluate_retry_candidates("smzdm")
+        self.assertIn("smzdm", res["tripped"])
+        self.assertNotIn("smzdm", res["suspended"])
+
+    def test_trip_read_failure_keeps_marker(self):
+        """trip 读取失败：保留标记返回、绝不写盘（fail-closed）。"""
+        with mock.patch.object(circuit_breaker, "load_circuit_state",
+                               return_value={circuit_breaker._CB_READ_FAILED: True}), \
+             mock.patch.object(circuit_breaker, "save_circuit_state") as m_save, \
+             mock.patch.object(circuit_breaker, "save_suspended_result_record") as m_rec, \
+             mock.patch("builtins.print"):
+            st = circuit_breaker.trip_circuit_breaker("smzdm")
+        self.assertTrue(st.get(circuit_breaker._CB_READ_FAILED))
+        m_save.assert_not_called()
+        m_rec.assert_not_called()
+
     def test_evaluate_retry_candidates_shared_script_mapping(self):
         """telecom.py 同时服务 telecom 与 telecom-exchange 两个任务：脚本名必须
         映射到全部共用任务，且只评估「今日确有失败」的任务。
