@@ -21,16 +21,29 @@ a real browser session and refreshed manually once the server-side session dies.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import math
 import os
 import re
 import sys
 import time
 import urllib.parse
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
-from common import Http, env_seq, main_guard, mask_str
+from common import (
+    Http,
+    env_seq,
+    load_kv_state,
+    main_guard,
+    mask_str,
+    redact_pii,
+    sanitize_snippet,
+    save_kv_state,
+)
+from proxy_manager import ProxyEndpoint, get_task_proxy_endpoints
 import cookie_validity as cv
 
 
@@ -49,7 +62,133 @@ class Emoji:
 CHECKIN_SUCCESS = 0
 CHECKIN_REPEAT = 1
 CHECKIN_FAILURE = -2
+CHECKIN_FAILURE_DEVICE = 4
 COOKIE_INVALID = -3
+
+# 签到挑战（2026-11 上游改版）：POST /api/user/checkin 不再接受裸 {"token": domain}，
+# 必须携带 GET /api/user/checkin/challenge 下发的 nonce 与客户端证明：
+#   proof = hex(SHA-256(nonce + "." + "glados-observe-v1"))
+# 常量取自控制台前端 checkinProof 分包的字节数组（g/l/a/d/o/s/-/o/b/s/e/r/v/e/-/v/1）。
+PROOF_SALT = "glados-observe-v1"
+# 前端在拿到挑战后至少等待 2500ms 才提交，服务端按首次请求耗时判定自动化，不能省。
+CHALLENGE_MIN_AGE_SEC = 2.5
+# Chrome TLS/JA3 指纹档位：与 DEFAULT_UA 的 Chrome/131 版本号保持一致，
+# 避免 UA 与 sec-ch-ua 自相矛盾（curl_cffi 0.16.3 支持 chrome131 profile）。
+IMPERSONATE = "chrome131"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+# ── 真浏览器签到（Turnstile 只能由真实浏览器解出）───────────────────────────
+# 2026-11-18 实测结论（家庭宽带 TW 出口 + Chrome131 JA3 也一样）：
+#   纯 HTTP 客户端拿到的挑战必然带 turnstile 站点密钥，POST 恒定
+#   {"code":..,"reason":"turnstile"}；headful 真 Chrome 在同一个家宽出口上
+#   5 秒内自动过盾。因此签到必须交给真浏览器，HTTP 链路只做查询与兑换。
+# 另外服务端把会话绑定到登录设备：设备不一致时返回
+#   {"code":4,"reason":"device-mismatch","loginDevice":"Windows","currentDevice":"Linux"}
+# 浏览器必须按登录设备伪装 UA/platform，否则过盾也会被判定为异地设备。
+DEVICE_PROFILES: Dict[str, Dict[str, str]] = {
+    "windows": {
+        "ua": USER_AGENT,
+        "platform": "Win32",
+        "ch_platform": '"Windows"',
+        "mobile": "?0",
+        "locale": "en-US",
+    },
+    "macos": {
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "platform": "MacIntel",
+        "ch_platform": '"macOS"',
+        "mobile": "?0",
+        "locale": "en-US",
+    },
+    "linux": {
+        "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "platform": "Linux x86_64",
+        "ch_platform": '"Linux"',
+        "mobile": "?0",
+        "locale": "en-US",
+    },
+    "android": {
+        "ua": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+        "platform": "Linux armv8l",
+        "ch_platform": '"Android"',
+        "mobile": "?1",
+        "locale": "en-US",
+    },
+    "ios": {
+        "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 "
+              "(KHTML, like Gecko) CriOS/131.0.0.0 Mobile/15E148 Safari/604.1",
+        "platform": "iPhone",
+        "ch_platform": '"iOS"',
+        "mobile": "?1",
+        "locale": "en-US",
+    },
+}
+DEFAULT_DEVICE = "windows"
+# 浏览器签到开关：auto（默认可用时启用）/ off（只走 HTTP，用于排查）
+BROWSER_MODE_ENV = "GLADOS_BROWSER"
+# 登录凭据 cookie（gld:sess + 其签名）；只有它们的到期时间代表登录有效期
+CREDENTIAL_COOKIE_RE = re.compile(r"^gld:sess(?:\.sig)?$", re.IGNORECASE)
+
+
+def resolve_device(login_device: str) -> str:
+    """把服务端的 loginDevice 归一化为 DEVICE_PROFILES 键。"""
+    key = (login_device or "").strip().lower()
+    if key in DEVICE_PROFILES:
+        return key
+    if key.startswith("mac") or key.startswith("darwin"):
+        return "macos"
+    if "win" in key:
+        return DEFAULT_DEVICE
+    if "android" in key:
+        return "android"
+    if "ios" in key or "iphone" in key:
+        return "ios"
+    if "linux" in key:
+        return "linux"
+    return DEFAULT_DEVICE
+
+
+def parse_cookie_pairs(cookie: str) -> Dict[str, str]:
+    """把浏览器导出的 Cookie 串拆成 name->value（Playwright add_cookies 用）。"""
+    pairs: Dict[str, str] = {}
+    for part in (cookie or "").split(";"):
+        name, sep, value = part.strip().partition("=")
+        if sep and name:
+            pairs[name] = value
+    return pairs
+
+
+def coerce_code(raw: Any) -> int:
+    """严格解析业务 code：只接受整数（含整值浮点/数字串），bool 与非数字一律失败。
+
+    浏览器链路与 HTTP 链路口径必须一致；`code=0` 是成功值，不能用 `or` 兜底
+    （0 是 falsy 会被吞成失败）。
+    """
+    if isinstance(raw, bool) or raw is None or raw == "":
+        return CHECKIN_FAILURE
+    if isinstance(raw, float) and not math.isfinite(raw):
+        return CHECKIN_FAILURE
+    # 用 Decimal 而非 float：超长数字串行经 float 会丢精度，把非整数舍入成 1
+    try:
+        value = Decimal(str(raw))
+    except (InvalidOperation, ValueError):
+        return CHECKIN_FAILURE
+    if not value.is_finite() or value != value.to_integral_value():
+        return CHECKIN_FAILURE
+    return int(value)
+
+# 允许出现在任务结果里的固定失败文案：只按服务端 reason 映射到白名单文案，
+# 服务端原始 message 可能夹带邮箱/PII，只在 verbose 日志里经 sanitize_snippet 输出。
+KNOWN_FAILURE_REASONS: Dict[str, str] = {
+    "turnstile": "签到被 Cloudflare Turnstile 拦截（reason=turnstile）",
+    "device-mismatch": "签到设备与登录设备不一致（reason=device-mismatch），请重新登录后更新 Cookie",
+}
 
 # Cookie 失效时响应中常见的登录关键词（命中即判定登录态过期）
 # 注意 "没有权限"/"No permission"（code=-2）是 koa:sess 签名校验失败时服务端的
@@ -68,17 +207,6 @@ EXCHANGE_PLANS = {
 }
 
 
-def _parse_cookie_expiry(cookie_str: str) -> Tuple[Optional[int], Optional[int]]:
-    """解析 Koa Session Cookie (koa:sess) 中的 _expire 时间戳，返回 (expire_ts, remaining_days)。
-
-    解析委托共享引擎 cookie_validity（全任务唯一实现，2026-10 收敛）。
-    """
-    expire_ts = cv.expire_from_cookie_str(cookie_str)
-    if not expire_ts:
-        return None, None
-    return expire_ts, cv.remaining_days(expire_ts)
-
-
 @dataclass
 class Result:
     cookie_index: int
@@ -93,6 +221,236 @@ class Result:
     message: str = ""
 
 
+class BrowserCheckin:
+    """真浏览器签到器：headful Chrome + 家宽出口 + 登录设备指纹。
+
+    一个浏览器实例服务全部账号（每次 new_context 隔离 Cookie），避免重复启动
+    Chromium 吃掉任务超时。Playwright 缺失或无显示环境（headful 起不来）时返回
+    None，由调用方退回 HTTP 链路（会拿到 reason=turnstile，如实失败）。
+    """
+
+    def __init__(self, proxy: str = "", verbose: bool = False) -> None:
+        self.proxy = proxy
+        self.verbose = verbose
+        self._pw = None
+        self._browser = None
+        self._failed = False
+        # True = 签到 POST 已发出但无法确认结果（超时/非 200/解析失败）
+        self.submitted_unknown = False
+        # 本次响应明确返回的登录设备（仅 code=4/reason=device-mismatch 时填）
+        self.last_login_device: str = ""
+
+    @staticmethod
+    def enabled() -> bool:
+        mode = (os.getenv(BROWSER_MODE_ENV) or "auto").strip().lower()
+        return mode not in ("0", "false", "off", "no")
+
+    def _log(self, message: str) -> None:
+        if self.verbose:
+            print(f"[browser] {message}")
+
+    def _ensure_browser(self):
+        if self._browser is not None:
+            return self._browser
+        if self._failed:
+            return None
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            print("⚠️ 未安装 Playwright，签到退回 HTTP 链路（Turnstile 将无法通过）")
+            self._failed = True
+            return None
+        try:
+            self._pw = sync_playwright().start()
+            self._browser = self._pw.chromium.launch(
+                channel="chrome",
+                headless=False,
+                proxy={"server": self.proxy} if self.proxy else None,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            self._log("headful chrome ready")
+        except Exception as exc:  # noqa: BLE001  无显示/无 Chrome 时退回 HTTP
+            print(f"⚠️ 浏览器启动失败（需要 xvfb DISPLAY 与 Chrome）：{str(exc)[:160]}")
+            self._failed = True
+            try:
+                if self._pw is not None:
+                    self._pw.stop()
+            except Exception:
+                pass
+            self._pw = None
+            self._browser = None
+            return None
+        return self._browser
+
+    def checkin(self, cookie: str, domain: str,
+                device: str = DEFAULT_DEVICE
+                ) -> Optional[Tuple[Tuple[str, int, int, str], Dict[str, int]]]:
+        """返回 (与 GladosAPI.checkin 同构的四元组, 本次浏览器学到的到期证据)。
+
+        到期证据只包含本次上下文确认属于登录凭据的 cookie，绝不跨调用复用；
+        基础设施不可用返回 None。
+        """
+        browser = self._ensure_browser()
+        if browser is None:
+            return None
+        profile = DEVICE_PROFILES.get(device) or DEVICE_PROFILES[DEFAULT_DEVICE]
+        base = f"https://{domain}"
+        ctx = None
+        learned_here: Dict[str, int] = {}
+        self.last_login_device = ""
+        try:
+            ctx = browser.new_context(
+                locale=profile["locale"],
+                timezone_id="Asia/Shanghai",
+                viewport={"width": 1366, "height": 900},
+                user_agent=profile["ua"],
+                extra_http_headers={
+                    "sec-ch-ua": '"Chromium";v="131", "Google Chrome";v="131", "Not_A Brand";v="24"',
+                    "sec-ch-ua-mobile": profile["mobile"],
+                    "sec-ch-ua-platform": profile["ch_platform"],
+                },
+            )
+            cookies = [
+                {"name": name, "value": value, "domain": domain, "path": "/", "secure": True}
+                for name, value in parse_cookie_pairs(cookie).items()
+            ]
+            if not cookies:
+                return None
+            ctx.add_cookies(cookies)
+            # navigator.platform / userAgentData 必须与 UA 一致，否则设备指纹露馅
+            ctx.add_init_script(
+                "Object.defineProperty(navigator,'platform',{get:()=>%r});"
+                "Object.defineProperty(navigator,'userAgentData',{get:()=>({"
+                "platform:%r,brands:[{brand:'Chromium',version:'131'},"
+                "{brand:'Google Chrome',version:'131'}]})});"
+                % (profile["platform"], profile["ch_platform"].strip('"'))
+            )
+            page = ctx.new_page()
+            try:
+                cdp = ctx.new_cdp_session(page)
+                cdp.send("Emulation.setUserAgentOverride", {
+                    "userAgent": profile["ua"],
+                    "acceptLanguage": "en-US,en;q=0.9",
+                    "platform": profile["platform"],
+                })
+            except Exception:
+                pass
+
+            captured: List[Tuple[int, str]] = []
+
+            def on_response(resp) -> None:
+                try:
+                    if "/api/user/checkin" in resp.url and resp.request.method == "POST" \
+                            and "/challenge" not in resp.url:
+                        captured.append((resp.status, resp.text()))
+                except Exception:
+                    pass
+
+            page.on("response", on_response)
+            page.goto(base + "/console/checkin", wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(4000)
+            button = None
+            for _ in range(6):
+                for candidate in page.query_selector_all("button"):
+                    text = (candidate.inner_text() or "").strip().lower()
+                    if text in ("checkin", "check in") or "签到" in text:
+                        button = candidate
+                        break
+                if button is not None:
+                    break
+                page.wait_for_timeout(2500)
+            if button is None:
+                self._log("未找到签到按钮")
+                return None
+            button.click()
+            for _ in range(12):
+                page.wait_for_timeout(5000)
+                if captured:
+                    break
+            if not captured:
+                self._log("等待签到响应超时（Turnstile 未通过）")
+                return None
+            status_code, body = captured[-1]
+            if status_code != 200:
+                # 非 200 一律不解析业务码：网关/CF 的 HTML 错误页可能恰好含 code 字样
+                self._log(f"签到接口返回 HTTP {status_code}，不判定业务结果")
+                self.submitted_unknown = True
+                return None
+            try:
+                data = json.loads(body)
+            except (ValueError, TypeError):
+                self.submitted_unknown = True
+                return None
+            if not isinstance(data, dict):
+                self.submitted_unknown = True
+                return None
+            # 浏览器上下文是 Set-Cookie 的最权威来源；只有 expires > 0 且属于登录凭据
+            # 的 cookie（gld:sess / gld:sess.sig）才记录，避免把无关 cookie 的时效
+            # 当成 Cookie 有效期（仅域名匹配不足以确认凭据归属）。
+            try:
+                for item in ctx.cookies():
+                    name = str(item.get("name") or "")
+                    expires = item.get("expires")
+                    if (name and CREDENTIAL_COOKIE_RE.search(name)
+                            and isinstance(expires, (int, float)) and expires > 0):
+                        learned_here[name] = int(expires)
+            except Exception:
+                pass
+
+        except Exception as exc:  # noqa: BLE001  浏览器链路异常统一退回 HTTP
+            self._log(f"浏览器签到异常: {str(exc)[:160]}")
+            return None
+        finally:
+            if ctx is not None:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+
+        # 与 HTTP 链路共用严格解析：缺失/非整数一律失败，绝不把缺字段当成 code=0
+        code = coerce_code(data.get("code"))
+        message = str(data.get("message", ""))
+        reason = str(data.get("reason", "") or "")
+        try:
+            points = int(float(data.get("points", 0) or 0))
+        except (TypeError, ValueError, OverflowError):
+            points = 0  # 已确认签到成功，积分字段异常不能撤销结果
+        if code == CHECKIN_SUCCESS:
+            return ("签到成功", code, points, message), learned_here
+        if code == CHECKIN_REPEAT:
+            return ("重复签到", code, 0, message), learned_here
+        if code == CHECKIN_FAILURE_DEVICE or reason == "device-mismatch":
+            # 只接受非空字符串设备字段：dict/对象不得 str() 强转（会把整个对象
+            # 灌进日志与重试判定），非字符串一律视为未上报
+            raw = data.get("loginDevice")
+            login_device = raw.strip() if isinstance(raw, str) else ""
+            if login_device:
+                self.last_login_device = login_device
+            # 服务端原始 message 可能夹带邮箱等 PII：与 HTTP 链路同等处理，
+            # 进 detail（会被 _run_one 打印/进日报）前必须双重脱敏
+            # （PR #32 第九轮评审指认）。顺序：先全文脱敏再截断——截断先行
+            # 会切开邮箱/手机号，redact_pii 识别不了残缺形态（第十轮评审）
+            detail = redact_pii(sanitize_snippet(message, None))[:120] if message else "登录设备与当前设备不一致"
+            return ("需重新登录", CHECKIN_FAILURE, 0,
+                    f"{detail} (reason=device-mismatch, loginDevice={login_device or '?'})"), learned_here
+        # 不回显原始响应体：可能夹带邮箱等个人信息，只保留脱敏后的服务端文案与 reason
+        detail = redact_pii(sanitize_snippet(message, None))[:120] if message else "签到失败（响应无 message 字段）"
+        if reason:
+            detail += f" (reason={reason})"
+        return ("签到失败", CHECKIN_FAILURE, 0, detail), learned_here
+
+    def close(self) -> None:
+        for closer in (getattr(self._browser, "close", None),
+                       getattr(self._pw, "stop", None)):
+            try:
+                if closer:
+                    closer()
+            except Exception:
+                pass
+        self._browser = None
+        self._pw = None
+
+
 class Config:
     def __init__(self) -> None:
         self.push_key = os.getenv("PUSHDEER_SENDKEY", "").strip()
@@ -101,6 +459,39 @@ class Config:
         self.exchange_plan = self._load_exchange_plan()
         self.auto_exchange = self._bool_env("GLADOS_AUTO_EXCHANGE", True)
         self.verbose = self._bool_env("GLADOS_VERBOSE", False)
+        self.proxies = self._load_proxies()
+        self.egress = self._resolve_egress()
+
+    @staticmethod
+    def _load_proxies() -> List[ProxyEndpoint]:
+        """出口候选：GLADOS_PROXY(*_PROXIES/*_BACKUP_PROXIES) 优先，全部缺失才复用
+        NodeSeek 的台湾家宽节点。
+
+        上游 CF 风控按出口 IP 信誉打分，脚本自身不持有住宅出口，直接复用工作流
+        统一 sing-box 入站（NodeSeek 已绑定的 TW-X1 节点），避免再维护一套节点。
+        """
+        endpoints = get_task_proxy_endpoints("glados")
+        if not endpoints:
+            endpoints = get_task_proxy_endpoints("nodeseek")
+        return endpoints
+
+    def _resolve_egress(self) -> Optional[ProxyEndpoint]:
+        """确定唯一出网出口。
+
+        依赖家宽出口的任务不应在代理缺失时静默直连（会拿到 reason=turnstile 且
+        掩盖代理故障，参照 NodeSeek 的「公平失败」约定）；只有显式
+        `GLADOS_ALLOW_DIRECT=1`（本机家宽排查）才允许无代理直连。
+        """
+        if self.proxies:
+            return self.proxies[0]
+        if self._bool_env("GLADOS_ALLOW_DIRECT", False):
+            print("⚠️ 未配置 GLaDOS 代理出口，按 GLADOS_ALLOW_DIRECT=1 直连出网")
+            return None
+        raise RuntimeError(
+            "未找到 GLaDOS 代理出口（GLADOS_PROXY / GLADOS_PROXIES / "
+            "GLADOS_BACKUP_PROXIES，或工作流注入的 NODESEEK_PROXY）；"
+            "家宽出口缺失时签到必被 Turnstile 拒绝。本机直连排查请设 GLADOS_ALLOW_DIRECT=1"
+        )
 
     def _load_cookies(self) -> List[str]:
         # 优先扫描 COOKIE_1, COOKIE_2 序列，回退至 COOKIES / cookie (含 && 切分)
@@ -129,20 +520,50 @@ class Config:
 
 
 class GladosAPI:
-    def __init__(self, domain: str, cookie_index: int, verbose: bool = False) -> None:
+    def __init__(self, domain: str, cookie_index: int, verbose: bool = False,
+                 proxy: str = "") -> None:
         self.domain = domain
         self.cookie_index = cookie_index
         self.verbose = verbose
-        self.http = Http()
+        # 出口走代理（CI 复用 NodeSeek 的 sing-box 台湾节点），并且必须叠加 Chrome
+        # TLS/JA3 指纹：Turnstile 的风险打分是「IP 信誉 + 指纹」的联合判定，裸 urllib
+        # 指纹在数据中心出口上即便换了 IP 也会被要求令牌。
+        self.http = Http(
+            follow_redirects=True,
+            proxy=proxy,
+            task_name="glados",
+            impersonate=IMPERSONATE,
+            # 无 endpoint = 显式直连（GLADOS_ALLOW_DIRECT 诊断），必须屏蔽环境代理推断
+            infer_proxy=bool(proxy),
+        )
         self.base = f"https://{domain}"
+        # 本轮从 Set-Cookie 学到的 {cookie 名: 到期 epoch}，给共享有效期引擎用
+        self.learned: Dict[str, int] = {}
+
+    def _learn(self, resp) -> None:
+        """从响应 Set-Cookie 学习到期证据，只认登录凭据 cookie。
+
+        上游当前只发会话 cookie（无 Expires/Max-Age），此处通常为空；一旦将来下发
+        时效，也只有 gld:sess / gld:sess.sig 的到期才算数（其余 cookie 的寿命不代表
+        登录状态）。
+        """
+        try:
+            self.learned = cv.merge_learned(
+                self.learned,
+                cv.learn_from_response(resp, credential_match=CREDENTIAL_COOKIE_RE.search),
+            )
+        except Exception:
+            pass
 
     def _headers(self, cookie: str) -> Dict[str, str]:
         return {
             "Cookie": cookie,
             "Origin": self.base,
             "Referer": f"{self.base}/console/checkin",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36",
+            "User-Agent": USER_AGENT,
+            # Chrome 默认 keep-alive；common.Http 的 "Connection: close" 默认值
+            # 与浏览器指纹不自洽，这里显式覆盖。
+            "Connection": "keep-alive",
         }
 
     def _log(self, message: str, force: bool = False) -> None:
@@ -156,14 +577,8 @@ class GladosAPI:
 
     @staticmethod
     def _parse_code(data: Dict[str, Any]) -> int:
-        """解析业务 code。注意 code=0 是成功值，不能用 `or` 兜底（0 是 falsy 会被吞掉）。"""
-        raw = data.get("code")
-        if raw is None or raw == "":
-            return CHECKIN_FAILURE
-        try:
-            return int(float(raw))
-        except (TypeError, ValueError):
-            return CHECKIN_FAILURE
+        """解析业务 code（与浏览器链路共用同一严格口径，见 coerce_code）。"""
+        return coerce_code(data.get("code"))
 
     def _ensure_auth(self, resp, data: Dict[str, Any]) -> None:
         """检测 Cookie 是否已失效（HTTP 非 200 / 非 JSON / 缺 code / 命中登录关键词）。
@@ -171,49 +586,131 @@ class GladosAPI:
         判定失效时抛出 CookieExpiredError 并附带响应摘要，避免事后翻日志找原因。
         """
         if resp.code != 200:
-            raise CookieExpiredError(f"HTTP {resp.code}，响应: {resp.text[:120]}")
+            raise CookieExpiredError(f"HTTP {resp.code}，响应: {sanitize_snippet(resp.text, 120)}")
         if not data:
-            raise CookieExpiredError(f"响应非 JSON（可能返回了登录页），响应: {resp.text[:120]}")
+            raise CookieExpiredError(
+                f"响应非 JSON（可能返回了登录页），响应: {sanitize_snippet(resp.text, 120)}"
+            )
         if "code" not in data:
-            raise CookieExpiredError(f"响应缺少 code 字段，响应: {str(data)[:150]}")
+            raise CookieExpiredError(
+                f"响应缺少 code 字段，响应: {sanitize_snippet(str(data), 150)}"
+            )
         message = str(data.get("message", "")).lower()
         if any(kw in message for kw in AUTH_FAILURE_KEYWORDS):
-            raise CookieExpiredError(f"接口提示需要重新登录，响应: {str(data)[:150]}")
+            raise CookieExpiredError(
+                f"接口提示需要重新登录，响应: {sanitize_snippet(str(data), 150)}"
+            )
 
     def status(self, cookie: str) -> Tuple[str, int]:
         resp = self.http.request("GET", self.base + "/api/user/status", headers=self._headers(cookie))
+        self._learn(resp)
         data = self._safe_json(resp)
         self._ensure_auth(resp, data)
         code = self._parse_code(data)
         left_days = (data.get("data") or {}).get("leftDays")
         if left_days is None:
-            self._log(f"{Emoji.FAIL} 查询剩余天数失败: {data}", force=True)
+            self._log(f"{Emoji.FAIL} 查询剩余天数失败: {sanitize_snippet(str(data), 150)}", force=True)
             return "None 天", code
         days = int(float(left_days))
         return f"{days} 天", code
 
+    def challenge(self, cookie: str) -> Dict[str, Any]:
+        """获取签到挑战（nonce / ttl / 是否强制 Cloudflare Turnstile）。
+
+        挑战接口抖动（5xx/网关错误/非 JSON）属于临时故障，返回空字典交由调用方
+        降级处理；只有明确表明登录态失效（HTTP 200 + code=-2/登录关键词）才抛
+        CookieExpiredError，避免一次 503 把整个账号判成 Cookie 过期。
+        """
+        resp = self.http.request(
+            "GET",
+            self.base + "/api/user/checkin/challenge",
+            headers=self._headers(cookie),
+        )
+        self._learn(resp)
+        data = self._safe_json(resp)
+        if resp.code != 200 or not data:
+            self._log(f"⚠️ 获取签到挑战失败: HTTP {resp.code}（临时故障，按无挑战处理）", force=True)
+            return {}
+        if "code" not in data:
+            # 缺 code 时仍先查登录关键词：命中即明确登录失效，交 _ensure_auth 抛错；
+            # 否则按协议/网关故障返回空挑战，交由调用方降级处理。
+            message = str(data.get("message", "") or "").lower()
+            if any(kw in message for kw in AUTH_FAILURE_KEYWORDS):
+                self._ensure_auth(resp, data)  # 命中登录失效语义 → 抛 CookieExpiredError
+            self._log("⚠️ 获取签到挑战失败: 响应缺少 code（协议故障，按无挑战处理）", force=True)
+            return {}
+        self._ensure_auth(resp, data)
+        code = self._parse_code(data)
+        if code != CHECKIN_SUCCESS:
+            self._log(f"⚠️ 获取签到挑战失败: code={code}（按无挑战处理）", force=True)
+            return {}
+        return data
+
+    @staticmethod
+    def proof(nonce: str) -> str:
+        """复刻前端 checkinProof：SHA-256(nonce + "." + PROOF_SALT) 的十六进制摘要。"""
+        return hashlib.sha256(f"{nonce}.{PROOF_SALT}".encode("utf-8")).hexdigest()
+
     def checkin(self, cookie: str) -> Tuple[str, int, int, str]:
+        started_at = time.monotonic()
+        challenge = self.challenge(cookie)
+        nonce = str(challenge.get("nonce") or "")
+        ts_required = bool(challenge.get("turnstile"))
+
+        payload: Dict[str, Any] = {"token": self.domain}
+        if nonce:
+            payload["nonce"] = nonce
+            payload["proof"] = self.proof(nonce)
+            # 无 Turnstile 时前端上报 "off"；有站点密钥但拿不到令牌时上报 "timeout"。
+            # 脚本无法执行 Cloudflare 挑战，令牌只能由服务端按风险降级放行。
+            payload["tsState"] = "timeout" if ts_required else "off"
+            remaining = CHALLENGE_MIN_AGE_SEC - (time.monotonic() - started_at)
+            if remaining > 0:
+                time.sleep(remaining)
+            if ts_required:
+                self._log("⚠️ 签到挑战要求 Cloudflare Turnstile，脚本无法生成令牌，尝试无令牌提交", force=True)
+
         resp = self.http.request(
             "POST",
             self.base + "/api/user/checkin",
             headers=self._headers(cookie),
-            json_data={"token": self.domain},
+            json_data=payload,
         )
+        self._learn(resp)
         data = self._safe_json(resp)
         self._ensure_auth(resp, data)
         code = self._parse_code(data)
         message = str(data.get("message", ""))
-        points = int(float(data.get("points", 0) or 0))
-
+        reason = str(data.get("reason", "") or "")
+        try:
+            points = int(float(data.get("points", 0) or 0))
+        except (TypeError, ValueError, OverflowError):
+            points = 0
         if code == CHECKIN_SUCCESS:
             return "签到成功", code, points, message
         if code == CHECKIN_REPEAT:
             return "重复签到", code, 0, message
+        if code == CHECKIN_FAILURE_DEVICE or reason == "device-mismatch":
+            # 归入常规失败码：summary/退出码/熔断器只认 CHECKIN_FAILURE/COOKIE_INVALID，
+            # 新增码会让失败被静默吞掉（不退出、不计入标题）。文案用白名单固定值。
+            return "需重新登录", CHECKIN_FAILURE, 0, KNOWN_FAILURE_REASONS["device-mismatch"]
 
-        return "签到失败", CHECKIN_FAILURE, 0, message or str(data)
+        if reason in KNOWN_FAILURE_REASONS:
+            detail = KNOWN_FAILURE_REASONS[reason]
+        else:
+            detail = ("签到失败（服务端返回未登记的原因码，详见 verbose 日志）"
+                      if reason else "签到失败（服务端未返回原因码）")
+        if not nonce:
+            detail += " (未取到签到挑战 nonce)"
+        if message:
+            # 原始 message 只进 verbose 日志且必须脱敏，绝不写入任务结果/邮件。
+            # 先全文脱敏再截断：截断先行会切开邮箱/手机号致 redact_pii 漏判
+            self._log(f"服务端消息: {redact_pii(sanitize_snippet(message, None))[:120]}")
+        return "签到失败", CHECKIN_FAILURE, 0, detail
 
     def points(self, cookie: str) -> Tuple[str, int]:
         resp = self.http.request("GET", self.base + "/api/user/points", headers=self._headers(cookie))
+        self._learn(resp)
         data = self._safe_json(resp)
         self._ensure_auth(resp, data)
         value = data.get("points")
@@ -241,6 +738,7 @@ class GladosAPI:
                 headers=self._headers(cookie),
                 json_data={"planType": plan},
             )
+            self._learn(resp)
             data = self._safe_json(resp)
             self._ensure_auth(resp, data)
             code = self._parse_code(data)
@@ -262,23 +760,87 @@ class Checker:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.results: List[Result] = []
+        self.devices: Dict[int, str] = {}
+        # 浏览器与 HTTP 链路共用同一条住宅出口；浏览器签到是该出口上唯一能过盾的路径
+        proxy_url = config.egress.url if config.egress else ""
+        self.browser: Optional[BrowserCheckin] = (
+            BrowserCheckin(proxy=proxy_url, verbose=config.verbose)
+            if BrowserCheckin.enabled() else None
+        )
 
     def run(self) -> None:
         print("【GLaDOS 签到兑换】")
         # 上游无密码登录接口，仅支持 Cookie 认证
-        for cookie_index, cookie in enumerate(self.config.cookies, 1):
-            for domain in self.config.domains:
-                api = GladosAPI(domain, cookie_index, self.config.verbose)
-                try:
-                    res = self._run_one(api, cookie, cookie_index, domain)
-                except CookieExpiredError as e:
-                    res = self._cookie_invalid_result(cookie_index, domain, "", str(e))
-                except Exception as e:
-                    # 单个 cookie 的解析等异常不能中断其余 cookie
-                    print(f"❌ 账号 {cookie_index} on {domain} 执行失败: {e}")
-                    res = Result(cookie_index=cookie_index, domain=domain, account_name="",
-                                 status=f"失败: {e}")
-                self.results.append(res)
+        endpoint = self.config.egress
+        tag = endpoint.display_name if endpoint else "直连（GLADOS_ALLOW_DIRECT=1）"
+        try:
+            for cookie_index, cookie in enumerate(self.config.cookies, 1):
+                for domain in self.config.domains:
+                    self.results.append(self._run_account(cookie, cookie_index, domain, endpoint, tag))
+        finally:
+            if self.browser is not None:
+                self.browser.close()
+
+    def _run_account(self, cookie: str, cookie_index: int, domain: str,
+                     endpoint: Optional[ProxyEndpoint], tag: str) -> Result:
+        """单账号单域名只跑一次：重试与熔断统一交给框架（规则 6），脚本内不再重跑。"""
+        api = GladosAPI(domain, cookie_index, self.config.verbose,
+                        proxy=endpoint.url if endpoint else "")
+        try:
+            return self._run_one(api, cookie, cookie_index, domain, tag)
+        except CookieExpiredError as e:
+            return self._cookie_invalid_result(cookie_index, domain, "", str(e))
+        except Exception as e:  # noqa: BLE001  单个账号异常不中断其余账号
+            print(f"❌ 账号 {cookie_index} on {domain} 执行失败: {e}")
+            return Result(cookie_index=cookie_index, domain=domain, account_name="",
+                          status=f"失败: {e}")
+
+    def _checkin(self, api: GladosAPI, cookie: str, cookie_index: int,
+                 domain: str) -> Tuple[Tuple[str, int, int, str], Dict[str, int]]:
+        """真浏览器优先；设备不匹配时按服务端 loginDevice 换指纹重试一次。
+
+        返回 (签到结果四元组, 本次浏览器产生的到期证据)。浏览器链路不可用
+        （未装 Playwright / 无 xvfb / 启动失败）时退回 HTTP，此时必然拿到
+        reason=turnstile，属于如实失败而不是静默假成功。
+        """
+        if self.browser is None:
+            return api.checkin(cookie), {}
+        device = self.devices.get(cookie_index, DEFAULT_DEVICE)
+        self.browser.submitted_unknown = False
+        outcome = self.browser.checkin(cookie, domain, device)
+        if outcome is None:
+            if self.browser.submitted_unknown:
+                # POST 已发出但结果未知：绝不重复提交，如实报告未知
+                return ("提交结果未知", CHECKIN_FAILURE, 0,
+                        "签到请求已提交但无法确认结果（超时/非 200/响应异常），未重复提交"), {}
+            return api.checkin(cookie), {}
+        res, learned = outcome
+        # 只有浏览器从结构化字段确认 device-mismatch 才换设备重试；
+        # 首次已成功/重复的签到绝不因文案里出现 loginDevice 字样被重试覆盖。
+        raw_device = getattr(self.browser, "last_login_device", "")
+        # 只接受非空字符串；空串/None/dict 一律忽略——空设备名若走 resolve_device
+        # 会兜底成 windows，凭空触发一次多余签到重试。日志只输出归一化后的固定设备名
+        reported_device = (resolve_device(raw_device)
+                           if isinstance(raw_device, str) and raw_device.strip() else "")
+        if reported_device and res[1] not in (CHECKIN_SUCCESS, CHECKIN_REPEAT):
+            login_device = reported_device
+            if login_device != device:
+                print(f"🔁 账号 {cookie_index} 登录设备为 {login_device}，按该设备指纹重试")
+                retry = self.browser.checkin(cookie, domain, login_device)
+                if retry is not None:
+                    retry_res, retry_learned = retry
+                    # 只有重试拿到真实业务成功才记住新设备，失败/None 保留原缓存
+                    if retry_res[1] in (CHECKIN_SUCCESS, CHECKIN_REPEAT):
+                        self.devices[cookie_index] = login_device
+                    return retry_res, retry_learned
+                if self.browser.submitted_unknown:
+                    return ("提交结果未知", CHECKIN_FAILURE, 0,
+                            "签到请求已提交但无法确认结果（超时/非 200/响应异常），未重复提交"), {}
+                return api.checkin(cookie), {}
+        elif res[1] in (CHECKIN_SUCCESS, CHECKIN_REPEAT):
+            # 签到成功即确认该设备指纹有效，后续域名复用
+            self.devices.setdefault(cookie_index, device)
+        return res, learned
 
     def _cookie_invalid_result(self, cookie_index: int, domain: str, account_name: str, detail: str) -> Result:
         """生成 Cookie 失效结果并打印明确的修复指引，跳过该账号后续流程。"""
@@ -296,12 +858,28 @@ class Checker:
             message=detail,
         )
 
-    def _run_one(self, api: GladosAPI, cookie: str, cookie_index: int, domain: str) -> Result:
+    def _run_one(self, api: GladosAPI, cookie: str, cookie_index: int, domain: str,
+                 egress: str = "") -> Result:
         result = Result(cookie_index=cookie_index, domain=domain)
         result.days, _ = api.status(cookie)
-        result.status, result.code, result.points, result.message = api.checkin(cookie)
-        _, points_total = api.points(cookie)
-        result.points_total = points_total
+        (result.status, result.code, result.points, result.message), learned = self._checkin(
+            api, cookie, cookie_index, domain)
+        # 签到成功即入账当日运行天数：后续积分/兑换失败也不能漏记（无到期证据时
+        # 只有成功运行日能反推 Cookie 寿命）
+        marked_state = None
+        if result.code in (CHECKIN_SUCCESS, CHECKIN_REPEAT):
+            marked_state = self._mark_run_day(cookie, cookie_index, learned, api)
+        try:
+            _, points_total = api.points(cookie)
+            result.points_total = points_total
+        except CookieExpiredError as exc:
+            # 积分查询失败不能覆盖已确认的签到结果；文案按是否已确认区分
+            confirmed = result.code in (CHECKIN_SUCCESS, CHECKIN_REPEAT)
+            prefix = "签到已确认，但" if confirmed else ""
+            print(f"⚠️ {prefix}积分查询失败（凭据可能在查询时过期）: "
+                  f"{sanitize_snippet(str(exc), 120)}")
+            result.exchange = f"积分查询失败（{'签到已确认' if confirmed else '签到未确认'}）"
+            return result
 
         if self.config.auto_exchange:
             required = EXCHANGE_PLANS[self.config.exchange_plan]
@@ -312,15 +890,10 @@ class Checker:
         else:
             result.exchange = "未开启自动兑换"
 
-        _, remaining_days = _parse_cookie_expiry(cookie)
-        expiry_desc = (
-            f"Cookie 剩余 {remaining_days} 天"
-            if remaining_days is not None
-            else "Cookie 有效期未知"
-        )
-
+        expiry_tag = self._expiry_tag(api, cookie, cookie_index, learned, marked_state)
         acc_label = mask_str(result.account_name) if result.account_name else f"账号 {cookie_index}"
-        print(f"📧 账号: {acc_label} | 🔑 {expiry_desc}")
+        egress_desc = f" | 🌐 出口: {egress}" if egress else ""
+        print(f"📧 账号: {acc_label}{expiry_tag}{egress_desc}")
         if result.code == CHECKIN_SUCCESS:
             print(f"✅ 签到状态: 签到成功 (+{result.points} 积分)")
         elif result.code == CHECKIN_REPEAT:
@@ -331,10 +904,71 @@ class Checker:
         print(f"📅 剩余天数: {result.days}")
         print(f"💰 当前积分: {result.points_total} 积分")
         print(f"🎯 兑换进度: {result.exchange}")
-        if remaining_days is not None and remaining_days < 30:
-            print(f"⚠️ Cookie 剩余有效期不足 30 天（剩余 {remaining_days} 天），请及时更新")
         print("")
         return result
+
+    def _state_paths(self, cookie_index: int) -> Tuple[str, str]:
+        """每账号独立的 Cookie 有效期状态（与 52pojie/cloud189 同构）。"""
+        return (f"cat_checkin:state:glados_{cookie_index}",
+                f".glados_state_{cookie_index}.json")
+
+    def _load_state(self, cookie_index: int) -> Tuple[str, str, Dict[str, Any]]:
+        redis_key, state_file = self._state_paths(cookie_index)
+        state = load_kv_state(redis_key, state_file) or {}
+        return redis_key, state_file, state
+
+    def _mark_run_day(self, cookie: str, cookie_index: int,
+                      learned: Dict[str, int], api: GladosAPI) -> Optional[Dict[str, Any]]:
+        """签到成功后立即入账运行日（不等积分/兑换走完），并返回已入账 state 供最终
+        证据合并复用——避免 _expiry_tag 重读 Redis 拿到较旧的值覆盖本次更新。
+        任何异常不影响主流程。
+        """
+        try:
+            redis_key, state_file, state = self._load_state(cookie_index)
+            evidence = cv.merge_learned(learned or {}, getattr(api, "learned", {}) or {})
+            evidence = {name: ts for name, ts in evidence.items()
+                        if CREDENTIAL_COOKIE_RE.search(name)}
+            cv.update_state(state, cookie, evidence)
+            cv.mark_ok(state)
+            save_kv_state(redis_key, state_file, state)
+            return state
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️ Cookie 运行日入账失败: {exc}")
+            return None
+
+    def _expiry_tag(self, api: GladosAPI, cookie: str, cookie_index: int,
+                    learned: Optional[Dict[str, int]] = None,
+                    state: Optional[Dict[str, Any]] = None) -> str:
+        """渲染 Cookie 有效期标签（唯一实现委托共享引擎，规则 8）。
+
+        GLaDOS 的会话 cookie 是纯会话态（无 Expires、无 _expire），拿不到真实到期
+        时间时 build_tag 会输出「有效期未知（已使用 N 天）」，并在 45 天老化基线
+        升级为 ⚠️ 黄卡——这是当前唯一诚实的口径，绝不编造倒计时。
+
+        证据只用本次运行的：浏览器本次上下文的到期时间 + 本次 HTTP 响应；不读
+        任何跨账号/跨运行的残留值。
+        """
+        try:
+            if state is None:
+                redis_key, state_file, state = self._load_state(cookie_index)
+            else:
+                redis_key, state_file = self._state_paths(cookie_index)
+            evidence = cv.merge_learned(
+                learned or {},
+                getattr(api, "learned", {}) or {},
+            )
+            # build_tag 的 credential_match 只作用于 cookie_str 解析，learned 字典
+            # 是整包取 max——合并前必须自行按登录凭据名过滤（双保险）。
+            evidence = {name: ts for name, ts in evidence.items()
+                        if CREDENTIAL_COOKIE_RE.search(name)}
+            cv.update_state(state, cookie, evidence)
+            save_kv_state(redis_key, state_file, state)
+            # credential_match 与响应学习路径一致：只接受登录凭据的证据
+            return cv.build_tag(state, cookie_str=cookie, learned=evidence,
+                                credential_match=CREDENTIAL_COOKIE_RE.search)
+        except Exception as exc:  # 有效期渲染绝不影响签到主流程
+            print(f"⚠️ Cookie 有效期计算失败: {exc}")
+            return " | 🔑 Cookie 有效期未知"
 
     def summary(self) -> Tuple[str, str]:
         success = sum(1 for r in self.results if r.code in (CHECKIN_SUCCESS, CHECKIN_REPEAT))
@@ -350,6 +984,8 @@ class Checker:
                 st = "今日已签到"
             elif r.code == COOKIE_INVALID:
                 st = "Cookie失效(需更新)"
+            elif r.status == "提交结果未知":
+                st = "提交结果未知（未重复提交）"
             else:
                 st = "签到失败"
             lines.append(f"#{idx} {name} | {st} | 剩余:{r.days} | 积分:{r.points_total} | {r.exchange}")

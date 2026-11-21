@@ -292,6 +292,8 @@ jobs:
           echo "NODESEEK_PROXY=" >> "$GITHUB_ENV"
           echo "AGENTROUTER_PROXY=" >> "$GITHUB_ENV"
           echo "CLOUDSTUDIO_PROXY=" >> "$GITHUB_ENV"
+          echo "GLADOS_PROXY=" >> "$GITHUB_ENV"
+          echo "GLADOS_ALLOW_DIRECT=1" >> "$GITHUB_ENV"
           echo "direct 诊断模式：跳过代理，任务用 runner IP 直连"
       - name: no_cffi mode (nodeseek 强制 urllib)
         if: inputs.no_cffi == true
@@ -544,6 +546,8 @@ jobs:
             echo "AGENTROUTER_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             echo "NODESEEK_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             echo "CLOUDSTUDIO_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
+            # GLaDOS 复用同一台湾住宅出口（CF Turnstile 按 IP 信誉+指纹联合判定）
+            echo "GLADOS_PROXY=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
             ns_code=$(curl -sS -x "socks5://127.0.0.1:1080" -m 12 -o /dev/null -w '%{http_code}' https://www.nodeseek.com/ 2>/dev/null || echo 000)
             echo "sing-box egress ready on 127.0.0.1:1080 (pid $SINGBOX_PID), nodeseek probe HTTP $ns_code"
             stash_proxy_state singbox "$node_tag" "$exit_ip" "$ns_code"
@@ -572,6 +576,20 @@ jobs:
           python3 scripts/setup_rights_schedule.py || \
             echo "⚠️ QStash 0点场排程注册失败（不影响本次执行；GitHub 心跳仍兜底）"
 
+      - name: Install browser for glados (Turnstile)
+        id: glados_browser
+        # 安装失败绝不影响后续编排：GLaDOS 运行时自会退回 HTTP 链路（如实失败），
+        # 其余到期任务（Railgun 等）照常执行。
+        if: contains(steps.orch_tasks.outputs.due_tasks, 'glados')
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          # Turnstile 只能由真浏览器解出：headful Chrome + xvfb 虚拟显示
+          pip install --quiet playwright
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb x11-utils >/dev/null
+          python3 -m playwright install --with-deps chrome >/dev/null
+
       - name: Execute daily orchestrator
         id: orchestrator
         if: steps.orch_tasks.outputs.due_tasks != 'none'
@@ -584,11 +602,40 @@ jobs:
           if [ "$RESET_CIRCUIT" = "true" ]; then
             RESET_FLAG="--reset-circuit"
           fi
-          if [ -n "$ORCH_TASKS" ] && [ "$ORCH_TASKS" != "none" ]; then
-            python3 scripts/daily_orchestrator.py --tasks "$ORCH_TASKS" $RESET_FLAG
+          # glados 的 Turnstile 需要 headful Chrome，xvfb 提供虚拟显示；
+          # 其余任务在 DISPLAY 存在的环境里行为不变。
+          # 探测与实际编排共用同一个 Xvfb 实例：先启动 Xvfb 并导出 DISPLAY，
+          # 探测通过后在该显示下直接运行编排器，结束后关闭；启动失败则退回
+          # 无显示模式（普通 python3），必须在编排器启动前决定，不能整批重跑。
+          XVFB_PID=""
+          if [ "${{ steps.glados_browser.outcome }}" = "success" ] \
+             && command -v Xvfb >/dev/null 2>&1; then
+            Xvfb :99 -screen 0 1366x900x24 >/tmp/xvfb.log 2>&1 &
+            XVFB_PID=$!
+            export DISPLAY=:99
+            for _i in $(seq 1 20); do
+              if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then break; fi
+              sleep 0.5
+            done
+            if ! xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
+              kill -9 "$XVFB_PID" 2>/dev/null || true
+              XVFB_PID=""
+              export DISPLAY=""
+              echo "⚠️ Xvfb 虚拟显示启动失败，GLaDOS 将退回 HTTP 链路（Turnstile 无法通过）"
+            fi
           else
-            python3 scripts/daily_orchestrator.py $RESET_FLAG
+            echo "⚠️ 浏览器环境不可用，GLaDOS 将退回 HTTP 链路（Turnstile 无法通过）"
           fi
+          ORCH_RC=0
+          if [ -n "$ORCH_TASKS" ] && [ "$ORCH_TASKS" != "none" ]; then
+            python3 scripts/daily_orchestrator.py --tasks "$ORCH_TASKS" $RESET_FLAG || ORCH_RC=$?
+          else
+            python3 scripts/daily_orchestrator.py $RESET_FLAG || ORCH_RC=$?
+          fi
+          if [ -n "$XVFB_PID" ]; then
+            kill "$XVFB_PID" 2>/dev/null || true
+          fi
+          exit "$ORCH_RC"
 
       # 日报邮件已收敛到 report-fallback job（20:00 主发 + 21:30 补发）；
       # 此步骤只归档当日汇总并输出 failed_matrix 供自动重跑，绝不发邮件
