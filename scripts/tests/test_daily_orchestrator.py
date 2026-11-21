@@ -377,5 +377,37 @@ class PlanModeTests(unittest.TestCase):
         self.assertNotIn("aistudio", pushed)
 
 
+class ResetCircuitOutputTests(unittest.TestCase):
+    """--reset-circuit 恢复输出必须检查 resume 结果，未确认不得报「已重置上线」
+    （PR #34 第十六轮评审）。"""
+
+    def _run_main(self, argv, resume_ret):
+        buf = io.StringIO()
+        with patch.object(sys, "argv", argv), \
+             patch.object(orch_mod, "resume_task", return_value=resume_ret), \
+             patch.object(orch_mod, "plan_due_tasks", return_value=[]), \
+             patch.object(orch_mod, "check_daily_report_needed", return_value=False), \
+             patch("sys.stdout", buf):
+            try:
+                orch_mod.main()
+            except SystemExit:
+                pass
+        return buf.getvalue()
+
+    def test_reset_unconfirmed_not_reported_success(self):
+        out = self._run_main(
+            ["orch", "--reset-circuit-tasks", "smzdm", "--plan"],
+            {orch_mod._CB_READ_FAILED: True})
+        self.assertNotIn("已重置上线", out)
+        self.assertIn("恢复未确认", out)
+
+    def test_reset_confirmed_reports_success(self):
+        out = self._run_main(
+            ["orch", "--reset-circuit-tasks", "smzdm", "--plan"],
+            {"status": "active"})
+        self.assertIn("已重置上线", out)
+        self.assertNotIn("恢复未确认", out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -29,6 +29,7 @@ from alert_levels import detect_unconfigured
 from discord_notify import notify_task_result, notify_unconfigured
 from task_registry import TASKS, resolve_execution_queue
 from circuit_breaker import (
+    _CB_READ_FAILED,
     is_task_suspended,
     load_circuit_state,
     record_task_outcome,
@@ -275,7 +276,7 @@ class Orchestrator:
                 # 内存态虽为 suspended 但远端未落盘，不得据此标 SUSPENDED
                 # （PR #34 终局自审：下游按 status 判定会绕过 tripped 防线）
                 suspended = (bool(circuit_info.get("status") == "suspended")
-                             and not circuit_info.get("_read_failed"))
+                             and not circuit_info.get(_CB_READ_FAILED))
             except Exception as exc:
                 print(f"WARN: circuit breaker 状态记录异常: {exc}", file=sys.stderr)
 
@@ -520,16 +521,23 @@ def main() -> None:
         target_tasks = [t.strip() for t in args.reset_circuit_tasks.split(",") if t.strip()]
         if target_tasks:
             for t in target_tasks:
-                resume_task(t, reason="命令行显式指定恢复上线 (--reset-circuit-tasks)")
-                print(f"🔄 [CIRCUIT_BREAKER] 任务 [{t}] 熔断状态已重置上线")
+                st = resume_task(t, reason="命令行显式指定恢复上线 (--reset-circuit-tasks)")
+                if st.get(_CB_READ_FAILED):
+                    print(f"⚠️ [CIRCUIT_BREAKER] 任务 [{t}] 恢复未确认（读取失败或写入未落盘），可能仍处停用")
+                else:
+                    print(f"🔄 [CIRCUIT_BREAKER] 任务 [{t}] 熔断状态已重置上线")
         elif args.reset_circuit:
             if is_explicit:
                 for t in [t.strip() for t in args.tasks.split(",") if t.strip()]:
-                    resume_task(t, reason="手动任务调度恢复上线 (--reset-circuit)")
-                    print(f"🔄 [CIRCUIT_BREAKER] 任务 [{t}] 熔断状态已重置上线")
+                    st = resume_task(t, reason="手动任务调度恢复上线 (--reset-circuit)")
+                    if st.get(_CB_READ_FAILED):
+                        print(f"⚠️ [CIRCUIT_BREAKER] 任务 [{t}] 恢复未确认（读取失败或写入未落盘），可能仍处停用")
+                    else:
+                        print(f"🔄 [CIRCUIT_BREAKER] 任务 [{t}] 熔断状态已重置上线")
             else:
-                resume_all_tasks(reason="全局调度恢复上线 (--reset-circuit)")
-                print("🔄 [CIRCUIT_BREAKER] 全部任务熔断状态已重置上线")
+                resumed = resume_all_tasks(reason="全局调度恢复上线 (--reset-circuit)")
+                print(f"🔄 [CIRCUIT_BREAKER] 已重置上线 {len(resumed)} 个任务: "
+                      f"{', '.join(resumed) if resumed else '无（无熔断任务或恢复未确认）'}")
 
     if args.plan:
         due = plan_due_tasks(args.tasks, due_only=args.due_only)
