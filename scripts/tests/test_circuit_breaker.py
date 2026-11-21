@@ -320,6 +320,91 @@ class TestCircuitBreaker(unittest.TestCase):
             st = circuit_breaker.resume_task("smzdm")
         self.assertTrue(st.get(circuit_breaker._CB_READ_FAILED))
 
+    def test_stale_local_cache_not_revive_suspended(self):
+        """CI 缓存恢复到陈旧 active 本地文件，但 Redis 已有较新 suspended：
+        按 updated_at 择新用远端，不得复活已熔断任务（PR #34 终局自审）。"""
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write('{"status": "active", "attempts": 1, "updated_at": "2026-11-19T10:00:00+08:00"}')
+            path = f.name
+        try:
+            remote = '{"status": "suspended", "circuit_broken": true, "attempts": 8, "updated_at": "2026-11-20T10:00:00+08:00"}'
+            with mock.patch.dict(os.environ, {"UPSTASH_REDIS_REST_URL": "https://fake",
+                                              "UPSTASH_REDIS_REST_TOKEN": "V1.0FAKEtok"}, clear=False), \
+                 mock.patch.object(circuit_breaker, "upstash_redis_command",
+                                   return_value=(True, {"result": remote})):
+                state, absent, failed = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", path)
+            self.assertEqual(state["status"], "suspended")
+            self.assertTrue(state["circuit_broken"])
+        finally:
+            os.unlink(path)
+
+    def test_newer_local_wins_over_stale_remote(self):
+        """本地熔断写入成功 + Redis SET 失败：本地 updated_at 较新，用本地，
+        不被远端旧 active 抹掉（PR #34 第十三轮，时间戳择新不回归）。"""
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write('{"status": "suspended", "attempts": 8, "updated_at": "2026-11-20T10:00:00+08:00"}')
+            path = f.name
+        try:
+            remote = '{"status": "active", "attempts": 0, "updated_at": "2026-11-19T10:00:00+08:00"}'
+            with mock.patch.dict(os.environ, {"UPSTASH_REDIS_REST_URL": "https://fake",
+                                              "UPSTASH_REDIS_REST_TOKEN": "V1.0FAKEtok"}, clear=False), \
+                 mock.patch.object(circuit_breaker, "upstash_redis_command",
+                                   return_value=(True, {"result": remote})):
+                state, _, _ = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", path)
+            self.assertEqual(state["status"], "suspended")
+        finally:
+            os.unlink(path)
+
+    def test_evaluate_missing_next_retry_not_due_now(self):
+        """迁移状态缺 next_retry_at（旧 notify 键从不写）：不得判立即到期
+        跳过退避梯子（PR #34 终局自审，与 get_due_retries 闸门对齐）。"""
+        today = circuit_breaker._bjt_today()
+        st = {"attempt_date": today, "attempts": 2, "status": "active"}  # 无 next_retry_at
+        with mock.patch.object(circuit_breaker, "load_circuit_state", return_value=dict(st)), \
+             mock.patch.object(circuit_breaker, "_bjt_now_ts", return_value=1750000000.0):
+            res = circuit_breaker.evaluate_retry_candidates("smzdm")
+            due = circuit_breaker.get_due_retries(["smzdm"])
+        self.assertIn("smzdm", res["retryable"])
+        self.assertNotIn("smzdm", res["due_now"], "缺排定时刻不得立即到期")
+        self.assertNotIn("smzdm", due)
+
+    def test_malformed_attempts_no_crash(self):
+        """attempts 为非数字畸形值：三个只读消费点不得抛 ValueError
+        （PR #34 终局自审）。"""
+        today = circuit_breaker._bjt_today()
+        st = {"attempt_date": today, "attempts": "7次", "status": "active", "next_retry_at": "bad"}
+        with mock.patch.object(circuit_breaker, "load_circuit_state", return_value=dict(st)), \
+             mock.patch.object(circuit_breaker, "_bjt_now_ts", return_value=1750000000.0):
+            self.assertEqual(circuit_breaker.get_due_retries(["smzdm"]), [])
+            self.assertIsNone(circuit_breaker.get_min_next_retry_delay(["smzdm"]))
+            res = circuit_breaker.evaluate_retry_candidates("smzdm")
+        self.assertEqual(res["total_checked"], 1)
+
+    def test_cli_status_read_failed_not_unexecuted(self):
+        """读取失败：status 表格显示「状态不可读」，不得渲染「尚未执行」
+        （PR #34 终局自审）。"""
+        import io
+        buf = io.StringIO()
+        with mock.patch.object(circuit_breaker, "load_circuit_state",
+                               return_value={circuit_breaker._CB_READ_FAILED: True}), \
+             mock.patch.object(circuit_breaker, "_redis_channel_status", return_value="x"), \
+             mock.patch("sys.stdout", buf), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: buf.write(" ".join(str(x) for x in a) + "\n")):
+            circuit_breaker.cli_status("smzdm")
+        out = buf.getvalue()
+        self.assertIn("状态不可读", out)
+        self.assertNotIn("尚未执行", out)
+
+    def test_attempts_today_read_failed_fail_closed(self):
+        """读取失败：get_task_attempts_today 返回上限（fail-closed），不以 0
+        冒充未尝试（PR #34 终局自审）。"""
+        with mock.patch.object(circuit_breaker, "load_circuit_state",
+                               return_value={circuit_breaker._CB_READ_FAILED: True}):
+            n = circuit_breaker.get_task_attempts_today("smzdm")
+        self.assertEqual(n, circuit_breaker.MAX_DAILY_ATTEMPTS)
+
     def test_trip_read_failure_keeps_marker(self):
         """trip 读取失败：保留标记返回、绝不写盘（fail-closed）。"""
         with mock.patch.object(circuit_breaker, "load_circuit_state",

@@ -56,5 +56,22 @@ class TelecomWheelReportTests(unittest.TestCase):
         self.assertTrue(r["error_lines"])
 
 
+    def test_combined_prize_and_failure_keeps_prize_badge(self):
+        """wapact 免费转盘中奖 + 签到大转盘故障合并行：真实奖品段仍进
+        reward 徽章，故障段不进（PR #34 第十四轮：整段关键词会吞掉奖品）。"""
+        out = (
+            "👤 用户: 【189****5678】\n"
+            "• 签到: 【成功】\n"
+            "• 抽奖: 【5G流量包；签到大转盘: 转盘提交故障(系统繁忙)】\n"
+            "❌ 签到大转盘: 转盘提交故障(系统繁忙)\n"
+        )
+        r = extract_for("telecom.py", out)
+        reward_texts = [t for k, t in r["badges"] if k == "reward"]
+        self.assertTrue(any("5G流量包" in t for t in reward_texts),
+                        f"另一活动的真实奖品不得被故障段吞掉: {reward_texts}")
+        self.assertFalse(any("故障" in t or "繁忙" in t for t in reward_texts))
+        self.assertTrue(r["error_lines"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1054,7 +1054,10 @@ class TelecomClient:
             # 不得判成功（网关错误页可能回显业务字段，PR #34 第十三轮评审指认）
             http_status = res.get("_http_status")
             http_ok = http_status is None or str(http_status) == "200"
-            ok = http_ok and (str(res.get("code")) == "0" or str(res.get("resoultCode")) == "0")
+            # 转盘提交成功码只认 code=0（HAR 实证）：resoultCode 是查询接口语义，
+            # 提交接口 code=1 + resoultCode="0" 的混合响应不得判成功
+            # （PR #34 第十四轮评审指认）
+            ok = http_ok and str(res.get("code")) == "0"
             msg = str(res.get("resoultMsg") or res.get("msg") or res.get("errorMsg") or "")
             # 先处理明确失败状态（传输故障/业务拒绝），保留脱敏后的真实原因；
             # 不要把 TimeoutError/HTTP 500 一律报成「data 字段异常」

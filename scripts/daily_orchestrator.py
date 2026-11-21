@@ -271,7 +271,11 @@ class Orchestrator:
         if not unconf:
             try:
                 circuit_info, newly_tripped = record_task_outcome(tid, ok=ok, output=out or "")
-                suspended = bool(circuit_info.get("status") == "suspended")
+                # 权威写入未确认时 record_task_outcome 附 _CB_READ_FAILED：
+                # 内存态虽为 suspended 但远端未落盘，不得据此标 SUSPENDED
+                # （PR #34 终局自审：下游按 status 判定会绕过 tripped 防线）
+                suspended = (bool(circuit_info.get("status") == "suspended")
+                             and not circuit_info.get("_read_failed"))
             except Exception as exc:
                 print(f"WARN: circuit breaker 状态记录异常: {exc}", file=sys.stderr)
 

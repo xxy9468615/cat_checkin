@@ -1379,6 +1379,20 @@ class TestJindouExchange(unittest.TestCase):
         self.assertNotIn("13812345678", msg)
         self.assertIn("已售罄", msg)
 
+    def test_wheel_mixed_code1_resoult0_not_success(self):
+        """提交接口 code=1 + resoultCode="0" 混合响应不得判成功：
+        转盘提交成功码只认 code=0（PR #34 第十四轮评审）。"""
+        client = self._wheel_client(remain=3)
+        self._wheel_req(client, [
+            {"code": 1, "resoultCode": "0", "data": {"prizeName": "88金豆"}},
+        ])
+        with patch.object(telecom.time, "sleep", lambda *_: None), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            res = client.wheel_daily_draws()
+        self.assertNotIn("88金豆", res)
+        self.assertIn("提交故障", res)
+        self.assertEqual(len(self._wheel_submits), 1)
+
     def test_wheel_missing_creds_silent(self):
         """缺 sign/accId → 空串静默跳过（不重复刷屏）。"""
         client = self._client()
