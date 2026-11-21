@@ -41,7 +41,7 @@ class TestCircuitBreaker(unittest.TestCase):
         )
         def _save(tid, st):
             self.mock_state.update(st)
-            return True  # 权威写入确认（save_circuit_state 现返回 bool）
+            return True, True  # (本地写入成功, 权威写入确认)
 
         self.save_patch = mock.patch.object(
             circuit_breaker,
@@ -281,7 +281,7 @@ class TestCircuitBreaker(unittest.TestCase):
         不写停用结果记录、不宣称已停用（PR #34 第十三轮评审）。"""
         with mock.patch.object(circuit_breaker, "load_circuit_state",
                                return_value={"status": "active", "attempts": 8}), \
-             mock.patch.object(circuit_breaker, "save_circuit_state", return_value=False), \
+             mock.patch.object(circuit_breaker, "save_circuit_state", return_value=(True, False)), \
              mock.patch.object(circuit_breaker, "save_suspended_result_record") as m_rec, \
              mock.patch("discord_notify.notify_circuit_breaker") as m_notify, \
              mock.patch("builtins.print"):
@@ -306,7 +306,7 @@ class TestCircuitBreaker(unittest.TestCase):
         """第 8 次失败但权威写入未确认：just_tripped=False（不得虚报熔断）。"""
         today = circuit_breaker._bjt_today()
         self.mock_state = {"attempts": 7, "attempt_date": today, "status": "active"}
-        with mock.patch.object(circuit_breaker, "save_circuit_state", return_value=False):
+        with mock.patch.object(circuit_breaker, "save_circuit_state", return_value=(True, False)):
             st, tripped = circuit_breaker.record_task_outcome(self.test_task, ok=False)
         self.assertFalse(tripped)
         self.assertEqual(st["attempts"], 8)
@@ -315,10 +315,25 @@ class TestCircuitBreaker(unittest.TestCase):
         """resume 权威写入未确认：保留标记、不宣称上线（resume_all 排除）。"""
         with mock.patch.object(circuit_breaker, "load_circuit_state",
                                return_value={"status": "suspended", "circuit_broken": True}), \
-             mock.patch.object(circuit_breaker, "save_circuit_state", return_value=False), \
+             mock.patch.object(circuit_breaker, "save_circuit_state", return_value=(True, False)), \
              mock.patch("builtins.print"):
             st = circuit_breaker.resume_task("smzdm")
         self.assertTrue(st.get(circuit_breaker._CB_READ_FAILED))
+
+    def test_resume_local_write_failed_not_claim_local_effective(self):
+        """纯本地模式文件写失败 (False, False)：不得谎称「本地恢复已生效」，
+        应报「本地+远端均未落盘」（PR #34 第十五轮评审）。"""
+        import io
+        buf = io.StringIO()
+        with mock.patch.object(circuit_breaker, "load_circuit_state",
+                               return_value={"status": "suspended", "circuit_broken": True}), \
+             mock.patch.object(circuit_breaker, "save_circuit_state", return_value=(False, False)), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: buf.write(" ".join(str(x) for x in a) + "\n")):
+            st = circuit_breaker.resume_task("smzdm")
+        self.assertTrue(st.get(circuit_breaker._CB_READ_FAILED))
+        out = buf.getvalue()
+        self.assertNotIn("本地恢复已生效", out)
+        self.assertIn("均未落盘", out)
 
     def test_stale_local_cache_not_revive_suspended(self):
         """CI 缓存恢复到陈旧 active 本地文件，但 Redis 已有较新 suspended：
