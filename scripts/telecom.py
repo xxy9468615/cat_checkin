@@ -1048,7 +1048,11 @@ class TelecomClient:
             # 不要把 TimeoutError/HTTP 500 一律报成「data 字段异常」
             # （final review 指认）。
             if not ok:
-                if "已" in msg and ("抽" in msg or "兑" in msg or "完" in msg):
+                # 只认服务端明确的「次数耗尽」措辞；松散的「已」+「抽」组合会把
+                # 「抽奖请求已超时，请稍后重试」（传输故障）误判成「今日已抽」
+                # （PR #34 终局评审指认，规则 9a(1)：杜绝字符串启发式假成功）
+                if any(p in msg for p in ("次数已用完", "次数已用尽", "已抽完",
+                                          "今日已抽", "抽奖次数已")):
                     if not prizes:
                         stop_note = "今日已抽"
                     break

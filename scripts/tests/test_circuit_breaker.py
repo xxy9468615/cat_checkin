@@ -166,7 +166,8 @@ class TestCircuitBreaker(unittest.TestCase):
 
         # 批量恢复
         with mock.patch.object(circuit_breaker, "is_task_suspended", side_effect=lambda tid: tid == "agentrouter"):
-            with mock.patch.object(circuit_breaker, "resume_task") as mock_resume:
+            with mock.patch.object(circuit_breaker, "resume_task",
+                                   return_value={"status": "active"}) as mock_resume:
                 resumed = circuit_breaker.resume_all_tasks()
                 self.assertIn("agentrouter", resumed)
                 mock_resume.assert_called_once()
@@ -414,6 +415,41 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
         # 只含非持久化失败标记，无迁移字段
         self.assertEqual(st, {circuit_breaker._CB_READ_FAILED: True})
         m_legacy.assert_not_called()
+
+    def test_legacy_read_failure_marker_propagates(self):
+        """cb 键确认缺键但旧 notify 键读取失败：标记必须传播为 fail-closed，
+        不得据残缺 legacy 数据迁移（PR #34 终局评审）。"""
+        legacy = {circuit_breaker._CB_READ_FAILED: True}
+        with mock.patch.object(circuit_breaker, "_load_cb_state_raw",
+                               return_value=({}, True, False)), \
+             mock.patch.object(circuit_breaker, "_legacy_notify_state", return_value=legacy):
+            st = circuit_breaker.load_circuit_state("smzdm")
+            self.assertEqual(st, {circuit_breaker._CB_READ_FAILED: True})
+            self.assertTrue(circuit_breaker.is_task_suspended("smzdm"))
+
+    def test_resume_task_read_failure_keeps_marker(self):
+        """resume 读取失败：保留标记返回、绝不写盘（fail-closed）。"""
+        with mock.patch.object(circuit_breaker, "load_circuit_state",
+                               return_value={circuit_breaker._CB_READ_FAILED: True}), \
+             mock.patch.object(circuit_breaker, "save_circuit_state") as m_save, \
+             mock.patch("builtins.print"):
+            st = circuit_breaker.resume_task("smzdm")
+        self.assertTrue(st.get(circuit_breaker._CB_READ_FAILED))
+        m_save.assert_not_called()
+
+    def test_resume_all_excludes_read_failed(self):
+        """resume all：读取失败被拒绝的任务不得计入 resumed 列表
+        （PR #34 终局评审）。"""
+        def fake_resume(tid, reason=""):
+            if tid == "smzdm":
+                return {circuit_breaker._CB_READ_FAILED: True}
+            return {"status": "active"}
+
+        with mock.patch.object(circuit_breaker, "is_task_suspended", return_value=True), \
+             mock.patch.object(circuit_breaker, "resume_task", side_effect=fake_resume):
+            resumed = circuit_breaker.resume_all_tasks()
+        self.assertNotIn("smzdm", resumed)
+        self.assertTrue(resumed, "其余任务应正常恢复")
 
     def test_migration_when_absence_confirmed(self):
         """确认缺键（纯本地模式文件缺失 / Redis 明确返回 nil）仍正常迁移。"""

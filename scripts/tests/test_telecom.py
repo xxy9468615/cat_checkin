@@ -1327,6 +1327,21 @@ class TestJindouExchange(unittest.TestCase):
         self.assertEqual(res, "88金豆")
         self.assertEqual(len(self._wheel_submits), 2)
 
+    def test_wheel_timeout_msg_not_reported_as_drawn(self):
+        """「抽奖请求已超时，请稍后重试」是传输故障，不得因含「已」「抽」
+        误判为「今日已抽」（PR #34 终局评审，规则 9a(1)）。"""
+        client = self._wheel_client(remain=3)
+        self._wheel_req(client, [
+            {"code": 500, "msg": "抽奖请求已超时，请稍后重试", "data": {}},
+        ])
+        with patch.object(telecom.time, "sleep", lambda *_: None), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            res = client.wheel_daily_draws()
+        self.assertIn("提交故障", res)
+        self.assertIn("超时", res)
+        self.assertNotIn("今日已抽", res)
+        self.assertEqual(len(self._wheel_submits), 1, "故障后不得继续提交")
+
     def test_wheel_missing_creds_silent(self):
         """缺 sign/accId → 空串静默跳过（不重复刷屏）。"""
         client = self._client()

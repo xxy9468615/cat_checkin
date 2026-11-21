@@ -79,13 +79,24 @@ _CB_OWNED_FIELDS = (
 
 
 def _legacy_notify_state(task_id: str) -> Dict[str, Any]:
-    """读取旧版共用的 notify 状态（只读迁移源，不回写）。"""
+    """读取旧版共用的 notify 状态（只读迁移源，不回写）。
+
+    与 cb 键同契约区分「确认不存在」与「读取失败」：notify 键读取失败时
+    返回 _CB_READ_FAILED 标记（调用方禁止据此初始化写入），确认不存在
+    时返回空 dict 允许初始化（PR #34 终局评审指认）。
+    """
     prefix = (os.getenv("CAT_CHECKIN_REDIS_PREFIX") or "cat_checkin:").rstrip(":")
-    try:
-        data = load_kv_state(f"{prefix}:state:notify:{task_id}", f".notify_state_{task_id}.json")
-        return dict(data) if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    key = f"{prefix}:state:notify:{task_id}"
+    state_file = f".notify_state_{task_id}.json"
+    state, confirmed_absent, read_failed = _load_cb_state_raw(key, state_file)
+    if read_failed:
+        state = dict(state)
+        state[_CB_READ_FAILED] = True
+        return state
+    if not state and not confirmed_absent:
+        # 键存在但值无法解析：同样不可作为初始化依据
+        return {_CB_READ_FAILED: True}
+    return state
 
 
 # 内部标记：读取失败（无法确认状态）时附加在返回字典上，绝不持久化。
@@ -166,7 +177,12 @@ def load_circuit_state(task_id: str) -> Dict[str, Any]:
     state, confirmed_absent, read_failed = _load_cb_state_raw(redis_key, state_file)
     if not state and confirmed_absent and not read_failed:
         legacy = _legacy_notify_state(task_id)
-        state = {k: legacy[k] for k in _CB_OWNED_FIELDS if k in legacy}
+        if legacy.get(_CB_READ_FAILED):
+            # 旧 notify 键读取失败：同样 fail-closed，不得据残缺数据迁移
+            # （标记不在 _CB_OWNED_FIELDS 中，必须显式传播，PR #34 终局评审）
+            read_failed = True
+        else:
+            state = {k: legacy[k] for k in _CB_OWNED_FIELDS if k in legacy}
     if read_failed:
         # 非持久化标记：调用方据此 fail-closed（不调度、不覆盖写入）
         state = dict(state)
@@ -295,7 +311,9 @@ def resume_task(task_id: str, reason: str = "人工修复后重新上线") -> Di
     读取失败时拒绝写入（无法确认真实状态，避免标记污染持久状态）。
     """
     state = load_circuit_state(task_id)
-    if state.pop(_CB_READ_FAILED, None):
+    if state.get(_CB_READ_FAILED):
+        # 保留标记返回：调用方（resume_all_tasks）据此区分「拒绝写入」与
+        # 「成功恢复」，不得把失败任务计入 resumed（PR #34 终局评审）
         print(f"⚠️ [CIRCUIT_BREAKER] [{task_id}] 状态读取失败，拒绝 resume 写入（fail-closed）",
               file=sys.stderr)
         return state
@@ -317,8 +335,9 @@ def resume_all_tasks(reason: str = "人工全量重新上线") -> List[str]:
     resumed = []
     for tid in TASKS.keys():
         if is_task_suspended(tid):
-            resume_task(tid, reason=reason)
-            resumed.append(tid)
+            st = resume_task(tid, reason=reason)
+            if not st.get(_CB_READ_FAILED):
+                resumed.append(tid)
     return resumed
 
 
