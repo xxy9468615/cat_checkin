@@ -139,9 +139,10 @@ class PlanModeTests(unittest.TestCase):
         telecom-exchange 的「场次窗口前 30 分钟」自排程因此从未生效）。"""
         captured = {}
 
-        def fake_load(redis_key, state_file):
+        def fake_load(redis_key, state_file, **kw):
             captured["redis_key"] = redis_key
             captured["state_file"] = state_file
+            captured["local_authoritative"] = kw.get("local_authoritative", False)
             return {"last_credit_ts": time.time() - 3600}
 
         cfg = {"id": "telecom-exchange", "sched": {"type": "rolling", "period_h": 24}}
@@ -152,6 +153,8 @@ class PlanModeTests(unittest.TestCase):
         self.assertIsNotNone(due_at)
         self.assertEqual(captured["redis_key"], "cat_checkin:state:rolling:telecom-exchange")
         self.assertEqual(captured["state_file"], ".rolling_state_telecom-exchange.json")
+        self.assertTrue(captured["local_authoritative"],
+                        "rolling 冷却本地新写入不得被远端旧值覆盖（PR #34 终局自审）")
 
     def test_cooldown_due_at_legacy_notify_key_fallback(self):
         """新 rolling 键无状态时只读回退旧 notify 键的 last_credit_ts。
@@ -161,7 +164,7 @@ class PlanModeTests(unittest.TestCase):
         calls = []
         fixed_ts = 1750000000.0
 
-        def fake_load(redis_key, state_file):
+        def fake_load(redis_key, state_file, **kw):
             calls.append((redis_key, state_file))
             if "state:rolling:" in redis_key:
                 return {}
@@ -183,7 +186,7 @@ class PlanModeTests(unittest.TestCase):
         calls = []
         fixed_ts = 1750000000.0
 
-        def fake_load(redis_key, state_file):
+        def fake_load(redis_key, state_file, **kw):
             calls.append((redis_key, state_file))
             if "state:rolling:" in redis_key:
                 return {"last_credit_ts": "corrupted_timestamp"}
@@ -247,15 +250,23 @@ class PlanModeTests(unittest.TestCase):
         self.assertIn("52pojie", due)
 
     def test_auto_plan_skips_tasks_in_backoff(self):
-        """今日失败但处于退避等待期（next_retry_at > now）的任务跳过，等待下次到期。"""
-        now = time.time()
-        today = orch_mod.bjt_now().strftime("%Y-%m-%d")
+        """今日失败但处于退避等待期（next_retry_at > now）的任务跳过，等待下次到期。
+
+        固定时钟：构造 fake_circuit 与 plan_due_tasks 内部取 today/now 必须
+        同源，否则跨北京时间午夜时 attempt_date 失配、退避断言假红
+        （PR #34 第十三轮评审指认）。"""
+        from datetime import datetime, timezone
+        fixed_dt = datetime(2026, 11, 19, 14, 0, 0, tzinfo=orch_mod.BJT)
+        now = fixed_dt.timestamp()
+        today = fixed_dt.strftime("%Y-%m-%d")
         fake_circuit = {
             "attempt_date": today,
             "attempts": 2,
             "next_retry_at": now + 1800,  # 30 分钟后到期
         }
-        with patch.object(orch_mod, "_get_today_successful_tasks", return_value=set()), \
+        with patch.object(orch_mod, "bjt_now", return_value=fixed_dt), \
+             patch.object(orch_mod.time, "time", return_value=now), \
+             patch.object(orch_mod, "_get_today_successful_tasks", return_value=set()), \
              patch.object(orch_mod, "is_task_suspended", return_value=False), \
              patch.object(orch_mod, "_cooldown_due_at", return_value=None), \
              patch.object(orch_mod, "load_circuit_state",
@@ -263,6 +274,50 @@ class PlanModeTests(unittest.TestCase):
             due = plan_due_tasks("", due_only=False)
         self.assertNotIn("52pojie", due, "处于重试退避冷却期的任务不应立即到期")
         self.assertIn("alipan", due)
+
+    def test_auto_plan_rolling_success_does_not_block_next_window(self):
+        """rolling 任务白天终局（ok=True）不得屏蔽当晚 23:30 的次日 0 点场预检
+        （PR #34 评审）：成功日期属于上一场次；冷却到期检查仍然生效。"""
+        with patch.object(orch_mod, "_get_today_successful_tasks",
+                          return_value={"telecom-exchange", "glados"}), \
+             patch.object(orch_mod, "is_task_suspended", return_value=False), \
+             patch.object(orch_mod, "_cooldown_due_at", return_value=None), \
+             patch.object(orch_mod, "load_circuit_state", return_value={}):
+            due = plan_due_tasks("", due_only=False)
+        self.assertIn("telecom-exchange", due, "rolling 自排程到期优先于今日成功去重")
+        self.assertNotIn("glados", due, "常规任务今日成功仍跳过")
+
+    def test_auto_plan_rolling_cooldown_still_blocks(self):
+        """rolling 豁免只针对「今日成功」去重：冷却未到期仍拦截。"""
+        with patch.object(orch_mod, "_get_today_successful_tasks",
+                          return_value={"telecom-exchange"}), \
+             patch.object(orch_mod, "is_task_suspended", return_value=False), \
+             patch.object(orch_mod, "_cooldown_due_at",
+                          side_effect=lambda cfg: time.time() + 3600
+                          if cfg["id"] == "telecom-exchange" else None), \
+             patch.object(orch_mod, "load_circuit_state", return_value={}):
+            due = plan_due_tasks("", due_only=False)
+        self.assertNotIn("telecom-exchange", due)
+
+    def test_auto_plan_rolling_ignores_framework_backoff(self):
+        """rolling 任务节奏由自排程 due_at 全权决定：框架退避梯子不得把
+        23:30 预检推迟到梯子时刻（PR #34 评审配套）。固定时钟防跨午夜假红。"""
+        from datetime import datetime
+        fixed_dt = datetime(2026, 11, 19, 14, 0, 0, tzinfo=orch_mod.BJT)
+        now = fixed_dt.timestamp()
+        today = fixed_dt.strftime("%Y-%m-%d")
+        fake_circuit = {"attempt_date": today, "attempts": 2, "next_retry_at": now + 1800}
+        with patch.object(orch_mod, "bjt_now", return_value=fixed_dt), \
+             patch.object(orch_mod.time, "time", return_value=now), \
+             patch.object(orch_mod, "_get_today_successful_tasks", return_value=set()), \
+             patch.object(orch_mod, "is_task_suspended", return_value=False), \
+             patch.object(orch_mod, "_cooldown_due_at", return_value=None), \
+             patch.object(orch_mod, "load_circuit_state",
+                          side_effect=lambda tid: fake_circuit
+                          if tid in ("telecom-exchange", "52pojie") else {}):
+            due = plan_due_tasks("", due_only=False)
+        self.assertIn("telecom-exchange", due, "rolling 到期不受框架退避梯子约束")
+        self.assertNotIn("52pojie", due, "常规任务退避梯子仍然生效")
 
     def test_auto_plan_due_only_night_skips_regular_tasks(self):
         """夜间（00:00~06:59 BJT）心跳模式：不偷跑常规单日任务，仅允许 rolling 任务。"""

@@ -1379,11 +1379,23 @@ def ex_telecom(output: str, res: Dict[str, Any]) -> None:
         mm = re.search(r"• 抽奖:\s*【(.+?)】", ln)
         if mm:
             lottery_txt = mm.group(1)
-            if lottery_txt and lottery_txt not in ("今日已抽", "无抽奖凭据"):
-                cur.parts.append(f"抽奖: {lottery_txt}")
-                res["badges"].append(("reward", f"抽奖 {lottery_txt}"))
-            elif lottery_txt == "今日已抽":
+            # 生产者把 wapact 免费转盘与签到大转盘用「；」合并：逐段判定，
+            # 真实奖品段进 reward 徽章，故障/字段异常段只进摘要不进徽章
+            # （PR #34 第十四轮评审：整段含故障关键词会吞掉另一活动的真实奖品）
+            _FAIL_KW = ("故障", "字段异常", "查询失败", "未开放")
+            reward_segs = []
+            for seg in lottery_txt.split("；"):
+                seg = seg.strip()
+                if not seg or seg in ("今日已抽", "无抽奖凭据"):
+                    continue
+                if not any(k in seg for k in _FAIL_KW):
+                    reward_segs.append(seg)
+            if lottery_txt == "今日已抽":
                 cur.parts.append("抽奖已完成")
+            elif lottery_txt:
+                cur.parts.append(f"抽奖: {lottery_txt}")
+                if reward_segs:
+                    res["badges"].append(("reward", f"抽奖 {'；'.join(reward_segs)}"))
             continue
         mm = re.search(r"• 任务:\s*【(.+?)】", ln)
         if mm:
@@ -1400,9 +1412,9 @@ def ex_telecom(output: str, res: Dict[str, Any]) -> None:
             cur.parts.append(f"金豆 {_d(mm.group(1))}")
             res["assets"].append(("金豆", _f(mm.group(1))))
             continue
-        mm = re.search(r"• 目标:\s*【(.+?)】", ln)
-        if mm:
-            cur.parts.append(f"目标: {mm.group(1)}")
+        # 「• 目标:」行已随 10元话费达标兑换机制下线移除（2026-11-19）；
+        # 旧结果缓存（14 天 TTL）里可能残留该行，静默忽略不展示。
+        if re.search(r"• 目标:\s*【", ln):
             continue
         mm = re.search(r"• 赢花费:\s*【(.+?)】", ln)
         if mm:
