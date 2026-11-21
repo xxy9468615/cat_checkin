@@ -427,6 +427,25 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
             self.assertEqual(st, {circuit_breaker._CB_READ_FAILED: True})
             self.assertTrue(circuit_breaker.is_task_suspended("smzdm"))
 
+    def test_legacy_valid_empty_dict_allows_init(self):
+        """旧 notify 键存在且为合法空字典 {}：读取成功（非缺键非失败），
+        不得判为读取失败，任务可正常初始化（PR #34 第十一轮评审）。"""
+        with mock.patch.object(circuit_breaker, "_load_cb_state_raw",
+                               return_value=({}, False, False)):
+            st = circuit_breaker._legacy_notify_state("smzdm")
+        self.assertEqual(st, {})
+        self.assertNotIn(circuit_breaker._CB_READ_FAILED, st)
+        # 经 load 迁移分支：cb 确认缺键 + legacy 合法空 → 可初始化空态
+        def fake_raw(redis_key, state_file):
+            if ":cb:" in redis_key:
+                return {}, True, False
+            return {}, False, False  # notify 键存在，值为合法 {}
+
+        with mock.patch.object(circuit_breaker, "_load_cb_state_raw", side_effect=fake_raw):
+            st = circuit_breaker.load_circuit_state("smzdm")
+            self.assertEqual(st, {})
+            self.assertFalse(circuit_breaker.is_task_suspended("smzdm"))
+
     def test_resume_task_read_failure_keeps_marker(self):
         """resume 读取失败：保留标记返回、绝不写盘（fail-closed）。"""
         with mock.patch.object(circuit_breaker, "load_circuit_state",

@@ -93,9 +93,9 @@ def _legacy_notify_state(task_id: str) -> Dict[str, Any]:
         state = dict(state)
         state[_CB_READ_FAILED] = True
         return state
-    if not state and not confirmed_absent:
-        # 键存在但值无法解析：同样不可作为初始化依据
-        return {_CB_READ_FAILED: True}
+    # 读取成功即有效：合法空字典 {}（键存在但无 owned 字段）允许正常初始化；
+    # 无效 JSON / 读取异常已由 _load_cb_state_raw 归入 read_failed
+    # （PR #34 第十一轮评审指认，不得把有效空态判为读取失败）
     return state
 
 
