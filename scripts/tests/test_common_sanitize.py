@@ -7,14 +7,90 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
 import common
+
+
+class TestKvStateWriteConfirmation(unittest.TestCase):
+    """save_kv_state 返回 (本地写入成功, 权威写入确认)；load_kv_state
+    local_authoritative 模式本地有效时不被远端旧值覆盖（PR #34 第十三轮）。"""
+
+    def test_save_local_mode_confirms_on_local_write(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                local_ok, confirmed = common.save_kv_state("k", path, {"a": 1})
+            self.assertTrue(local_ok)
+            self.assertTrue(confirmed)
+        finally:
+            os.unlink(path)
+
+    def test_save_redis_set_failure_not_confirmed(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            with mock.patch.dict(os.environ, {"UPSTASH_REDIS_REST_URL": "https://fake",
+                                              "UPSTASH_REDIS_REST_TOKEN": "V1.0FAKEtok"}, clear=False), \
+                 mock.patch.object(common, "upstash_redis_command", return_value=(False, "err")):
+                local_ok, confirmed = common.save_kv_state("k", path, {"a": 1})
+            self.assertTrue(local_ok)
+            self.assertFalse(confirmed, "Redis SET 失败时权威写入未确认")
+        finally:
+            os.unlink(path)
+
+    def test_save_redis_ok_confirmed(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            with mock.patch.dict(os.environ, {"UPSTASH_REDIS_REST_URL": "https://fake",
+                                              "UPSTASH_REDIS_REST_TOKEN": "V1.0FAKEtok"}, clear=False), \
+                 mock.patch.object(common, "upstash_redis_command", return_value=(True, {"result": "OK"})):
+                local_ok, confirmed = common.save_kv_state("k", path, {"a": 1})
+            self.assertTrue(local_ok)
+            self.assertTrue(confirmed)
+        finally:
+            os.unlink(path)
+
+    def test_load_local_authoritative_skips_stale_remote(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write('{"last_credit_ts": 200}')
+            path = f.name
+        try:
+            with mock.patch.object(common, "upstash_redis_command",
+                                   return_value=(True, {"result": '{"last_credit_ts": 100}'})) as m_get:
+                state = common.load_kv_state("k", path, local_authoritative=True)
+            self.assertEqual(state["last_credit_ts"], 200)
+            m_get.assert_not_called()
+        finally:
+            os.unlink(path)
+
+    def test_load_default_remote_still_wins(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write('{"v": 1}')
+            path = f.name
+        try:
+            with mock.patch.dict(os.environ, {"UPSTASH_REDIS_REST_URL": "https://fake",
+                                              "UPSTASH_REDIS_REST_TOKEN": "V1.0FAKEtok"}, clear=False), \
+                 mock.patch.object(common, "upstash_redis_command",
+                                   return_value=(True, {"result": '{"v": 2}'})):
+                state = common.load_kv_state("k", path)
+            self.assertEqual(state["v"], 2, "默认模式远端优先语义不变")
+        finally:
+            os.unlink(path)
 
 
 class TestSanitizeSnippet(unittest.TestCase):

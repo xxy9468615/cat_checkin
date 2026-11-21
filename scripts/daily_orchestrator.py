@@ -185,7 +185,11 @@ def _cooldown_due_at(cfg: Dict[str, Any]) -> Optional[float]:
     prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
     try:
         from common import load_kv_state
-        state = load_kv_state(f"{prefix}:state:rolling:{task_id}", f".rolling_state_{task_id}.json")
+        # rolling 冷却是整份替换型时间戳：本地新写入不得被远端旧值覆盖
+        # （Redis SET 失败时远端仍是上一场时间戳，默认合并会让冷却静默失效，
+        # 任务每 30 分钟被心跳反复拉起直至熔断——PR #34 终局自审指认）
+        state = load_kv_state(f"{prefix}:state:rolling:{task_id}",
+                              f".rolling_state_{task_id}.json", local_authoritative=True)
         try:
             ts = float(state.get("last_credit_ts") or 0)
         except (TypeError, ValueError):

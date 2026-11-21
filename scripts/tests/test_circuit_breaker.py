@@ -39,10 +39,14 @@ class TestCircuitBreaker(unittest.TestCase):
         self.load_patch = mock.patch.object(
             circuit_breaker, "load_circuit_state", side_effect=lambda tid: dict(self.mock_state)
         )
+        def _save(tid, st):
+            self.mock_state.update(st)
+            return True  # 权威写入确认（save_circuit_state 现返回 bool）
+
         self.save_patch = mock.patch.object(
             circuit_breaker,
             "save_circuit_state",
-            side_effect=lambda tid, st: self.mock_state.update(st),
+            side_effect=_save,
         )
         self.save_record_patch = mock.patch.object(
             circuit_breaker, "save_suspended_result_record", return_value=None
@@ -272,6 +276,50 @@ class TestCircuitBreaker(unittest.TestCase):
         self.assertIn("smzdm", res["tripped"])
         self.assertNotIn("smzdm", res["suspended"])
 
+    def test_trip_write_unconfirmed_not_reported(self):
+        """熔断权威写入未确认（Redis SET 失败）：trip 保留失败标记返回，
+        不写停用结果记录、不宣称已停用（PR #34 第十三轮评审）。"""
+        with mock.patch.object(circuit_breaker, "load_circuit_state",
+                               return_value={"status": "active", "attempts": 8}), \
+             mock.patch.object(circuit_breaker, "save_circuit_state", return_value=False), \
+             mock.patch.object(circuit_breaker, "save_suspended_result_record") as m_rec, \
+             mock.patch("discord_notify.notify_circuit_breaker") as m_notify, \
+             mock.patch("builtins.print"):
+            st = circuit_breaker.trip_circuit_breaker("smzdm")
+        self.assertTrue(st.get(circuit_breaker._CB_READ_FAILED))
+        m_rec.assert_not_called()
+        m_notify.assert_not_called()
+
+    def test_evaluate_tripped_requires_confirmed_write(self):
+        """补触发熔断时权威写入未确认：不得计入 tripped（远端仍是 active）。"""
+        today = circuit_breaker._bjt_today()
+        st = {"attempt_date": today, "attempts": 8, "status": "active"}
+        with mock.patch.object(circuit_breaker, "load_circuit_state", return_value=dict(st)), \
+             mock.patch.object(circuit_breaker, "trip_circuit_breaker",
+                               return_value={"status": "suspended", circuit_breaker._CB_READ_FAILED: True}), \
+             mock.patch.object(circuit_breaker, "_bjt_now_ts", return_value=1750000000.0):
+            res = circuit_breaker.evaluate_retry_candidates("smzdm")
+        self.assertNotIn("smzdm", res["tripped"])
+        self.assertIn("smzdm", res["suspended"])
+
+    def test_record_outcome_trip_requires_confirmed_write(self):
+        """第 8 次失败但权威写入未确认：just_tripped=False（不得虚报熔断）。"""
+        today = circuit_breaker._bjt_today()
+        self.mock_state = {"attempts": 7, "attempt_date": today, "status": "active"}
+        with mock.patch.object(circuit_breaker, "save_circuit_state", return_value=False):
+            st, tripped = circuit_breaker.record_task_outcome(self.test_task, ok=False)
+        self.assertFalse(tripped)
+        self.assertEqual(st["attempts"], 8)
+
+    def test_resume_write_unconfirmed_keeps_marker(self):
+        """resume 权威写入未确认：保留标记、不宣称上线（resume_all 排除）。"""
+        with mock.patch.object(circuit_breaker, "load_circuit_state",
+                               return_value={"status": "suspended", "circuit_broken": True}), \
+             mock.patch.object(circuit_breaker, "save_circuit_state", return_value=False), \
+             mock.patch("builtins.print"):
+            st = circuit_breaker.resume_task("smzdm")
+        self.assertTrue(st.get(circuit_breaker._CB_READ_FAILED))
+
     def test_trip_read_failure_keeps_marker(self):
         """trip 读取失败：保留标记返回、绝不写盘（fail-closed）。"""
         with mock.patch.object(circuit_breaker, "load_circuit_state",
@@ -404,6 +452,7 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
 
         def fake_save(redis_key, state_file, state):
             store[redis_key] = dict(state)
+            return True, True  # (本地写入成功, 权威写入确认)
 
         with mock.patch.object(circuit_breaker, "_load_cb_state_raw", side_effect=fake_raw), \
              mock.patch.object(circuit_breaker, "save_kv_state", side_effect=fake_save), \
@@ -560,8 +609,10 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
         self.assertEqual(state, {})
         self.assertFalse(absent)
 
-    def test_raw_redis_data_wins_over_local(self):
-        """Redis 有数据时远端权威（覆盖本地），不迁移。"""
+    def test_raw_local_valid_not_overwritten_by_stale_remote(self):
+        """cb 字典是整份替换型快照：本地文件有效时不被远端旧值覆盖——
+        「本地熔断写入成功 + Redis SET 失败」后远端 active 不得抹掉本地
+        suspended（PR #34 第十三轮评审指认）。"""
         import tempfile
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             f.write('{"status": "suspended", "attempts": 8}')
@@ -572,10 +623,24 @@ class TestCircuitStateKeyIsolation(unittest.TestCase):
                  mock.patch.object(circuit_breaker, "upstash_redis_command",
                                    return_value=(True, {"result": '{"status": "active", "attempts": 0}'})):
                 state, absent, failed = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", path)
-            self.assertEqual(state["status"], "active")
+            self.assertEqual(state["status"], "suspended")
+            self.assertEqual(state["attempts"], 8)
             self.assertFalse(absent)
+            self.assertFalse(failed)
         finally:
             os.unlink(path)
+
+    def test_raw_remote_restores_when_local_absent(self):
+        """本地文件缺失时远端仍是恢复源（既有语义不回归）。"""
+        with mock.patch.dict(os.environ, {"UPSTASH_REDIS_REST_URL": "https://fake",
+                                          "UPSTASH_REDIS_REST_TOKEN": "V1.0FAKEtok"}, clear=False), \
+             mock.patch("os.path.exists", return_value=False), \
+             mock.patch.object(circuit_breaker, "upstash_redis_command",
+                               return_value=(True, {"result": '{"status": "active", "attempts": 0}'})):
+            state, absent, failed = circuit_breaker._load_cb_state_raw("cat_checkin:cb:x", ".cb_state_x.json")
+        self.assertEqual(state["status"], "active")
+        self.assertFalse(absent)
+        self.assertFalse(failed)
 
     def test_raw_redis_non_dict_value_no_migration(self):
         """键存在但值结构不符（如 "[]"）：不是缺键，禁止迁移

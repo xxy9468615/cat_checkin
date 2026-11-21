@@ -1342,6 +1342,43 @@ class TestJindouExchange(unittest.TestCase):
         self.assertNotIn("今日已抽", res)
         self.assertEqual(len(self._wheel_submits), 1, "故障后不得继续提交")
 
+    def test_wheel_non_200_with_code0_not_success(self):
+        """HTTP 非 200 即使正文带 code:0 + prizeName 也不得判成功
+        （网关错误页可能回显业务字段，PR #34 第十三轮评审）。"""
+        client = self._wheel_client(remain=3)
+        self._wheel_req(client, [
+            {"code": 0, "_http_status": 502, "data": {"prizeName": "88金豆"}},
+        ])
+        with patch.object(telecom.time, "sleep", lambda *_: None), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            res = client.wheel_daily_draws()
+        self.assertIn("提交故障", res)
+        self.assertNotIn("88金豆", res)
+        self.assertEqual(len(self._wheel_submits), 1)
+
+    def test_wheel_server_msg_pii_redacted_before_truncate(self):
+        """服务端原始 msg 含裸手机号：必须先全文 PII 脱敏再截断，
+        不得把完整号码带进公开日志/日报（PR #34 终局自审）。"""
+        client = self._wheel_client(remain=3)
+        self._wheel_req(client, [
+            {"code": 1, "msg": "账号13812345678抽奖失败，请稍后重试", "data": {}},
+        ])
+        with patch.object(telecom.time, "sleep", lambda *_: None), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            res = client.wheel_daily_draws()
+        self.assertNotIn("13812345678", res)
+        self.assertIn("提交故障", res)
+
+    def test_rights_terminal_msg_pii_redacted(self):
+        """等级权益终局文案（售罄/限兑）里的裸手机号同样必须脱敏。"""
+        client = self._rights_client()
+        ok, msg = self._run_rights(client, receive_results=[
+            {"resoultCode": "1", "resoultMsg": "账号13812345678已抢光，请下次再来"},
+        ])
+        self.assertTrue(ok)
+        self.assertNotIn("13812345678", msg)
+        self.assertIn("已售罄", msg)
+
     def test_wheel_missing_creds_silent(self):
         """缺 sign/accId → 空串静默跳过（不重复刷屏）。"""
         client = self._client()

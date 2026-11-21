@@ -151,6 +151,13 @@ def _load_cb_state_raw(redis_key: str, state_file: str) -> Tuple[Dict[str, Any],
             try:
                 remote = json.loads(raw_val)
                 if isinstance(remote, dict):
+                    if local_ok:
+                        # cb 字典是整份替换型快照：本地文件有效时不被远端旧值
+                        # 逐字段覆盖——否则「本地熔断写入成功 + Redis SET 失败」
+                        # 后远端 circuit_broken=False 会抹掉本地停用标记，任务
+                        # 复活（PR #34 第十三轮评审指认）。远端仅在本地缺失时
+                        # 作为恢复源。
+                        return state, False, False
                     state.update(remote)
                     return state, False, False
             except Exception:
@@ -190,15 +197,18 @@ def load_circuit_state(task_id: str) -> Dict[str, Any]:
     return state
 
 
-def save_circuit_state(task_id: str, state: Dict[str, Any]) -> None:
-    """双通道持久化指定任务的重试与熔断状态字典。
+def save_circuit_state(task_id: str, state: Dict[str, Any]) -> bool:
+    """双通道持久化指定任务的重试与熔断状态字典，返回权威写入是否确认。
 
     保存边界强制剔除内部标记（_read_failed 绝不落盘）。读取失败时
     写入入口应停止调用本函数；此处的过滤是最后一道防线。
+    权威确认语义见 common.save_kv_state：配置 Redis 时必须 SET 成功，
+    纯本地模式本地写入成功即确认（PR #34 第十三轮评审指认）。
     """
     redis_key, state_file = _state_paths(task_id)
     clean = {k: v for k, v in state.items() if k != _CB_READ_FAILED}
-    save_kv_state(redis_key, state_file, clean)
+    _local_ok, confirmed = save_kv_state(redis_key, state_file, clean)
+    return confirmed
 
 
 def is_task_suspended(task_id: str) -> bool:
@@ -289,7 +299,14 @@ def trip_circuit_breaker(
     state["suspended_at"] = now_iso
     state["suspend_reason"] = reason
     state["updated_at"] = now_iso
-    save_circuit_state(task_id, state)
+    if not save_circuit_state(task_id, state):
+        # 权威写入未确认（Redis SET 失败）：不得宣称已停用——远端仍是旧状态，
+        # 下次读取会还原本任务为 active。保留失败标记交调用方 fail-closed
+        # （PR #34 第十三轮评审指认）
+        print(f"⚠️ [CIRCUIT_BREAKER] [{task_id}] 熔断状态权威写入未确认，不报告停用（fail-closed）",
+              file=sys.stderr)
+        state[_CB_READ_FAILED] = True
+        return state
     save_suspended_result_record(task_id, reason)
     print(f"🚨 [CIRCUIT_BREAKER] 任务 [{task_id}] 已触发熔断停用！原因: {reason}")
     try:
@@ -328,7 +345,13 @@ def resume_task(task_id: str, reason: str = "人工修复后重新上线") -> Di
     state["attempts"] = 0
     state["next_retry_at"] = None
     state["updated_at"] = now_iso
-    save_circuit_state(task_id, state)
+    if not save_circuit_state(task_id, state):
+        # 权威写入未确认：不得宣称已恢复（远端仍是熔断态），保留标记
+        # 让 resume_all_tasks 排除本任务（PR #34 第十三轮评审指认）
+        print(f"⚠️ [CIRCUIT_BREAKER] [{task_id}] 恢复状态权威写入未确认，不报告上线（fail-closed）",
+              file=sys.stderr)
+        state[_CB_READ_FAILED] = True
+        return state
     print(f"🔄 [CIRCUIT_BREAKER] 任务 [{task_id}] 已重新上线（{reason}）")
     return state
 
@@ -388,7 +411,9 @@ def record_task_outcome(
         state["suspended_at"] = None
         state["suspend_reason"] = None
         state["next_retry_at"] = None
-        save_circuit_state(task_id, state)
+        if not save_circuit_state(task_id, state):
+            print(f"⚠️ [CIRCUIT_BREAKER] [{task_id}] 成功状态权威写入未确认（远端可能仍是旧失败态）",
+                  file=sys.stderr)
         return state, False
 
     # 任务失败
@@ -417,7 +442,11 @@ def record_task_outcome(
             f"安排在 {next_dt_str} BJT（{int(delay_sec // 60)} 分钟后）进行下次重试"
         )
 
-    save_circuit_state(task_id, state)
+    if not save_circuit_state(task_id, state):
+        # 权威写入未确认：不得报告刚触发熔断（远端仍是旧状态，下次读取会还原）
+        print(f"⚠️ [CIRCUIT_BREAKER] [{task_id}] 状态权威写入未确认，不报告熔断触发（fail-closed）",
+              file=sys.stderr)
+        just_tripped = False
     return state, just_tripped
 
 

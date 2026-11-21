@@ -50,10 +50,11 @@ from common import (
     main_guard,
     mask_str,
     parse_proxies_text,
+    redact_pii,
     sanitize_snippet,
     save_kv_state,
 )
-from circuit_breaker import trip_circuit_breaker
+from circuit_breaker import _CB_READ_FAILED, trip_circuit_breaker
 
 # 加密库：金豆中心接口依赖 RSA-1024 与 AES-ECB / 3DES
 try:
@@ -128,6 +129,13 @@ WHEEL_STATUS_URL = "https://wappark.189.cn/jt-sign/activity/getWheelStatusAndInf
 WHEEL_SUBMIT_URL = "https://wappark.189.cn/jt-sign/activity/wheelRewardSubmit"
 WHEEL_PROVINCE_CODE = "600202"  # 随账号归属省固定（与 getSingle 抓包值同源）
 WHEEL_MAX_DRAWS = 3  # 服务端 userMaximum 为准，此值仅作上限护栏
+
+
+def _safe_msg(text: str, limit: int) -> str:
+    """服务端原始文案进公开日志/日报前的双重脱敏：先全文 PII（裸手机号/邮箱）
+    + 凭据形态脱敏，再截断。顺序是硬要求——先截断会把邮箱/号码切开，令
+    redact_pii 的形态匹配失效（PR #34 终局自审指认，对齐 glados 前例）。"""
+    return redact_pii(sanitize_snippet(text, None))[:limit]
 
 # ---------- 金豆商城（wapact.189.cn:9001）遗留链路（转盘抽奖仍在用）----------
 # getGoodsList 商品目录已下线（见上），但 unified/login + queryInfo + queryTurnTable
@@ -1009,7 +1017,7 @@ class TelecomClient:
                            headers={"sign": self.sign})
         if str(status.get("resoultCode")) != "0":
             msg = str(status.get("resoultMsg") or status.get("msg") or "")
-            return f"转盘查询失败({sanitize_snippet(msg, 40) or status.get('resoultCode')})"
+            return f"转盘查询失败({_safe_msg(msg, 40) or status.get('resoultCode')})"
         data = status.get("data")
         # data 必须是字典：非映射响应（如 [1]）不得绕过畸形处理抛 AttributeError
         # 中断已签到账号的后续任务与会话保存（PR #34 第四轮评审指认）
@@ -1042,7 +1050,11 @@ class TelecomClient:
             res = self._req("POST", WHEEL_SUBMIT_URL,
                             json_data={"para": _encrypt_rsa(para)},
                             headers={"sign": self.sign})
-            ok = str(res.get("code")) == "0" or str(res.get("resoultCode")) == "0"
+            # HTTP 状态先行：非 200 响应即使 JSON 正文带 code:0 + prizeName 也
+            # 不得判成功（网关错误页可能回显业务字段，PR #34 第十三轮评审指认）
+            http_status = res.get("_http_status")
+            http_ok = http_status is None or str(http_status) == "200"
+            ok = http_ok and (str(res.get("code")) == "0" or str(res.get("resoultCode")) == "0")
             msg = str(res.get("resoultMsg") or res.get("msg") or res.get("errorMsg") or "")
             # 先处理明确失败状态（传输故障/业务拒绝），保留脱敏后的真实原因；
             # 不要把 TimeoutError/HTTP 500 一律报成「data 字段异常」
@@ -1057,9 +1069,9 @@ class TelecomClient:
                         stop_note = "今日已抽"
                     break
                 if "金豆" in msg and ("不足" in msg or "不够" in msg):
-                    stop_note = f"金豆不足({sanitize_snippet(msg, 30)})"
+                    stop_note = f"金豆不足({_safe_msg(msg, 30)})"
                     break
-                fail_note = sanitize_snippet(msg, 40) or f"code={res.get('code')}"
+                fail_note = _safe_msg(msg, 40) or f"code={res.get('code')}"
                 print(f"    [转盘] 第{i + 1}抽提交故障，停手: {fail_note}", flush=True)
                 break
             # 成功响应必须带字典 data 才能读奖品：data=[1] 时停手，
@@ -1332,6 +1344,11 @@ def execute_telecom_task(client: TelecomClient) -> Dict[str, Any]:
                 res["lottery_res"] = f"{res['lottery_res']}；签到大转盘: {wheel_res}"
             else:
                 res["lottery_res"] = f"签到大转盘: {wheel_res}"
+            # 转盘故障/字段异常/活动未开放不是奖品：如实打 ❌ 行让日报失败卡
+            # 可见（金豆不足是资源状态非故障，不在此列）
+            # （PR #34 终局自审指认，规则 9a(1)(2)）
+            if any(k in wheel_res for k in ("故障", "字段异常", "未开放", "查询失败")):
+                print(f"❌ 签到大转盘: {wheel_res}", flush=True)
         if wheel_res:
             print(f"    [转盘] {wheel_res}", flush=True)
 
@@ -1551,15 +1568,24 @@ def _rights_schedule_next_run(terminal: bool) -> None:
     last_credit_ts = (next_due - timedelta(hours=24)).timestamp()
     prefix = os.getenv("CAT_CHECKIN_REDIS_PREFIX", "cat_checkin:").rstrip(":")
     try:
-        save_kv_state(
+        local_ok, confirmed = save_kv_state(
             f"{prefix}:state:rolling:telecom-exchange",
             ".rolling_state_telecom-exchange.json",
             {"last_credit_ts": last_credit_ts},
         )
-        print(f"    [权益] 下次运行已排定: {next_due.strftime('%Y-%m-%d %H:%M')} BJT（滚动冷却）",
-              flush=True)
+        if confirmed:
+            print(f"    [权益] 下次运行已排定: {next_due.strftime('%Y-%m-%d %H:%M')} BJT（滚动冷却）",
+                  flush=True)
+        elif local_ok:
+            # Redis SET 失败但本地已写入：_cooldown_due_at 以本地为准
+            # （local_authoritative），冷却仍生效；如实告警远端未同步
+            print(f"    [权益] 下次运行已排定: {next_due.strftime('%Y-%m-%d %H:%M')} BJT"
+                  f"（仅本地；Redis 同步失败，远端冷却未更新）", flush=True)
+        else:
+            print("    [权益] ⚠️ 排程写入失败（本地+远端均未落盘），冷却缺失，"
+                  "心跳可能反复拉起本任务", flush=True)
     except Exception as exc:
-        print(f"    [权益] 排程写入失败（退回重试梯兜底）: {exc}", flush=True)
+        print(f"    [权益] 排程写入异常: {exc}", flush=True)
 
 
 def _parse_goal_amount(goal: str) -> Optional[int]:
@@ -1654,8 +1680,8 @@ def run_rights_exchange(
     if str(rights_res.get("resoultCode")) != "0":
         msg = str(rights_res.get("resoultMsg") or rights_res.get("msg") or "")
         if any(k in msg for k in ("登录", "失效", "过期", "sign")):
-            return False, f"等级权益查询鉴权失败: {sanitize_snippet(msg, 60)}"
-        return False, f"等级权益查询失败: {sanitize_snippet(msg, 60) or rights_res.get('resoultCode')}"
+            return False, f"等级权益查询鉴权失败: {_safe_msg(msg, 60)}"
+        return False, f"等级权益查询失败: {_safe_msg(msg, 60) or rights_res.get('resoultCode')}"
 
     item, pick_note = _pick_phone_right(rights_res, goal)
     if item is None:
@@ -1729,15 +1755,15 @@ def run_rights_exchange(
             print(f"    [权益] 🎉 第{attempt}发兑换成功: {title}", flush=True)
             return True, f"🎉 成功兑换【{title}】(耗 {cost} 金豆)，话费 7 个工作日内到账"
         if "还未达到该等级" in msg or "等级" in msg and "不足" in msg:
-            return True, f"【{title}】等级不足（{sanitize_snippet(msg, 40)}），今日终止"
+            return True, f"【{title}】等级不足（{_safe_msg(msg, 40)}），今日终止"
         # 限兑终局只认明确状态文案；「每月限兑次数查询异常」等含「每月/限兑」
         # 的故障文案不得判终局（PR #34 第二轮评审指认）
         if "已兑换" in msg or "已领取" in msg or "本月已兑" in msg or "限兑次数已" in msg \
                 or "已达兑换上限" in msg or "超过兑换次数" in msg:
-            return True, f"【{title}】本月已兑/限兑（{sanitize_snippet(msg, 40)}），今日终止"
+            return True, f"【{title}】本月已兑/限兑（{_safe_msg(msg, 40)}），今日终止"
         # 售罄只认明确文案；「库存服务异常」等含「库存」的故障文案不得判终局
         if "已抢光" in msg or "抢光" in msg or "已领完" in msg or "售罄" in msg or "库存不足" in msg:
-            return True, f"【{title}】已售罄（{sanitize_snippet(msg, 40)}），今日终止"
+            return True, f"【{title}】已售罄（{_safe_msg(msg, 40)}），今日终止"
         http_code = res.get("_http_status") or res.get("code")
         if http_code in (429, "429"):
             wait = min(2.0 * attempt, 8.0)
@@ -1746,9 +1772,9 @@ def run_rights_exchange(
             continue
         if http_code in (412, "412"):
             return False, f"【{title}】WAF 拦截(HTTP 412)，换出口重试"
-        print(f"    [权益] 第{attempt}/{burst}发未中: rc={rc} {sanitize_snippet(msg, 50)}", flush=True)
+        print(f"    [权益] 第{attempt}/{burst}发未中: rc={rc} {_safe_msg(msg, 50)}", flush=True)
         time.sleep(random.uniform(0.3, 0.8))
-    return False, f"【{title}】连发 {burst} 次未成功（末次: {sanitize_snippet(last_msg, 50) or 'HTTP错误'}）"
+    return False, f"【{title}】连发 {burst} 次未成功（末次: {_safe_msg(last_msg, 50) or 'HTTP错误'}）"
 
 
 def run_exchange_mode() -> int:
@@ -1835,11 +1861,18 @@ def _run_account(acc: TelecomAccount) -> Tuple[bool, Dict[str, Any]]:
         # 服务密码类硬错误：立即熔断当日重试（密码连错约 5 次会被锁定 24h，
         # 次数/退避驱动的重试梯子对此无感知，必须在此显式熔断；跨日自动归零复跑）
         if "服务密码凭证错误" in err:
-            trip_circuit_breaker(
+            st = trip_circuit_breaker(
                 "telecom",
                 reason=f"服务密码凭证错误，停止当日重试以防密码锁定（{client.credential_error}）",
                 output=err,
             )
+            if st.get(_CB_READ_FAILED):
+                # 熔断写入未确认（读取失败/Redis SET 失败）：如实标注，不得
+                # 让日志/日报暗示已停用——密码锁定防护未生效，需人工介入
+                # （PR #34 第十三轮评审指认）
+                outcome["error"] = (
+                    f"{err}；⚠️ 熔断写入未确认，自动停用未生效，请人工暂停本任务防密码锁定"
+                )
             return False, outcome
         # 若凭据失效（401未授权等）或完全没有凭据，无需轮换代理，直接返回失败；
         # 「现签未取得 sign」的网络类失败已归因为网络请求异常，走下方轮换分支

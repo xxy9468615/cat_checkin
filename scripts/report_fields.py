@@ -1379,7 +1379,11 @@ def ex_telecom(output: str, res: Dict[str, Any]) -> None:
         mm = re.search(r"• 抽奖:\s*【(.+?)】", ln)
         if mm:
             lottery_txt = mm.group(1)
-            if lottery_txt and lottery_txt not in ("今日已抽", "无抽奖凭据"):
+            # 故障/字段异常/查询失败文案不是奖品：不得包装成 reward 徽章
+            # （PR #34 终局自审指认；对应 ❌ 行已由上方失败分支归集 error_lines）
+            if any(k in lottery_txt for k in ("故障", "字段异常", "查询失败", "未开放")):
+                cur.parts.append(f"抽奖: {lottery_txt}")
+            elif lottery_txt and lottery_txt not in ("今日已抽", "无抽奖凭据"):
                 cur.parts.append(f"抽奖: {lottery_txt}")
                 res["badges"].append(("reward", f"抽奖 {lottery_txt}"))
             elif lottery_txt == "今日已抽":
