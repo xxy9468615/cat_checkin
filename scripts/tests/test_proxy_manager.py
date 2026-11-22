@@ -185,15 +185,34 @@ class TestProxyManager(unittest.TestCase):
             self.assertFalse(endpoints[0].is_self_hosted)
 
     def test_smzdm_domestic_proxy_reuse(self):
-        # 验证 SMZDM 能够自动复用 WUAI_PROXY 等境内 CN 代理出口
+        # 验证 SMZDM 能够自动复用 CN_PROXY 等境内 CN 代理出口
         env = {
-            "WUAI_PROXY": "http://113.1.2.3:8080#国内CN节点",
+            "CN_PROXY": "http://113.1.2.3:8080#国内CN节点",
         }
         with patch.dict(os.environ, env, clear=True):
             endpoints = get_all_proxy_endpoints(task_prefix="SMZDM")
             self.assertEqual(len(endpoints), 1)
             self.assertEqual(endpoints[0].name, "国内CN节点")
             self.assertEqual(endpoints[0].url, "http://113.1.2.3:8080")
+
+    def test_legacy_wuai_proxy_still_readable(self):
+        # WUAI_PROXY 更名为 CN_PROXY 后的过渡期：旧名仍只读生效，避免 secrets 未迁移时任务断流
+        env = {
+            "WUAI_PROXY": "http://113.9.9.9:8080#旧名CN节点",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            endpoints = get_all_proxy_endpoints(task_prefix="SMZDM")
+            self.assertEqual([ep.name for ep in endpoints], ["旧名CN节点"])
+
+    def test_cn_proxy_precedes_legacy_wuai_proxy(self):
+        # 两个变量同时存在时，规范名 CN_PROXY 必须先于旧名进入候选链
+        env = {
+            "CN_PROXY": "http://1.1.1.1:8080#CN规范名节点",
+            "WUAI_PROXY": "http://2.2.2.2:8080#旧名节点",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            endpoints = get_all_proxy_endpoints(task_prefix="SMZDM")
+            self.assertEqual([ep.name for ep in endpoints], ["CN规范名节点", "旧名节点"])
 
     def test_oppo_domestic_proxy_reuse(self):
         # 验证 OPPO 能够自动复用 52POJIE / WUAI / SMZDM 等境内 CN 代理出口
@@ -215,7 +234,8 @@ class TestProxyManager(unittest.TestCase):
         from proxy_manager import get_task_proxy_endpoints
 
         env = {
-            "WUAI_PROXY": "http://113.1.2.3:8080#国内CN节点",
+            "CN_PROXY": "http://113.1.2.3:8080#国内CN节点",
+            "WUAI_PROXY": "http://113.9.9.9:8080#旧名CN节点",
             "SMZDM_PROXY": "http://114.1.2.3:8080#CN备用",
             "TELECOM_PROXY": "http://115.1.2.3:8080#电信家宽",
         }

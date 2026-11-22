@@ -129,18 +129,18 @@ jobs:
       AISTUDIO_COOKIE_2: ${{ secrets.AISTUDIO_COOKIE_2 }}
       ALIPAN_REFRESH_TOKEN_1: ${{ secrets.ALIPAN_REFRESH_TOKEN_1 }}
       SMZDM_COOKIE_1: ${{ secrets.SMZDM_COOKIE_1 }}
-      SMZDM_PROXY: ${{ secrets.SMZDM_PROXY || secrets.WUAI_PROXY }}
-      # CN 代理备用池：主出口（WUAI_PROXY，单点晨间离线）之外的容灾候选，
+      SMZDM_PROXY: ${{ secrets.SMZDM_PROXY || secrets.CN_PROXY || secrets.WUAI_PROXY }}
+      # CN 代理备用池：主出口（CN_PROXY，规范名；WUAI_PROXY 为过渡期旧名兜底）之外的容灾候选，
       # 被 proxy_manager 的 52POJIE/CLOUD189/TELECOM/OPPO 别名链自动复用
       SMZDM_BACKUP_PROXIES: ${{ secrets.SMZDM_BACKUP_PROXIES }}
       52POJIE_COOKIE_1: ${{ secrets.WUAI_COOKIE_1 }}
-      52POJIE_PROXY: ${{ secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
+      52POJIE_PROXY: ${{ secrets.CN_PROXY || secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
       # 夸克 App 鉴权签名凭据
       QUARK_MPARAM_1: ${{ secrets.QUARK_MPARAM_1 }}
       CLOUD189_USERNAME_1: ${{ secrets.CLOUD189_USERNAME_1 }}
       CLOUD189_PASSWORD_1: ${{ secrets.CLOUD189_PASSWORD_1 }}
       CLOUD189_COOKIE_1: ${{ secrets.CLOUD189_COOKIE_1 }}
-      CLOUD189_PROXY: ${{ secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
+      CLOUD189_PROXY: ${{ secrets.CN_PROXY || secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
       # 中国电信 App 请求头凭据
       TELECOM_HEADER_1: ${{ secrets.TELECOM_HEADER_1 }}
       TELECOM_HEADER_2: ${{ secrets.TELECOM_HEADER_2 }}
@@ -152,11 +152,11 @@ jobs:
       # 金豆兑换目标（缺省即 10 元话费直充券 / 8000 豆）
       TELECOM_EXCHANGE_GOAL: ${{ secrets.TELECOM_EXCHANGE_GOAL || '等级权益话费' }}
       # TELECOM_EXCHANGE_BEANS 已随 10元话费达标兑换机制下线移除（2026-11-19）
-      TELECOM_PROXY: ${{ secrets.TELECOM_PROXY || secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
+      TELECOM_PROXY: ${{ secrets.TELECOM_PROXY || secrets.CN_PROXY || secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
       # OPPO 商城打卡与赚积分
       OPPO_COOKIE_1: ${{ secrets.OPPO_COOKIE_1 }}
       OPPO_COOKIE_2: ${{ secrets.OPPO_COOKIE_2 }}
-      OPPO_PROXY: ${{ secrets.OPPO_PROXY || secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
+      OPPO_PROXY: ${{ secrets.OPPO_PROXY || secrets.CN_PROXY || secrets.WUAI_PROXY || secrets.SMZDM_PROXY }}
       # 腾讯 IMA 每日登录福利（x-ima-cookie 整串，根凭据为 IMA-REFRESH-TOKEN）
       IMA_COOKIE_1: ${{ secrets.IMA_COOKIE_1 }}
       IMA_COOKIE_2: ${{ secrets.IMA_COOKIE_2 }}

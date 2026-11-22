@@ -19,6 +19,13 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+# CN 出口池变量名：规范名 CN_PROXY（2026-11-22 由 WUAI_PROXY 更名）。
+# WUAI_PROXY 保留为只读兜底一版，便于 secrets 平滑迁移；元组顺序决定优先级，
+# CN_PROXY 永远排在 WUAI_PROXY 之前。
+CN_POOL_ENV = "CN_PROXY"
+CN_POOL_LEGACY_ENV = "WUAI_PROXY"
+CN_POOL_ENVS = (CN_POOL_ENV, CN_POOL_LEGACY_ENV)
+
 
 def _safe_proxy_name(name: str) -> str:
     """Discard URL-like labels and mask bare PII (email/phone) in node labels.
@@ -366,19 +373,21 @@ def get_all_proxy_endpoints(task_prefix: str = "") -> List[ProxyEndpoint]:
             f"{task_prefix}_BACKUP_PROXIES",
         ]
         # 特殊兼容映射（国内服务复用仓库 CN 代理出口：SMZDM / 52POJIE / CLOUD189 / TELECOM / OPPO 等）
+        # CN_PROXY 是规范名（2026-11-22 由 WUAI_PROXY 更名）；WUAI_PROXY 仅作一版只读兜底，
+        # 新配置一律写 CN_PROXY，避免再次出现「变量名与用途不符」的误配。
         if task_prefix in ("52POJIE", "WUAI", "POJIE"):
-            task_specific_keys.extend(["WUAI_PROXY", "POJIE_PROXY", "SMZDM_PROXY", "SMZDM_BACKUP_PROXIES", "TELECOM_PROXY"])
+            task_specific_keys.extend([*CN_POOL_ENVS, "POJIE_PROXY", "SMZDM_PROXY", "SMZDM_BACKUP_PROXIES", "TELECOM_PROXY"])
         elif task_prefix == "SMZDM":
-            task_specific_keys.extend(["WUAI_PROXY", "POJIE_PROXY", "52POJIE_PROXY", "TELECOM_PROXY", "SMZDM_BACKUP_PROXIES"])
+            task_specific_keys.extend([*CN_POOL_ENVS, "POJIE_PROXY", "52POJIE_PROXY", "TELECOM_PROXY", "SMZDM_BACKUP_PROXIES"])
         elif task_prefix == "CLOUD189":
-            task_specific_keys.extend(["52POJIE_PROXY", "WUAI_PROXY", "POJIE_PROXY", "SMZDM_PROXY", "SMZDM_BACKUP_PROXIES", "TELECOM_PROXY"])
+            task_specific_keys.extend(["52POJIE_PROXY", *CN_POOL_ENVS, "POJIE_PROXY", "SMZDM_PROXY", "SMZDM_BACKUP_PROXIES", "TELECOM_PROXY"])
         elif task_prefix == "TELECOM":
             # 不引入 SMZDM_BACKUP_PROXIES：wappark.189.cn 的 WAF 按出口 IP 信誉拦截，
             # 备用住宅池 IP 全部 412（2026-09-19 CI 实测），引入只会白白烧掉重试梯子
             # 的尝试次数；电信仅信任 TELECOM_PROXY 的家宽出口 + 直连兜底
-            task_specific_keys.extend(["WUAI_PROXY", "POJIE_PROXY", "52POJIE_PROXY", "SMZDM_PROXY"])
+            task_specific_keys.extend([*CN_POOL_ENVS, "POJIE_PROXY", "52POJIE_PROXY", "SMZDM_PROXY"])
         elif task_prefix == "OPPO":
-            task_specific_keys.extend(["52POJIE_PROXY", "WUAI_PROXY", "POJIE_PROXY", "SMZDM_PROXY", "SMZDM_BACKUP_PROXIES", "TELECOM_PROXY"])
+            task_specific_keys.extend(["52POJIE_PROXY", *CN_POOL_ENVS, "POJIE_PROXY", "SMZDM_PROXY", "SMZDM_BACKUP_PROXIES", "TELECOM_PROXY"])
         _collect(
             task_specific_keys,
             is_self=False,
