@@ -172,6 +172,37 @@ def _query_ip_geo(ip: str) -> Tuple[str, str]:
         return "公网", "未知"
 
 
+_RAW_IPV4_PORT_RE = re.compile(r"\b((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})\b")
+_RAW_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+# 宽松 IPv6（含 :: 压缩形式）：hex 段 + 冒号组成的 token，不会命中 http:// 等协议头
+_RAW_IPV6_RE = re.compile(r"(?<![0-9A-Za-z])(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}(?![0-9A-Za-z])")
+
+
+def sanitize_proxy_error(msg: str, endpoint: ProxyEndpoint, limit: int = 200) -> str:
+    """错误文本脱敏：隐去节点真实 host/port 与任何裸 IP。
+
+    curl/libcurl 的错误串常回显完整代理 URL（curl_cffi: "Failed to perform,
+    curl: (28) ... via http://1.2.3.4:8888"），直接用会把资产明文写进公开
+    仓库的 Actions 日志与 JSON 产物。先按完整文本脱敏，最后才截断——截断
+    在前会把 IP 切成两半而绕过正则（与 glados.py 的「先脱敏后截断」同规）。
+    """
+    text = msg or ""
+    # 1) 完整连接串（可能带 userinfo）整体替换
+    if endpoint.url:
+        text = text.replace(endpoint.url, mask_proxy_url(endpoint.url))
+    # 2) host:port 必须先于裸 host 处理，否则端口会残留在已掩码的 IP 后面
+    if endpoint.host_port:
+        text = text.replace(endpoint.host_port, f"{mask_host(endpoint.host)}:****")
+    if endpoint.host:
+        text = text.replace(endpoint.host, mask_host(endpoint.host))
+    # 3) 任意裸 IP（含 IPv4:port / IPv6），先匹配带端口的形态
+    text = _RAW_IPV4_PORT_RE.sub(lambda m: f"{mask_host(m.group(1))}:****", text)
+    text = _RAW_IPV4_RE.sub(lambda m: mask_host(m.group(0)), text)
+    text = re.sub(r"\[([0-9A-Fa-f:]+)\]", lambda m: f"[{mask_host(m.group(1))}]", text)
+    text = _RAW_IPV6_RE.sub(lambda m: mask_host(m.group(0)), text)
+    return text[:limit]
+
+
 def check_single_proxy(
     endpoint: ProxyEndpoint,
     test_sites: bool = True,
@@ -201,7 +232,9 @@ def check_single_proxy(
     if not res.exit_ip:
         # 代理完全不可达，标记为死代理
         res.alive = False
-        res.error_msg = body[:100] if body else "连接超时或代理拒绝连接"
+        res.error_msg = sanitize_proxy_error(
+            body if body else "连接超时或代理拒绝连接", endpoint, limit=100
+        )
         return res
 
     res.alive = True
@@ -232,6 +265,92 @@ def check_single_proxy(
                 res.site_status[name] = f"HTTP {scode}"
 
     return res
+
+
+def load_candidate_endpoints(path: str, prefix: str = "CN") -> List[ProxyEndpoint]:
+    """从候选文件加载节点，并按出现顺序补全稳定编号（CN-01, CN-02, ...）。
+
+    显式名称（`[CN-01] http://...` 或 `... #名称`）原样保留；无名称的行按文件
+    顺序编号——编号是跨轮次筛选与替换的唯一键，绝不依赖会重排的序号。
+    """
+    text = Path(path).read_text(encoding="utf-8", errors="ignore")
+    # 候选文件里的 # 行是文档注释，不是「下一个节点的名称」——干掉它们，
+    # 否则 `# 本轮候选` 会被 parse_proxies_text 当成 CN-01 的名称，编号错位。
+    # 需要固定编号请用 `[CN-01] http://...` 显式前缀。
+    body = "\n".join(
+        line
+        for line in text.replace("\r\n", "\n").split("\n")
+        if line.strip() and not line.strip().startswith(("#", "//", ";"))
+    )
+    endpoints = parse_proxies_text(body, default_name_prefix=prefix)
+    for idx, ep in enumerate(endpoints, 1):
+        # 无显式名称时 parse_proxies_text 会生成 "{prefix}-{掩码host}"（含 * 或 .）
+        if not ep.name or "*" in ep.name or "." in ep.name:
+            ep.name = f"{prefix}-{idx:02d}"
+    return endpoints
+
+
+def result_to_dict(res: ProxyCheckResult) -> Dict[str, Any]:
+    """序列化单节点结果（出口 IP 与错误文本均已脱敏，可安全落盘/上抛）。"""
+    ep = res.endpoint
+    return {
+        "name": ep.name,
+        "display_name": ep.display_name,
+        "protocol": ep.protocol,
+        "source": ep.source,
+        "alive": res.alive,
+        "latency_ms": res.latency_ms,
+        "exit_ip": mask_host(res.exit_ip) if res.exit_ip else "",
+        "geo": res.ip_geo,
+        "isp": res.ip_isp,
+        "error": sanitize_proxy_error(res.error_msg, ep),
+        "sites": res.site_status,
+    }
+
+
+def write_json_report(
+    path: str,
+    alive_list: List[ProxyCheckResult],
+    dead_list: List[ProxyCheckResult],
+) -> None:
+    """写出机器可读体检报告（编号稳定，供后续筛选/替换脚本消费）。"""
+    payload = {
+        "total": len(alive_list) + len(dead_list),
+        "alive": len(alive_list),
+        "dead": len(dead_list),
+        "results": [result_to_dict(r) for r in sorted(alive_list + dead_list, key=lambda r: r.endpoint.name)],
+    }
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"📄 JSON 报告已写入: {out}")
+
+
+def print_summary_table(
+    alive_list: List[ProxyCheckResult],
+    dead_list: List[ProxyCheckResult],
+) -> None:
+    """按编号打印单行摘要表——一眼筛出可用节点（IP/端口全程脱敏）。"""
+    rows = sorted(alive_list + dead_list, key=lambda r: r.endpoint.name)
+    if not rows:
+        return
+    print("\n" + "=" * 92)
+    print(f"🏷️  编号速查表 | 总计 {len(rows)} | ✅ 存活 {len(alive_list)} | ❌ 失联 {len(dead_list)}")
+    print("=" * 92)
+    print(f"{'编号':<8}{'状态':<6}{'延迟':<10}{'出口(掩码)':<16}{'归属':<14}站点连通")
+    print("-" * 92)
+    for res in rows:
+        ep = res.endpoint
+        status = "✅" if res.alive else "❌"
+        latency = f"{res.latency_ms:.0f}ms" if res.alive else "-"
+        exit_ip = mask_host(res.exit_ip) if res.exit_ip else "***"
+        geo = f"{res.ip_geo}" if res.ip_geo else "-"
+        if res.site_status:
+            sites = " / ".join(f"{k}:{v.replace('HTTP ', '').replace(' OK', '')}" for k, v in res.site_status.items())
+        else:
+            sites = "-"
+        print(f"{ep.name:<8}{status:<6}{latency:<10}{exit_ip:<16}{geo:<14}{sites}")
+    print("=" * 92)
 
 
 def run_proxy_healthcheck(
@@ -328,6 +447,13 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=6, help="并发线程数(默认 6)")
     parser.add_argument("--env-file", default=".env", help="本地 .env 路径")
     parser.add_argument("--strict", action="store_true", help="严格模式: 若存在死代理则以退出码 1 结束")
+    parser.add_argument(
+        "--input-file",
+        default="",
+        help="候选节点文件（每行一个；支持 [CN-01] 前缀编号，无名称行按顺序自动编号）",
+    )
+    parser.add_argument("--name-prefix", default="CN", help="自动编号前缀（默认 CN → CN-01）")
+    parser.add_argument("--json-out", default="", help="输出机器可读 JSON 报告路径（内容已脱敏）")
 
     args = parser.parse_args()
 
@@ -350,7 +476,12 @@ def main() -> None:
                         os.environ[k] = v
 
     custom_eps: Optional[List[ProxyEndpoint]] = None
-    if args.proxies:
+    if args.input_file:
+        custom_eps = load_candidate_endpoints(args.input_file, prefix=args.name_prefix)
+        if not custom_eps:
+            print(f"❌ 候选文件未解析出任何节点: {args.input_file}")
+            sys.exit(2)
+    elif args.proxies:
         custom_eps = []
         for p in args.proxies:
             eps = parse_proxies_text(p, default_name_prefix="命令行输入")
@@ -364,6 +495,10 @@ def main() -> None:
     )
 
     print_healthcheck_report(alive, dead)
+    print_summary_table(alive, dead)
+
+    if args.json_out:
+        write_json_report(args.json_out, alive, dead)
 
     if args.strict and dead:
         sys.exit(1)
