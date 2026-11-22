@@ -1,0 +1,140 @@
+name: Proxy Candidates Healthcheck
+
+# 候选代理批量体检（手动触发）
+# ---------------------------------------------------------------------------
+# 用途：验证一批新的 CN 出口代理在「GitHub Runner（境外出口）」这一真实 CI
+#       网络位置下是否可用，并把结果按固定编号（CN-01, CN-02 ...）输出，
+#       方便按编号筛选出可用节点后再写入 WUAI_PROXY / TELECOM_PROXY 等 secrets。
+# 安全：候选清单只从仓库 secret `CN_PROXY_CANDIDATES` 读取，绝不入库；
+#       输出统一走 mask_host（IP 首尾可见、中间掩码，端口隐去），
+#       错误文本先全文脱敏再截断。
+# 规则：编号是跨轮次的唯一键——候选清单里请用 `[CN-01] http://host:port`
+#       的写法固定编号，未命名的行会按出现顺序自动编号。
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_sites:
+        description: '同时探测业务站点（AgentRouter / NodeSeek / 52Pojie / SMZDM）'
+        required: false
+        default: true
+        type: boolean
+      timeout:
+        description: '单节点超时秒数'
+        required: false
+        default: '10'
+        type: string
+      workers:
+        description: '并发线程数'
+        required: false
+        default: '6'
+        type: string
+      strict:
+        description: '存在失联节点时本次运行标记失败（默认仅报告）'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proxy-candidates-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Numbered Proxy Healthcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (SHA 固定，node24)
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0 (SHA 固定，node24)
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install --no-cache-dir -r requirements.txt
+
+      # 候选清单只存在于 secret 中；逐行 add-mask 防止多行 secret 按行漏遮
+      - name: Materialize candidates (masked)
+        env:
+          CN_PROXY_CANDIDATES: ${{ secrets.CN_PROXY_CANDIDATES }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CN_PROXY_CANDIDATES//[[:space:]]/}" ]; then
+            echo "::error::未配置 repository secret CN_PROXY_CANDIDATES（编号候选清单，每行一个：[CN-01] http://host:port）"
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$CN_PROXY_CANDIDATES" > /tmp/candidates.txt
+          while IFS= read -r line; do
+            if [ -n "${line//[[:space:]]/}" ]; then
+              echo "::add-mask::$line"
+            fi
+          done < /tmp/candidates.txt
+          echo "候选节点行数: $(grep -c '[^[:space:]]' /tmp/candidates.txt)"
+
+      - name: Run numbered healthcheck
+        continue-on-error: ${{ !inputs.strict }}
+        run: |
+          set -euo pipefail
+          extra_args=""
+          if [ "${{ inputs.test_sites }}" != "true" ]; then
+            extra_args="--no-sites"
+          fi
+          python3 scripts/proxy_check.py \
+            --input-file /tmp/candidates.txt \
+            --name-prefix CN \
+            --timeout "${{ inputs.timeout }}" \
+            --workers "${{ inputs.workers }}" \
+            --json-out /tmp/proxy_report.json \
+            $extra_args
+
+      # 编号速查表进 Step Summary：运行页首屏即可看到哪些编号能用
+      - name: Publish numbered summary
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f /tmp/proxy_report.json ]; then
+            echo "⚠️ 未生成 JSON 报告（体检步骤未完成）" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+
+          with open("/tmp/proxy_report.json", encoding="utf-8") as fh:
+              data = json.load(fh)
+
+          rows = data.get("results", [])
+          print(f"### 代理候选体检结果：✅ {data.get('alive', 0)} / {data.get('total', 0)} 存活\n")
+          print("| 编号 | 状态 | 延迟 | 出口(掩码) | 归属 | 站点连通 |")
+          print("| --- | --- | --- | --- | --- | --- |")
+          for r in rows:
+              status = "✅" if r.get("alive") else "❌"
+              latency = f"{r.get('latency_ms', 0):.0f}ms" if r.get("alive") else "-"
+              sites = " / ".join(
+                  f"{k}:{v}" for k, v in (r.get("sites") or {}).items()
+              ) or "-"
+              geo = r.get("geo") or "-"
+              print(
+                  f"| {r.get('name', '')} | {status} | {latency} | "
+                  f"{r.get('exit_ip') or '***'} | {geo} | {sites} |"
+              )
+          usable = [r.get("name", "") for r in rows if r.get("alive")]
+          print(f"\n**可用编号**：{'、'.join(usable) if usable else '无'}\n")
+          dead = [r.get("name", "") for r in rows if not r.get("alive")]
+          print(f"**失联编号**：{'、'.join(dead) if dead else '无'}")
+          PY
+
+      - name: Upload masked JSON report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1（SHA 固定，node24）
+        with:
+          name: proxy-candidates-report
+          path: /tmp/proxy_report.json
+          if-no-files-found: warn
+          retention-days: 14
