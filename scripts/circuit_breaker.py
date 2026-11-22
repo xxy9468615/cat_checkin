@@ -83,7 +83,7 @@ def _state_paths(task_id: str) -> Tuple[str, str]:
 # 熔断器专属字段：旧实现曾把这些字段写进 notify 键，迁移时只认领这些字段，
 # 绝不把 notify 的展示字段（ok_streak/warn_texts 等）带进 cb 状态。
 _CB_OWNED_FIELDS = (
-    "status", "circuit_broken", "suspended_at", "suspend_reason",
+    "status", "circuit_broken", "suspended_at", "suspend_reason", "suspend_source",
     "attempts", "attempt_date", "next_retry_at", "last_fail_ts",
     "last_ok_date", "fail_streak", "updated_at",
 )
@@ -309,8 +309,14 @@ def trip_circuit_breaker(
     task_id: str,
     reason: str = f"单日连续失败已达 {MAX_DAILY_ATTEMPTS} 次上限，自动熔断停用",
     output: str = "",
+    source: str = "auto",
 ) -> Dict[str, Any]:
-    """将任务置为熔断停用状态并持久化。"""
+    """将任务置为熔断停用状态并持久化。
+
+    `source` 必须由调用方显式声明：`auto` = 失败上限/评估器自动熔断，
+    `manual` = 人工 `circuit_breaker.py suspend`。常驻任务自愈只认 `auto`，
+    不能靠 reason 文案猜来源（人工原因里完全可能出现「8 次上限」字样）。
+    """
     state = load_circuit_state(task_id)
     if state.get(_CB_READ_FAILED):
         # 保留标记返回：调用方（evaluate_retry_candidates）据此区分
@@ -324,6 +330,7 @@ def trip_circuit_breaker(
     state["circuit_broken"] = True
     state["suspended_at"] = now_iso
     state["suspend_reason"] = reason
+    state["suspend_source"] = "manual" if source == "manual" else "auto"
     state["updated_at"] = now_iso
     _local_ok, confirmed = save_circuit_state(task_id, state)
     if not confirmed:
@@ -369,6 +376,7 @@ def resume_task(task_id: str, reason: str = "人工修复后重新上线") -> Di
     state["circuit_broken"] = False
     state["suspended_at"] = None
     state["suspend_reason"] = None
+    state["suspend_source"] = None
     state["attempts"] = 0
     state["next_retry_at"] = None
     state["updated_at"] = now_iso
@@ -392,12 +400,26 @@ def resume_task(task_id: str, reason: str = "人工修复后重新上线") -> Di
     return state
 
 
-_AUTO_TRIP_REASON_MARKERS = (
-    "8 次上限",
-    "单日累计失败达",
-    "单日连续失败已达",
-    f"{MAX_DAILY_ATTEMPTS} 次上限",
+# 旧状态（无 suspend_source 字段）的自动熔断原因模板；必须整句精确匹配，
+# 不能做子串包含判断——人工原因里完全可能出现「8 次上限」字样。
+_LEGACY_AUTO_TRIP_REASONS = (
+    f"单日连续失败已达 {MAX_DAILY_ATTEMPTS} 次上限（时域风控/持续故障熔断）",
+    f"单日累计失败达 {MAX_DAILY_ATTEMPTS} 次上限，自动熔断停用",
 )
+
+
+def _is_auto_suspension(state: Dict[str, Any]) -> bool:
+    """判断当前停用是否由自动熔断产生。
+
+    优先看 `suspend_source`（trip_circuit_breaker / record_task_outcome 显式写）；
+    历史状态没有该字段时才回落到「整句模板匹配」。两处都无法确认就按人工处理，
+    宁可让操作员手动 resume，也不擅自把人工停用改回 active。
+    """
+    source = str(state.get("suspend_source") or "").strip().lower()
+    if source:
+        return source == "auto"
+    reason = str(state.get("suspend_reason") or "").strip()
+    return reason in _LEGACY_AUTO_TRIP_REASONS
 
 
 def reconcile_constant_task_suspensions() -> List[str]:
@@ -407,8 +429,8 @@ def reconcile_constant_task_suspensions() -> List[str]:
     可能已经把它的状态写成 suspended——不清理的话 rolling 自排程永远拉不起它
     （plan_due_tasks 直接跳过 suspended），规则改了也等于没改。
 
-    只处理注册表标了 `no_auto_suspend` 的任务，且 suspend_reason 必须命中自动
-    熔断文案；人工 `suspend`（原因自定义）一律不动。写入未确认的不计入返回值。
+    只处理注册表标了 `no_auto_suspend` 的任务，且停用来源必须是自动熔断；
+    人工 `suspend` 一律不动。写入未确认的不计入返回值。
     """
     resumed: List[str] = []
     for tid, cfg in TASKS.items():
@@ -422,8 +444,7 @@ def reconcile_constant_task_suspensions() -> List[str]:
             or str(state.get("status") or "").lower() == "suspended"
         ):
             continue
-        reason = str(state.get("suspend_reason") or "")
-        if not any(marker in reason for marker in _AUTO_TRIP_REASON_MARKERS):
+        if not _is_auto_suspension(state):
             continue
         st = resume_task(
             tid,
@@ -525,6 +546,7 @@ def record_task_outcome(
         state["circuit_broken"] = True
         state["suspended_at"] = now_iso
         state["suspend_reason"] = reason
+        state["suspend_source"] = "auto"
         state["next_retry_at"] = None
         # 停用结果记录与文案必须在权威写入确认之后才落盘/输出——否则 Redis
         # SET 失败时日报与操作人员仍收到「已停用」结论（PR #34 第十四轮评审）
@@ -673,8 +695,9 @@ def evaluate_retry_candidates(
 
         if att >= max_attempts:
             if not task_allows_auto_suspend(tid):
-                # 常驻任务：达到上限也不补熔断，交由 rolling 自排程继续下一场次
-                retryable.append(tid)
+                # 常驻任务：达到上限也不补熔断，且不能进 retryable——retryable
+                # 会驱动 CI SHOULD_RETRY 立刻再拉起一次，把任务拉离自排程节奏。
+                # 它的下一次执行只由 rolling due_at 决定，这里直接放过。
                 continue
             # 达到上限，补触发熔断；仅在熔断写入确认完成后才报 tripped，
             # 二次读取失败拒写时归入 suspended（fail-closed 不调度），
@@ -821,7 +844,7 @@ def main() -> None:
         else:
             resume_task(args.task_id, reason=args.reason)
     elif args.subcommand == "suspend":
-        trip_circuit_breaker(args.task_id, reason=args.reason)
+        trip_circuit_breaker(args.task_id, reason=args.reason, source="manual")
     elif args.subcommand == "check-retry":
         res = evaluate_retry_candidates(args.tasks, max_attempts=args.max_attempts)
         retryable_str = ",".join(res["retryable"])

@@ -192,8 +192,9 @@ class TestCircuitBreaker(unittest.TestCase):
             res = circuit_breaker.evaluate_retry_candidates([self.test_task])
         self.assertNotIn(self.test_task, res["tripped"])
         self.assertNotIn(self.test_task, res["suspended"])
-        self.assertIn(self.test_task, res["retryable"])
-        # 没有 next_retry_at 不得被判为「立即到期」，避免心跳空转
+        # 也不得进 retryable：retryable 会驱动 SHOULD_RETRY 立刻再拉起一次，
+        # 把任务拉离 rolling 自排程节奏。它的下一次执行只由 due_at 决定。
+        self.assertNotIn(self.test_task, res["retryable"])
         self.assertNotIn(self.test_task, res["due_now"])
 
     def test_reconcile_resumes_auto_suspended_constant_task(self):
@@ -228,6 +229,49 @@ class TestCircuitBreaker(unittest.TestCase):
         self.assertEqual(resumed, [])
         self.assertEqual(self.mock_state["status"], "suspended")
         self.assertTrue(self.mock_state["circuit_broken"])
+
+    def test_reconcile_rejects_manual_reason_containing_keywords(self):
+        """人工原因里出现「8 次上限」字样也不得被当成自动熔断（子串匹配陷阱）。"""
+        self.mock_state = {
+            "status": "suspended",
+            "circuit_broken": True,
+            "suspend_reason": "人工停用：已核对 8 次上限记录，账号需人工检查",
+            "suspend_source": None,
+        }
+        with mock.patch.dict(
+            circuit_breaker.TASKS, {self.test_task: {"no_auto_suspend": True}}, clear=True
+        ):
+            resumed = circuit_breaker.reconcile_constant_task_suspensions()
+
+        self.assertEqual(resumed, [])
+        self.assertEqual(self.mock_state["status"], "suspended")
+
+    def test_reconcile_rejects_explicit_manual_source(self):
+        """suspend_source=manual 时，即便 reason 与自动文案一致也不恢复。"""
+        self.mock_state = {
+            "status": "suspended",
+            "circuit_broken": True,
+            "suspend_reason": "单日连续失败已达 8 次上限（时域风控/持续故障熔断）",
+            "suspend_source": "manual",
+        }
+        with mock.patch.dict(
+            circuit_breaker.TASKS, {self.test_task: {"no_auto_suspend": True}}, clear=True
+        ):
+            resumed = circuit_breaker.reconcile_constant_task_suspensions()
+
+        self.assertEqual(resumed, [])
+        self.assertEqual(self.mock_state["status"], "suspended")
+
+    def test_trip_records_source(self):
+        """自动熔断写 auto、CLI 手动熔断写 manual——来源必须显式，不靠文案猜。"""
+        st = circuit_breaker.trip_circuit_breaker(self.test_task, reason="自动原因")
+        self.assertEqual(st.get("suspend_source"), "auto")
+
+        self.mock_state.clear()
+        st = circuit_breaker.trip_circuit_breaker(
+            self.test_task, reason="人工原因", source="manual"
+        )
+        self.assertEqual(st.get("suspend_source"), "manual")
 
     def test_reconcile_ignores_normal_task(self):
         """没有 no_auto_suspend 标记的任务维持 8 次上限熔断语义。"""
