@@ -206,6 +206,24 @@ class TestProxyManager(unittest.TestCase):
             self.assertEqual(endpoints[0].name, "吾爱国内CN出口")
             self.assertEqual(endpoints[0].url, "http://114.1.2.3:8080")
 
+    def test_cn_pool_never_leaks_into_nodeseek(self):
+        """NodeSeek 只走台湾 sing-box 出口，CN 代理池不得渗入 NODESEEK 链路。
+
+        NODESEEK 没有境内别名链，环境里堆满 WUAI/SMZDM/TELECOM 也必须返回空；
+        同时反证同一环境下 CN 站点仍能正常取到候选（避免「全都拿不到」的假通过）。
+        """
+        from proxy_manager import get_task_proxy_endpoints
+
+        env = {
+            "WUAI_PROXY": "http://113.1.2.3:8080#国内CN节点",
+            "SMZDM_PROXY": "http://114.1.2.3:8080#CN备用",
+            "TELECOM_PROXY": "http://115.1.2.3:8080#电信家宽",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(get_task_proxy_endpoints("nodeseek"), [])
+            self.assertEqual(get_all_proxy_endpoints(task_prefix="NODESEEK"), [])
+            self.assertTrue(get_task_proxy_endpoints("smzdm"))
+
     def test_telecom_excludes_smzdm_backup_pool(self):
         # wappark WAF 按出口 IP 信誉拦截备用住宅池（412），TELECOM 不得继承 SMZDM_BACKUP_PROXIES，
         # 否则每次重试梯子都会在死代理上空烧尝试次数（2026-09-19 CI 实测回归）

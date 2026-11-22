@@ -10,16 +10,25 @@ name: Proxy Candidates Healthcheck
 #       错误文本先全文脱敏再截断。
 # 规则：编号是跨轮次的唯一键——候选清单里请用 `[CN-01] http://host:port`
 #       的写法固定编号，未命名的行会按出现顺序自动编号。
+# 出口：本工作流只体检 CN 出口池，默认 site_profile=cn，只探测 SMZDM / 52Pojie /
+#       Cloud189 / OPPO。NodeSeek 与 AgentRouter 必须走台湾 sing-box 出口
+#       （socks5://127.0.0.1:1080），用 CN 代理探测只会得到恒定超时，属于错误
+#       对照——需要单独体检时选 site_profile=global 并显式提供对应出口节点。
 # ---------------------------------------------------------------------------
 
 on:
   workflow_dispatch:
     inputs:
-      test_sites:
-        description: '同时探测业务站点（AgentRouter / NodeSeek / 52Pojie / SMZDM）'
+      site_profile:
+        description: '站点探测分组：cn=国内站点（CN 出口）｜global=境外站点（台湾 sing-box 出口）｜all｜none'
         required: false
-        default: true
-        type: boolean
+        default: cn
+        type: choice
+        options:
+          - cn
+          - global
+          - all
+          - none
       timeout:
         description: '单节点超时秒数'
         required: false
@@ -85,7 +94,7 @@ jobs:
         env:
           PROXY_TIMEOUT: ${{ inputs.timeout }}
           PROXY_WORKERS: ${{ inputs.workers }}
-          PROXY_TEST_SITES: ${{ inputs.test_sites }}
+          PROXY_SITE_PROFILE: ${{ inputs.site_profile }}
           PROXY_STRICT: ${{ inputs.strict }}
         run: |
           set -euo pipefail
@@ -95,10 +104,11 @@ jobs:
           case "$PROXY_WORKERS" in
             ''|*[!0-9]*) echo "::error::workers 必须是整数"; exit 1 ;;
           esac
+          case "$PROXY_SITE_PROFILE" in
+            cn|global|all|none) ;;
+            *) echo "::error::site_profile 必须是 cn/global/all/none"; exit 1 ;;
+          esac
           extra_args=()
-          if [ "$PROXY_TEST_SITES" != "true" ]; then
-            extra_args+=(--no-sites)
-          fi
           if [ "$PROXY_STRICT" = "true" ]; then
             extra_args+=(--strict)
           fi
@@ -107,6 +117,7 @@ jobs:
             --name-prefix CN \
             --timeout "$PROXY_TIMEOUT" \
             --workers "$PROXY_WORKERS" \
+            --site-profile "$PROXY_SITE_PROFILE" \
             --json-out /tmp/proxy_report.json \
             "${extra_args[@]}"
 
