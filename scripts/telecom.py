@@ -185,6 +185,7 @@ def _get_candidate_proxies() -> List[ProxyEndpoint]:
             or os.getenv("CLOUD189_PROXY")
             or os.getenv("SMZDM_PROXY")
             or os.getenv("52POJIE_PROXY")
+            or os.getenv("CN_PROXY")
             or os.getenv("WUAI_PROXY")
             or ""
         )

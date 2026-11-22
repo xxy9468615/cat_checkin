@@ -7,7 +7,7 @@
 1. 每日自动完成任务中心签到任务（两步流：apply id=2 & draw id=2）领取 2 吾爱币（CB）
 2. 提取吾爱币 (CB)、积分、贡献、热心值、用户组等级等资产明细
 3. 支持 curl_cffi Chrome TLS 指纹与 urllib 双引擎，有效绕过安域防护/WAF 阻断
-4. 支持固定 CN 出口代理与候选代理容灾轮换（52POJIE_PROXY / WUAI_PROXY / SMZDM_PROXY / PROXY）
+4. 支持固定 CN 出口代理与候选代理容灾轮换（52POJIE_PROXY / CN_PROXY / SMZDM_PROXY / PROXY）
 5. Upstash Redis + 本地 State 双层跨 CI 持久化（cat_checkin:state:52pojie_{idx}）与 Cookie 滚动保活
 6. 多账号独立隔离运行与用户名/UID 智能脱敏
 7. 自动识别 Cookie 有效期：优先采用真实到期证据（响应 Set-Cookie 的 Expires/Max-Age
@@ -17,7 +17,7 @@
 环境变量：
 - 52POJIE_COOKIE_1, 52POJIE_COOKIE_2... (多账号序列，推荐)
 - 52POJIE_COOKIE / WUAI_COOKIE / POJIE_COOKIE (单账号兼容)
-- 52POJIE_PROXY / WUAI_PROXY / SMZDM_PROXY / SMZDM_BACKUP_PROXIES (代理出口，可选)
+- 52POJIE_PROXY / CN_PROXY / SMZDM_PROXY / SMZDM_BACKUP_PROXIES (代理出口，可选)
 """
 from __future__ import annotations
 
@@ -255,6 +255,7 @@ def _get_candidate_proxies() -> List[str]:
         return [ep.url for ep in endpoints]
     raw = (
         os.getenv("52POJIE_PROXY")
+        or os.getenv("CN_PROXY")
         or os.getenv("WUAI_PROXY")
         or os.getenv("POJIE_PROXY")
         or os.getenv("SMZDM_PROXY")

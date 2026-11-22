@@ -4,7 +4,7 @@ name: Proxy Candidates Healthcheck
 # ---------------------------------------------------------------------------
 # 用途：验证一批新的 CN 出口代理在「GitHub Runner（境外出口）」这一真实 CI
 #       网络位置下是否可用，并把结果按固定编号（CN-01, CN-02 ...）输出，
-#       方便按编号筛选出可用节点后再写入 WUAI_PROXY / TELECOM_PROXY 等 secrets。
+#       方便按编号筛选出可用节点后再写入 CN_PROXY / TELECOM_PROXY 等 secrets。
 # 安全：候选清单只从仓库 secret `CN_PROXY_CANDIDATES` 读取，绝不入库；
 #       输出统一走 mask_host（IP 首尾可见、中间掩码，端口隐去），
 #       错误文本先全文脱敏再截断。
@@ -69,15 +69,15 @@ jobs:
         run: pip install --no-cache-dir -r requirements.txt
 
       # 候选清单只存在于 secret 中；逐行 add-mask 防止多行 secret 按行漏遮。
-      # 默认读专用体检 secret；未配置时回落到生产 CN 池 WUAI_PROXY——
+      # 默认读专用体检 secret；未配置时回落到生产 CN 池 CN_PROXY——
       # 生产池本身就是「编号候选清单」格式，可直接复检，不必再维护一份副本。
       - name: Materialize candidates (masked)
         env:
-          CN_PROXY_CANDIDATES: ${{ secrets.CN_PROXY_CANDIDATES || secrets.WUAI_PROXY }}
+          CN_PROXY_CANDIDATES: ${{ secrets.CN_PROXY_CANDIDATES || secrets.CN_PROXY || secrets.WUAI_PROXY }}
         run: |
           set -euo pipefail
           if [ -z "${CN_PROXY_CANDIDATES//[[:space:]]/}" ]; then
-            echo "::error::未配置 repository secret CN_PROXY_CANDIDATES 或 WUAI_PROXY（编号候选清单，每行一个：[CN-01] http://host:port）"
+            echo "::error::未配置 repository secret CN_PROXY_CANDIDATES / CN_PROXY（编号候选清单，每行一个：[CN-01] http://host:port）"
             exit 1
           fi
           umask 077
