@@ -80,21 +80,35 @@ jobs:
           done < /tmp/candidates.txt
           echo "候选节点行数: $(grep -c '[^[:space:]]' /tmp/candidates.txt)"
 
+      # 输入值只通过 env 进入 shell，绝不内联进 run 脚本（避免输入被当作源码执行）
       - name: Run numbered healthcheck
-        continue-on-error: ${{ !inputs.strict }}
+        env:
+          PROXY_TIMEOUT: ${{ inputs.timeout }}
+          PROXY_WORKERS: ${{ inputs.workers }}
+          PROXY_TEST_SITES: ${{ inputs.test_sites }}
+          PROXY_STRICT: ${{ inputs.strict }}
         run: |
           set -euo pipefail
-          extra_args=""
-          if [ "${{ inputs.test_sites }}" != "true" ]; then
-            extra_args="--no-sites"
+          case "$PROXY_TIMEOUT" in
+            ''|*[!0-9.]*) echo "::error::timeout 必须是数字（秒）"; exit 1 ;;
+          esac
+          case "$PROXY_WORKERS" in
+            ''|*[!0-9]*) echo "::error::workers 必须是整数"; exit 1 ;;
+          esac
+          extra_args=()
+          if [ "$PROXY_TEST_SITES" != "true" ]; then
+            extra_args+=(--no-sites)
+          fi
+          if [ "$PROXY_STRICT" = "true" ]; then
+            extra_args+=(--strict)
           fi
           python3 scripts/proxy_check.py \
             --input-file /tmp/candidates.txt \
             --name-prefix CN \
-            --timeout "${{ inputs.timeout }}" \
-            --workers "${{ inputs.workers }}" \
+            --timeout "$PROXY_TIMEOUT" \
+            --workers "$PROXY_WORKERS" \
             --json-out /tmp/proxy_report.json \
-            $extra_args
+            "${extra_args[@]}"
 
       # 编号速查表进 Step Summary：运行页首屏即可看到哪些编号能用
       - name: Publish numbered summary
