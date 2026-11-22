@@ -32,6 +32,7 @@ from circuit_breaker import (
     _CB_READ_FAILED,
     is_task_suspended,
     load_circuit_state,
+    reconcile_constant_task_suspensions,
     record_task_outcome,
     resume_task,
     resume_all_tasks,
@@ -538,6 +539,13 @@ def main() -> None:
                 resumed = resume_all_tasks(reason="全局调度恢复上线 (--reset-circuit)")
                 print(f"🔄 [CIRCUIT_BREAKER] 已重置上线 {len(resumed)} 个任务: "
                       f"{', '.join(resumed) if resumed else '无（无熔断任务或恢复未确认）'}")
+
+    # 常驻任务（no_auto_suspend）自愈：旧规则留下的「8 次上限」停用状态必须先
+    # 清掉，否则 rolling 自排程永远拉不起它——规则改了等于没改。只认自动熔断
+    # 文案，人工 suspend 不动。放在 --reset-circuit 之后、调度计划之前。
+    reconciled = reconcile_constant_task_suspensions()
+    if reconciled:
+        print(f"🛡️ [CIRCUIT_BREAKER] 常驻任务自动恢复上线: {', '.join(reconciled)}")
 
     if args.plan:
         due = plan_due_tasks(args.tasks, due_only=args.due_only)

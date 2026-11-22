@@ -31,6 +31,17 @@ from task_registry import TASKS
 # 单日累计最大尝试次数上限（超过该次数立即熔断）
 MAX_DAILY_ATTEMPTS = 8
 
+def task_allows_auto_suspend(task_id: str) -> bool:
+    """该任务是否允许被「8 次失败上限」自动熔断。
+
+    注册表里标了 `no_auto_suspend` 的常驻任务（如 telecom-exchange 0点场抢兑）
+    「错过即损失整场」，自动停用等于永久停跑——它由 rolling 自排程每天按时
+    拉起，失败只写当日结果。人工 `circuit_breaker.py suspend` 不受此开关影响。
+    注册表查不到时返回 True（保守沿用原行为）。
+    """
+    return not bool((TASKS.get(task_id) or {}).get("no_auto_suspend"))
+
+
 # 分时段重试延时阶梯（秒）：对应第 1~7 次失败后距离下一次重试的等待时间
 # 15分 -> 30分 -> 45分 -> 1小时 -> 1.5小时 -> 2小时 -> 3小时（累计达 9 小时时域跨度）
 RETRY_INTERVALS: List[int] = [
@@ -381,6 +392,48 @@ def resume_task(task_id: str, reason: str = "人工修复后重新上线") -> Di
     return state
 
 
+_AUTO_TRIP_REASON_MARKERS = (
+    "8 次上限",
+    "单日累计失败达",
+    "单日连续失败已达",
+    f"{MAX_DAILY_ATTEMPTS} 次上限",
+)
+
+
+def reconcile_constant_task_suspensions() -> List[str]:
+    """把历史上被「8 次上限」自动停用的常驻任务恢复上线。
+
+    2026-11-22：telecom-exchange 这类每日必跑任务不再参与自动熔断。但旧规则
+    可能已经把它的状态写成 suspended——不清理的话 rolling 自排程永远拉不起它
+    （plan_due_tasks 直接跳过 suspended），规则改了也等于没改。
+
+    只处理注册表标了 `no_auto_suspend` 的任务，且 suspend_reason 必须命中自动
+    熔断文案；人工 `suspend`（原因自定义）一律不动。写入未确认的不计入返回值。
+    """
+    resumed: List[str] = []
+    for tid, cfg in TASKS.items():
+        if not cfg.get("no_auto_suspend"):
+            continue
+        state = load_circuit_state(tid)
+        if state.get(_CB_READ_FAILED):
+            continue
+        if not (
+            state.get("circuit_broken")
+            or str(state.get("status") or "").lower() == "suspended"
+        ):
+            continue
+        reason = str(state.get("suspend_reason") or "")
+        if not any(marker in reason for marker in _AUTO_TRIP_REASON_MARKERS):
+            continue
+        st = resume_task(
+            tid,
+            reason="常驻任务（no_auto_suspend）不再适用 8 次上限自动熔断，自动恢复上线",
+        )
+        if st and not st.get(_CB_READ_FAILED):
+            resumed.append(tid)
+    return resumed
+
+
 def resume_all_tasks(reason: str = "人工全量重新上线") -> List[str]:
     """重新上线所有处于熔断停用状态的任务。"""
     resumed = []
@@ -445,7 +498,27 @@ def record_task_outcome(
     # 任务失败
     state["last_fail_ts"] = now_ts
 
-    if attempts >= MAX_DAILY_ATTEMPTS:
+    # 常驻任务（registry 标记 no_auto_suspend）不参与 8 次上限自动熔断。
+    # 例：telecom-exchange 0点场抢兑「错过即损失整场」，自动停用等于永久停跑；
+    # 它会由 rolling 自排程每天按时拉起，失败原因写进当日结果即可。
+    # 手动 `circuit_breaker.py suspend` 仍然有效（trip_circuit_breaker 不经此处）。
+    no_auto_suspend = not task_allows_auto_suspend(task_id)
+
+    if no_auto_suspend:
+        # 常驻任务：只记账，不自动停用、也不排框架重试阶梯（心跳 get-due-retries
+        # 会按 next_retry_at 拉起任务，多出来的白天跑与自排程打架）。节奏完全
+        # 交给 rolling 的 due_at；手工 suspend 留下的 status/circuit_broken 不动。
+        state["next_retry_at"] = None
+        _local_ok, confirmed = save_circuit_state(task_id, state)
+        if not confirmed:
+            print(f"⚠️ [CIRCUIT_BREAKER] [{task_id}] 常驻任务失败计数权威写入未确认",
+                  file=sys.stderr)
+        print(
+            f"🛡️ [常驻任务] [{task_id}] 今日第 {attempts} 次失败"
+            f"（上限 {MAX_DAILY_ATTEMPTS} 仅作参考），该任务为每日必跑"
+            f"（no_auto_suspend），不自动熔断、不排框架重试，交由自排程继续下一场次。"
+        )
+    elif attempts >= MAX_DAILY_ATTEMPTS:
         # 达到 8 次上限，立即触发熔断停用！
         reason = f"单日连续失败已达 {MAX_DAILY_ATTEMPTS} 次上限（时域风控/持续故障熔断）"
         state["status"] = "suspended"
@@ -599,6 +672,10 @@ def evaluate_retry_candidates(
             continue
 
         if att >= max_attempts:
+            if not task_allows_auto_suspend(tid):
+                # 常驻任务：达到上限也不补熔断，交由 rolling 自排程继续下一场次
+                retryable.append(tid)
+                continue
             # 达到上限，补触发熔断；仅在熔断写入确认完成后才报 tripped，
             # 二次读取失败拒写时归入 suspended（fail-closed 不调度），
             # 不得虚报 SUSPENDED_TASKS（PR #34 第十二轮评审指认）
