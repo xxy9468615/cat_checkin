@@ -30,6 +30,7 @@ if str(BASE_DIR) not in sys.path:
 
 from proxy_manager import (
     ProxyEndpoint,
+    _safe_proxy_name,
     format_dead_proxy_alert,
     get_all_proxy_endpoints,
     mask_host,
@@ -176,6 +177,9 @@ _RAW_IPV4_PORT_RE = re.compile(r"\b((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})\b")
 _RAW_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 # 宽松 IPv6（含 :: 压缩形式）：hex 段 + 冒号组成的 token，不会命中 http:// 等协议头
 _RAW_IPV6_RE = re.compile(r"(?<![0-9A-Za-z])(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}(?![0-9A-Za-z])")
+# 标准 URL 里 IPv6 必须带方括号：[240e::1]:8888
+_BRACKET_IPV6_PORT_RE = re.compile(r"\[([0-9A-Fa-f:]+)\]:(\d{1,5})")
+_BRACKET_IPV6_RE = re.compile(r"\[([0-9A-Fa-f:]+)\]")
 
 
 def sanitize_proxy_error(msg: str, endpoint: ProxyEndpoint, limit: int = 200) -> str:
@@ -190,15 +194,18 @@ def sanitize_proxy_error(msg: str, endpoint: ProxyEndpoint, limit: int = 200) ->
     # 1) 完整连接串（可能带 userinfo）整体替换
     if endpoint.url:
         text = text.replace(endpoint.url, mask_proxy_url(endpoint.url))
-    # 2) host:port 必须先于裸 host 处理，否则端口会残留在已掩码的 IP 后面
+    # 2) 方括号 IPv6（含端口）必须先处理：裸 host 替换按子串匹配，会先把
+    #    [240e::1]:8888 里的 host 掩掉，导致 ":8888" 残留在日志里
+    text = _BRACKET_IPV6_PORT_RE.sub(lambda m: f"[{mask_host(m.group(1))}]:****", text)
+    # 3) host:port 必须先于裸 host 处理，否则端口会残留在已掩码的 IP 后面
     if endpoint.host_port:
         text = text.replace(endpoint.host_port, f"{mask_host(endpoint.host)}:****")
     if endpoint.host:
         text = text.replace(endpoint.host, mask_host(endpoint.host))
-    # 3) 任意裸 IP（含 IPv4:port / IPv6），先匹配带端口的形态
+    # 4) 任意裸 IP（含 IPv4:port / IPv6），先匹配带端口的形态
     text = _RAW_IPV4_PORT_RE.sub(lambda m: f"{mask_host(m.group(1))}:****", text)
     text = _RAW_IPV4_RE.sub(lambda m: mask_host(m.group(0)), text)
-    text = re.sub(r"\[([0-9A-Fa-f:]+)\]", lambda m: f"[{mask_host(m.group(1))}]", text)
+    text = _BRACKET_IPV6_RE.sub(lambda m: f"[{mask_host(m.group(1))}]", text)
     text = _RAW_IPV6_RE.sub(lambda m: mask_host(m.group(0)), text)
     return text[:limit]
 
@@ -283,10 +290,30 @@ def load_candidate_endpoints(path: str, prefix: str = "CN") -> List[ProxyEndpoin
         if line.strip() and not line.strip().startswith(("#", "//", ";"))
     )
     endpoints = parse_proxies_text(body, default_name_prefix=prefix)
-    for idx, ep in enumerate(endpoints, 1):
-        # 无显式名称时 parse_proxies_text 会生成 "{prefix}-{掩码host}"（含 * 或 .）
-        if not ep.name or "*" in ep.name or "." in ep.name:
-            ep.name = f"{prefix}-{idx:02d}"
+
+    # 前缀同样会进入摘要表与 JSON：URL-like / 邮箱手机号形态必须脱敏
+    safe_prefix = _safe_proxy_name(prefix) or "CN"
+
+    def _auto_generated(ep: ProxyEndpoint) -> bool:
+        """解析器未拿到显式名称时会生成 "{prefix}-{掩码host}"，据此精确判定。
+
+        不能用「名称含 . 或 *」猜：显式名称 `[HK.01]` 合法且必须保留，
+        而 `localhost` 这类无点无星的自动名称又会被漏掉。
+        """
+        auto_name = _safe_proxy_name(f"{prefix}-{mask_host(ep.host)}")
+        return ep.name in ("", auto_name)
+
+    # 已显式指定的编号先占位，自动编号只分配未被占用的序号，避免重复编号
+    used = {ep.name for ep in endpoints if ep.name and not _auto_generated(ep)}
+    next_idx = 1
+    for ep in endpoints:
+        if not _auto_generated(ep):
+            continue
+        while f"{safe_prefix}-{next_idx:02d}" in used:
+            next_idx += 1
+        ep.name = f"{safe_prefix}-{next_idx:02d}"
+        used.add(ep.name)
+        next_idx += 1
     return endpoints
 
 
