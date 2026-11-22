@@ -273,6 +273,9 @@ TASKS: Dict[str, Dict[str, Any]] = {
         "account": "",
         "env": {"TELECOM_MODE": "exchange"},
         "sched": {"type": "rolling", "period_h": 24},
+        # 每日必跑：单日失败次数再多也不自动熔断停用（错过即损失整场，
+        # 停用等于永久停跑）。账号保护类人工 `suspend` 仍然有效。
+        "no_auto_suspend": True,
         "tags": ["exchange", "daily"],
     },
 
