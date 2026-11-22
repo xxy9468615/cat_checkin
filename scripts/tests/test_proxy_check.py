@@ -11,6 +11,7 @@ if str(BASE_DIR) not in sys.path:
 from proxy_check import (
     ProxyCheckResult,
     load_candidate_endpoints,
+    resolve_site_targets,
     result_to_dict,
     sanitize_proxy_error,
 )
@@ -109,6 +110,26 @@ class TestProxyCheckNumbering(unittest.TestCase):
             self.assertEqual(load_candidate_endpoints(path, prefix="CN"), [])
         finally:
             Path(path).unlink()
+
+
+class TestSiteProfiles(unittest.TestCase):
+    def test_cn_profile_has_domestic_sites_only(self):
+        names = {name for name, _ in resolve_site_targets("cn")}
+        self.assertIn("CN·SMZDM", names)
+        self.assertIn("CN·52Pojie", names)
+        # NodeSeek / AgentRouter 必须走台湾 sing-box 出口，不能混进 CN 分组
+        self.assertNotIn("TW·NodeSeek", names)
+        self.assertNotIn("TW·AgentRouter", names)
+
+    def test_global_profile_has_overseas_sites_only(self):
+        names = {name for name, _ in resolve_site_targets("global")}
+        self.assertEqual(names, {"TW·AgentRouter", "TW·NodeSeek"})
+
+    def test_none_profile_is_empty(self):
+        self.assertEqual(resolve_site_targets("none"), [])
+
+    def test_unknown_profile_falls_back_to_empty(self):
+        self.assertEqual(resolve_site_targets("bogus"), [])
 
 
 class TestProxyCheckMasking(unittest.TestCase):

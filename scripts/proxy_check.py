@@ -173,6 +173,35 @@ def _query_ip_geo(ip: str) -> Tuple[str, str]:
         return "公网", "未知"
 
 
+# 站点探测按「出口用途」分组——CN 代理池与台湾 sing-box 出口是两条互不复用的
+# 通道（NODESEEK_PROXY 由 sing-box 注入 socks5://127.0.0.1:1080）：
+#   cn     : 国内直连 WAF 站点，只有 CN 出口能过（SMZDM / 52Pojie / Cloud189 / OPPO）
+#   global : 境外站点，必须走台湾住宅出口（AgentRouter / NodeSeek），
+#            用 CN 代理探测只会得到恒定的「连接超时」，属于错误对照
+SITE_TARGETS: Dict[str, List[Tuple[str, str]]] = {
+    "cn": [
+        ("CN·52Pojie", "https://www.52pojie.cn/index.php"),
+        ("CN·SMZDM", "https://user-api.smzdm.com/checkin"),
+        ("CN·Cloud189", "https://cloud.189.cn"),
+        ("CN·OPPO", "https://hd.opposhop.cn"),
+    ],
+    "global": [
+        ("TW·AgentRouter", "https://ps.air-outer.com"),
+        ("TW·NodeSeek", "https://www.nodeseek.com"),
+    ],
+}
+
+
+def resolve_site_targets(site_profile: str) -> List[Tuple[str, str]]:
+    """把 site_profile 展开为 [(名称, URL)]；非法值返回空列表（等价 --no-sites）。"""
+    profile = (site_profile or "all").strip().lower()
+    if profile in ("none", "off", "no"):
+        return []
+    if profile == "all":
+        return SITE_TARGETS["cn"] + SITE_TARGETS["global"]
+    return list(SITE_TARGETS.get(profile, []))
+
+
 _RAW_IPV4_PORT_RE = re.compile(r"\b((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})\b")
 _RAW_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 # 宽松 IPv6（含 :: 压缩形式）：hex 段 + 冒号组成的 token，不会命中 http:// 等协议头
@@ -214,6 +243,7 @@ def check_single_proxy(
     endpoint: ProxyEndpoint,
     test_sites: bool = True,
     timeout: float = 8.0,
+    site_profile: str = "all",
 ) -> ProxyCheckResult:
     """全面体检单个代理节点。"""
     res = ProxyCheckResult(endpoint=endpoint)
@@ -248,14 +278,9 @@ def check_single_proxy(
     res.latency_ms = lat
     res.ip_geo, res.ip_isp = _query_ip_geo(res.exit_ip)
 
-    # 2. 关键业务目标站点可达性探测
-    if test_sites:
-        targets = [
-            ("AgentRouter", "https://ps.air-outer.com"),
-            ("NodeSeek", "https://www.nodeseek.com"),
-            ("52Pojie", "https://www.52pojie.cn/index.php"),
-            ("SMZDM", "https://user-api.smzdm.com/checkin"),
-        ]
+    # 2. 关键业务目标站点可达性探测（按出口用途分组，见 SITE_TARGETS）
+    targets = resolve_site_targets(site_profile) if test_sites else []
+    if targets:
         for name, url in targets:
             scode, sbody, _ = _probe_via_curl_or_urllib(
                 endpoint, url, timeout=max(5.0, timeout - 2)
@@ -385,6 +410,7 @@ def run_proxy_healthcheck(
     test_sites: bool = True,
     timeout: float = 8.0,
     max_workers: int = 5,
+    site_profile: str = "all",
 ) -> Tuple[List[ProxyCheckResult], List[ProxyCheckResult]]:
     """批量并发检测所有代理节点，返回 (存活列表, 死代理列表)。"""
     if custom_proxies:
@@ -403,7 +429,8 @@ def run_proxy_healthcheck(
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
-            executor.submit(check_single_proxy, ep, test_sites, timeout): ep for ep in endpoints
+            executor.submit(check_single_proxy, ep, test_sites, timeout, site_profile): ep
+            for ep in endpoints
         }
         for future in concurrent.futures.as_completed(future_map):
             try:
@@ -469,7 +496,14 @@ def print_healthcheck_report(alive_list: List[ProxyCheckResult], dead_list: List
 def main() -> None:
     parser = argparse.ArgumentParser(description="代理自建与多渠道节点健康自检工具")
     parser.add_argument("proxies", nargs="*", help="可选命令行传入代理串，如 'socks5://1.2.3.4:1080#自建-HK'")
-    parser.add_argument("--no-sites", action="store_true", help="跳过目标业务站点(NodeSeek/52Pojie等)的探测")
+    parser.add_argument("--no-sites", action="store_true", help="跳过所有目标业务站点探测")
+    parser.add_argument(
+        "--site-profile",
+        default="all",
+        choices=["all", "cn", "global", "none"],
+        help="站点探测分组：cn=国内站点（SMZDM/52Pojie/Cloud189/OPPO，走 CN 出口）；"
+        "global=境外站点（AgentRouter/NodeSeek，必须走台湾 sing-box 出口）；默认 all",
+    )
     parser.add_argument("--timeout", type=float, default=8.0, help="单节点超时时间(秒，默认 8.0)")
     parser.add_argument("--workers", type=int, default=6, help="并发线程数(默认 6)")
     parser.add_argument("--env-file", default=".env", help="本地 .env 路径")
@@ -519,6 +553,7 @@ def main() -> None:
         test_sites=not args.no_sites,
         timeout=args.timeout,
         max_workers=args.workers,
+        site_profile=args.site_profile,
     )
 
     print_healthcheck_report(alive, dead)
