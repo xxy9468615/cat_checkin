@@ -59,14 +59,16 @@ jobs:
       - name: Install dependencies
         run: pip install --no-cache-dir -r requirements.txt
 
-      # 候选清单只存在于 secret 中；逐行 add-mask 防止多行 secret 按行漏遮
+      # 候选清单只存在于 secret 中；逐行 add-mask 防止多行 secret 按行漏遮。
+      # 默认读专用体检 secret；未配置时回落到生产 CN 池 WUAI_PROXY——
+      # 生产池本身就是「编号候选清单」格式，可直接复检，不必再维护一份副本。
       - name: Materialize candidates (masked)
         env:
-          CN_PROXY_CANDIDATES: ${{ secrets.CN_PROXY_CANDIDATES }}
+          CN_PROXY_CANDIDATES: ${{ secrets.CN_PROXY_CANDIDATES || secrets.WUAI_PROXY }}
         run: |
           set -euo pipefail
           if [ -z "${CN_PROXY_CANDIDATES//[[:space:]]/}" ]; then
-            echo "::error::未配置 repository secret CN_PROXY_CANDIDATES（编号候选清单，每行一个：[CN-01] http://host:port）"
+            echo "::error::未配置 repository secret CN_PROXY_CANDIDATES 或 WUAI_PROXY（编号候选清单，每行一个：[CN-01] http://host:port）"
             exit 1
           fi
           umask 077
