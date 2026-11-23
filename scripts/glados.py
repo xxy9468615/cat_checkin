@@ -8,6 +8,9 @@ Environment compatibility:
   GLADOS_COOKIES          Cookies split by "&", newline, or "&&".
   GLADOS_EXCHANGE_PLAN    plan100 / plan200 / plan500, default: plan500.
   GLADOS_AUTO_EXCHANGE    true/false, default: true.
+  GLADOS_EXCHANGE_SKIP    逗号分隔的账号序号（1 起，按 COOKIE_N 顺序），默认 2,3：
+                          这些账号只签到、不兑换，积分全额留存。设为 none 才允许
+                          全部账号按 GLADOS_AUTO_EXCHANGE 兑换。
   GLADOS_VERBOSE          true/false, default: false.
   GLADOS_DOMAINS          Comma-separated domains, default: glados.cloud.
   PUSHDEER_SENDKEY        Optional PushDeer key, sends summary without extra dependency.
@@ -205,6 +208,33 @@ EXCHANGE_PLANS = {
     "plan200": 200,
     "plan500": 500,
 }
+
+# 默认不参与自动兑换的账号序号（1 起，按 GLADOS_COOKIE_N 顺序）：
+# 2、3 号只签到、积分全额留存（2026-11 用户指令）。默认值写进代码而不是只靠
+# CI 变量——变量被误删时宁可少兑换，也不能意外花掉账号积分。
+DEFAULT_EXCHANGE_SKIP_INDEXES = (2, 3)
+
+
+def parse_exchange_skip(raw: Optional[str]) -> set:
+    """解析 GLADOS_EXCHANGE_SKIP → 不参与自动兑换的账号序号集合。
+
+    - 逗号分隔的正整数序号（1 起），非数字/非正数忽略；
+    - 整体写 none / off 表示「所有账号都按 GLADOS_AUTO_EXCHANGE 兑换」；
+    - 无任何有效序号（含变量为空或全是垃圾字符）时退回默认 {2, 3}：
+      解析失败的方向必须是「少兑换」，不能因为配置写错就把积分花掉。
+    """
+    text = (raw or "").strip().lower()
+    if text in ("none", "off"):
+        return set()
+    indexes = set()
+    for token in text.split(","):
+        try:
+            idx = int(token.strip())
+        except ValueError:
+            continue
+        if idx > 0:
+            indexes.add(idx)
+    return indexes or set(DEFAULT_EXCHANGE_SKIP_INDEXES)
 
 
 @dataclass
@@ -458,6 +488,7 @@ class Config:
         self.domains = self._load_domains()
         self.exchange_plan = self._load_exchange_plan()
         self.auto_exchange = self._bool_env("GLADOS_AUTO_EXCHANGE", True)
+        self.exchange_skip = self._load_exchange_skip()
         self.verbose = self._bool_env("GLADOS_VERBOSE", False)
         self.proxies = self._load_proxies()
         self.egress = self._resolve_egress()
@@ -510,6 +541,12 @@ class Config:
         if plan not in EXCHANGE_PLANS:
             return "plan500"
         return plan
+
+    def _load_exchange_skip(self) -> set:
+        raw = os.getenv("GLADOS_EXCHANGE_SKIP")
+        return parse_exchange_skip(
+            raw if raw is not None else ",".join(str(i) for i in DEFAULT_EXCHANGE_SKIP_INDEXES)
+        )
 
     @staticmethod
     def _bool_env(name: str, default: bool) -> bool:
@@ -770,6 +807,9 @@ class Checker:
 
     def run(self) -> None:
         print("【GLaDOS 签到兑换】")
+        skip = sorted(getattr(self.config, "exchange_skip", set()) or set())
+        if self.config.auto_exchange and skip:
+            print("🎁 自动兑换范围: 除 " + "、".join(f"{i} 号" for i in skip) + "外（以上账号仅签到）")
         # 上游无密码登录接口，仅支持 Cookie 认证
         endpoint = self.config.egress
         tag = endpoint.display_name if endpoint else "直连（GLADOS_ALLOW_DIRECT=1）"
@@ -881,14 +921,17 @@ class Checker:
             result.exchange = f"积分查询失败（{'签到已确认' if confirmed else '签到未确认'}）"
             return result
 
-        if self.config.auto_exchange:
+        if not self.config.auto_exchange:
+            result.exchange = "未开启自动兑换"
+        elif cookie_index in self.config.exchange_skip:
+            # 指定账号只签到：积分全额留存，任何情况下都不调用兑换接口
+            result.exchange = "跳过兑换（本账号仅签到）"
+        else:
             required = EXCHANGE_PLANS[self.config.exchange_plan]
             result.exchange, ex_count = api.exchange(cookie, self.config.exchange_plan, required, points_total)
             # 若兑换成功，刷新最新的剩余天数
             if ex_count > 0:
                 result.days, _ = api.status(cookie)
-        else:
-            result.exchange = "未开启自动兑换"
 
         expiry_tag = self._expiry_tag(api, cookie, cookie_index, learned, marked_state)
         acc_label = mask_str(result.account_name) if result.account_name else f"账号 {cookie_index}"

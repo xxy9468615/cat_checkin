@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # cron: 10 9 * * *
-# new Env("Railgun 签到兑换")
+# new Env("Railgun 签到")
 """Railgun standalone task: multi-account, multi-cookie, multi-domain check-in and auto exchange.
 
 Environment compatibility:
   RAILGUN_COOKIE_1, _2...  Multi-account cookie sequence variables (cookie auth ONLY).
   RAILGUN_COOKIES          Cookies split by "&", newline, or "&&".
   RAILGUN_EXCHANGE_PLAN    plan100 / plan200 / plan500, default: plan500.
-  RAILGUN_AUTO_EXCHANGE    true/false, default: true.
+  RAILGUN_AUTO_EXCHANGE    true/false, default: false（2026-11 用户指令：本任务只签到，
+                           不再兑换积分；需要恢复自动兑换时才显式设 true）。
   RAILGUN_VERBOSE          true/false, default: false.
   RAILGUN_DOMAINS          Comma-separated domains, default: railgun.info.
   PUSHDEER_SENDKEY         Optional PushDeer key, sends summary without extra dependency.
@@ -100,7 +101,8 @@ class Config:
         self.cookies = self._load_cookies()
         self.domains = self._load_domains()
         self.exchange_plan = self._load_exchange_plan()
-        self.auto_exchange = self._bool_env("RAILGUN_AUTO_EXCHANGE", True)
+        # 只签到任务：兑换默认关闭（user mandate 2026-11），兑换代码保留为显式 opt-in
+        self.auto_exchange = self._bool_env("RAILGUN_AUTO_EXCHANGE", False)
         self.verbose = self._bool_env("RAILGUN_VERBOSE", False)
 
     def _load_cookies(self) -> List[str]:
@@ -265,7 +267,7 @@ class Checker:
         self.results: List[Result] = []
 
     def run(self) -> None:
-        print("【Railgun 签到兑换】")
+        print("【Railgun 签到】")
         # 上游无密码登录接口，仅支持 Cookie 认证
         for cookie_index, cookie in enumerate(self.config.cookies, 1):
             for domain in self.config.domains:
@@ -311,7 +313,7 @@ class Checker:
             if ex_count > 0:
                 result.days, _ = api.status(cookie)
         else:
-            result.exchange = "未开启自动兑换"
+            result.exchange = "未兑换（本任务仅签到）"
 
         _, remaining_days = _parse_cookie_expiry(cookie)
         expiry_desc = (

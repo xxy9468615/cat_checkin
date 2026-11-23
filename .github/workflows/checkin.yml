@@ -86,11 +86,14 @@ jobs:
       GLADOS_COOKIE_3: ${{ secrets.GLADOS_COOKIE_3 }}
       GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
       GLADOS_AUTO_EXCHANGE: "true"
+      # 2、3 号只签到不兑换（积分留存）；代码默认值同为 2,3，此处显式声明便于审计
+      GLADOS_EXCHANGE_SKIP: "2,3"
       GLADOS_DOMAINS: glados.cloud
       RAILGUN_COOKIE_1: ${{ secrets.RAILGUN_COOKIE_1 }}
       RAILGUN_COOKIE_2: ${{ secrets.RAILGUN_COOKIE_2 }}
       RAILGUN_COOKIE_3: ${{ secrets.RAILGUN_COOKIE_3 }}
-      RAILGUN_AUTO_EXCHANGE: "true"
+      # 只签到任务：不再兑换积分（2026-11 用户指令），恢复需显式改回 true
+      RAILGUN_AUTO_EXCHANGE: "false"
       RAILGUN_DOMAINS: railgun.info
       BIANJIE_AI_USERNAME_1: ${{ secrets.BIANJIE_AI_USERNAME_1 }}
       BIANJIE_AI_PASSWORD_1: ${{ secrets.BIANJIE_AI_PASSWORD_1 }}
