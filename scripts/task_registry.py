@@ -32,7 +32,8 @@ TASKS: Dict[str, Dict[str, Any]] = {
     "railgun": {
         "id": "railgun",
         "script": "railgun.py",
-        "name": "Railgun 签到兑换",
+        # 只签到不兑换（2026-11 用户指令）：RAILGUN_AUTO_EXCHANGE 默认 false
+        "name": "Railgun 签到",
         "result": "railgun.json",
         "timeout": 300,
         "account": "",

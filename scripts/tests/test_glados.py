@@ -1,6 +1,7 @@
 """GLaDOS 签到挑战回归测试；全部挑战、响应与 Cookie 均为合成数据。"""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -575,6 +576,81 @@ class TestEmptyDeviceField(unittest.TestCase):
     def test_valid_linux_still_normalized(self):
         self.assertEqual(glados.resolve_device("Linux"), "linux")
         self.assertEqual(glados.resolve_device("WINDOWS"), "windows")
+
+
+class TestExchangeSkipPolicy(unittest.TestCase):
+    """2、3 号只签到：兑换接口绝不被调用，积分全额留存（2026-11 用户指令）。"""
+
+    def _checker(self, skip):
+        checker = glados.Checker.__new__(glados.Checker)
+        checker.results = []
+        checker.devices = {}
+        checker.browser = None
+        checker.config = Mock(auto_exchange=True, exchange_plan="plan500",
+                              exchange_skip=skip, verbose=False)
+        checker._checkin = Mock(
+            return_value=(("签到成功", glados.CHECKIN_SUCCESS, 5, "ok"), {}))
+        checker._mark_run_day = Mock(return_value=None)
+        checker._expiry_tag = Mock(return_value="")
+        return checker
+
+    @staticmethod
+    def _api():
+        api = Mock()
+        api.status.return_value = ("12 天", glados.CHECKIN_SUCCESS)
+        api.points.return_value = ("600 积分", 600)
+        api.exchange.return_value = ("🎁 成功兑换 plan500", 1)
+        return api
+
+    def test_skipped_account_never_calls_exchange(self):
+        checker = self._checker({2, 3})
+        api = self._api()
+        result = checker._run_one(api, SYNTHETIC_COOKIE, 2, "glados.example")
+        api.exchange.assert_not_called()
+        self.assertEqual(result.exchange, "跳过兑换（本账号仅签到）")
+        # 只读查询不受影响：积分照常上报，只是不花
+        self.assertEqual(result.points_total, 600)
+        self.assertEqual(result.code, glados.CHECKIN_SUCCESS)
+
+    def test_unlisted_account_still_exchanges(self):
+        checker = self._checker({2, 3})
+        api = self._api()
+        result = checker._run_one(api, SYNTHETIC_COOKIE, 1, "glados.example")
+        api.exchange.assert_called_once()
+        self.assertIn("成功兑换", result.exchange)
+
+    def test_auto_exchange_off_wins(self):
+        checker = self._checker(set())
+        checker.config = Mock(auto_exchange=False, exchange_plan="plan500",
+                              exchange_skip=set(), verbose=False)
+        api = self._api()
+        result = checker._run_one(api, SYNTHETIC_COOKIE, 1, "glados.example")
+        api.exchange.assert_not_called()
+        self.assertEqual(result.exchange, "未开启自动兑换")
+
+    def test_parse_defaults(self):
+        # 变量缺失/为空/写错方向一律退回默认跳过 2、3 号（宁可少兑换）
+        for raw in (None, "", "   ", "garbage", "x, y"):
+            with self.subTest(raw=raw):
+                self.assertEqual(glados.parse_exchange_skip(raw), {2, 3})
+
+    def test_parse_custom(self):
+        self.assertEqual(glados.parse_exchange_skip("1, 3 ,4"), {1, 3, 4})
+        # 非数字/非正数忽略，保留有效序号
+        self.assertEqual(glados.parse_exchange_skip("1, 0, -2, x"), {1})
+
+    def test_parse_none_reenables_every_account(self):
+        for raw in ("none", "NONE", "off"):
+            with self.subTest(raw=raw):
+                self.assertEqual(glados.parse_exchange_skip(raw), set())
+
+    def test_config_reads_env(self):
+        config = glados.Config.__new__(glados.Config)
+        with patch.dict("os.environ", {"GLADOS_EXCHANGE_SKIP": "1"}):
+            self.assertEqual(config._load_exchange_skip(), {1})
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("GLADOS_EXCHANGE_SKIP", None)
+            self.assertEqual(config._load_exchange_skip(), {2, 3})
 
 
 if __name__ == "__main__":
