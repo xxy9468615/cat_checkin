@@ -745,7 +745,8 @@ def env(prefix: str, name: str, default: str = "", required: bool = True) -> str
     return default
 
 
-def env_seq(prefix: str, name: str, default: list[str] | None = None, required: bool = True) -> list[str]:
+def env_seq(prefix: str, name: str, default: list[str] | None = None, required: bool = True,
+            with_index: bool = False) -> list:
     """获取多账号序列环境变量（统一支持 <PREFIX>_<NAME>_1, <PREFIX>_<NAME>_2 序列）。
 
     检索策略：
@@ -758,6 +759,11 @@ def env_seq(prefix: str, name: str, default: list[str] | None = None, required: 
     3. 若均未找到：
        - 当 required=True 且 default 为 None 时，抛出 RuntimeError。
        - 否则返回 default if default is not None else []。
+
+    with_index=True 时返回 [(原始序号, 值)]：序号是环境变量的编号（_N 的 N），
+    不是结果列表下标。切分/丢弃空值都不会让序号前移，调用方可以据此实现
+    「按账号序号生效」的策略（如 glados 的 GLADOS_EXCHANGE_SKIP）。同一编号下
+    用 && 拆出的多条值共用同一序号；回退的未编号单变量按切分后的位置编号 1..N。
     """
     clean_prefix = prefix.removeprefix("QL_")
     results = []
@@ -789,7 +795,7 @@ def env_seq(prefix: str, name: str, default: list[str] | None = None, required: 
             for piece in re.split(r"\n|&&", found):
                 p = piece.strip()
                 if p:
-                    results.append(p)
+                    results.append((idx, p) if with_index else p)
             idx += 1
         else:
             break
@@ -802,7 +808,7 @@ def env_seq(prefix: str, name: str, default: list[str] | None = None, required: 
     if fallback_val:
         parts = [x.strip() for x in re.split(r"\n|&&", fallback_val) if x.strip()]
         if parts:
-            return parts
+            return list(enumerate(parts, 1)) if with_index else parts
 
     if required and default is None:
         raise RuntimeError(f"缺少环境变量：{clean_prefix}{name}_1 或 {clean_prefix}{name}")

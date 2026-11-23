@@ -652,6 +652,38 @@ class TestExchangeSkipPolicy(unittest.TestCase):
             os.environ.pop("GLADOS_EXCHANGE_SKIP", None)
             self.assertEqual(config._load_exchange_skip(), {2, 3})
 
+    def test_account_index_is_env_number_not_list_position(self):
+        """空白 Cookie 被丢弃后下标会前移，账号序号必须保持环境变量原始编号，
+        否则 skip 2/3 会落到 1 号的 cookie 上（PR #39 评审）。"""
+        config = glados.Config.__new__(glados.Config)
+        env = {"GLADOS_COOKIE_1": "koa:sess=V1.0FAKEa",
+               "GLADOS_COOKIE_2": "   ",
+               "GLADOS_COOKIE_3": "koa:sess=V1.0FAKEc"}
+        with patch.dict("os.environ", env, clear=True):
+            accounts = config._load_cookies()
+        self.assertEqual([idx for idx, _ in accounts], [1, 3])
+
+    def test_run_skips_by_env_index(self):
+        """端到端：Checker.run 传给 _run_one 的序号 = 环境变量编号。"""
+        config = Mock(auto_exchange=True, exchange_plan="plan500",
+                      exchange_skip={2, 3}, verbose=False, egress=None,
+                      domains=["glados.example"],
+                      cookies=[(1, "koa:sess=V1.0FAKEa"), (3, "koa:sess=V1.0FAKEc")])
+        checker = glados.Checker.__new__(glados.Checker)
+        checker.results = []
+        checker.devices = {}
+        checker.browser = None
+        checker.config = config
+        seen = []
+
+        def fake(cookie, cookie_index, domain, endpoint, tag):
+            seen.append(cookie_index)
+            return glados.Result(cookie_index=cookie_index, domain=domain)
+
+        checker._run_account = fake
+        checker.run()
+        self.assertEqual(seen, [1, 3])
+
 
 if __name__ == "__main__":
     unittest.main()

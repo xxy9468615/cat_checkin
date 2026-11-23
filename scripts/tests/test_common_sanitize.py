@@ -406,5 +406,39 @@ class TestMaskEnhanced(unittest.TestCase):
         self.assertEqual(common.mask_str("a@b.com", 1, 1), "***@***")
 
 
+class TestEnvSeqWithIndex(unittest.TestCase):
+    """env_seq(with_index=True) 返回原始环境编号：丢弃空值不得让序号前移，
+    否则「按账号序号生效」的策略会落到别的账号上（PR #39 评审）。"""
+
+    def test_default_behavior_unchanged(self):
+        env = {"GLADOS_COOKIE_1": "a", "GLADOS_COOKIE_2": "b"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(common.env_seq("GLADOS_", "cookie"), ["a", "b"])
+
+    def test_index_preserved_after_blank_slot(self):
+        # 空白值：env_seq 视为「已配置但无内容」，条目被丢弃，但编号必须留在 3
+        env = {"GLADOS_COOKIE_1": "a", "GLADOS_COOKIE_2": "   ", "GLADOS_COOKIE_3": "c"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(common.env_seq("GLADOS_", "cookie", with_index=True),
+                             [(1, "a"), (3, "c")])
+
+    def test_split_values_share_the_same_index(self):
+        env = {"GLADOS_COOKIE_1": "a&&b", "GLADOS_COOKIE_2": "c"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(common.env_seq("GLADOS_", "cookie", with_index=True),
+                             [(1, "a"), (1, "b"), (2, "c")])
+
+    def test_fallback_single_variable_numbered_by_position(self):
+        env = {"GLADOS_COOKIES": "a\nb"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(common.env_seq("GLADOS_", "cookies", with_index=True),
+                             [(1, "a"), (2, "b")])
+
+    def test_missing_returns_empty(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(common.env_seq("GLADOS_", "cookie",
+                                            required=False, with_index=True), [])
+
+
 if __name__ == "__main__":
     unittest.main()

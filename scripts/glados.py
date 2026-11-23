@@ -524,12 +524,18 @@ class Config:
             "家宽出口缺失时签到必被 Turnstile 拒绝。本机直连排查请设 GLADOS_ALLOW_DIRECT=1"
         )
 
-    def _load_cookies(self) -> List[str]:
+    def _load_cookies(self) -> List[Tuple[int, str]]:
+        """返回 [(账号序号, cookie)]。
+
+        序号取环境变量原始编号（GLADOS_COOKIE_N 的 N），不是过滤后列表的下标：
+        空值被丢弃后下标会前移，用下标判定 GLADOS_EXCHANGE_SKIP 会让跳过策略
+        落到另一个账号的 cookie 上。回退的 GLADOS_COOKIES 按切分位置编号。
+        """
         # 优先扫描 COOKIE_1, COOKIE_2 序列，回退至 COOKIES / cookie (含 && 切分)
-        cookies = env_seq("GLADOS_", "cookie", required=False)
+        cookies = env_seq("GLADOS_", "cookie", required=False, with_index=True)
         if not cookies:
-            cookies = env_seq("GLADOS_", "cookies", required=False)
-        return [c.strip() for c in cookies if c.strip()]
+            cookies = env_seq("GLADOS_", "cookies", required=False, with_index=True)
+        return [(index, cookie.strip()) for index, cookie in cookies if cookie.strip()]
 
     def _load_domains(self) -> List[str]:
         raw = os.getenv("GLADOS_DOMAINS", "glados.cloud")
@@ -814,7 +820,8 @@ class Checker:
         endpoint = self.config.egress
         tag = endpoint.display_name if endpoint else "直连（GLADOS_ALLOW_DIRECT=1）"
         try:
-            for cookie_index, cookie in enumerate(self.config.cookies, 1):
+            # 账号序号来自环境变量原始编号（见 _load_cookies），不是列表下标
+            for cookie_index, cookie in self.config.cookies:
                 for domain in self.config.domains:
                     self.results.append(self._run_account(cookie, cookie_index, domain, endpoint, tag))
         finally:
