@@ -25,10 +25,10 @@ class TestRightsSchedule(unittest.TestCase):
         ids = [sid for sid, _, _ in srs.SCHEDULES]
         self.assertEqual(ids, ["cat-checkin-rights-window", "cat-checkin-rights-catchup"])
         crons = {sid: cron for sid, cron, _ in srs.SCHEDULES}
-        # UTC 15:30 = BJT 23:30（0 点场前 30 分钟）；00:00:05 UTC = BJT 00:00:05
+        # UTC 15:30 = BJT 23:30；UTC 16:00 = BJT 00:00（5 字段 cron 无秒）
         # 补发必须在窗口内：旧 23:50 被 workflow 并发锁延后到 00:04 形同虚设
         self.assertEqual(crons["cat-checkin-rights-window"], "30 15 * * *")
-        self.assertEqual(crons["cat-checkin-rights-catchup"], "5 0 * * *")
+        self.assertEqual(crons["cat-checkin-rights-catchup"], "0 16 * * *")
         self.assertEqual(srs.EVENT_TYPE, "checkin_rights")
 
     def test_create_requires_credentials(self):
@@ -69,6 +69,13 @@ class TestRightsSchedule(unittest.TestCase):
         m = re.search(r'checkin_rights\)\s+CANDIDATES="([^"]+)"', wf)
         self.assertIsNotNone(m, "Precheck case 分支缺少 checkin_rights 映射")
         self.assertEqual(m.group(1), "telecom-exchange")
+
+    def test_rights_dispatch_has_independent_concurrency_group(self):
+        """0 点场派发不得排在主力 unified 并发组之后（PR #40 评审）：
+        23:30 主力占用队列到 00:04，补发必须能同时进入窗口。"""
+        wf = (BASE_DIR.parent / ".github" / "workflows" / "checkin.yml").read_text(encoding="utf-8")
+        self.assertIn("github.event.action == 'checkin_rights'", wf)
+        self.assertIn("unified-rights-", wf)
 
     def test_workflow_self_heals_rights_schedule(self):
         """自愈护栏：unified job 必须有 Ensure QStash rights schedule 步骤，

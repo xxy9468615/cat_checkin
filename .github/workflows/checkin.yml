@@ -70,7 +70,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     concurrency:
-      group: unified-${{ github.ref }}
+      # 0 点场补发派发（checkin_rights）必须独立于主力并发组：旧补发 23:50
+      # 排在 23:30 主力之后，主力等到 00:04 结束，补发启动时库存早已抢光。
+      # 00:00 补发与主力走不同 group 才能同时进入窗口；账号级串行由任务内
+      # rolling 冷却 + 服务端库存/月限裁决保证（重复派发秒退，不重复兑换）。
+      group: ${{ github.event.action == 'checkin_rights' && format('unified-rights-{0}', github.ref) || format('unified-{0}', github.ref) }}
       cancel-in-progress: false
     env:
       TZ: Asia/Shanghai
@@ -252,7 +256,7 @@ jobs:
               # ModelScope 双实例已于 2026-10-28 退役（风控簇风险）——遗留 dispatch 入口指向空队列
               checkin_modelscope)            CANDIDATES="none" ;;
               checkin_morning)               CANDIDATES="all" ;;
-              # 0 点抢兑精准派发（QStash 23:30 + 00:00:05 BJT 双排程，2026-11-24 补发时刻复盘）：
+              # 0 点抢兑精准派发（QStash 23:30 + 00:00 BJT 双排程，2026-11-24 补发时刻复盘）：
               # GitHub */30 心跳实测断档 4.5h 错过整场，主力改 QStash，心跳仅兜底。
               # 不带 --due-only：精准派发本身就是到期信号，rolling 冷却由任务自排程
               # 管理；重复派发经服务端库存/月限裁决幂等，不会重复兑换。
@@ -563,11 +567,11 @@ jobs:
             stash_proxy_state none "" "" ""
           fi
 
-      # 自愈式排程注册（0 点抢兑）：QStash 双排程（23:30 主力 + 00:00:05 补发）是
+      # 自愈式排程注册（0 点抢兑）：QStash 双排程（23:30 主力 + 00:00 补发）是
       # telecom-exchange 的定时主力，一旦被误删或首次部署缺失，任何一次非空 run
       # 即原地重建（固定 scheduleId => 幂等 update）。2026-11-19 GitHub */30 心跳
       # 断档 4.5h 整场错过的复盘对策。失败不影响本次执行，仅告警。
-      # 0 点场派发自身不重复注册（避免 23:30/00:00:05 双派发各自重写排程）。
+      # 0 点场派发自身不重复注册（避免 23:30/00:00 双派发各自重写排程）。
       - name: Ensure QStash rights schedule
         if: steps.orch_tasks.outputs.due_tasks != 'none' && github.event.action != 'checkin_rights'
         env:
