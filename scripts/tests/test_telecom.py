@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1472,6 +1473,93 @@ class TestJindouExchange(unittest.TestCase):
         self.assertIn("金豆不足", res)
         self.assertNotEqual(res, "今日已抽")
         self.assertEqual(len(self._wheel_submits), 1)
+
+
+    # ---------- 0 点场提速/降级回归（2026-11-24 CI 复盘）----------
+
+    def test_rights_precheck_before_long_wait(self):
+        """23:30 派发时先查权益/库存，不得跨越 29 分钟长睡后再鉴权。
+
+        旧实现先 sleep 到 23:59 再查询，sign 在等待期失效 → 换出口烧掉
+        4 分钟 → 00:04 抢兑，库存早已售罄（2026-11-23/24 CI 实证）。"""
+        rights = self._rights(4)
+        rights["V3"][0]["isReceive"] = "false"
+        client = self._rights_client()
+        calls = []
+
+        def fake_req(method, url, **kw):
+            calls.append(url.rsplit("/", 1)[-1])
+            if "queryLevelRightInfo" in url:
+                return rights
+            if "querystockNum" in url:
+                return {"resoultCode": "0", "stockNum": 102}
+            return {"resoultCode": "1", "resoultMsg": "系统繁忙"}
+
+        client._req = MagicMock(side_effect=fake_req)
+        fixed_now = datetime(2026, 11, 24, 23, 30, tzinfo=telecom.BJT)
+
+        class _FixedDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now
+
+        def fake_sleep(seconds):
+            if seconds < 1:
+                return
+            raise RuntimeError("LONG_WAIT_REACHED")
+
+        with patch.object(telecom.time, "sleep", side_effect=fake_sleep), \
+             patch.object(telecom, "datetime", _FixedDT), \
+             patch.object(telecom, "_rights_refresh_session", return_value=True), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            try:
+                telecom.run_rights_exchange(client, "2元话费", wait_for_window=True, burst=1)
+            except RuntimeError as exc:
+                self.assertEqual(str(exc), "LONG_WAIT_REACHED")
+        self.assertEqual(calls[0], "queryLevelRightInfo")
+        self.assertEqual(calls[1], "querystockNum")
+
+    def test_rights_sold_out_primary_falls_back_to_available_tier(self):
+        """主档售罄 + 备用档有库存：必须继续抢低档，不得直接判「今日终止」。"""
+        rights = self._rights(4)
+        client = self._rights_client()
+        submitted_ids = []
+
+        def fake_req(method, url, **kw):
+            if "queryLevelRightInfo" in url:
+                return rights
+            if "querystockNum" in url:
+                para = kw.get("json_data", {}).get("para", "")
+                # 主档 activityId 末位 4；备用档 V3 末位 3
+                return {"resoultCode": "0", "stockNum": 0 if "right4" in para else 12}
+            if "receiverRights" in url:
+                para = kw.get("json_data", {}).get("para", "")
+                rid = "main" if "right4" in para else "alt"
+                submitted_ids.append(rid)
+                if rid == "main":
+                    return {"resoultCode": "1", "resoultMsg": "抱歉，奖品已领完"}
+                return {"resoultCode": "0", "resoultMsg": "兑换成功"}
+            return {}
+
+        client._req = MagicMock(side_effect=fake_req)
+        fixed_now = datetime(2026, 11, 25, 0, 30, tzinfo=telecom.BJT)
+
+        class _FixedDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now
+
+        with patch.object(telecom.time, "sleep", lambda *_: None), \
+             patch.object(telecom, "datetime", _FixedDT), \
+             patch.object(telecom, "_encrypt_rsa", lambda data: json.dumps(data, ensure_ascii=False)), \
+             patch.object(telecom, "RIGHTS_FALLBACK_TIERS", 2), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok, msg = telecom.run_rights_exchange(
+                client, "2元话费", wait_for_window=True, burst=2)
+        self.assertTrue(ok)
+        self.assertIn("成功兑换", msg)
+        self.assertIn("1元", msg)
+        self.assertEqual(submitted_ids, ["main", "alt"])
 
 
 if __name__ == "__main__":

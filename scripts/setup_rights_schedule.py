@@ -12,10 +12,13 @@
   - 主力 cat-checkin-rights-window：23:30 BJT（UTC 15:30）精准派发
     repository_dispatch(checkin_rights)，拉起 telecom-exchange，任务内等到
     23:59:20 预检 + 00:00:00 突发；
-  - 补发 cat-checkin-rights-catchup：23:50 BJT（UTC 15:50）再派发一次——
-    主力派发失败/runner 排队过长时接力。两次派发都经 rolling 冷却 + 服务端
-    remainCount/库存裁决幂等：已终局（成功/售罄/限兑）的场次重复拉起只会
-    秒退，不会重复兑换。0 点后的迟到派发由任务内「场次已过」判定直接排下一场。
+  - 补发 cat-checkin-rights-catchup：00:00:05 BJT（UTC 16:00:05）再派发一次——
+    2026-11-24 CI 复盘：旧补发时刻 23:50 BJT 会排在 23:30 主力之后进入
+    workflow concurrency 队列（group=unified-refs/heads/main，cancel=false），
+    主力任务在 23:30~00:04 持续占用队列，补发直到 00:04 才启动，首发库存
+    早已抢光，补发形同虚设。改到 00:00:05 后，补发与主力的 0 点突发几乎
+    同时发生，且主力若已终局则服务端库存/月限裁决幂等（秒退不重复兑换）。
+    两次派发都经 rolling 冷却 + 服务端 remainCount/库存裁决幂等。
 
 用法：
   python3 scripts/setup_rights_schedule.py            # 创建/更新双排程（幂等）
@@ -47,10 +50,12 @@ from common import Http, create_qstash_schedule, sanitize_snippet  # noqa: E402
 # 派发事件名（checkin.yml Precheck 的 case 分支认此 action → telecom-exchange）
 EVENT_TYPE = "checkin_rights"
 
-# (scheduleId, UTC cron, BJT 说明)：主力 23:30 + 补发 23:50
+# (scheduleId, UTC cron, BJT 说明)：主力 23:30 + 补发 00:00:05
+# 补发不能排在 23:50：workflow concurrency 会把 23:50 dispatch 排在 23:30
+# 任务之后，00:04 才启动，库存已空（2026-11-24 CI 实证）。
 SCHEDULES = [
     ("cat-checkin-rights-window", "30 15 * * *", "每日 23:30 北京时间（0 点场预检主力）"),
-    ("cat-checkin-rights-catchup", "50 15 * * *", "每日 23:50 北京时间（窗口补发兜底）"),
+    ("cat-checkin-rights-catchup", "5 0 * * *", "每日 00:00:05 北京时间（窗口内补发兜底）"),
 ]
 
 

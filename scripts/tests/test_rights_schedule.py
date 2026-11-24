@@ -25,9 +25,10 @@ class TestRightsSchedule(unittest.TestCase):
         ids = [sid for sid, _, _ in srs.SCHEDULES]
         self.assertEqual(ids, ["cat-checkin-rights-window", "cat-checkin-rights-catchup"])
         crons = {sid: cron for sid, cron, _ in srs.SCHEDULES}
-        # UTC 15:30 = BJT 23:30（0 点场前 30 分钟）；15:50 = BJT 23:50（补发）
+        # UTC 15:30 = BJT 23:30（0 点场前 30 分钟）；00:00:05 UTC = BJT 00:00:05
+        # 补发必须在窗口内：旧 23:50 被 workflow 并发锁延后到 00:04 形同虚设
         self.assertEqual(crons["cat-checkin-rights-window"], "30 15 * * *")
-        self.assertEqual(crons["cat-checkin-rights-catchup"], "50 15 * * *")
+        self.assertEqual(crons["cat-checkin-rights-catchup"], "5 0 * * *")
         self.assertEqual(srs.EVENT_TYPE, "checkin_rights")
 
     def test_create_requires_credentials(self):
