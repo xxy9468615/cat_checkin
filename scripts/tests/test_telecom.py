@@ -1519,6 +1519,125 @@ class TestJindouExchange(unittest.TestCase):
         self.assertEqual(calls[0], "queryLevelRightInfo")
         self.assertEqual(calls[1], "querystockNum")
 
+    def test_rights_refresh_recheck_failure_returns_transient(self):
+        """开抢前复核鉴权失败必须交还框架换出口，不得用旧 sign 烧 burst（PR #40 评审）。"""
+        rights = self._rights(4)
+        client = self._rights_client()
+        seq = [rights, {"resoultCode": "0", "stockNum": 102},
+               {"resoultCode": "1", "resoultMsg": "未授权访问"}]
+        calls = []
+
+        def fake_req(method, url, **kw):
+            calls.append(url.rsplit("/", 1)[-1])
+            return seq.pop(0) if seq else {"resoultCode": "1", "resoultMsg": "x"}
+
+        client._req = MagicMock(side_effect=fake_req)
+        # 固定时钟：23:59:29（距 31s），should_refresh=True 且已过 refresh_at；
+        # 直接跳过分段等待，复核立即发生（避免固定时钟卡在 _rights_wait_until）。
+        fixed_now = datetime(2026, 11, 24, 23, 59, 29, tzinfo=telecom.BJT)
+
+        class _FixedDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now
+
+        with patch.object(telecom.time, "sleep", lambda *_: None), \
+             patch.object(telecom, "datetime", _FixedDT), \
+             patch.object(telecom, "_rights_wait_until", lambda *a, **k: None), \
+             patch.object(telecom, "_rights_refresh_session", return_value=True), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok, msg = telecom.run_rights_exchange(client, "2元话费", wait_for_window=True, burst=2)
+        self.assertFalse(ok)
+        self.assertIn("复核", msg)
+        self.assertNotIn("receiverRights", calls)
+
+    def test_rights_http_500_body_no_fake_success(self):
+        """HTTP 500 正文带 code=0 + 兑换成功 不得判成功（PR #40 评审）。"""
+        client = self._rights_client()
+        client._req = MagicMock(return_value={"code": 500, "resoultCode": "0",
+                                              "resoultMsg": "兑换成功", "_http_status": 500})
+        with patch.object(telecom.time, "sleep", lambda *_: None), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok, msg = telecom.run_rights_exchange(client, "2元话费", wait_for_window=False, burst=1)
+        self.assertFalse(ok)
+        self.assertNotIn("成功兑换", msg)
+
+    def test_rights_no_fallback_on_burst_exhaustion(self):
+        """主档「系统繁忙」耗尽 burst ≠ 售罄：不得消耗月限去兑低档（PR #40 评审）。"""
+        rights = self._rights(4)
+        client = self._rights_client()
+        submitted = []
+
+        def fake_req(method, url, **kw):
+            if "queryLevelRightInfo" in url:
+                return rights
+            if "querystockNum" in url:
+                return {"resoultCode": "0", "stockNum": 12}
+            if "receiverRights" in url:
+                submitted.append(1)
+                return {"resoultCode": "1", "resoultMsg": "系统繁忙"}
+            return {}
+
+        client._req = MagicMock(side_effect=fake_req)
+        fixed_now = datetime(2026, 11, 25, 0, 30, tzinfo=telecom.BJT)
+
+        class _FixedDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now
+
+        with patch.object(telecom.time, "sleep", lambda *_: None), \
+             patch.object(telecom, "datetime", _FixedDT), \
+             patch.object(telecom, "_encrypt_rsa", lambda d: "V1.0FAKEcipher"), \
+             patch.object(telecom, "RIGHTS_FALLBACK_TIERS", 2), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok, msg = telecom.run_rights_exchange(client, "2元话费", wait_for_window=True, burst=2)
+        self.assertFalse(ok)
+        self.assertIn("未成功", msg)
+        self.assertEqual(len(submitted), 2)  # 仅主档 burst，无备用档提交
+
+    def test_rights_fallback_prefers_highest_lower_tier(self):
+        """LV5 主档 3元售罄：备用池按金额降序，优先 2元而非 1元（PR #40 评审）。"""
+        rights = self._rights(5)
+        client = self._rights_client()
+        calls = []
+
+        def fake_req(method, url, **kw):
+            if "queryLevelRightInfo" in url:
+                return rights
+            if "querystockNum" in url:
+                para = json.dumps(kw.get("json_data", {}), ensure_ascii=False)
+                if "right5" in para:
+                    return {"resoultCode": "0", "stockNum": 0}
+                return {"resoultCode": "0", "stockNum": 5}
+            if "receiverRights" in url:
+                para = json.dumps(kw.get("json_data", {}), ensure_ascii=False)
+                calls.append(para)
+                if "right5" in para:
+                    return {"resoultCode": "1", "resoultMsg": "奖品已抢光"}
+                if "right4" in para:
+                    return {"resoultCode": "0", "resoultMsg": "兑换成功"}
+                return {"resoultCode": "1", "resoultMsg": "系统繁忙"}
+            return {}
+
+        client._req = MagicMock(side_effect=fake_req)
+        fixed_now = datetime(2026, 11, 25, 0, 30, tzinfo=telecom.BJT)
+
+        class _FixedDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now
+
+        with patch.object(telecom.time, "sleep", lambda *_: None), \
+             patch.object(telecom, "datetime", _FixedDT), \
+             patch.object(telecom, "_encrypt_rsa", lambda d: json.dumps(d, ensure_ascii=False)), \
+             patch.object(telecom, "RIGHTS_FALLBACK_TIERS", 1), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok, msg = telecom.run_rights_exchange(client, "3元话费", wait_for_window=True, burst=1)
+        self.assertTrue(ok)
+        self.assertIn("2元", msg)
+        self.assertNotIn("1元", msg)
+
     def test_rights_sold_out_primary_falls_back_to_available_tier(self):
         """主档售罄 + 备用档有库存：必须继续抢低档，不得直接判「今日终止」。"""
         rights = self._rights(4)

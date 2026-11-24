@@ -128,6 +128,7 @@ try:
 except ValueError:
     RIGHTS_REFRESH_LEAD_SECONDS = 30
 RIGHTS_KEEPALIVE_INTERVAL_SECONDS = 45
+_SOLD_OUT_FALLBACK = "_SOLD_OUT_FALLBACK_"  # 内部哨兵：仅主档明确售罄时切备用档
 try:
     RIGHTS_FALLBACK_TIERS = max(0, min(5, int(
         (os.getenv("TELECOM_EXCHANGE_FALLBACK_TIERS") or "").strip() or "2")))
@@ -1660,6 +1661,11 @@ def _pick_phone_right(rights: Dict[str, Any], goal: str) -> Tuple[Optional[Dict[
     return it, f"自动选择 LV{cur_level} 最高档 {amount}元话费"
 
 
+def _amount_of_title(title: str) -> int:
+    m = re.search(r"(\d+(?:\.\d+)?)\s*元", title or "")
+    return int(float(m.group(1))) if m else 0
+
+
 def _rights_payload(client: TelecomClient, item: Dict[str, Any]) -> Dict[str, str]:
     return {
         "id": str(item.get("activityId") or ""),
@@ -1725,12 +1731,19 @@ def run_rights_exchange(
 
     now = datetime.now(BJT)
     window = _rights_next_window(now)
-    lead = timedelta(seconds=RIGHTS_LEAD_SECONDS)
     gap = window - now
-    will_wait = (wait_for_window and timedelta(0) < gap <= timedelta(minutes=35)
-                 and gap > lead)
+    # 等待窗口与「是否刷新」分开判定（PR #40 评审）：
+    #   in_window  = 距 0 点 ≤35 分钟且尚未开抢 —— 必须在窗口内等到 window 再提交，
+    #                超预算则交还调度器，绝不在 23:59:30 提前烧光 burst；
+    #   should_refresh = 尚有 ≥30s 可用于现签/复核 —— 太贴近开抢时不再现签，
+    #                直接用开场已验的 sign 首发；
+    #   白天补跑（gap > 35min / 场次已过）不等待、不刷新，行为同旧版。
+    in_window = wait_for_window and timedelta(0) < gap <= timedelta(minutes=35)
+    should_refresh = in_window and gap > timedelta(seconds=RIGHTS_REFRESH_LEAD_SECONDS)
+    if in_window and gap.total_seconds() > RIGHTS_MAX_WAIT_SECONDS:
+        return False, (f"距 0 点开抢 {int(gap.total_seconds())}s 超出任务内等待预算 "
+                       f"{RIGHTS_MAX_WAIT_SECONDS}s，交还调度器按 23:30 场重试")
     # 预检前移：23:30 拉起时立刻查权益/库存，不再在 JWT 寿命上赌 29 分钟。
-    # 窗口外运行（白天补跑）行为保持不变。
     # 1. 查询等级权益目录
     rights_res = client._req(
         "POST", PARADISE_RIGHTS_URL,
@@ -1779,47 +1792,55 @@ def run_rights_exchange(
             stock = None
     print(f"    [权益] 目标: {title} ({cost}金豆) 预查库存: {stock}", flush=True)
 
-    # 3. 窗口内等待：刷新 sign 到开抢前 40s，复核库存，选目标档/降级档
+    # 3. 窗口内等待：刷新 sign → 复核权益 → 等到 0 点整
     # 2026-11-24 CI 根因：23:30 现签 → 等 29min → 23:59 查询「未授权访问」，
     # 出口轮换烧掉 4min → 00:04 提交时 LV4 2元档 102 份已抢光。
-    if will_wait:
-        now = datetime.now(BJT)
+    if should_refresh:
         refresh_at = window - timedelta(seconds=RIGHTS_REFRESH_LEAD_SECONDS)
-        if now < refresh_at:
-            wait_s = (refresh_at - now).total_seconds()
-            if wait_s <= RIGHTS_MAX_WAIT_SECONDS:
-                print(f"    [权益] 距 0 点开抢 {int(gap.total_seconds())}s，"
-                      f"分段等待 {int(wait_s)}s 至开抢前 "
-                      f"{RIGHTS_REFRESH_LEAD_SECONDS}s 刷新会话...", flush=True)
-                _rights_wait_until(refresh_at, RIGHTS_MAX_WAIT_SECONDS)
-        # 开抢前刷新 sign（现签优先），避免 JWT 在等待期失效
+        wait_s = (refresh_at - datetime.now(BJT)).total_seconds()
+        if 0 < wait_s <= RIGHTS_MAX_WAIT_SECONDS:
+            print(f"    [权益] 距 0 点开抢 {int(gap.total_seconds())}s，"
+                  f"分段等待 {int(wait_s)}s 至开抢前 "
+                  f"{RIGHTS_REFRESH_LEAD_SECONDS}s 刷新会话...", flush=True)
+            _rights_wait_until(refresh_at, RIGHTS_MAX_WAIT_SECONDS)
         before_sign = client.sign
         if _rights_refresh_session(client):
             print(f"    [权益] 开抢前 sign 已刷新: "
                   f"{mask_str(before_sign, 4, 4)} → {mask_str(client.sign, 4, 4)}", flush=True)
         else:
             print("    [权益] ⚠️ 开抢前 sign 刷新失败，沿用旧 sign（突发仍会尝试）", flush=True)
+        # 复核失败必须按首次查询同一语义交还框架换出口（PR #40 评审）：
+        # 已过期 sign 的鉴权失败若不识别，会带着旧凭据烧光 burst 且轮换永远不触发。
         refreshed_res = client._req(
             "POST", PARADISE_RIGHTS_URL,
             json_data={"para": _encrypt_rsa({
                 "type": PARADISE_RIGHTS_TYPE, "accId": client.acc_id, "shopId": PARADISE_SHOP_ID})},
             headers={"sign": client.sign},
         )
-        if str(refreshed_res.get("resoultCode")) == "0":
-            rights_res = refreshed_res
-            refreshed_item, refreshed_note = _pick_phone_right(refreshed_res, goal)
-            if refreshed_item is not None:
-                item, pick_note = refreshed_item, refreshed_note
-                print(f"    [权益] 开抢前复核: {pick_note}", flush=True)
-                activity_id = str(item.get("activityId") or "")
-                title = str(item.get("title") or goal)
-                try:
-                    cost = int(float(str(item.get("promotionalPrice") or "0")))
-                except (TypeError, ValueError):
-                    cost = 0
-                show_effect = str(item.get("showEffect") or "8")
-        if (window - datetime.now(BJT)).total_seconds() <= RIGHTS_MAX_WAIT_SECONDS:
-            print("    [权益] 等待 0 点整开抢...", flush=True)
+        if str(refreshed_res.get("resoultCode")) != "0":
+            rmsg = str(refreshed_res.get("resoultMsg") or refreshed_res.get("msg") or "")
+            if any(k in rmsg for k in ("登录", "失效", "过期", "sign")):
+                return False, f"等级权益开抢前复核鉴权失败: {_safe_msg(rmsg, 60)}"
+            return False, f"等级权益开抢前复核失败: {_safe_msg(rmsg, 60) or refreshed_res.get('resoultCode')}"
+        rights_res = refreshed_res
+        refreshed_item, refreshed_note = _pick_phone_right(refreshed_res, goal)
+        if refreshed_item is None:
+            if "无法确定账号等级" in refreshed_note:
+                return False, refreshed_note
+            return True, refreshed_note
+        item, pick_note = refreshed_item, refreshed_note
+        print(f"    [权益] 开抢前复核: {pick_note}", flush=True)
+        activity_id = str(item.get("activityId") or "")
+        title = str(item.get("title") or goal)
+        try:
+            cost = int(float(str(item.get("promotionalPrice") or "0")))
+        except (TypeError, ValueError):
+            cost = 0
+        show_effect = str(item.get("showEffect") or "8")
+    if in_window:
+        remaining = (window - datetime.now(BJT)).total_seconds()
+        if remaining > 0:
+            print(f"    [权益] 等待 0 点整开抢（{int(remaining)}s）...", flush=True)
             _rights_wait_until(window, RIGHTS_MAX_WAIT_SECONDS)
 
     # 4. 突发提交 receiverRights（售罄时按可用库存降级档位补抢）
@@ -1830,12 +1851,13 @@ def run_rights_exchange(
     # 有界（≤ burst×8s）。跨场次重试仍由 rolling 自排程 + 框架梯子管理。
     # 降级档从 queryLevelRightInfo 同一次响应中提取，只有主档确认售罄/限兑
     # 时才懒查库存（绝不拖慢 00:00:00 首发），最多 RIGHTS_FALLBACK_TIERS 档。
-    fallback_pool: List[Dict[str, Any]] = []
+    fallback_pool: List[Tuple[int, Dict[str, Any]]] = []
     if wait_for_window and RIGHTS_FALLBACK_TIERS > 0:
         try:
             cur_level = int(rights_res.get("currentLevel") or 0)
         except (TypeError, ValueError):
             cur_level = 0
+        primary_amount = _amount_of_title(title)
         for lv in range(1, cur_level + 1):
             for it in rights_res.get(f"V{lv}") or []:
                 if not isinstance(it, dict) or it is item:
@@ -1844,7 +1866,11 @@ def run_rights_exchange(
                     continue
                 if str(it.get("isReceive")) == "true":
                     continue
-                fallback_pool.append(it)
+                amount = _amount_of_title(str(it.get("title") or ""))
+                # 只保留金额低于主档的档位；按金额降序，优先最接近主档的低档
+                if primary_amount and amount and 0 < amount < primary_amount:
+                    fallback_pool.append((amount, it))
+        fallback_pool.sort(key=lambda x: x[0], reverse=True)
     last_msg = ""
 
     def _burst_target(target_item: Dict[str, Any], target_cost: int, target_label: str,
@@ -1862,27 +1888,31 @@ def run_rights_exchange(
             rc = str(res.get("resoultCode") or "")
             msg = str(res.get("resoultMsg") or res.get("msg") or "")
             last_msg = msg
+            http_code = res.get("_http_status") or res.get("code")
+            # HTTP 状态先行：500 正文带 code=0+兑换成功 也不得判成功（PR #40 评审）
+            if http_code not in (None, 200, "200"):
+                if http_code in (412, "412"):
+                    return False, f"{target_label}WAF 拦截(HTTP 412)，换出口重试"
+                if http_code in (429, "429"):
+                    wait = min(2.0 * attempt, 8.0)
+                    print(f"    [权益] 第{attempt}发限频(429)，退避 {wait:.1f}s", flush=True)
+                    time.sleep(wait)
+                    continue
+                print(f"    [权益] 第{attempt}发HTTP {http_code} 失败", flush=True)
+                continue
             # 成功判定必须协议码先行：「未兑换成功，请稍后重试」也含「兑换成功」
             # 子串，纯文案匹配会把失败判成成功（PR #34 评审指认，规则 9a(1)）
             if rc == "0" and "兑换成功" in msg:
                 print(f"    [权益] 🎉 第{attempt}发兑换成功: {target_label}", flush=True)
                 return True, f"🎉 成功兑换{target_label}(耗 {target_cost} 金豆)，话费 7 个工作日内到账"
-            http_code = res.get("_http_status") or res.get("code")
-            if http_code in (412, "412"):
-                return False, f"{target_label}WAF 拦截(HTTP 412)，换出口重试"
             terminal = _rights_is_terminal(msg)
             if terminal:
                 sold_out = any(k in msg for k in ("已抢光", "抢光", "已领完", "售罄", "库存不足"))
                 if sold_out and allow_fallback:
                     print(f"    [权益] {target_label}售罄，尝试备用档", flush=True)
-                    return ("_SOLD_OUT_FALLBACK_", "")
+                    return (_SOLD_OUT_FALLBACK, "")
                 note = "已售罄" if sold_out else "本月已兑/限兑/等级不足"
                 return True, f"{target_label}{note}（{_safe_msg(msg, 40)}），今日终止"
-            if http_code in (429, "429"):
-                wait = min(2.0 * attempt, 8.0)
-                print(f"    [权益] 第{attempt}发限频(429)，退避 {wait:.1f}s", flush=True)
-                time.sleep(wait)
-                continue
             print(f"    [权益] 第{attempt}发未中: rc={rc} {_safe_msg(msg, 50)}", flush=True)
             time.sleep(random.uniform(0.3, 0.8))
         return None
@@ -1891,18 +1921,29 @@ def run_rights_exchange(
     # 降级档按主档剩余时间补抢（错过首发后聊胜于无），总量受 RIGHTS_FALLBACK_TIERS 限制。
     primary = _burst_target(item, cost, f"【{title}】", burst,
                             allow_fallback=bool(fallback_pool))
-    if primary is not None and primary[0] != "_SOLD_OUT_FALLBACK_":
+    if primary is None:
+        # burst 耗尽 ≠ 售罄：主档可能仍有库存，交框架按退避梯子重试，
+        # 绝不因「系统繁忙」就消耗每月一次的话费额度去兑低档（PR #40 评审）。
+        return False, (f"【{title}】连发 {burst} 次未成功"
+                       f"（末次: {_safe_msg(last_msg, 50) or 'HTTP错误'}）")
+    if primary[0] != _SOLD_OUT_FALLBACK:
         return primary
     fallbacks: List[Tuple[Dict[str, Any], int, str]] = []
-    for alt in fallback_pool[:RIGHTS_FALLBACK_TIERS]:
+    for _amount, alt in fallback_pool[:RIGHTS_FALLBACK_TIERS]:
         alt_id = str(alt.get("activityId") or "")
         alt_stock_res = client._req(
             "POST", PARADISE_STOCK_URL,
             json_data={"para": _encrypt_rsa({"id": alt_id, "accId": client.acc_id})},
             headers={"sign": client.sign},
         )
-        if str(alt_stock_res.get("resoultCode")) != "0" \
-                or int(alt_stock_res.get("stockNum") or 0) <= 0:
+        if str(alt_stock_res.get("resoultCode")) != "0":
+            continue
+        try:
+            alt_stock = int(alt_stock_res.get("stockNum") or 0)
+        except (TypeError, ValueError):
+            print("    [权益] 备用档库存字段异常，跳过该档", flush=True)
+            continue
+        if alt_stock <= 0:
             continue
         alt_cost = 0
         try:
@@ -1914,13 +1955,16 @@ def run_rights_exchange(
     if fallbacks:
         print("    [权益] 主档售罄，备用档(库存>0): " + "、".join(
             x[2] for x in fallbacks), flush=True)
-    # 降级补抢使用与主档同等的 burst（此时首发窗口已错过，无「抢首发」优先级）；
-    # 单个降级档次数仍受全局 burst 上限约束，412 立即交还框架换出口。
+    # 降级补抢：每个备用档只提交一次（无自建 burst/退避循环，规则 6）；售罄
+    # 继续下一档，成功/限兑/等级不足/412 立即返回，框架负责后续退避与重试。
     for alt, alt_cost, alt_label in fallbacks:
-        outcome = _burst_target(alt, alt_cost, alt_label, burst)
-        if outcome is not None:
-            return outcome
-    return False, f"【{title}】连发 {burst} 次未成功（末次: {_safe_msg(last_msg, 50) or 'HTTP错误'}）"
+        outcome = _burst_target(alt, alt_cost, alt_label, 1, allow_fallback=True)
+        if outcome is None:
+            continue
+        if outcome[0] == _SOLD_OUT_FALLBACK:
+            continue
+        return outcome
+    return True, f"【{title}】主档与备用档均已售罄（{_safe_msg(last_msg, 40)}），今日终止"
 
 
 def run_exchange_mode() -> int:
