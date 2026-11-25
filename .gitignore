@@ -54,3 +54,6 @@ legacy/
 scripts/unregistered/
 *.md
 .zcodeignore
+
+# ---- CodeRabbit 评审配置：本地/服务端维护，不进 GH 仓库 ----
+.coderabbit.yaml
