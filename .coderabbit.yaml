@@ -1,38 +1,60 @@
-# CodeRabbit 评审配置（仓库级，版本化；文档 https://docs.coderabbit.ai/reference/configuration）
-# 机器评审口径与 CLAUDE.md 规则保持一致；改动本文件同样走 PR 评审。
-language: zh-CN
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# Machine-review policy kept in sync with CLAUDE.md rules; changes to this
+# file also go through PR review. Instructions are written in English on
+# purpose (repo language is en-US) so the reviewer model reads them at full
+# fidelity — only downstream-parsed literal anchors stay in Chinese.
+language: en-US
 
 reviews:
-  profile: assertive             # 严格档（用户指令：强审）
-  request_changes_workflow: true # 修复 push 后自动复审，直至无 CHANGES_REQUESTED
+  profile: assertive             # strict profile (user mandate)
+  request_changes_workflow: true # auto re-review after fix pushes until no CHANGES_REQUESTED
   auto_review:
-    enabled: true                # 公开仓 ≥10 星：每个 PR 自动评审
-    drafts: false                # draft 不审，转正式后自动开审
+    enabled: true                # 2026-11-25: repo reached 15 stars, the >=10-star gate
+                                 # has passed — every ready PR gets auto-reviewed.
+                                 # (Old regime, verified 2026-10-31 at <10 stars: gate OFF,
+                                 # check-run showed "skipping" (cosmetic), manual
+                                 # "@coderabbitai review" comment was required.)
+    drafts: false                # drafts are not reviewed; auto-starts when marked ready
   path_filters:
-    - "!**/*.md"                 # 文档类不进评审（凭据防线由 CI 密钥扫描把守）。
-                                 # 注意必须带 ! 否则语义反转为「仅审 .md」——2026-11-01
-                                 # 发现扁平列表正则被当作 include-only，全 PR 评审被跳过
+    - "!**/*.md"                 # docs excluded from review (the credential line of
+                                 # defense is the CI secret scan).
+                                 # NOTE: the leading "!" is mandatory — without it the
+                                 # semantics flip to "review ONLY .md" (found 2026-11-01:
+                                 # the flat-list glob was treated as include-only and
+                                 # review was silently skipped for all PRs).
   path_instructions:
     - path: "scripts/**"
       instructions: >-
-        本仓库是定时签到/领取类自动化脚本矩阵。评审重点：
-        (1) 绝不允许假成功——对外部响应的判定必须依据真实 code/字段，
-        禁止无依据的乐观文案（历史教训：receiverRights HTTP 500 被美化成
-        「已提交」）；
-        (2) 凭据/手机号/昵称/邮箱等 PII 的展示与落盘必须经 common.mask_str
-        系脱敏（手机号只留末4、昵称末3、邮箱前缀末4+域名全脱）；
-        (3) 调度与窗口时刻一律按北京时间（BJT）推算，不得用本地时区；
-        (4) 任务脚本内禁止自建重试/退避/熔断循环，调度与重试由框架统一管理；
-        (5) 测试夹具只允许合成凭据，合成 token 必须用 V1.0FAKE 前缀，
-        严禁真实凭据/手机号入测试文件。
+        This repository is a matrix of scheduled check-in / reward-claim
+        automation scripts. Review priorities:
+        (1) Never fabricate success — verdicts on external responses must be
+        based on real protocol codes/fields; optimistic copy without evidence
+        is forbidden (historical lesson: a receiverRights HTTP 500 was once
+        glossed as "submitted");
+        (2) Any PII shown or persisted (credentials, phone numbers,
+        nicknames, emails) must go through the common.mask_str family of
+        masking helpers (phones: last 4 digits only; nicknames: last 3 chars;
+        emails: last 4 chars of prefix + fully masked domain);
+        (3) Scheduling and window times must always be computed in Beijing
+        time (BJT, UTC+8), never in local timezone;
+        (4) Task scripts must NOT implement their own retry/backoff/
+        circuit-breaker loops — scheduling and retries are managed solely
+        by the framework orchestrator;
+        (5) Test fixtures must use synthetic credentials only; synthetic
+        tokens must carry the V1.0FAKE prefix; real credentials or phone
+        numbers in test files are strictly forbidden.
     - path: "scripts/telecom.py"
       instructions: >-
-        电信上游协议（getSingle/clientXML 报文、wapact 网关）本身强制使用
-        3DES/AES-ECB/DES 等算法，这些既有加密用法是上游约束，不要作为新
-        问题标记；MD5 仅用于指纹/状态键（如 cookie_validity），非安全散列用途。
+        The telecom upstream protocol (getSingle/clientXML payloads, wapact
+        gateway) mandates legacy crypto such as 3DES/AES-ECB/DES. These
+        existing usages are upstream constraints — do not flag them as new
+        findings. MD5 here is only used for fingerprint/state keys (e.g.
+        cookie_validity), not as a security hash.
     - path: "scripts/cookie_validity.py"
       instructions: >-
-        本模块是全任务共享的凭据有效期引擎（唯一事实来源）。输出标签文案
-        被下游 alert_levels / report_fields 以字面锚点解析（如
-        「Cookie 有效期未知」「Cookie 剩余 N 天」），改动文案前必须核对这些
-        锚点；build_tag 不得产出无证据的假倒计时/假 0 天告警。
+        This module is the shared credential-validity engine and the single
+        source of truth. Its output tag strings are parsed downstream by
+        alert_levels / report_fields via literal anchors (e.g.
+        "Cookie 有效期未知", "Cookie 剩余 N 天"). Before changing any tag
+        copy, verify these anchors; build_tag must never emit evidence-free
+        countdowns or fabricated 0-day warnings.
