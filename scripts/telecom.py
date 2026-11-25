@@ -1840,7 +1840,8 @@ def run_rights_exchange(
                 rmsg = f"HTTP {refreshed_http_code}" if refreshed_http_code else "HTTP错误"
             if _rights_is_auth_error(rmsg):
                 return False, f"等级权益开抢前复核鉴权失败: {_safe_msg(rmsg, 60)}"
-            return False, f"等级权益开抢前复核失败: {_safe_msg(rmsg, 60) or refreshed_res.get('resoultCode')}"
+            # 必须含「查询失败」：调用方按此关键词决定是否换出口（PR #40 第五轮评审）
+            return False, f"等级权益查询失败（开抢前复核）: {_safe_msg(rmsg, 60) or refreshed_res.get('resoultCode')}"
         rights_res = refreshed_res
         refreshed_item, refreshed_note = _pick_phone_right(refreshed_res, goal)
         if refreshed_item is None:
@@ -1971,8 +1972,12 @@ def run_rights_exchange(
         if str(alt_stock_res.get("resoultCode")) != "0":
             stock_query_failed = True
             continue
+        raw_stock = alt_stock_res.get("stockNum")
+        # 缺失/null/空串是字段异常，不能经 `or 0` 伪装成明确零库存（PR #40 第五轮评审）
         try:
-            alt_stock = int(alt_stock_res.get("stockNum") or 0)
+            if raw_stock is None or raw_stock == "":
+                raise ValueError("stockNum missing")
+            alt_stock = int(raw_stock)
         except (TypeError, ValueError):
             stock_query_failed = True
             print("    [权益] 备用档库存字段异常，跳过该档", flush=True)
