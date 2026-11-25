@@ -1670,6 +1670,38 @@ class TestJindouExchange(unittest.TestCase):
         self.assertFalse(ok)
         self.assertNotIn("均已售罄", msg)
 
+    def test_rights_fallback_http_500_zero_stock_not_terminal(self):
+        """HTTP 500 正文带 resoultCode=0+stockNum=0 不得判售罄终局（PR #40 第四轮评审）。"""
+        rights = self._rights(4)
+        client = self._rights_client()
+
+        def fake_req(method, url, **kw):
+            if "queryLevelRightInfo" in url:
+                return rights
+            if "querystockNum" in url:
+                return {"resoultCode": "0", "stockNum": 0,
+                        "_http_status": 500}
+            if "receiverRights" in url:
+                return {"resoultCode": "1", "resoultMsg": "抱歉，奖品已抢光"}
+            return {}
+
+        client._req = MagicMock(side_effect=fake_req)
+        fixed_now = datetime(2026, 11, 25, 0, 30, tzinfo=telecom.BJT)
+
+        class _FixedDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now
+
+        with patch.object(telecom.time, "sleep", lambda *_: None), \
+             patch.object(telecom, "datetime", _FixedDT), \
+             patch.object(telecom, "_encrypt_rsa", lambda d: json.dumps(d, ensure_ascii=False)), \
+             patch.object(telecom, "RIGHTS_FALLBACK_TIERS", 2), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            ok, msg = telecom.run_rights_exchange(client, "2元话费", wait_for_window=True, burst=1)
+        self.assertFalse(ok)
+        self.assertNotIn("均已售罄", msg)
+
     def test_rights_auth_keyword_recognized(self):
         """「未授权访问」必须归类为鉴权失败以触发出口轮换（PR #40 第二轮评审）。"""
         self.assertTrue(telecom._rights_is_auth_error("未授权访问"))
