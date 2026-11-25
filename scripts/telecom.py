@@ -1761,8 +1761,12 @@ def run_rights_exchange(
         })},
         headers={"sign": client.sign},
     )
-    if str(rights_res.get("resoultCode")) != "0":
+    rights_http_code = rights_res.get("_http_status")
+    rights_http_fault = rights_res.get("_http_error") or rights_http_code not in (None, 200, "200")
+    if rights_http_fault or str(rights_res.get("resoultCode")) != "0":
         msg = str(rights_res.get("resoultMsg") or rights_res.get("msg") or "")
+        if rights_http_fault and not msg:
+            msg = f"HTTP {rights_http_code}" if rights_http_code else str(rights_res.get("msg") or "HTTP错误")
         if _rights_is_auth_error(msg):
             return False, f"等级权益查询鉴权失败: {_safe_msg(msg, 60)}"
         return False, f"等级权益查询失败: {_safe_msg(msg, 60) or rights_res.get('resoultCode')}"
@@ -1792,7 +1796,11 @@ def run_rights_exchange(
         headers={"sign": client.sign},
     )
     stock = None
-    if str(stock_res.get("resoultCode")) == "0":
+    # HTTP 状态先行：传输故障正文带 resoultCode=0 也不得当成有效库存读数
+    # （PR #40 第四轮评审，规则 9a(1) 绝无假成功）。
+    stock_http_code = stock_res.get("_http_status")
+    if not stock_res.get("_http_error") and stock_http_code in (None, 200, "200") \
+            and str(stock_res.get("resoultCode")) == "0":
         try:
             stock = int(stock_res.get("stockNum") or 0)
         except (TypeError, ValueError):
@@ -1824,8 +1832,12 @@ def run_rights_exchange(
                 "type": PARADISE_RIGHTS_TYPE, "accId": client.acc_id, "shopId": PARADISE_SHOP_ID})},
             headers={"sign": client.sign},
         )
-        if str(refreshed_res.get("resoultCode")) != "0":
+        refreshed_http_code = refreshed_res.get("_http_status")
+        refreshed_http_fault = refreshed_res.get("_http_error") or refreshed_http_code not in (None, 200, "200")
+        if refreshed_http_fault or str(refreshed_res.get("resoultCode")) != "0":
             rmsg = str(refreshed_res.get("resoultMsg") or refreshed_res.get("msg") or "")
+            if refreshed_http_fault and not rmsg:
+                rmsg = f"HTTP {refreshed_http_code}" if refreshed_http_code else "HTTP错误"
             if _rights_is_auth_error(rmsg):
                 return False, f"等级权益开抢前复核鉴权失败: {_safe_msg(rmsg, 60)}"
             return False, f"等级权益开抢前复核失败: {_safe_msg(rmsg, 60) or refreshed_res.get('resoultCode')}"
@@ -1949,6 +1961,13 @@ def run_rights_exchange(
             json_data={"para": _encrypt_rsa({"id": alt_id, "accId": client.acc_id})},
             headers={"sign": client.sign},
         )
+        # HTTP 状态先行：500 正文可能带 resoultCode=0+stockNum=0，不能当明确零库存
+        # （PR #40 第四轮评审，规则 9a(1) 绝无假成功）。
+        alt_http_code = alt_stock_res.get("_http_status")
+        if alt_stock_res.get("_http_error") or alt_http_code not in (None, 200, "200"):
+            stock_query_failed = True
+            print("    [权益] 备用档库存查询 HTTP 故障，跳过该档", flush=True)
+            continue
         if str(alt_stock_res.get("resoultCode")) != "0":
             stock_query_failed = True
             continue
