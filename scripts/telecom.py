@@ -1937,6 +1937,11 @@ def run_rights_exchange(
     if primary[0] != _SOLD_OUT_FALLBACK:
         return primary
     fallbacks: List[Tuple[Dict[str, Any], int, str]] = []
+    # 保留库存查询分类：明确 stockNum=0 与「查询失败/字段异常」区分开——
+    # 全部档位均确认无库存是售罄终局；查询失败必须交框架暂时失败重试
+    # （PR #40 第三轮评审）。
+    stock_query_failed = False
+    stock_checked = 0
     for _amount, alt in fallback_pool[:RIGHTS_FALLBACK_TIERS]:
         alt_id = str(alt.get("activityId") or "")
         alt_stock_res = client._req(
@@ -1945,12 +1950,15 @@ def run_rights_exchange(
             headers={"sign": client.sign},
         )
         if str(alt_stock_res.get("resoultCode")) != "0":
+            stock_query_failed = True
             continue
         try:
             alt_stock = int(alt_stock_res.get("stockNum") or 0)
         except (TypeError, ValueError):
+            stock_query_failed = True
             print("    [权益] 备用档库存字段异常，跳过该档", flush=True)
             continue
+        stock_checked += 1
         if alt_stock <= 0:
             continue
         alt_cost = 0
@@ -1975,7 +1983,9 @@ def run_rights_exchange(
         if outcome[0] == _SOLD_OUT_FALLBACK:
             continue
         return outcome
-    if any_sold_out and fallbacks:
+    # 全部档位均明确 stockNum=0 才是售罄终局；查询失败/字段异常仍交框架重试
+    # （PR #40 第三轮评审）。
+    if any_sold_out and not stock_query_failed and stock_checked > 0:
         return True, f"【{title}】主档与备用档均已售罄（{_safe_msg(last_msg, 40)}），今日终止"
     return False, f"【{title}】主档售罄、备用档提交故障（{_safe_msg(last_msg, 50) or 'HTTP错误'}），交框架重试"
 
