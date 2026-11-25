@@ -1661,6 +1661,13 @@ def _pick_phone_right(rights: Dict[str, Any], goal: str) -> Tuple[Optional[Dict[
     return it, f"自动选择 LV{cur_level} 最高档 {amount}元话费"
 
 
+_RIGHTS_AUTH_ERROR_WORDS = ("登录", "失效", "过期", "sign", "未授权")
+
+
+def _rights_is_auth_error(msg: str) -> bool:
+    return any(k in msg for k in _RIGHTS_AUTH_ERROR_WORDS)
+
+
 def _amount_of_title(title: str) -> int:
     m = re.search(r"(\d+(?:\.\d+)?)\s*元", title or "")
     return int(float(m.group(1))) if m else 0
@@ -1756,7 +1763,7 @@ def run_rights_exchange(
     )
     if str(rights_res.get("resoultCode")) != "0":
         msg = str(rights_res.get("resoultMsg") or rights_res.get("msg") or "")
-        if any(k in msg for k in ("登录", "失效", "过期", "sign")):
+        if _rights_is_auth_error(msg):
             return False, f"等级权益查询鉴权失败: {_safe_msg(msg, 60)}"
         return False, f"等级权益查询失败: {_safe_msg(msg, 60) or rights_res.get('resoultCode')}"
 
@@ -1819,7 +1826,7 @@ def run_rights_exchange(
         )
         if str(refreshed_res.get("resoultCode")) != "0":
             rmsg = str(refreshed_res.get("resoultMsg") or refreshed_res.get("msg") or "")
-            if any(k in rmsg for k in ("登录", "失效", "过期", "sign")):
+            if _rights_is_auth_error(rmsg):
                 return False, f"等级权益开抢前复核鉴权失败: {_safe_msg(rmsg, 60)}"
             return False, f"等级权益开抢前复核失败: {_safe_msg(rmsg, 60) or refreshed_res.get('resoultCode')}"
         rights_res = refreshed_res
@@ -1888,7 +1895,8 @@ def run_rights_exchange(
             rc = str(res.get("resoultCode") or "")
             msg = str(res.get("resoultMsg") or res.get("msg") or "")
             last_msg = msg
-            http_code = res.get("_http_status") or res.get("code")
+            # HTTP 状态只认 _http_status（HTTP 200 的 body code=0 是业务码！）
+            http_code = res.get("_http_status")
             # HTTP 状态先行：500 正文带 code=0+兑换成功 也不得判成功（PR #40 评审）
             if http_code not in (None, 200, "200"):
                 if http_code in (412, "412"):
@@ -1957,14 +1965,19 @@ def run_rights_exchange(
             x[2] for x in fallbacks), flush=True)
     # 降级补抢：每个备用档只提交一次（无自建 burst/退避循环，规则 6）；售罄
     # 继续下一档，成功/限兑/等级不足/412 立即返回，框架负责后续退避与重试。
+    any_sold_out = True
     for alt, alt_cost, alt_label in fallbacks:
         outcome = _burst_target(alt, alt_cost, alt_label, 1, allow_fallback=True)
         if outcome is None:
+            # 备用档故障/未知，不得包装成「均已售罄」终局（PR #40 第二轮评审）
+            any_sold_out = False
             continue
         if outcome[0] == _SOLD_OUT_FALLBACK:
             continue
         return outcome
-    return True, f"【{title}】主档与备用档均已售罄（{_safe_msg(last_msg, 40)}），今日终止"
+    if any_sold_out and fallbacks:
+        return True, f"【{title}】主档与备用档均已售罄（{_safe_msg(last_msg, 40)}），今日终止"
+    return False, f"【{title}】主档售罄、备用档提交故障（{_safe_msg(last_msg, 50) or 'HTTP错误'}），交框架重试"
 
 
 def run_exchange_mode() -> int:

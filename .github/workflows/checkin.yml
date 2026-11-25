@@ -70,11 +70,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     concurrency:
-      # 0 点场补发派发（checkin_rights）必须独立于主力并发组：旧补发 23:50
-      # 排在 23:30 主力之后，主力等到 00:04 结束，补发启动时库存早已抢光。
-      # 00:00 补发与主力走不同 group 才能同时进入窗口；账号级串行由任务内
-      # rolling 冷却 + 服务端库存/月限裁决保证（重复派发秒退，不重复兑换）。
-      group: ${{ github.event.action == 'checkin_rights' && format('unified-rights-{0}', github.ref) || format('unified-{0}', github.ref) }}
+      # 0 点场主力(23:30)与补发(00:00)必须走不同并发组，否则补发排在主力
+      # 之后到 00:04 才启动、库存已空（PR #40 第二轮评审：两次派发都叫
+      # checkin_rights，仅按 action 分支会让两场解析为同一 group）。
+      # 用 workflow_run.id / run_id 无法区分同一事件的两次派发，改用
+      # github.event.client_payload.catchup 标记：补发 QStash schedule 投递
+      # 时带 {"catchup": true}，主力不带，从而拆成两个独立 group。
+      # 账号级串行仍由 rolling 冷却 + 服务端库存/月限裁决保证。
+      group: ${{ github.event.action == 'checkin_rights' && github.event.client_payload.catchup == true && format('unified-rights-catchup-{0}', github.ref) || (github.event.action == 'checkin_rights' && format('unified-rights-window-{0}', github.ref)) || format('unified-{0}', github.ref) }}
       cancel-in-progress: false
     env:
       TZ: Asia/Shanghai
